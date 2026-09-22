@@ -80,6 +80,20 @@ def _is_catastrophic_command(command: str) -> bool:
     normalized: str = " ".join(command.split())
     return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in _CATASTROPHIC_SHELL_PATTERNS)
 
+# write_file/self_modify hassas yolları reddediyor; execute_shell'in de aynı korumaya
+# ihtiyacı var, yoksa `echo x > ~/.ssh/...` gibi bir yönlendirme aynı korumayı atlatır.
+_SHELL_REDIRECT_TARGET_PATTERN = re.compile(r"(?:>{1,2}|\btee\b(?:\s+-a)?)\s+(~?/?[^\s;|&<>]+)")
+
+def _shell_writes_to_sensitive_path(command: str) -> bool:
+    """Komut metnindeki `>`, `>>` veya `tee` hedeflerinden herhangi biri korunan bir yola mı yazıyor."""
+    for match in _SHELL_REDIRECT_TARGET_PATTERN.finditer(command):
+        target: str = match.group(1).strip("'\"")
+        if not target:
+            continue
+        if _is_sensitive_path(Path(target)):
+            return True
+    return False
+
 def _backup_file(path: Path) -> Path:
     """Üzerine yazılmadan önce mevcut dosyanın zaman damgalı yedeğini alır."""
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -206,6 +220,11 @@ class Toolbox:
             raise ToolError(
                 f"Bilinen yıkıcı komut kalıbıyla eşleşti, çalıştırma engellendi: {command}",
                 "CATASTROPHIC_COMMAND_BLOCKED", False,
+            )
+        if _shell_writes_to_sensitive_path(command):
+            raise ToolError(
+                f"Komut korunan bir sistem/kimlik yoluna yönlendirme yapıyor, engellendi: {command}",
+                "SENSITIVE_PATH_BLOCKED", False,
             )
         if use_sudo:
             logging.warning("Sudo ile kabuk komutu çalıştırılıyor", extra={"command": command})
