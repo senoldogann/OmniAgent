@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 from openai import AsyncOpenAI
 
-from config import config
+from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, BackendProfile, config
 from tools import Toolbox, ToolError
 import state_manager as sm
 
@@ -19,6 +20,8 @@ MAX_API_RETRIES: int = 3
 MAX_WALL_CLOCK_SECONDS: float = 600.0
 MAX_TOOL_MESSAGE_AGE: int = 6
 TRIMMED_CONTENT_LIMIT: int = 400
+CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
+MAX_RESPONSE_TOKENS: int = 2048
 
 
 class ToolResult(TypedDict, total=False):
@@ -361,27 +364,46 @@ def _trim_old_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
 
 
 async def _call_model_with_retries(
-    client: AsyncOpenAI,
+    clients: Dict[str, AsyncOpenAI],
     messages: List[Dict[str, Any]],
     tool_schemas: List[Dict[str, Any]],
     session_id: str,
-) -> Any:
-    """Model çağrısını yeniden deneme politikasıyla yapar; son hatada raise eder."""
+    backend: str,
+) -> Tuple[Any, str]:
+    """
+    Model çağrısını yeniden deneme politikasıyla yapar. İlk deneme verilen backend'de,
+    kalan denemeler (ESCALATION_BACKEND kullanılabilirse ve zaten o değilse) daha güçlü
+    ESCALATION_BACKEND'de yapılır — hız için ucuz/varsayılan model önce denenir, ısrarlı
+    hata/aksama durumunda otomatik olarak daha güçlü modele geçilir. Hangi backend'in
+    gerçekten yanıt verdiğini de döner ki çağıran taraf mevcut backend'i güncelleyebilsin.
+    """
     last_error: Optional[Exception] = None
     for attempt in range(1, MAX_API_RETRIES + 1):
+        escalate: bool = attempt > 1 and backend != ESCALATION_BACKEND and ESCALATION_BACKEND in clients
+        active_backend: str = ESCALATION_BACKEND if escalate else backend
+        client: AsyncOpenAI = clients[active_backend]
+        profile: BackendProfile = BACKENDS[active_backend]
+        headers: Dict[str, str] = dict(profile["extra_headers"])
+        if active_backend == "opencode":
+            headers["x-opencode-session"] = session_id
         try:
-            return await client.chat.completions.create(
-                model=config["MODEL"],
+            response: Any = await client.chat.completions.create(
+                model=profile["model"],
                 messages=messages,
                 tools=tool_schemas,
                 tool_choice="auto",
-                extra_headers={"x-opencode-session": session_id},
+                max_tokens=MAX_RESPONSE_TOKENS,
+                extra_headers=headers,
             )
+            return response, active_backend
         except Exception as error:
             last_error = error
             logging.warning(
                 "Model çağrısı başarısız, yeniden deneniyor",
-                extra={"attempt": attempt, "max_attempts": MAX_API_RETRIES, "error_type": type(error).__name__},
+                extra={
+                    "attempt": attempt, "max_attempts": MAX_API_RETRIES,
+                    "backend": active_backend, "error_type": type(error).__name__,
+                },
             )
             if attempt < MAX_API_RETRIES:
                 await asyncio.sleep(2 ** (attempt - 1))
@@ -391,15 +413,24 @@ async def _call_model_with_retries(
 
 async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) -> str:
     """Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; ilerlemeyi callback'e bildirir."""
-    api_key: Optional[str] = config["API_KEY"]
-    if not api_key:
+    clients: Dict[str, AsyncOpenAI] = {
+        name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"])
+        for name, profile in BACKENDS.items()
+        if profile["api_key"]
+    }
+    if DEFAULT_BACKEND not in clients:
         raise RuntimeError(
-            "API anahtarı bulunamadı: ~/.local/share/opencode/auth.json içinde "
-            "'opencode-go' veya 'openai' girdisi yok. Önce opencode ile oturum açın."
+            f"Varsayılan backend '{DEFAULT_BACKEND}' için API anahtarı bulunamadı: "
+            "~/.local/share/opencode/auth.json içinde 'opencode-go' girdisi yok."
         )
+    callback(f"Kullanılabilir modeller: {', '.join(sorted(clients))}")
+
+    requested_backend: str = os.environ.get("OMNI_BACKEND", DEFAULT_BACKEND)
+    if requested_backend not in clients:
+        callback(f"Uyarı: '{requested_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak.")
+        requested_backend = DEFAULT_BACKEND
 
     toolbox: Toolbox = Toolbox()
-    client: AsyncOpenAI = AsyncOpenAI(api_key=api_key, base_url=config["BASE_URL"])
     session_id: str = str(uuid.uuid4())
     state: sm.StateDict = sm.load_state(STATE_FILE)
 
@@ -417,6 +448,8 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
     outcome: str = ""
     success: bool = False
     start_time: float = time.monotonic()
+    current_backend: str = requested_backend
+    consecutive_tool_failures: int = 0
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -427,8 +460,15 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
                 break
 
             messages = _trim_old_tool_messages(messages)
-            callback(f"[{iteration}/{MAX_ITERATIONS}] Model düşünüyor...")
-            response: Any = await _call_model_with_retries(client, messages, tool_schemas, session_id)
+            callback(f"[{iteration}/{MAX_ITERATIONS}] Model düşünüyor... (backend: {current_backend})")
+            response: Any
+            used_backend: str
+            response, used_backend = await _call_model_with_retries(
+                clients, messages, tool_schemas, session_id, current_backend
+            )
+            if used_backend != current_backend:
+                callback(f"  -> API hatası nedeniyle '{used_backend}' backend'ine yükseltildi.")
+                current_backend = used_backend
             message: Any = response.choices[0].message
             messages.append(message.model_dump(exclude_none=True))
 
@@ -448,8 +488,10 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
                 steps.append({"tool": call.function.name, "result": result})
                 hint: Optional[str] = None
                 if result.get("ok"):
+                    consecutive_tool_failures = 0
                     callback(f"  -> Başarılı ({call.function.name}): {str(result.get('result', ''))[:300]}")
                 else:
+                    consecutive_tool_failures += 1
                     error_text: str = f"{result.get('error_type')}: {result.get('error')}"
                     callback(f"  -> Hata ({call.function.name}): {error_text}")
                     hint = sm.check_for_lessons(state, error_text)
@@ -459,6 +501,15 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
 
                 if result.get("ok") and call.function.name == "take_screenshot":
                     _attach_screenshot_observation(messages, call, callback)
+
+            if (
+                consecutive_tool_failures >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD
+                and current_backend != ESCALATION_BACKEND
+                and ESCALATION_BACKEND in clients
+            ):
+                callback(f"  -> Art arda {consecutive_tool_failures} araç hatası, '{ESCALATION_BACKEND}' backend'ine yükseltiliyor.")
+                current_backend = ESCALATION_BACKEND
+                consecutive_tool_failures = 0
         else:
             outcome = f"Maksimum iterasyon sayısına ({MAX_ITERATIONS}) ulaşıldı, görev tamamlanamadı."
             callback(outcome)
@@ -470,6 +521,7 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
         state = sm.record_episode(state, goal, steps, outcome, success)
         sm.save_state(STATE_FILE, state)
         await toolbox.close_browser()
+        await asyncio.gather(*(c.close() for c in clients.values()))
 
     return outcome
 

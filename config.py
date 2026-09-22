@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Optional, TypedDict
+from typing import Dict, Optional, TypedDict
 
 # Yapılandırma veri tipi tanımı
 class ConfigDict(TypedDict):
@@ -9,9 +9,18 @@ class ConfigDict(TypedDict):
     MODEL: str
     SYSTEM_PROMPT: str
 
-def load_opencode_auth() -> Optional[str]:
+# Çoklu model backend'i için profil tanımı
+class BackendProfile(TypedDict):
+    provider: str
+    base_url: str
+    api_key: Optional[str]
+    model: str
+    extra_headers: Dict[str, str]
+
+def load_provider_key(provider: str) -> Optional[str]:
     """
-    Kullanıcı ana dizininden opencode kimlik doğrulama anahtarını yükler.
+    opencode'un yerel auth.json dosyasından belirtilen sağlayıcı için kayıtlı
+    API anahtarını okur. Bu proje kendi kimlik bilgisini ayrıca saklamaz.
     """
     auth_path: Path = Path.home() / ".local/share/opencode/auth.json"
     try:
@@ -21,18 +30,61 @@ def load_opencode_auth() -> Optional[str]:
         return None
     if not isinstance(data, dict):
         raise ValueError(f"Kimlik doğrulama dosyası nesne içermiyor: {auth_path}")
-    for provider in ("opencode-go", "openai"):
-        entry: object = data.get(provider)
-        if isinstance(entry, dict):
-            key: object = entry.get("key")
-            if isinstance(key, str) and key:
-                return key
+    entry: object = data.get(provider)
+    if isinstance(entry, dict):
+        key: object = entry.get("key")
+        if isinstance(key, str) and key:
+            return key
     return None
 
-# Sabit yapılandırma değerleri
+def load_opencode_auth() -> Optional[str]:
+    """
+    Kullanıcı ana dizininden opencode kimlik doğrulama anahtarını yükler.
+    Geriye dönük uyumluluk: önce opencode-go, yoksa openai anahtarını döner.
+    """
+    for provider in ("opencode-go", "openai"):
+        key: Optional[str] = load_provider_key(provider)
+        if key:
+            return key
+    return None
+
+# Sabit yapılandırma değerleri (varsayılan/tek-backend geriye dönük uyumluluk)
 API_KEY: Optional[str] = load_opencode_auth()
 BASE_URL: str = "https://opencode.ai/zen/go/v1"
 MODEL: str = "qwen3.8-flash"
+
+# --- Çoklu model backend'i (hız + doğruluk yönlendirmesi) ---
+# Üçü de opencode'un auth.json'ında zaten kayıtlı anahtarları kullanır, yeni bir
+# kimlik bilgisi saklama mekanizması eklenmedi. Ampirik olarak doğrulandı (2026-09-22):
+# opencode ~2.7sn, claude-sonnet-5 (openrouter üzerinden) ~4.2sn, ikisi de tool-calling
+# destekliyor. openai backend'i kayıtlı ama hesapta kredi yok (429) — kod hazır, çalışması
+# için platform.openai.com üzerinden kredi eklenmesi gerekiyor.
+DEFAULT_BACKEND: str = "opencode"
+ESCALATION_BACKEND: str = "claude"
+
+BACKENDS: Dict[str, BackendProfile] = {
+    "opencode": {
+        "provider": "opencode",
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "api_key": load_provider_key("opencode-go"),
+        "model": "qwen3.8-flash",
+        "extra_headers": {},
+    },
+    "claude": {
+        "provider": "claude",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": load_provider_key("openrouter"),
+        "model": "anthropic/claude-sonnet-5",
+        "extra_headers": {},
+    },
+    "openai": {
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": load_provider_key("openai"),
+        "model": "gpt-5-mini",
+        "extra_headers": {},
+    },
+}
 
 SYSTEM_PROMPT: str = """
 You are OmniAgent, an autonomous local automation agent running on the user's own machine,

@@ -69,6 +69,22 @@ Projenin "God-tier" seviyesine çıkarılması için `@Chatgpt-System` pluginind
   tasarım derslerinden (tek seferlik fiziksel eylem hattı, toplu `computer_run`, opt-in
   doğrulama) esinlenildi — kod taşınmadı, sadece prensipler uygulandı.
 
+## 🔀 Çoklu Model Backend'i (config.py: BACKENDS)
+- Üç backend tanımlı: `opencode` (varsayılan, qwen3.8-flash, ~2.7sn), `claude`
+  (openrouter üzerinden claude-sonnet-5, ~4.2sn, ESCALATION_BACKEND), `openai`
+  (gpt-5-mini, doğrudan api.openai.com). Üçü de opencode'un auth.json'ındaki mevcut
+  anahtarları kullanır, ayrı bir kimlik bilgisi saklama eklenmedi.
+- **Otomatik yükseltme**: aynı API çağrısı başarısız olursa (`_call_model_with_retries`)
+  veya aynı görevde art arda `CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD` (2) araç hatası
+  olursa, kalan çalışma otomatik olarak `claude`'a geçer.
+- **Manuel seçim**: `OMNI_BACKEND=claude` veya `OMNI_BACKEND=openai` ortam değişkeniyle
+  bir görev o backend'le başlatılabilir (anahtar yoksa varsayılana düşer, uyarı verir).
+- **Bilinen kısıt (2026-09-22 itibarıyla)**: `openai` backend'inin anahtarı var ama
+  hesapta kredi yok (429 "no credits remaining") — platform.openai.com'dan kredi
+  eklenmeden çalışmaz. `claude` backend'inin openrouter bakiyesi de düşük; bu yüzden
+  `max_tokens` 2048 ile sınırlandı (65536 varsayılanı bakiyeyi aşıp 402 hatası
+  veriyordu). Bakiye tükenirse aynı 402 hatası tekrar görülebilir.
+
 ## 🎯 Hedefler
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (`process_list`, `get_pointer_position`, `session_authority_status/end`)
 - [x] Ajanın kendi yetki seviyesini yönetebildiği bir güvenlik katmanı eklemek. (bkz. 🛡️ Güvenlik Rayları — yol koruması, yıkıcı komut engeli, sözdizimi doğrulaması, yedekleme)
