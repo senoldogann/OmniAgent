@@ -34,6 +34,11 @@ class ToolResult(TypedDict, total=False):
     recoverable: bool
 
 
+class RunOptions(TypedDict):
+    requested_backend: Optional[str]
+    should_stop: Callable[[], bool]
+
+
 def encode_image(path: str) -> str:
     """Görüntü dosyasını base64 metnine çevirir."""
     with open(path, "rb") as source:
@@ -411,7 +416,7 @@ async def _call_model_with_retries(
     raise last_error
 
 
-async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) -> str:
+async def run_agent_with_callback(goal: str, callback: Callable[[str], None], options: RunOptions) -> str:
     """Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; ilerlemeyi callback'e bildirir."""
     clients: Dict[str, AsyncOpenAI] = {
         name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"])
@@ -425,7 +430,8 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
         )
     callback(f"Kullanılabilir modeller: {', '.join(sorted(clients))}")
 
-    requested_backend: str = os.environ.get("OMNI_BACKEND", DEFAULT_BACKEND)
+    backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
+    requested_backend: str = backend_override if backend_override else DEFAULT_BACKEND
     if requested_backend not in clients:
         callback(f"Uyarı: '{requested_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak.")
         requested_backend = DEFAULT_BACKEND
@@ -453,6 +459,11 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
+            if options["should_stop"]():
+                outcome = "Kullanıcı tarafından durduruldu."
+                callback(outcome)
+                break
+
             elapsed: float = time.monotonic() - start_time
             if elapsed > MAX_WALL_CLOCK_SECONDS:
                 outcome = f"Zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı, görev tamamlanamadı."
@@ -545,7 +556,8 @@ def _attach_screenshot_observation(messages: List[Dict[str, Any]], call: Any, ca
 
 async def run_agent(goal: str) -> str:
     """Hedefi konsola log basarak çalıştırır."""
-    return await run_agent_with_callback(goal, callback=print)
+    options: RunOptions = {"requested_backend": None, "should_stop": lambda: False}
+    return await run_agent_with_callback(goal, callback=print, options=options)
 
 
 if __name__ == "__main__":
