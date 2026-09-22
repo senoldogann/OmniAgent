@@ -150,7 +150,7 @@ async def run_one(
             "state_file": str(root / "memory.json"),
         }
         started: float = time.monotonic()
-        report: RunReport = await run_agent_with_callback(scenario["goal"], lambda line: None, options, clients)
+        report: RunReport = await run_agent_with_callback(scenario["goal"], lambda event: None, options, clients)
         ok, detail = scenario["check"](report["outcome"])
         ok = ok and report["success"]
         metrics = report["metrics"]

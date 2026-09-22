@@ -4,12 +4,15 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TypedDict
+from threading import Thread
+from typing import IO, Callable, Dict, List, Optional, Tuple, TypedDict, Union
 
 import AppKit
 import ApplicationServices as AX
@@ -52,11 +55,80 @@ UNICODE_CHUNK_DELAY_SECONDS: float = 0.005
 MAX_WAIT_SECONDS: float = 5.0
 
 
+SHELL_TIMEOUT_SECONDS: float = 60.0
+JS_TIMEOUT_SECONDS: float = 20.0
+
+PROCESS_POLL_SECONDS: float = 0.05
+
+
+class ToolRuntime(TypedDict):
+    """Çağrı başına araç bağlamı: canlı çıktı hedefi ve kullanıcı durdurma denetimi."""
+    emit_output: Callable[[str], None]
+    should_stop: Callable[[], bool]
+
+
+# main.execute_tool her çağrı için ayarlar; asyncio.to_thread bağlamı kopyaladığından işçi
+# thread'inde de görünür. Ayarlı değilse (testler, doğrudan kullanım) çıktı yalnızca biriktirilir.
+TOOL_RUNTIME: ContextVar[Optional[ToolRuntime]] = ContextVar("TOOL_RUNTIME", default=None)
+
+
 def _clip(text: str, limit: int) -> str:
     """Metni belirtilen uzunlukta kırpıp kısaltma bilgisini ekler (model kopsa da bilir)."""
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n…[kısaltıldı, toplam {len(text)} karakter]"
+
+
+def _pump_lines(stream: IO[str], lines: List[str], sink: Optional[Callable[[str], None]]) -> None:
+    """Borudan satırları okuyup biriktirir; hedef varsa her satırı anında yayınlar."""
+    for line in stream:
+        lines.append(line)
+        if sink is not None:
+            sink(line)
+    stream.close()
+
+
+def run_streaming_process(command: Union[str, List[str]], shell: bool, timeout: float) -> Tuple[int, str, str]:
+    """
+    Süreci çalıştırır ve (çıkış kodu, stdout, stderr) döner. TOOL_RUNTIME ayarlıysa satırlar
+    geldikçe yayınlanır (arayüz komut çıktısını akış olarak gösterir) ve kullanıcı durdurunca
+    süreç hemen sonlandırılır. Zaman aşımında/durdurmada süreç GRUBU öldürülür: kabuğun alt
+    süreçleri boruyu açık tutup okuyucuları sonsuza dek bekletmesin. Çözülemeyen baytlar
+    U+FFFD ile değiştirilir.
+    """
+    runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
+    sink: Optional[Callable[[str], None]] = runtime["emit_output"] if runtime is not None else None
+    process: subprocess.Popen[str] = subprocess.Popen(
+        command, shell=shell, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", bufsize=1, start_new_session=True,
+    )
+    stdout_lines: List[str] = []
+    stderr_lines: List[str] = []
+    readers: List[Thread] = [
+        Thread(target=_pump_lines, args=(process.stdout, stdout_lines, sink), daemon=True),
+        Thread(target=_pump_lines, args=(process.stderr, stderr_lines, sink), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+    deadline: float = time.monotonic() + timeout
+    while True:
+        try:
+            process.wait(timeout=PROCESS_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired:
+            stopped: bool = runtime is not None and runtime["should_stop"]()
+            if not stopped and time.monotonic() < deadline:
+                continue
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            for reader in readers:
+                reader.join(timeout=1)
+            if stopped:
+                raise ToolError("Komut kullanıcı tarafından durduruldu.", "STOPPED", False)
+            raise
+    for reader in readers:
+        reader.join()
+    return process.returncode, "".join(stdout_lines), "".join(stderr_lines)
 
 
 # Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı
@@ -808,25 +880,22 @@ class Toolbox:
             logging.warning("Hassas yola kabuk yönlendirmesine kullanıcı bayrağıyla izin verildi", extra={"command": command})
         if use_sudo:
             logging.warning("Sudo ile kabuk komutu çalıştırılıyor", extra={"command": command})
-        full_cmd: str | List[str] = (
+        full_cmd: Union[str, List[str]] = (
             ["sudo", "-n", "/bin/sh", "-c", command] if use_sudo else command
         )
         try:
-            result: subprocess.CompletedProcess[str] = subprocess.run(
-                full_cmd, shell=not use_sudo, capture_output=True, text=True,
-                timeout=60, stdin=subprocess.DEVNULL,
-            )
+            returncode, stdout, stderr = run_streaming_process(full_cmd, not use_sudo, SHELL_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired as error:
-            raise ToolError("Kabuk komutu 60 saniyede tamamlanmadı.", "SHELL_TIMEOUT", True) from error
-        if result.returncode != 0:
+            raise ToolError(f"Kabuk komutu {SHELL_TIMEOUT_SECONDS:.0f} saniyede tamamlanmadı.", "SHELL_TIMEOUT", True) from error
+        if returncode != 0:
             # Çoğu araç (npm, git, python, brew) asıl hatayı STDOUT'a basar; model
             # komutu sırf okumak için tekrar çalıştırmasın diye ikisi de taşınır.
             raise ToolError(
-                f"Kabuk komutu başarısız: çıkış={result.returncode}, "
-                f"stdout={_clip(result.stdout, 1000)}, stderr={_clip(result.stderr, 1000)}",
+                f"Kabuk komutu başarısız: çıkış={returncode}, "
+                f"stdout={_clip(stdout, 1000)}, stderr={_clip(stderr, 1000)}",
                 "SHELL_EXIT", True,
             )
-        return f"STDOUT: {_clip(result.stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(result.stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: {result.returncode}"
+        return f"STDOUT: {_clip(stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: {returncode}"
 
     def process_list(self) -> str:
         """
@@ -1089,15 +1158,16 @@ class Toolbox:
             ) as source:
                 temp_path = Path(source.name)
                 source.write(code)
-            result: subprocess.CompletedProcess[str] = subprocess.run(
-                ["node", str(temp_path)], capture_output=True, text=True, timeout=20,
-            )
-            if result.returncode != 0:
+            try:
+                returncode, stdout, stderr = run_streaming_process(["node", str(temp_path)], False, JS_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as error:
+                raise ToolError(f"JS {JS_TIMEOUT_SECONDS:.0f} saniyede tamamlanmadı.", "JS_TIMEOUT", True) from error
+            if returncode != 0:
                 raise ToolError(
-                    f"JS çalıştırma başarısız: çıkış={result.returncode}, stderr={result.stderr.strip()}",
+                    f"JS çalıştırma başarısız: çıkış={returncode}, stderr={_clip(stderr.strip(), 1000)}",
                     "JS_EXIT", True,
                 )
-            return f"STDOUT: {_clip(result.stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(result.stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: 0"
+            return f"STDOUT: {_clip(stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: 0"
         finally:
             if temp_path is not None and temp_path.exists():
                 temp_path.unlink()

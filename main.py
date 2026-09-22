@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, Timeout
-from openai.types.chat import ChatCompletion
+from openai.types import CompletionUsage
 from PIL import Image
 
 from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER, SYSTEM_PROMPT, BackendProfile
-from tools import MODEL_SCREEN_MAX_EDGE, Toolbox, ToolError
+from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
+from tools import MODEL_SCREEN_MAX_EDGE, TOOL_RUNTIME, Toolbox, ToolError
 import state_manager as sm
 
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
@@ -29,14 +30,18 @@ FULL_DETAIL_TURNS: int = 2
 TRIMMED_CONTENT_LIMIT: int = 400
 TRIMMED_ARGS_LIMIT: int = 120
 CALL_LABEL_ARGS_LIMIT: int = 100
+# Arayüze giden araç sonucu metninin üst sınırı (özet gösterimi için yeterli)
+EVENT_RESULT_LIMIT: int = 4000
 CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
 # SDK varsayılanı 600sn zaman aşımı + 2 gizli yeniden denemeydi: takılan tek bir çağrı tüm
 # görev bütçesini yiyebiliyor, yükseltme mantığı da SDK aynı backend'i tekrar denedikten
-# sonra devreye giriyordu. Yeniden denemeyi yalnızca bu döngü yönetir.
+# sonra devreye giriyordu. Yeniden denemeyi yalnızca bu döngü yönetir. Akışta zaman aşımı
+# iki parça arasındaki beklemeye uygulanır.
 MODEL_REQUEST_TIMEOUT_SECONDS: float = 60.0
 MODEL_CONNECT_TIMEOUT_SECONDS: float = 5.0
 TURKISH_WEEKDAYS: Tuple[str, ...] = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
 ENGLISH_WEEKDAYS: Tuple[str, ...] = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+ZERO_USAGE: TokenUsage = {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
 
 
 class ToolResult(TypedDict, total=False):
@@ -49,17 +54,26 @@ class ToolResult(TypedDict, total=False):
     recoverable: bool
 
 
+class ToolCallDraft(TypedDict):
+    """Modelin istediği araç çağrısı (akış parçalarından birleştirilmiş)."""
+    id: str
+    name: str
+    arguments: str
+
+
+class ModelTurn(TypedDict):
+    """Bir model turunun akıştan birleştirilmiş sonucu."""
+    content: str
+    tool_calls: List[ToolCallDraft]
+    finish_reason: Optional[str]
+    usage: TokenUsage
+
+
 class RunOptions(TypedDict):
     requested_backend: Optional[str]
     should_stop: Callable[[], bool]
     # Epizot kaydının yazılacağı bellek dosyası (benchmark ayrı dosya kullanır)
     state_file: str
-
-
-class TokenUsage(TypedDict):
-    prompt_tokens: int
-    cached_tokens: int
-    completion_tokens: int
 
 
 class RunReport(TypedDict):
@@ -233,19 +247,26 @@ def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
     return name + ":" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
 
 
-async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]) -> ToolResult:
-    """Tek bir araç çağrısını çalıştırır; başarı/hata durumunu yapılandırılmış şekilde döner."""
-    name: str = call.function.name
+async def execute_tool(
+    call: ToolCallDraft, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
+    should_stop: Callable[[], bool],
+) -> ToolResult:
+    """
+    Tek bir araç çağrısını çalıştırır; başarı/hata durumunu yapılandırılmış şekilde döner.
+    Çalışırken üretilen canlı çıktı (komut satırları) tool_output olayı olarak yayınlanır;
+    kullanıcı durdurursa çalışan komut hemen sonlandırılır.
+    """
+    name: str = call["name"]
     try:
-        arguments: Dict[str, Any] = json.loads(call.function.arguments or "{}")
+        arguments: Dict[str, Any] = json.loads(call["arguments"] or "{}")
     except json.JSONDecodeError as error:
         return {
-            "tool_call_id": call.id, "ok": False,
+            "tool_call_id": call["id"], "ok": False,
             "error_type": "JSONDecodeError", "error": f"Araç argümanları çözümlenemedi: {error}",
         }
     if name not in TOOL_NAMES:
         return {
-            "tool_call_id": call.id, "ok": False,
+            "tool_call_id": call["id"], "ok": False,
             "error_type": "UnknownTool", "error": f"Bilinmeyen araç: {name}. Geçerli araçlar: {', '.join(sorted(TOOL_NAMES))}",
         }
 
@@ -253,32 +274,38 @@ async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]
     if name in _CACHEABLE_TOOLS:
         cache_key = _tool_cache_key(name, arguments)
         if cache_key in cache:
-            return {**cache[cache_key], "tool_call_id": call.id}
+            return {**cache[cache_key], "tool_call_id": call["id"]}
 
     method: Callable[..., Any] = getattr(toolbox, name)
+    token = TOOL_RUNTIME.set({
+        "emit_output": lambda text: emit({"kind": "tool_output", "call_id": call["id"], "text": text}),
+        "should_stop": should_stop,
+    })
     try:
         if asyncio.iscoroutinefunction(method):
             result: Any = await method(**arguments)
         else:
             result = await asyncio.to_thread(method, **arguments)
-        outcome: ToolResult = {"tool_call_id": call.id, "ok": True, "result": str(result)}
+        outcome: ToolResult = {"tool_call_id": call["id"], "ok": True, "result": str(result)}
     except ToolError as error:
         outcome = {
-            "tool_call_id": call.id, "ok": False,
+            "tool_call_id": call["id"], "ok": False,
             "error_type": "ToolError", "error": str(error),
             "code": error.code, "recoverable": error.recoverable,
         }
     except TypeError as error:
         outcome = {
-            "tool_call_id": call.id, "ok": False,
+            "tool_call_id": call["id"], "ok": False,
             "error_type": "TypeError", "error": f"Geçersiz argümanlar ({name}): {error}",
         }
     except Exception as error:  # Araç sınırı: üçüncü taraf hataları döngüyü çökertmeden modele raporlanır.
         logging.warning("Araç beklenmeyen hata verdi", extra={"tool": name, "error_type": type(error).__name__})
         outcome = {
-            "tool_call_id": call.id, "ok": False,
+            "tool_call_id": call["id"], "ok": False,
             "error_type": type(error).__name__, "error": str(error),
         }
+    finally:
+        TOOL_RUNTIME.reset(token)
 
     if outcome.get("ok") and name in _SIDE_EFFECT_TOOLS:
         cache.clear()
@@ -287,7 +314,31 @@ async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]
     return outcome
 
 
-async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox, cache: Dict[str, ToolResult]) -> List[ToolResult]:
+def result_text(result: ToolResult) -> str:
+    """Araç sonucunun gösterim/kayıt metni (başarıda çıktı, hatada 'tip: mesaj'). Saf."""
+    if result.get("ok"):
+        return str(result.get("result", ""))
+    return f"{result.get('error_type')}: {result.get('error')}"
+
+
+async def _run_tool_with_events(
+    index: int, call: ToolCallDraft, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
+    should_stop: Callable[[], bool],
+) -> ToolResult:
+    """Aracı çalıştırır; başlangıcını ve bitişini (süre + sonuç) olay olarak yayınlar."""
+    emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
+          "preview": preview_arguments(call["name"], call["arguments"])})
+    started: float = time.monotonic()
+    result: ToolResult = await execute_tool(call, toolbox, cache, emit, should_stop)
+    emit({"kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
+          "text": result_text(result)[:EVENT_RESULT_LIMIT], "seconds": round(time.monotonic() - started, 2)})
+    return result
+
+
+async def _execute_tool_calls(
+    calls: List[ToolCallDraft], toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
+    should_stop: Callable[[], bool],
+) -> List[ToolResult]:
     """
     Bir turdaki tüm araç çağrılarını MODELİN DÖNDÜRDÜĞÜ SIRAYI koruyarak çalıştırır:
     yan etkili çağrılar seri, aralarındaki bağımsız salt okunur bloklar paralel. Böylece
@@ -297,54 +348,52 @@ async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox, cache: Dict[st
     results: List[Optional[ToolResult]] = [None] * len(calls)
     index: int = 0
     while index < len(calls):
-        if calls[index].function.name in _SIDE_EFFECT_TOOLS:
-            results[index] = await execute_tool(calls[index], toolbox, cache)
+        if calls[index]["name"] in _SIDE_EFFECT_TOOLS:
+            results[index] = await _run_tool_with_events(index, calls[index], toolbox, cache, emit, should_stop)
             index += 1
             continue
         stop: int = index
-        while stop < len(calls) and calls[stop].function.name not in _SIDE_EFFECT_TOOLS:
+        while stop < len(calls) and calls[stop]["name"] not in _SIDE_EFFECT_TOOLS:
             stop += 1
         group: List[ToolResult] = list(await asyncio.gather(
-            *(execute_tool(calls[k], toolbox, cache) for k in range(index, stop))
+            *(_run_tool_with_events(k, calls[k], toolbox, cache, emit, should_stop) for k in range(index, stop))
         ))
         results[index:stop] = group
         index = stop
     return [r for r in results if r is not None]
 
 
-def _call_label(call: Any) -> str:
+def _call_label(call: ToolCallDraft) -> str:
     """
     Sonucun hangi çağrıya ait olduğunu gösteren kısa etiket. Paralel toplu sonuçlar yalnızca
     tool_call_id ile eşleşince hızlı model onları karıştırabiliyordu (ölçümde 5 dosyalık
     okumada kodlar yanlış sıralandı/atlandı). Saf fonksiyon.
     """
-    arguments: str = " ".join((call.function.arguments or "").split())
-    return f"[{call.function.name} {arguments[:CALL_LABEL_ARGS_LIMIT]}]"
+    arguments: str = " ".join(call["arguments"].split())
+    return f"[{call['name']} {arguments[:CALL_LABEL_ARGS_LIMIT]}]"
 
 
-def _tool_result_to_message(call: Any, result: ToolResult) -> Dict[str, Any]:
+def _tool_result_to_message(call: ToolCallDraft, result: ToolResult) -> Dict[str, Any]:
     """Araç sonucunu, başında çağrı etiketiyle modele geri gönderilecek 'tool' mesajına çevirir."""
     if result.get("ok"):
         content: str = result.get("result", "")
     else:
         content = f"HATA [{result.get('error_type')}]: {result.get('error')}"
-    return {"role": "tool", "tool_call_id": call.id, "content": f"{_call_label(call)}\n{content}"}
+    return {"role": "tool", "tool_call_id": call["id"], "content": f"{_call_label(call)}\n{content}"}
 
 
-def _assistant_entry(message: Any) -> Dict[str, Any]:
+def _assistant_entry(turn: ModelTurn) -> Dict[str, Any]:
     """
-    Assistant yanıtını geçmiş için {role, content, tool_calls} biçiminde normalize eder.
-    Sağlayıcıya özel alanlar (örn. qwen'in reasoning_content'i) her turda tekrar
-    gönderilmesin ve yükseltmede başka bir API'ye taşınmasın diye atılır. Saf.
+    Model turunu geçmiş için {role, content, tool_calls} biçiminde kurar. Düşünme metni
+    (reasoning_content) her turda tekrar gönderilmesin diye geçmişe eklenmez. Saf.
     """
     entry: Dict[str, Any] = {"role": "assistant"}
-    if message.content:
-        entry["content"] = message.content
-    if message.tool_calls:
+    if turn["content"]:
+        entry["content"] = turn["content"]
+    if turn["tool_calls"]:
         entry["tool_calls"] = [
-            {"id": call.id, "type": "function",
-             "function": {"name": call.function.name, "arguments": call.function.arguments or ""}}
-            for call in message.tool_calls
+            {"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"]}}
+            for call in turn["tool_calls"]
         ]
     return entry
 
@@ -429,11 +478,10 @@ def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str
     return True, ""
 
 
-def token_usage(response: ChatCompletion) -> TokenUsage:
-    """Yanıttaki token kullanımını (önbellekten okunan girdi dahil) çıkarır. Saf."""
-    usage: Any = response.usage
+def token_usage(usage: Optional[CompletionUsage]) -> TokenUsage:
+    """Akışın son parçasındaki token kullanımını (önbellekten okunan girdi dahil) çıkarır. Saf."""
     if usage is None:
-        return {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+        return ZERO_USAGE
     details: Any = usage.prompt_tokens_details
     cached: int = int(details.cached_tokens or 0) if details is not None else 0
     return {"prompt_tokens": int(usage.prompt_tokens), "cached_tokens": cached, "completion_tokens": int(usage.completion_tokens)}
@@ -446,6 +494,25 @@ def add_usage(total: TokenUsage, turn: TokenUsage) -> TokenUsage:
         "cached_tokens": total["cached_tokens"] + turn["cached_tokens"],
         "completion_tokens": total["completion_tokens"] + turn["completion_tokens"],
     }
+
+
+def merge_tool_call_delta(
+    drafts: List[ToolCallDraft], index: int, call_id: Optional[str], name: Optional[str], arguments: Optional[str],
+) -> List[ToolCallDraft]:
+    """
+    Akıştaki bir araç çağrısı parçasını taslak listesine işler: kimlik ve ad ilk parçada
+    gelir (sonrakilerde boş/None), argümanlar parça parça eklenir. Saf fonksiyon.
+    """
+    padded: List[ToolCallDraft] = drafts + [
+        {"id": "", "name": "", "arguments": ""} for _ in range(index + 1 - len(drafts))
+    ]
+    current: ToolCallDraft = padded[index]
+    updated: ToolCallDraft = {
+        "id": call_id or current["id"],
+        "name": current["name"] + (name or ""),
+        "arguments": current["arguments"] + (arguments or ""),
+    }
+    return padded[:index] + [updated] + padded[index + 1:]
 
 
 def create_model_clients() -> Dict[str, AsyncOpenAI]:
@@ -463,15 +530,19 @@ async def close_model_clients(clients: Dict[str, AsyncOpenAI]) -> None:
     await asyncio.gather(*(client.close() for client in clients.values()))
 
 
-async def _request_completion(
+async def _stream_completion(
     client: AsyncOpenAI, profile: BackendProfile, messages: List[Dict[str, Any]],
-    tool_schemas: List[Dict[str, Any]], session_id: str,
-) -> ChatCompletion:
-    """Profilin modeli, token sınırı, başlıkları ve ek gövdesiyle tek bir tamamlama isteği yapar."""
+    tool_schemas: List[Dict[str, Any]], session_id: str, emit: EventSink, should_stop: Callable[[], bool],
+) -> ModelTurn:
+    """
+    Tamamlamayı AKIŞ olarak ister: metin, düşünme metni ve araç çağrısı önizlemeleri geldikçe
+    yayınlanır (arayüzde komut harf harf belirir). Durdurma istenirse akış hemen kapatılır ve
+    tur finish_reason='stopped' ile döner.
+    """
     headers: Dict[str, str] = dict(profile["extra_headers"])
     if profile["session_header"] is not None:
         headers[profile["session_header"]] = session_id
-    return await client.chat.completions.create(
+    stream: Any = await client.chat.completions.create(
         model=profile["model"],
         messages=messages,
         tools=tool_schemas,
@@ -479,7 +550,49 @@ async def _request_completion(
         max_tokens=profile["max_tokens"],
         extra_headers=headers,
         extra_body=profile["extra_body"],
+        stream=True,
+        stream_options={"include_usage": True},
     )
+    content_parts: List[str] = []
+    drafts: List[ToolCallDraft] = []
+    previews: Dict[int, str] = {}
+    finish_reason: Optional[str] = None
+    usage: TokenUsage = ZERO_USAGE
+    try:
+        async for chunk in stream:
+            if should_stop():
+                finish_reason = "stopped"
+                break
+            if chunk.usage is not None:
+                usage = token_usage(chunk.usage)
+            if not chunk.choices:
+                continue
+            choice: Any = chunk.choices[0]
+            delta: Any = choice.delta
+            if delta.content:
+                content_parts.append(delta.content)
+                emit({"kind": "text_delta", "text": delta.content})
+            reasoning: object = (delta.model_extra or {}).get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                emit({"kind": "reasoning_delta", "text": reasoning})
+            for call_delta in delta.tool_calls or []:
+                function: Any = call_delta.function
+                drafts = merge_tool_call_delta(
+                    drafts, call_delta.index, call_delta.id,
+                    function.name if function is not None else None,
+                    function.arguments if function is not None else None,
+                )
+                draft: ToolCallDraft = drafts[call_delta.index]
+                preview: str = preview_arguments(draft["name"], draft["arguments"])
+                # Yalnızca önizleme değiştiğinde yayınla (büyük write_file içeriği arayüzü boğmasın)
+                if previews.get(call_delta.index) != preview:
+                    previews[call_delta.index] = preview
+                    emit({"kind": "tool_call_preview", "index": call_delta.index, "name": draft["name"], "preview": preview})
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
+    finally:
+        await stream.close()
+    return {"content": "".join(content_parts), "tool_calls": drafts, "finish_reason": finish_reason, "usage": usage}
 
 
 async def _call_model_with_retries(
@@ -488,22 +601,32 @@ async def _call_model_with_retries(
     tool_schemas: List[Dict[str, Any]],
     session_id: str,
     backend: str,
-) -> Tuple[ChatCompletion, str]:
+    emit: EventSink,
+    should_stop: Callable[[], bool],
+) -> Tuple[ModelTurn, str]:
     """
     Model çağrısını attempt_plan'a göre yapar ve yanıt veren backend'i de döner. Kalıcı
     istemci hataları (400/401/402/403…) yeniden denenmez. Zaman aşımında aynı backend'i bir
-    kez daha beklemek boşa gider: doğrudan son (farklı sağlayıcı) denemeye atlanır.
+    kez daha beklemek boşa gider: doğrudan son (farklı sağlayıcı) denemeye atlanır. Yarıda
+    kesilen bir akış yeniden denenirse önce stream_reset yayınlanır (arayüz o turun akmış
+    içeriğini siler, metin iki kez görünmez).
     """
     plan: Tuple[str, str, str] = attempt_plan(backend, frozenset(clients))
+    emitted: List[bool] = [False]
+
+    def tracking_emit(event: AgentEvent) -> None:
+        emitted[0] = True
+        emit(event)
+
     last_error: Optional[Exception] = None
     attempt: int = 0
     while attempt < len(plan):
         active: str = plan[attempt]
         try:
-            response: ChatCompletion = await _request_completion(
-                clients[active], BACKENDS[active], messages, tool_schemas, session_id,
+            turn: ModelTurn = await _stream_completion(
+                clients[active], BACKENDS[active], messages, tool_schemas, session_id, tracking_emit, should_stop,
             )
-            return response, active
+            return turn, active
         except (APIStatusError, APIConnectionError) as error:
             status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
             if status is not None and status < 500 and status != 429:
@@ -514,6 +637,9 @@ async def _call_model_with_retries(
                 extra={"attempt": attempt + 1, "max_attempts": len(plan), "backend": active,
                        "status_code": status, "error_type": type(error).__name__},
             )
+            if emitted[0]:
+                emit({"kind": "stream_reset", "reason": f"{type(error).__name__} ({active}), yeniden deneniyor"})
+                emitted[0] = False
             timed_out: bool = isinstance(error, APITimeoutError)
             attempt = len(plan) - 1 if timed_out and attempt < len(plan) - 1 else attempt + 1
             if attempt < len(plan):
@@ -522,9 +648,9 @@ async def _call_model_with_retries(
     raise last_error
 
 
-async def _screenshot_observation(call: Any) -> Dict[str, Any]:
+async def _screenshot_observation(call: ToolCallDraft) -> Dict[str, Any]:
     """Başarılı bir ekran görüntüsünü modele gidecek görsel gözlem mesajına çevirir."""
-    arguments: Dict[str, Any] = json.loads(call.function.arguments or "{}")
+    arguments: Dict[str, Any] = json.loads(call["arguments"] or "{}")
     image_b64: str = await asyncio.to_thread(encode_image, str(Path(arguments["filename"]).expanduser()))
     return {
         "role": "user",
@@ -536,26 +662,27 @@ async def _screenshot_observation(call: Any) -> Dict[str, Any]:
 
 
 async def run_agent_with_callback(
-    goal: str, callback: Callable[[str], None], options: RunOptions, clients: Dict[str, AsyncOpenAI],
+    goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
 ) -> RunReport:
     """
-    Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; ilerlemeyi ve tur başına
-    süre/token ölçümlerini callback'e bildirir. İstemciler çağırana aittir (kapatılmaz),
-    böylece arayüz görevler arasında sıcak bağlantıları yeniden kullanır.
+    Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; model yanıtını, araç
+    çağrılarını ve komut çıktılarını yapılandırılmış olaylar olarak AKIŞ hâlinde yayınlar.
+    İstemciler çağırana aittir (kapatılmaz), böylece arayüz görevler arasında sıcak
+    bağlantıları yeniden kullanır.
     """
     if DEFAULT_BACKEND not in clients:
         raise RuntimeError(
             f"Varsayılan backend '{DEFAULT_BACKEND}' için API anahtarı bulunamadı: "
             "~/.local/share/opencode/auth.json içinde 'opencode-go' girdisi yok."
         )
-    callback(f"Kullanılabilir modeller: {', '.join(sorted(clients))}")
     available: frozenset[str] = frozenset(clients)
-
     backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
     current_backend: str = backend_override if backend_override else DEFAULT_BACKEND
     if current_backend not in available:
-        callback(f"Uyarı: '{current_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak.")
+        emit({"kind": "notice", "level": "warning",
+              "text": f"'{current_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak."})
         current_backend = DEFAULT_BACKEND
+    emit({"kind": "run_started", "goal": goal, "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
 
     toolbox: Toolbox = Toolbox()
     session_id: str = str(uuid.uuid4())
@@ -567,75 +694,67 @@ async def run_agent_with_callback(
     tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
     steps: List[sm.StepRecord] = []
     outcome: str = ""
+    reason: str = ""
     success: bool = False
     start_time: float = time.monotonic()
     consecutive_failed_turns: int = 0
     tool_cache: Dict[str, ToolResult] = {}
     turns: int = 0
     tool_call_count: int = 0
-    usage: TokenUsage = {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+    usage: TokenUsage = ZERO_USAGE
     metrics: sm.EpisodeMetrics
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
             if options["should_stop"]():
-                outcome = "Kullanıcı tarafından durduruldu."
-                callback(outcome)
+                outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
             if time.monotonic() - start_time > MAX_WALL_CLOCK_SECONDS:
-                outcome = f"Zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı, görev tamamlanamadı."
-                callback(outcome)
+                outcome, reason = "", f"zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı"
                 break
 
             messages = _trim_old_turns(messages)
-            callback(f"[{iteration}/{MAX_ITERATIONS}] Model düşünüyor... (backend: {current_backend})")
+            emit({"kind": "turn_started", "turn": iteration, "max_turns": MAX_ITERATIONS,
+                  "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
             model_started: float = time.monotonic()
-            response, used_backend = await _call_model_with_retries(
-                clients, messages, tool_schemas, session_id, current_backend,
+            turn, used_backend = await _call_model_with_retries(
+                clients, messages, tool_schemas, session_id, current_backend, emit, options["should_stop"],
             )
             turns += 1
-            turn_usage: TokenUsage = token_usage(response)
-            usage = add_usage(usage, turn_usage)
-            callback(
-                f"  ⏱ model {time.monotonic() - model_started:.1f}sn · girdi {turn_usage['prompt_tokens']} "
-                f"(önbellek {turn_usage['cached_tokens']}) · çıktı {turn_usage['completion_tokens']} token"
-            )
+            usage = add_usage(usage, turn["usage"])
+            emit({"kind": "model_finished", "turn": iteration,
+                  "seconds": round(time.monotonic() - model_started, 2), "usage": turn["usage"]})
             if used_backend != current_backend:
-                callback(f"  -> API hatası nedeniyle '{used_backend}' backend'ine yükseltildi.")
+                emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
+                      "reason": "API hatası"})
                 current_backend = used_backend
-            choice: Any = response.choices[0]
-            message: Any = choice.message
-            messages.append(_assistant_entry(message))
+            if turn["finish_reason"] == "stopped":
+                outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
+                break
+            messages.append(_assistant_entry(turn))
 
-            if not message.tool_calls:
-                outcome = message.content or ""
-                success, reason = final_verdict(outcome, choice.finish_reason)
-                callback(f"Tamamlandı: {outcome}" if success else f"Tamamlanamadı: {reason}. Son yanıt: {outcome[:300]}")
+            if not turn["tool_calls"]:
+                outcome = turn["content"]
+                success, reason = final_verdict(outcome, turn["finish_reason"])
                 break
 
-            if choice.finish_reason == "length":
-                callback("  -> Uyarı: yanıt max_tokens sınırında kesildi; araç argümanları eksik olabilir.")
-            tool_call_count += len(message.tool_calls)
-            for call in message.tool_calls:
-                callback(f"Araç çağrısı: {call.function.name}({(call.function.arguments or '')[:TRIMMED_ARGS_LIMIT]})")
-
-            tools_started: float = time.monotonic()
-            results: List[ToolResult] = await _execute_tool_calls(message.tool_calls, toolbox, tool_cache)
-            callback(f"  ⏱ araçlar {time.monotonic() - tools_started:.1f}sn")
+            if turn["finish_reason"] == "length":
+                emit({"kind": "notice", "level": "warning",
+                      "text": "Yanıt max_tokens sınırında kesildi; araç argümanları eksik olabilir."})
+            tool_call_count += len(turn["tool_calls"])
+            results: List[ToolResult] = await _execute_tool_calls(
+                turn["tool_calls"], toolbox, tool_cache, emit, options["should_stop"],
+            )
 
             failures_in_turn: int = 0
-            pending_shots: List[Any] = []
-            for call, result in zip(message.tool_calls, results):
+            pending_shots: List[ToolCallDraft] = []
+            for call, result in zip(turn["tool_calls"], results):
                 ok: bool = bool(result.get("ok"))
-                detail: str = str(result.get("result", "")) if ok else f"{result.get('error_type')}: {result.get('error')}"
-                steps.append(sm.make_step_record(call.function.name, call.function.arguments or "", ok, detail))
-                if ok:
-                    callback(f"  -> Başarılı ({call.function.name}): {detail[:300]}")
-                    if call.function.name == "take_screenshot":
-                        pending_shots.append(call)
-                else:
+                steps.append(sm.make_step_record(call["name"], call["arguments"], ok, result_text(result)))
+                if ok and call["name"] == "take_screenshot":
+                    pending_shots.append(call)
+                if not ok:
                     failures_in_turn += 1
-                    callback(f"  -> Hata ({call.function.name}): {detail}")
                 messages.append(_tool_result_to_message(call, result))
 
             # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: tool sonuçları assistant
@@ -645,22 +764,23 @@ async def run_agent_with_callback(
                     messages.append(await _screenshot_observation(shot_call))
                 except (OSError, KeyError, ValueError) as error:
                     logging.warning("Ekran görüntüsü modele eklenemedi", extra={"error_type": type(error).__name__})
-                    callback(f"  -> Not: ekran görüntüsü modele iliştirilemedi ({type(error).__name__}: {error}).")
+                    emit({"kind": "notice", "level": "warning",
+                          "text": f"Ekran görüntüsü modele iliştirilemedi ({type(error).__name__}: {error})."})
 
             # Yükseltme sayacı TUR bazlıdır: turda herhangi bir başarı varsa sıfırlanır.
             consecutive_failed_turns = consecutive_failed_turns + 1 if failures_in_turn == len(results) else 0
             if consecutive_failed_turns >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD:
                 upgraded: Optional[str] = next_quality_backend(current_backend, available)
                 if upgraded is not None:
-                    callback(f"  -> Art arda {consecutive_failed_turns} başarısız tur, '{upgraded}' backend'ine yükseltiliyor.")
+                    emit({"kind": "backend_changed", "backend": upgraded, "model": BACKENDS[upgraded]["model"],
+                          "reason": f"art arda {consecutive_failed_turns} başarısız tur"})
                     current_backend = upgraded
                 consecutive_failed_turns = 0
         else:
-            outcome = f"Maksimum iterasyon sayısına ({MAX_ITERATIONS}) ulaşıldı, görev tamamlanamadı."
-            callback(outcome)
+            reason = f"maksimum iterasyon sayısına ({MAX_ITERATIONS}) ulaşıldı"
     except Exception as error:
-        outcome = f"Kritik hata: {error}"
-        callback(outcome)
+        outcome, reason = f"Kritik hata: {error}", f"kritik hata: {error}"
+        emit({"kind": "notice", "level": "error", "text": outcome})
         raise
     finally:
         metrics = {
@@ -672,19 +792,47 @@ async def run_agent_with_callback(
         sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
         await toolbox.close_browser()
 
-    callback(
-        f"Özet: {turns} tur · {tool_call_count} araç · {metrics['elapsed_seconds']:.1f}sn · girdi {usage['prompt_tokens']} "
-        f"(önbellek {usage['cached_tokens']}) · çıktı {usage['completion_tokens']} token"
-    )
+    emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "metrics": metrics}
 
 
+def print_event(event: AgentEvent) -> None:
+    """Olayları terminale akış olarak basar (CLI): metin harf harf, komut çıktısı satır satır."""
+    if event["kind"] == "run_started":
+        print(f"› {event['goal']}\n  ({event['backend']} · {event['model']})")
+    elif event["kind"] == "text_delta":
+        sys.stdout.write(event["text"])
+        sys.stdout.flush()
+    elif event["kind"] == "tool_started":
+        print(f"\n⏺ {tool_label(event['name'])}({event['preview'].splitlines()[0] if event['preview'] else ''})")
+    elif event["kind"] == "tool_output":
+        sys.stdout.write(f"  │ {event['text']}")
+        sys.stdout.flush()
+    elif event["kind"] == "tool_finished":
+        first_line: str = event["text"].strip().splitlines()[0][:160] if event["text"].strip() else ""
+        print(f"  ⎿ {'✓' if event['ok'] else '✗'} {first_line} ({event['seconds']:.1f}sn)")
+    elif event["kind"] == "model_finished":
+        tokens: str = (f"↑{compact_count(event['usage']['prompt_tokens'])} "
+                       f"(önbellek {compact_count(event['usage']['cached_tokens'])}) ↓{event['usage']['completion_tokens']}")
+        print(f"\n  ⏱ model {event['seconds']:.1f}sn · {tokens}")
+    elif event["kind"] == "backend_changed":
+        print(f"  ↻ backend: {event['backend']} ({event['reason']})")
+    elif event["kind"] == "stream_reset":
+        print(f"\n  ↻ akış sıfırlandı: {event['reason']}")
+    elif event["kind"] == "notice":
+        print(f"  [{event['level']}] {event['text']}")
+    elif event["kind"] == "run_finished":
+        metrics: sm.EpisodeMetrics = event["metrics"]
+        status: str = "✓ Tamamlandı" if event["success"] else f"✗ Tamamlanamadı: {event['reason']}"
+        print(f"\n{status} · {metrics['turns']} tur · {metrics['tool_calls']} araç · {metrics['elapsed_seconds']:.1f}sn")
+
+
 async def run_agent(goal: str) -> RunReport:
-    """Hedefi konsola log basarak çalıştırır (CLI)."""
+    """Hedefi terminale akış olarak basarak çalıştırır (CLI)."""
     clients: Dict[str, AsyncOpenAI] = create_model_clients()
     try:
         options: RunOptions = {"requested_backend": None, "should_stop": lambda: False, "state_file": STATE_FILE}
-        return await run_agent_with_callback(goal, print, options, clients)
+        return await run_agent_with_callback(goal, print_event, options, clients)
     finally:
         await close_model_clients(clients)
 

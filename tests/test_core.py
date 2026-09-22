@@ -3,14 +3,15 @@ import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
-from types import SimpleNamespace
+from typing import List
 from uuid import uuid4
 
 import pytest
 from openai import AsyncOpenAI
 
 from config import BACKENDS, DEFAULT_BACKEND
-from main import _trim_old_turns, encode_image, execute_tool
+from events import AgentEvent, preview_arguments
+from main import ToolCallDraft, _trim_old_turns, encode_image, execute_tool, merge_tool_call_delta
 from state_manager import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
 from tools import ScreenGeometry, ToolError, Toolbox, _is_sensitive_path, model_to_points, points_to_model
 
@@ -108,17 +109,16 @@ def test_fetch_raw_keeps_url_literal() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_error_is_explicit() -> None:
-    """Araç çağrısı hatasını başarıdan ayırır; şemada olmayan adlar (özel yöntemler) reddedilir."""
-    call = SimpleNamespace(
-        id="call-1",
-        function=SimpleNamespace(name="execute_shell", arguments='{"command":"exit 7","use_sudo":false}'),
-    )
-    result = await execute_tool(call, Toolbox(), {})
+    """Araç hatasını başarıdan ayırır, komut çıktısını canlı yayınlar, özel yöntemleri reddeder."""
+    events: List[AgentEvent] = []
+    call: ToolCallDraft = {"id": "call-1", "name": "execute_shell", "arguments": '{"command":"echo canli; exit 7","use_sudo":false}'}
+    result = await execute_tool(call, Toolbox(), {}, events.append, lambda: False)
     assert result["tool_call_id"] == "call-1"
     assert result["ok"] is False
     assert result["error_type"] == "ToolError"
-    private = SimpleNamespace(id="call-2", function=SimpleNamespace(name="_read_full", arguments='{"path":"/etc/hosts"}'))
-    assert (await execute_tool(private, Toolbox(), {}))["error_type"] == "UnknownTool"
+    assert [e for e in events if e["kind"] == "tool_output"] == [{"kind": "tool_output", "call_id": "call-1", "text": "canli\n"}]
+    private: ToolCallDraft = {"id": "call-2", "name": "_read_full", "arguments": '{"path":"/etc/hosts"}'}
+    assert (await execute_tool(private, Toolbox(), {}, events.append, lambda: False))["error_type"] == "UnknownTool"
 
 
 def test_vision_capture(tmp_path: Path) -> None:
@@ -137,18 +137,29 @@ async def test_readonly_tool_calls_are_cached(tmp_path: Path) -> None:
     toolbox: Toolbox = Toolbox()
     target: Path = tmp_path / "omni_cache_read.txt"
     target.write_text("icerik", encoding="utf-8")
-    make_call = lambda name, args: SimpleNamespace(
-        id="c", function=SimpleNamespace(name=name, arguments=json.dumps(args)),
-    )
-    first = await execute_tool(make_call("read_file", {"path": str(target)}), toolbox, cache)
-    second = await execute_tool(make_call("read_file", {"path": str(target)}), toolbox, cache)
+    def make_call(name: str, args: dict) -> ToolCallDraft:
+        return {"id": "c", "name": name, "arguments": json.dumps(args)}
+    first = await execute_tool(make_call("read_file", {"path": str(target)}), toolbox, cache, lambda event: None, lambda: False)
+    second = await execute_tool(make_call("read_file", {"path": str(target)}), toolbox, cache, lambda event: None, lambda: False)
     assert first["ok"] and second["ok"]
     assert first["result"] == second["result"]
     assert len(cache) == 1
     await execute_tool(
         make_call("write_file", {"path": str(tmp_path / "omni_cache_probe.txt"), "content": "x"}), toolbox, cache,
+        lambda event: None, lambda: False,
     )
     assert cache == {}
+
+
+def test_streaming_tool_call_assembly_and_preview() -> None:
+    """Akış parçalarından araç çağrısının birleştirildiğini ve yarım JSON'dan komut önizlemesi çıktığını sınar."""
+    drafts: List[ToolCallDraft] = []
+    for call_id, name, chunk in [("c1", "execute_shell", ""), ("", None, '{"command": "ls /'), ("", None, 'tmp | head'), ("", None, ' -3", "use')]:
+        drafts = merge_tool_call_delta(drafts, 0, call_id, name, chunk)
+    assert drafts == [{"id": "c1", "name": "execute_shell", "arguments": '{"command": "ls /tmp | head -3", "use'}]
+    assert preview_arguments("execute_shell", drafts[0]["arguments"]) == "ls /tmp | head -3"
+    assert preview_arguments("execute_shell", '{"command": "echo \\"a') == 'echo "a'
+    assert preview_arguments("write_file", '{"path": "/tmp/ç.txt", "content": "uzun') == "/tmp/ç.txt"
 
 
 def test_trim_never_cuts_latest_turn() -> None:

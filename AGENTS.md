@@ -71,10 +71,26 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 - **Zaman sınırları:** model isteği 60sn (bağlantı 5sn) ve SDK içi yeniden deneme kapalıdır
   (SDK varsayılanı 600sn + 2 gizli deneme idi); görev başına 10dk (`MAX_WALL_CLOCK_SECONDS`)
   ve 25 tur.
+- **Akış:** model yanıtı `stream=True` ile alınır. Metin, düşünme metni, araç çağrısı
+  önizlemesi (komut model yazarken harf harf) ve komut çıktısı (`run_streaming_process`,
+  satır satır) `events.py`'deki tipli olaylarla yayınlanır; yarıda kesilen akış yeniden
+  denenirse önce `stream_reset` gelir. Durdurma isteği model akışını ve çalışan komutu (süreç
+  grubuyla) anında keser.
 - **Bellek:** `cognitive_memory.json` son 30 görevi ölçümleriyle kaydeder ve modele geri
   enjekte EDİLMEZ. Otomatik ders/rota enjeksiyonu ölçümde zararlı bulundu (alakasız "çözümler",
   başka görevlerin yolları, "görev belirtilmedi" yanıtları) ve kaldırıldı; macOS'a özgü bilinen
   tuzaklar `SYSTEM_PROMPT` içindeki sabit ENVIRONMENT bloğundadır.
+
+## 🖥️ Arayüz (ui.py)
+- Yalnızca `events.py` olaylarını tüketir; log metni ayrıştırılmaz. Olaylar ajan thread'lerinden
+  kuyruğa gelir, tüm çizim Tk thread'inde ~60 fps'lik tek kare döngüsünde (`_tick`) yapılır.
+- Tasarım dili Claude Code + Codex: nötr koyu yüzeyler, Menlo mono transkript, Claude turuncusu
+  (`#D97757`) vurgu; araçlar `⏺ Ad(önizleme)` blokları, komutlar `$` satırları, çıktılar `⎿`
+  altında (çalışırken canlı son 6 satır, bitince ilk 4 satır + "… +N satır").
+- Animasyonlar: daktilo akışı, yanıp sönen imleç ve çalışan araç işareti, yıldız spinner'lı ve
+  parıltılı durum satırı (süre, token, "esc ile durdur").
+- Görevler kalıcı bir event loop'ta paylaşımlı model istemcileriyle çalışır; `Esc` durdurur,
+  `⌘K` temizler.
 
 ## 🔀 Çoklu Model Backend'i (config.py: BACKENDS)
 - Dört profil: `opencode` (varsayılan, qwen3.8-flash, düşünme kapalı), `opencode-think` (aynı
