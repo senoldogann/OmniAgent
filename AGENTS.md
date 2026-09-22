@@ -89,4 +89,8 @@ Projenin "God-tier" seviyesine çıkarılması için `@Chatgpt-System` pluginind
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (`process_list`, `get_pointer_position`, `session_authority_status/end`)
 - [x] Ajanın kendi yetki seviyesini yönetebildiği bir güvenlik katmanı eklemek. (bkz. 🛡️ Güvenlik Rayları — yol koruması, yıkıcı komut engeli, sözdizimi doğrulaması, yedekleme)
 - [x] Vizyon ve Koordinat sistemini hibrit hale getirerek tıklama başarısını %100'e yaklaştırmak. (`smart_click`: AX → görsel şablon → koordinat)
-- [ ] `main.py` içindeki ajan döngüsünü canlı hedeflerle daha fazla test edip iterasyon/maliyet sınırlarını ayarlamak.
+- [x] Ajan döngüsünü canlı hedeflerle test edip hız/tutarlılık/öğrenme sınırlarını ayarlamak.
+  (2026-09-22 doğrulandı: paralel araştırma 76sn→6.9sn, hata-kurtarma dersleri otomatik
+  damıtılıp geri çağrılıyor, `process_list` 76KB→1.7KB, eski ekran görüntüsü bağlamı budanıyor.)
+- [ ] `distill_lesson_pairs` çözüm notlarını daha zenginleştirmek (şu an yalnızca başarılı
+  adımın sonucunu alıntılıyor; araç argüman farklarını da derlese daha isabetli ders üretir).

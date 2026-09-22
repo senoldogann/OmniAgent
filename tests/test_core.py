@@ -11,8 +11,19 @@ from openai import AsyncOpenAI
 
 from config import config
 from main import encode_image, execute_tool
-from state_manager import clear_active_goal, load_state, save_state, set_active_goal
-from tools import ToolError, Toolbox
+from state_manager import (
+    absorb_episode_lessons,
+    check_for_lessons,
+    clear_active_goal,
+    distill_lesson_pairs,
+    load_state,
+    normalize_error_pattern,
+    recall_similar_success,
+    record_episode,
+    save_state,
+    set_active_goal,
+)
+from tools import ToolError, Toolbox, _is_sensitive_path
 
 
 @pytest.mark.asyncio
@@ -107,7 +118,7 @@ async def test_tool_error_is_explicit() -> None:
         id="call-1",
         function=SimpleNamespace(name="execute_shell", arguments='{"command":"exit 7","use_sudo":false}'),
     )
-    result = await execute_tool(call, Toolbox())
+    result = await execute_tool(call, Toolbox(), {})
     assert result["tool_call_id"] == "call-1"
     assert result["ok"] is False
     assert result["error_type"] == "ToolError"
@@ -120,3 +131,88 @@ def test_vision_capture(tmp_path: Path) -> None:
     toolbox.take_screenshot(str(path))
     assert path.exists()
     assert len(encode_image(str(path))) > 0
+
+
+def test_normalize_error_pattern_strips_volatile_parts() -> None:
+    """Hata desenindeki yol/sayı/uuid gibi kararsız parçaların atıldığını sınar."""
+    a = normalize_error_pattern("SHELL_EXIT: /Users/dogan/a.py satır 4096 bulunamadı")
+    b = normalize_error_pattern("SHELL_EXIT: /Users/ali/b.py satır 8192 bulunamadı")
+    assert a == b
+
+
+def test_distill_lesson_pairs_from_recovery() -> None:
+    """Başarısız olup sonra toparlanan araçtan ders damıtıldığını sınar."""
+    steps = [
+        {"tool": "execute_shell", "result": {"ok": False, "error_type": "ToolError", "error": "kabuk komutu başarısız: exit=2"}},
+        {"tool": "web_search", "result": {"ok": True, "result": "sonuçlar"}},
+        {"tool": "execute_shell", "result": {"ok": True, "result": "STDOUT: tamam"}},
+    ]
+    pairs = distill_lesson_pairs(steps)
+    assert len(pairs) == 1
+    pattern, fix = pairs[0]
+    assert "execute_shell" in fix
+    assert "kabuk" in pattern
+
+
+def test_distill_lesson_pairs_without_recovery_is_empty() -> None:
+    """Hiç toparlanmayan hataların ders üretmediğini sınar (çözüm kanıtı yok)."""
+    steps = [{"tool": "find_and_click", "result": {"ok": False, "error_type": "ToolError", "error": "hedef yok"}}]
+    assert distill_lesson_pairs(steps) == []
+
+
+def test_absorb_episode_lessons_persists_and_recalls() -> None:
+    """Damıtılan dersin belleğe yazıldığını ve hata anında geri çağrıldığını sınar."""
+    state = load_state(str(Path("/tmp/omni_lesson_test.json")))
+    steps = [
+        {"tool": "web_search", "result": {"ok": False, "error_type": "ToolError", "error": "paket import edilemedi"}},
+        {"tool": "web_search", "result": {"ok": True, "result": "5 sonuç"}},
+    ]
+    state = absorb_episode_lessons(state, steps, success=True)
+    assert state["lessons_learned"]
+    hint = check_for_lessons(state, "ToolError: paket import edilemedi")
+    assert hint is not None and "web_search" in hint
+
+
+def test_recall_similar_success_uses_token_overlap() -> None:
+    """Benzer hedefli başarılı epizotlardan rota özeti döndüğünü sınar."""
+    state = load_state(str(Path("/tmp/omni_route_test.json")))
+    state = record_episode(
+        state,
+        "hava durumu raporu hazırla ve kaydet",
+        [{"tool": "web_search", "result": {"ok": True, "result": "sonuç"}}],
+        "Tamamlandı",
+        True,
+    )
+    recalled = recall_similar_success(state, "hava durumu raporu hazırla", limit=3)
+    assert recalled is not None
+    assert "web_search" in recalled
+
+
+@pytest.mark.asyncio
+async def test_readonly_tool_calls_are_cached(tmp_path: Path) -> None:
+    """Salt okunur araçların önbelleklendiğini, yan etkili çağrı sonrası önbelleğin temizlendiğini sınar."""
+    cache: dict = {}
+    toolbox: Toolbox = Toolbox()
+    target: Path = tmp_path / "omni_cache_read.txt"
+    target.write_text("icerik", encoding="utf-8")
+    make_call = lambda name, args: SimpleNamespace(
+        id="c", function=SimpleNamespace(name=name, arguments=json.dumps(args)),
+    )
+    first = await execute_tool(make_call("read_file", {"path": str(target)}), toolbox, cache)
+    second = await execute_tool(make_call("read_file", {"path": str(target)}), toolbox, cache)
+    assert first["ok"] and second["ok"]
+    assert first["result"] == second["result"]
+    assert len(cache) == 1
+    await execute_tool(
+        make_call("write_file", {"path": str(tmp_path / "omni_cache_probe.txt"), "content": "x"}), toolbox, cache,
+    )
+    assert cache == {}
+
+
+def test_sensitive_path_macos_firmlink_false_positive() -> None:
+    """macOS'ta /System/Volumes/Data altına çözülen kullanıcı yollarının bloklanmadığını sınar."""
+    assert not _is_sensitive_path(Path("/tmp/omni_yazilabilir.txt"))
+    assert not _is_sensitive_path(Path("/home/kullanici/notlar.txt"))
+    assert _is_sensitive_path(Path("/System/Library/CoreServices/test.txt"))
+    assert _is_sensitive_path(Path("/etc/hosts"))
+    assert _is_sensitive_path(Path.home() / ".ssh" / "id_rsa")

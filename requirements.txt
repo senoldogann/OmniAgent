@@ -5,7 +5,7 @@ pyautogui
 pillow
 opencv-python
 numpy
-duckduckgo-search
+ddgs
 pyobjc-framework-ApplicationServices
 pyobjc-framework-Quartz
 customtkinter

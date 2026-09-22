@@ -18,8 +18,9 @@ STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
 MAX_ITERATIONS: int = 25
 MAX_API_RETRIES: int = 3
 MAX_WALL_CLOCK_SECONDS: float = 600.0
-MAX_TOOL_MESSAGE_AGE: int = 6
+MAX_TOOL_MESSAGE_AGE: int = 4
 TRIMMED_CONTENT_LIMIT: int = 400
+TRIMMED_ARGS_LIMIT: int = 120
 CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
 MAX_RESPONSE_TOKENS: int = 2048
 
@@ -40,9 +41,18 @@ class RunOptions(TypedDict):
 
 
 def encode_image(path: str) -> str:
-    """Görüntü dosyasını base64 metnine çevirir."""
-    with open(path, "rb") as source:
-        return base64.b64encode(source.read()).decode("utf-8")
+    """
+    Görüntü dosyasını JPEG base64 metnine çevirir. Retina PNG'leri megabaytla
+    gider; küçültüp JPEG'e çevirmek görsel token yükünü 10-20x azaltır.
+    """
+    from io import BytesIO
+    from PIL import Image
+    with Image.open(path) as source:
+        frame: Any = source.convert("RGB")
+        frame.thumbnail((1280, 1280))
+        buffer: BytesIO = BytesIO()
+        frame.save(buffer, format="JPEG", quality=70)
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def build_tool_schemas() -> List[Dict[str, Any]]:
@@ -260,7 +270,31 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
     ]
 
 
-async def execute_tool(call: Any, toolbox: Toolbox) -> ToolResult:
+# Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir — yan etkisi yoktur.
+# Canlı durum (imleç, pencere, yetki) önbelleklenmez: anında bayatlar ve yanlış
+# tıklamaya yol açar. Yazma/eylem araçları ASLA önbelleklenmez ve her başarılı
+# yan etkili çağrıdan sonra önbellek tamamen temizlenir.
+_CACHEABLE_TOOLS: frozenset[str] = frozenset({
+    "process_list", "deep_system_probe",
+    "read_file", "web_search", "fetch_raw",
+})
+
+_MUTATING_TOOLS: frozenset[str] = frozenset({
+    "write_file", "self_modify", "execute_shell", "take_screenshot",
+    "execute_js", "session_authority_end",
+    "mouse_click", "mouse_move", "keyboard_type", "keyboard_press",
+    "cua_click", "cua_press_key", "cua_get_app",
+    "find_and_click", "smart_click", "run_action_sequence",
+    "browse_url",
+})
+
+
+def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
+    """Önbellek anahtarı: araç adı + kararlı (sıralı) argüman JSON'u."""
+    return name + ":" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+
+
+async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]) -> ToolResult:
     """Tek bir araç çağrısını çalıştırır; başarı/hata durumunu yapılandırılmış şekilde döner."""
     name: str = call.function.name
     try:
@@ -270,6 +304,12 @@ async def execute_tool(call: Any, toolbox: Toolbox) -> ToolResult:
             "tool_call_id": call.id, "ok": False,
             "error_type": "JSONDecodeError", "error": f"Araç argümanları çözümlenemedi: {error}",
         }
+
+    cache_key: Optional[str] = None
+    if name in _CACHEABLE_TOOLS:
+        cache_key = _tool_cache_key(name, arguments)
+        if cache_key in cache:
+            return {**cache[cache_key], "tool_call_id": call.id}
 
     method: Optional[Callable[..., Any]] = getattr(toolbox, name, None)
     if method is None or not callable(method):
@@ -283,29 +323,37 @@ async def execute_tool(call: Any, toolbox: Toolbox) -> ToolResult:
             result: Any = await method(**arguments)
         else:
             result = await asyncio.to_thread(method, **arguments)
-        return {"tool_call_id": call.id, "ok": True, "result": str(result)}
+        outcome: ToolResult = {"tool_call_id": call.id, "ok": True, "result": str(result)}
     except ToolError as error:
-        return {
+        outcome = {
             "tool_call_id": call.id, "ok": False,
             "error_type": "ToolError", "error": str(error),
             "code": error.code, "recoverable": error.recoverable,
         }
     except TypeError as error:
-        return {
+        outcome = {
             "tool_call_id": call.id, "ok": False,
             "error_type": "TypeError", "error": f"Geçersiz argümanlar ({name}): {error}",
         }
     except Exception as error:  # Araç sınırı: rastgele üçüncü taraf hatalarını döngüyü çökertmeden yakala.
-        return {
+        outcome = {
             "tool_call_id": call.id, "ok": False,
             "error_type": type(error).__name__, "error": str(error),
         }
+
+    if outcome.get("ok") and name in _MUTATING_TOOLS:
+        cache.clear()
+    if cache_key is not None and outcome.get("ok"):
+        cache[cache_key] = outcome
+    return outcome
 
 
 # Fiziksel fare/klavye eylemleri paralelleştirilemez: aynı anda iki tıklama/yazma
 # yarış durumu yaratıp yanlış elemente etki edebilir. Bunlar model bir turda birden
 # fazlasını döndürürse orijinal sırayla SERİ çalışır; geri kalan (salt okunur/bağımsız)
-# çağrılar gerçek paralellikle çalışır.
+# çağrılar gerçek paralellikle çalışır. Yan etkili araçlar da (execute_shell, write_file
+# vb.) seri tutulur ki paralel bir okuma yazmadan önce bayat sonuç önbelleğe girmesin
+# ve eylem->gözlem sırası bozulmasın.
 _SEQUENTIAL_TOOLS: frozenset[str] = frozenset({
     "mouse_click", "mouse_move", "keyboard_type", "keyboard_press",
     "cua_click", "cua_press_key", "cua_get_app", "find_and_click",
@@ -313,26 +361,33 @@ _SEQUENTIAL_TOOLS: frozenset[str] = frozenset({
 })
 
 
-async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox) -> List[ToolResult]:
-    """Bir turdaki tüm araç çağrılarını, fiziksel eylemleri seri tutarak çalıştırır."""
-    concurrent_indices: List[int] = [i for i, c in enumerate(calls) if c.function.name not in _SEQUENTIAL_TOOLS]
-    sequential_indices: List[int] = [i for i, c in enumerate(calls) if c.function.name in _SEQUENTIAL_TOOLS]
-
-    async def run_sequential() -> List[Tuple[int, ToolResult]]:
-        outcomes: List[Tuple[int, ToolResult]] = []
-        for i in sequential_indices:
-            outcomes.append((i, await execute_tool(calls[i], toolbox)))
-        return outcomes
-
-    async def run_concurrent() -> List[Tuple[int, ToolResult]]:
-        if not concurrent_indices:
-            return []
-        outcomes = await asyncio.gather(*(execute_tool(calls[i], toolbox) for i in concurrent_indices))
-        return list(zip(concurrent_indices, outcomes))
-
-    sequential_results, concurrent_results = await asyncio.gather(run_sequential(), run_concurrent())
-    by_index: Dict[int, ToolResult] = dict(sequential_results + concurrent_results)
-    return [by_index[i] for i in range(len(calls))]
+async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox, cache: Dict[str, ToolResult]) -> List[ToolResult]:
+    """
+    Bir turdaki tüm araç çağrılarını MODELİN DÖNDÜRDÜĞÜ SIRAYI koruyarak çalıştırır:
+    yan etkili/fiziksel çağrılar seri, aralarındaki bağımsız salt okunur bloklar
+    paralel. Böylece 'tıkla -> ekran görüntüsü al' gibi eylem-gözlem çiftlerinde
+    gözlem her zaman eylemden SONRA gelir (yarış yok).
+    """
+    results: List[Optional[ToolResult]] = [None] * len(calls)
+    index: int = 0
+    while index < len(calls):
+        name: str = calls[index].function.name
+        if name in _MUTATING_TOOLS or name in _SEQUENTIAL_TOOLS:
+            results[index] = await execute_tool(calls[index], toolbox, cache)
+            index += 1
+            continue
+        stop: int = index
+        while stop < len(calls):
+            nxt: str = calls[stop].function.name
+            if nxt in _MUTATING_TOOLS or nxt in _SEQUENTIAL_TOOLS:
+                break
+            stop += 1
+        group: List[ToolResult] = list(await asyncio.gather(
+            *(execute_tool(calls[k], toolbox, cache) for k in range(index, stop))
+        ))
+        results[index:stop] = group
+        index = stop
+    return [r for r in results if r is not None]
 
 
 def _tool_result_to_message(call: Any, result: ToolResult, hint: Optional[str]) -> Dict[str, Any]:
@@ -348,21 +403,45 @@ def _tool_result_to_message(call: Any, result: ToolResult, hint: Optional[str]) 
 
 def _trim_old_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Son MAX_TOOL_MESSAGE_AGE mesajın dışında kalan uzun araç sonuçlarını kısaltır.
-    Saf fonksiyon: girdiyi değiştirmez, yeni bir liste döner. Bağlamın turlar
-    ilerledikçe sınırsız büyümesini (ve her turu giderek yavaşlatmasını) önler.
+    Yaş penceresi (son MAX_TOOL_MESSAGE_AGE ARAÇ mesajı) dışında kalan:
+      1) uzun araç sonuçlarını kısaltır,
+      2) görsel (ekran görüntüsü) içeriklerini metin notuna indirger,
+      3) assistant tool_calls argümanlarını budar (write_file içeriği gibi
+         devasa JSON'lar her tur tekrar tekrar gönderilmesin).
+    Saf fonksiyon: girdiyi değiştirmez, yeni bir liste döner. Yaş penceresi
+    ham mesaj sayısına değil ARAÇ mesajı sayısına göre sayılır: paralel bir
+    tur 5 sonuç ürettiğinde 4'lü pencere neredeyse tüm toplu hâli tam boy
+    tutup şişirmesin diye.
     """
-    cutoff: int = len(messages) - MAX_TOOL_MESSAGE_AGE
+    tool_age: int = 0
+    cutoff: int = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "tool":
+            tool_age += 1
+            if tool_age >= MAX_TOOL_MESSAGE_AGE:
+                cutoff = index + 1
+                break
+
     trimmed: List[Dict[str, Any]] = []
     for index, entry in enumerate(messages):
         content: Any = entry.get("content")
-        if (
-            index < cutoff
-            and entry.get("role") == "tool"
-            and isinstance(content, str)
-            and len(content) > TRIMMED_CONTENT_LIMIT
-        ):
+        if index >= cutoff:
+            trimmed.append(entry)
+            continue
+        if entry.get("role") == "tool" and isinstance(content, str) and len(content) > TRIMMED_CONTENT_LIMIT:
             trimmed.append({**entry, "content": content[:TRIMMED_CONTENT_LIMIT] + " …[eski çıktı kısaltıldı]"})
+        elif isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "image_url" for part in content
+        ):
+            trimmed.append({**entry, "content": "[eski ekran görüntüsü bağlamdan çıkarıldı]"})
+        elif entry.get("role") == "assistant" and entry.get("tool_calls"):
+            slim_calls: List[Dict[str, Any]] = [
+                {**call, "function": {**call["function"], "arguments": "{}"}}
+                if len(str(call.get("function", {}).get("arguments", ""))) > TRIMMED_ARGS_LIMIT
+                else call
+                for call in entry["tool_calls"]
+            ]
+            trimmed.append({**entry, "tool_calls": slim_calls})
         else:
             trimmed.append(entry)
     return trimmed
@@ -402,6 +481,11 @@ async def _call_model_with_retries(
             )
             return response, active_backend
         except Exception as error:
+            status: Optional[int] = getattr(error, "status_code", None)
+            # 400/401/403 gibi kalıcı istemci hatalarını yeniden denemek zaman ve
+            # backend yükseltmesi israfıdır; yalnızca 5xx ve 429 (rate limit) denenir.
+            if status is not None and status < 500 and status != 429:
+                raise
             last_error = error
             logging.warning(
                 "Model çağrısı başarısız, yeniden deneniyor",
@@ -440,10 +524,15 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
     session_id: str = str(uuid.uuid4())
     state: sm.StateDict = sm.load_state(STATE_FILE)
 
-    known_fix: Optional[str] = sm.check_for_lessons(state, goal)
+    # Benzer geçmiş başarılı görevlerden rota önerisi al (epizodik bellek hatırlaması).
+    known_route: Optional[str] = sm.recall_similar_success(state, goal, limit=3)
     system_content: str = config["SYSTEM_PROMPT"]
-    if known_fix:
-        system_content += f"\n\n### BİLİNEN DERS\nBenzer bir görevde şu çözüm işe yaramıştı: {known_fix}"
+    if known_route:
+        system_content += (
+            "\n\n### BİLİNEN ROTA (benzer geçmiş görevlerden)\n"
+            "Aşağıdaki bilgi YALNIZCA araç sırası içindir. Hedef metnindeki yol ve dosya "
+            "adlarını ASLA değiştirme; eski görevin yollarını kullanma.\n" + known_route
+        )
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_content},
@@ -456,6 +545,7 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
     start_time: float = time.monotonic()
     current_backend: str = requested_backend
     consecutive_tool_failures: int = 0
+    tool_cache: Dict[str, ToolResult] = {}
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -490,19 +580,22 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
                 break
 
             for call in message.tool_calls:
-                callback(f"Araç çağrısı: {call.function.name}({call.function.arguments})")
+                shown_args: str = call.function.arguments or ""
+                callback(f"Araç çağrısı: {call.function.name}({shown_args[:TRIMMED_ARGS_LIMIT]})")
 
-            # Bağımsız araç çağrıları paralel, fiziksel GUI eylemleri sıralı çalışır.
-            results: List[ToolResult] = await _execute_tool_calls(message.tool_calls, toolbox)
+            # Bağımsız araç çağrıları paralel, fiziksel/yan etkili eylemler model
+            # sırasına sadık kalarak seri çalışır.
+            results: List[ToolResult] = await _execute_tool_calls(message.tool_calls, toolbox, tool_cache)
 
+            failures_in_turn: int = 0
+            pending_shots: List[Any] = []
             for call, result in zip(message.tool_calls, results):
                 steps.append({"tool": call.function.name, "result": result})
                 hint: Optional[str] = None
                 if result.get("ok"):
-                    consecutive_tool_failures = 0
                     callback(f"  -> Başarılı ({call.function.name}): {str(result.get('result', ''))[:300]}")
                 else:
-                    consecutive_tool_failures += 1
+                    failures_in_turn += 1
                     error_text: str = f"{result.get('error_type')}: {result.get('error')}"
                     callback(f"  -> Hata ({call.function.name}): {error_text}")
                     hint = sm.check_for_lessons(state, error_text)
@@ -511,7 +604,22 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
                 messages.append(_tool_result_to_message(call, result, hint))
 
                 if result.get("ok") and call.function.name == "take_screenshot":
-                    _attach_screenshot_observation(messages, call, callback)
+                    pending_shots.append(call)
+
+            # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: OpenAI uyumlu
+            # API'lerde tool sonuçlarının assistant tool_calls'ı kesintisiz izlemesi
+            # gerekir; araya user mesajı sıkıştırmak 400'e ve boşa giden yeniden
+            # denemelere yol açar.
+            for shot_call in pending_shots:
+                await _attach_screenshot_observation(messages, shot_call, callback)
+
+            # Yükseltme sayacı TUR bazlıdır: tek turdaki iki bağımsız hata (örn. iki
+            # yanlış yol) ajanı kalıcı olarak yavaş backend'e düşürmesin; turda herhangi
+            # bir başarı varsa sayaç sıfırlanır.
+            if failures_in_turn == len(results) and failures_in_turn > 0:
+                consecutive_tool_failures += 1
+            elif failures_in_turn < len(results):
+                consecutive_tool_failures = 0
 
             if (
                 consecutive_tool_failures >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD
@@ -530,6 +638,9 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
         raise
     finally:
         state = sm.record_episode(state, goal, steps, outcome, success)
+        # Epizottaki hata->toparlanma desenlerinden ders damıt: ajan her görevde
+        # kendi hatalarından öğrenir ve bir sonraki görevde çözümleri enjekte edilir.
+        state = sm.absorb_episode_lessons(state, steps, success)
         sm.save_state(STATE_FILE, state)
         await toolbox.close_browser()
         await asyncio.gather(*(c.close() for c in clients.values()))
@@ -537,16 +648,16 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
     return outcome
 
 
-def _attach_screenshot_observation(messages: List[Dict[str, Any]], call: Any, callback: Callable[[str], None]) -> None:
+async def _attach_screenshot_observation(messages: List[Dict[str, Any]], call: Any, callback: Callable[[str], None]) -> None:
     """Başarılı bir ekran görüntüsünü modele görsel gözlem olarak ekler (en iyi çaba)."""
     try:
         arguments: Dict[str, Any] = json.loads(call.function.arguments or "{}")
-        image_b64: str = encode_image(arguments["filename"])
+        image_b64: str = await asyncio.to_thread(encode_image, arguments["filename"])
         messages.append({
             "role": "user",
             "content": [
                 {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
             ],
         })
     except Exception as error:

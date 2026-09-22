@@ -20,6 +20,21 @@ from typing import Any, Dict, List, Optional, Tuple
 # başına bu bekleme payını taşıdığı için varsayılanla saniyelerce sürebiliyor.
 pyautogui.PAUSE = 0.02
 
+# Araç sonuçları modele gider: her bayt token demektir. Uzun çıktılar kırpılır.
+SHELL_STDOUT_LIMIT: int = 4000
+SHELL_STDERR_LIMIT: int = 1000
+FILE_READ_LIMIT: int = 8000
+TYPED_TEXT_ECHO_LIMIT: int = 80
+SCREENSHOT_MAX_EDGE: int = 1600
+BACKUP_KEEP_PER_FILE: int = 5
+
+
+def _clip(text: str, limit: int) -> str:
+    """Metni belirtilen uzunlukta kırpıp kısaltma bilgisini ekler (model kopsa da bilir)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n…[kısaltıldı, toplam {len(text)} karakter]"
+
 # Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı
 class ToolError(Exception):
     def __init__(self, message: str, code: str, recoverable: bool) -> None:
@@ -66,14 +81,42 @@ _CATASTROPHIC_SHELL_PATTERNS: Tuple[str, ...] = (
     r"\bsudo\s+rm\s+-\w*[rR]",
 )
 
+def _logical_path(path: Path) -> Path:
+    """
+    macOS firmlink tuzağını çözer: kullanıcı yolları çözümlenince
+    `/System/Volumes/Data/...` altına düşer; bu bir SİSTEM yolu değil, veri
+    biriminin arka plan yoludur. Karşılaştırmayı mantıksal yol üzerinden yapmak,
+    `/System` korumasının yanlışlıkla `/home`, `/Users`, `/tmp` gibi yolları
+    engellemesini (false positive) önler.
+    """
+    resolved: Path = path.expanduser().resolve()
+    posix: str = resolved.as_posix()
+    marker: str = "/System/Volumes/Data"
+    if posix == marker:
+        return Path("/")
+    if posix.startswith(marker + "/"):
+        return Path(posix[len(marker):])
+    return resolved
+
 def _is_sensitive_path(path: Path) -> bool:
     """Hedef yolun korunan sistem/kimlik dosyalarından biri olup olmadığını denetler."""
-    resolved: Path = path.expanduser().resolve()
+    resolved: Path = _logical_path(path)
     for raw_prefix in _SENSITIVE_PATH_PREFIXES:
-        prefix: Path = raw_prefix.expanduser()
+        prefix: Path = _logical_path(raw_prefix.expanduser())
         if resolved == prefix or prefix in resolved.parents:
             return True
     return False
+
+def _sensitive_write_allowed() -> bool:
+    """
+    Hassas yol koruması varsayılan olarak kapalı bırakılır. Kullanıcı, betiği
+    ÇALIŞTIRMADAN ÖNCE kendi ortamında OMNI_ALLOW_SENSITIVE_WRITE=1 ayarladıysa
+    bu çalıştırma boyunca gevşetilir. Ajan bunu kendi kendine açamaz:
+    execute_shell alt-süreçlerinin `export` gibi ortam değişiklikleri bu Python
+    sürecine geri sızmaz, ve hiçbir araç os.environ'ı programatik olarak
+    değiştirmez — karar her zaman kullanıcıda kalır.
+    """
+    return os.environ.get("OMNI_ALLOW_SENSITIVE_WRITE") == "1"
 
 def _is_catastrophic_command(command: str) -> bool:
     """Bilinen yıkıcı kabuk komutu kalıplarını tespit eder (en iyi çaba kontrolü)."""
@@ -95,11 +138,19 @@ def _shell_writes_to_sensitive_path(command: str) -> bool:
     return False
 
 def _backup_file(path: Path) -> Path:
-    """Üzerine yazılmadan önce mevcut dosyanın zaman damgalı yedeğini alır."""
+    """
+    Üzerine yazılmadan önce mevcut dosyanın zaman damgalı yedeğini alır.
+    Aynı dosya başına yalnızca son BACKUP_KEEP_PER_FILE yedek tutulur; uzun
+    otonom oturumlarda disk sızıntısını önler.
+    """
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     stamp: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     backup_path: Path = BACKUP_DIR / f"{path.name}.{stamp}.bak"
     backup_path.write_bytes(path.read_bytes())
+    existing: List[Path] = sorted(BACKUP_DIR.glob(f"{path.name}.*.bak"))
+    stale: List[Path] = existing[:-BACKUP_KEEP_PER_FILE] if len(existing) > BACKUP_KEEP_PER_FILE else []
+    for old in stale:
+        old.unlink()
     return backup_path
 
 # Bilgisayar Kullanım Ajansı (CUA) - macOS GUI etkileşimleri
@@ -117,7 +168,7 @@ class CUA:
         """
         script: str = f'tell application {json.dumps(app_name)} to activate'
         result: subprocess.CompletedProcess[str] = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=15,
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=8,
         )
         if result.returncode == 0:
             self.active_apps[app_name] = True
@@ -135,7 +186,7 @@ class CUA:
             f'to click UI element {element_id} of front window'
         )
         result: subprocess.CompletedProcess[str] = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=15,
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=8,
         )
         
         if result.returncode == 0:
@@ -163,7 +214,7 @@ class CUA:
             f'of process {json.dumps(app_name)}'
         )
         result: subprocess.CompletedProcess[str] = subprocess.run(
-            ["osascript", "-e", script], capture_output=True, text=True, timeout=15,
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=8,
         )
         if result.returncode != 0:
             raise ToolError(
@@ -208,7 +259,7 @@ class Toolbox:
             element.decompose()
         text: str = soup.get_text(separator=' ')
         lines: List[str] = [line.strip() for line in text.splitlines() if line.strip()]
-        return " ".join(lines)[:15000]
+        return _clip(" ".join(lines), 5000)
 
     def execute_shell(self, command: str, use_sudo: bool) -> str:
         """
@@ -222,10 +273,13 @@ class Toolbox:
                 "CATASTROPHIC_COMMAND_BLOCKED", False,
             )
         if _shell_writes_to_sensitive_path(command):
-            raise ToolError(
-                f"Komut korunan bir sistem/kimlik yoluna yönlendirme yapıyor, engellendi: {command}",
-                "SENSITIVE_PATH_BLOCKED", False,
-            )
+            if not _sensitive_write_allowed():
+                raise ToolError(
+                    f"Komut korunan bir sistem/kimlik yoluna yönlendirme yapıyor, engellendi: {command}. "
+                    "Kullanıcı bilerek izin vermek isterse OMNI_ALLOW_SENSITIVE_WRITE=1 ile çalıştırmalı.",
+                    "SENSITIVE_PATH_BLOCKED", False,
+                )
+            logging.warning("Hassas yola kabuk yönlendirmesine kullanıcı bayrağıyla izin verildi", extra={"command": command})
         if use_sudo:
             logging.warning("Sudo ile kabuk komutu çalıştırılıyor", extra={"command": command})
         full_cmd: str | List[str] = (
@@ -234,16 +288,19 @@ class Toolbox:
         try:
             result: subprocess.CompletedProcess[str] = subprocess.run(
                 full_cmd, shell=not use_sudo, capture_output=True, text=True,
-                timeout=300, stdin=subprocess.DEVNULL,
+                timeout=60, stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired as error:
-            raise ToolError("Kabuk komutu 300 saniyede tamamlanmadı.", "SHELL_TIMEOUT", True) from error
+            raise ToolError("Kabuk komutu 60 saniyede tamamlanmadı.", "SHELL_TIMEOUT", True) from error
         if result.returncode != 0:
+            # Çoğu araç (npm, git, python, brew) asıl hatayı STDOUT'a basar; model
+            # komutu sırf okumak için tekrar çalıştırmasın diye ikisi de taşınır.
             raise ToolError(
-                f"Kabuk komutu başarısız: çıkış={result.returncode}, stderr={result.stderr.strip()}",
+                f"Kabuk komutu başarısız: çıkış={result.returncode}, "
+                f"stdout={_clip(result.stdout, 1000)}, stderr={_clip(result.stderr, 1000)}",
                 "SHELL_EXIT", True,
             )
-        return f"STDOUT: {result.stdout}\\nSTDERR: {result.stderr}\\nÇıkış Kodu: {result.returncode}"
+        return f"STDOUT: {_clip(result.stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(result.stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: {result.returncode}"
 
     def get_window_bounds(self, window_title: str) -> Tuple[int, int, int, int]:
         """
@@ -251,27 +308,68 @@ class Toolbox:
         """
         script: str = (
             f'tell application "System Events" '
-            f'to get position and size of window 1 of (first process whose name contains "{window_title}")'
+            f'to get position and size of window 1 of (first process whose name contains {json.dumps(window_title)})'
         )
         try:
             result: subprocess.CompletedProcess[str] = subprocess.run(
-                ["osascript", "-e", script], capture_output=True, text=True, timeout=10,
+                ["osascript", "-e", script], capture_output=True, text=True, timeout=6,
             )
-            if result.returncode != 0:
-                raise ToolError(f"Pencere boyutları alınamadı: {result.stderr.strip()}", "WINDOW_NOT_FOUND", True)
-            
-            # Result format: "0, 0, 450, 600" (approx)
-            parts: List[int] = [int(p.strip()) for p in result.stdout.split(',')]
-            return tuple(parts)
-        except Exception as e:
-            raise ToolError(f"Pencere sınırları belirlenemedi: {e}", "WINDOW_BOUNDS_FAILED", True)
+        except subprocess.TimeoutExpired as error:
+            raise ToolError(f"Pencere sorgusu zaman aşımı: {window_title}", "WINDOW_TIMEOUT", True) from error
+        if result.returncode != 0:
+            raise ToolError(
+                f"Pencere boyutları alınamadı: pencere={window_title}, ayrıntı={result.stderr.strip()}",
+                "WINDOW_NOT_FOUND", True,
+            )
+        parts: List[int] = []
+        for piece in result.stdout.split(','):
+            piece = piece.strip()
+            if piece:
+                try:
+                    parts.append(int(piece))
+                except ValueError as error:
+                    raise ToolError(
+                        f"Pencere koordinatları çözümlenemedi: pencere={window_title}, ham={result.stdout!r}",
+                        "WINDOW_PARSE", True,
+                    ) from error
+        if len(parts) != 4:
+            raise ToolError(
+                f"Pencere koordinatları eksik: pencere={window_title}, ham={result.stdout!r}",
+                "WINDOW_PARSE", True,
+            )
+        return (parts[0], parts[1], parts[2], parts[3])
 
     def process_list(self) -> str:
         """
         Sistemdeki aktif süreçlerin yapılandırılmış listesini döner.
+        Ham `ps` çıktısı onlarca KB olabilir ve her model turuna binen token
+        maliyeti tur süresini doğrudan uzatır; bu yüzden özet + en ağır N süreç
+        döndürülür. Tam ps çıktısı execute_shell'in model kırpımından bağımsız
+        olarak doğrudan toplanır (kırpım süreç sayısını eksiltmesin).
         """
-        result = self.execute_shell("ps -eo pid,ppid,user,%cpu,%mem,comm", False)
-        return result
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["ps", "-eo", "pid,ppid,user,%cpu,%mem,comm"],
+            capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            raise ToolError(
+                f"Süreç listesi alınamadı: çıkış={result.returncode}, stderr={result.stderr.strip()}",
+                "SHELL_EXIT", True,
+            )
+        process_lines: List[str] = [ln for ln in result.stdout.splitlines() if ln.strip()]
+        if process_lines and process_lines[0].lstrip().startswith("PID"):
+            process_lines = process_lines[1:]
+        def cpu_key(line: str) -> float:
+            parts: List[str] = line.split()
+            try:
+                return float(parts[3]) if len(parts) > 3 else 0.0
+            except ValueError:
+                return 0.0
+        top: List[str] = sorted(process_lines, key=cpu_key, reverse=True)[:15]
+        return (
+            f"Toplam süreç sayısı: {len(process_lines)}\n"
+            f"En ağır 15 süreç (CPU'ya göre):\n" + "\n".join(top)
+        )
 
     def get_pointer_position(self) -> str:
         """
@@ -306,14 +404,23 @@ class Toolbox:
         if target == "process":
             return self.process_list()
         if target == "network":
-            return self.execute_shell("netstat -anp tcp", False)
+            return self.execute_shell("netstat -anp tcp | head -40", False)
         raise ToolError(f"Bilinmeyen tarama hedefi: {target}", "INVALID_PROBE", False)
 
     def take_screenshot(self, filename: str) -> str:
         """
-        Ekran görüntüsü alır ve dosyaya kaydeder.
+        Ekran görüntüsü alır ve dosyaya kaydeder. Retina çözünürlüğü modele
+        taşımak megabaytlık görsel yükü demek olduğu için uzun kenar
+        SCREENSHOT_MAX_EDGE ile sınırlanır; eşleme (find_and_click) kendi
+        tam çözünürlüklü görüntüsünü ayrı alır.
         """
+        if _is_sensitive_path(Path(filename)):
+            raise ToolError(
+                f"Korunan bir sistem/kimlik yoluna ekran görüntüsü yazılamaz: {filename}",
+                "SENSITIVE_PATH_BLOCKED", False,
+            )
         screenshot = ImageGrab.grab()
+        screenshot.thumbnail((SCREENSHOT_MAX_EDGE, SCREENSHOT_MAX_EDGE))
         screenshot.save(filename)
         return f"Ekran görüntüsü {filename} dosyasına kaydedildi."
 
@@ -329,8 +436,17 @@ class Toolbox:
         
         if window_title:
             x, y, w, h = self.get_window_bounds(window_title)
-            screen_gray = cv2.cvtColor(full_screen[y:y+h, x:x+w], cv2.COLOR_RGB2GRAY)
-            offset_x, offset_y = x, y
+            # Negatif/ekran dışı pencere koordinatları numpy'da sessizce sondan
+            # sarılır ve yanlış bölgeye tıklanır; kırpımı ekrana sınırla.
+            x0, y0 = max(x, 0), max(y, 0)
+            x1, y1 = min(x + w, full_screen.shape[1]), min(y + h, full_screen.shape[0])
+            if x1 <= x0 or y1 <= y0:
+                raise ToolError(
+                    f"Pencere kırpımı geçersiz (ekran dışı): x={x}, y={y}, w={w}, h={h}",
+                    "WINDOW_OFFSCREEN", True,
+                )
+            screen_gray = cv2.cvtColor(full_screen[y0:y1, x0:x1], cv2.COLOR_RGB2GRAY)
+            offset_x, offset_y = x0, y0
         else:
             screen_gray = cv2.cvtColor(full_screen, cv2.COLOR_RGB2GRAY)
             offset_x, offset_y = 0, 0
@@ -357,35 +473,63 @@ class Toolbox:
 
     def smart_click(self, app_name: str, element_id: Optional[int] = None, template_path: Optional[str] = None, confidence: float = 0.8) -> str:
         """
-        Hibrit Tıklama Protokolü: AX -> Görsel Şablon -> Koordinat sırasıyla dener.
+        Hibrit Tıklama Protokolü: AX -> Görsel Şablon sırasıyla dener.
+        Başarısız katmanların nedenleri tek hatada biriktirilir ki model tek
+        turda düzeltebilsin (boş CLICK_FAILED için ek keşif turu gerekmesin).
         """
+        failures: List[str] = []
         # Katman 1: AX (Erişilebilirlik)
         if element_id:
             try:
                 return self.cua_click(app_name, element_id)
-            except ToolError:
-                pass
-        
+            except ToolError as error:
+                failures.append(f"AX: {error}")
+
         # Katman 2: Görsel Şablon
         if template_path:
             try:
                 return self.find_and_click(template_path, confidence, window_title=app_name)
-            except ToolError:
-                pass
-        
-        raise ToolError(f"Tüm tıklama yöntemleri başarısız oldu: {app_name}", "CLICK_FAILED", True)
+            except ToolError as error:
+                failures.append(f"şablon: {error}")
+
+        detail: str = "; ".join(failures) if failures else "hiç denenmedi (element_id/template_path verilmedi)"
+        raise ToolError(
+            f"Tüm tıklama yöntemleri başarısız oldu: {app_name}. Katman hataları: {detail}",
+            "CLICK_FAILED", True,
+        )
 
     def web_search(self, query: str) -> str:
         """
         DuckDuckGo üzerinden web araması yapar.
+        `ddgs` paketi (duckduckgo_search'ün yeniden adlandırılmış hali) kullanılır;
+        eski paket adı 2026 itibarıyla sonuç döndürmez hale geldi.
+        Boş sonuç kararlı bir durumdur, yeniden denenmez (3x gidiş-dönüş israfı).
         """
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
+        last_error: Optional[Exception] = None
         for attempt in range(1, 4):
             try:
                 with DDGS() as ddgs:
-                    results: List[Dict[str, Any]] = list(ddgs.text(query, max_results=8))
-                return json.dumps(results, indent=2, ensure_ascii=False)
+                    results: List[Dict[str, Any]] = list(ddgs.text(query, max_results=5))
+                if not results:
+                    raise ToolError(
+                        f"Web araması boş sonuç döndü: sorgu={query}",
+                        "WEB_SEARCH_EMPTY", True,
+                    )
+                # Model turuna binen token'ı azalt: gövde metinlerini 200 karakterle sınırla.
+                clipped: List[Dict[str, Any]] = [
+                    {
+                        "title": r.get("title", ""),
+                        "href": r.get("href", ""),
+                        "body": str(r.get("body", ""))[:200],
+                    }
+                    for r in results
+                ]
+                return json.dumps(clipped, indent=2, ensure_ascii=False)
+            except ToolError:
+                raise
             except Exception as error:
+                last_error = error
                 logging.warning(
                     "Web araması başarısız",
                     extra={"query": query, "attempt": attempt, "error_type": type(error).__name__},
@@ -395,7 +539,7 @@ class Toolbox:
                         f"Web araması başarısız: sorgu={query}, ayrıntı={error}",
                         "WEB_SEARCH_FAILED", True,
                     ) from error
-        raise AssertionError("Arama denemeleri sonuç vermedi.")
+        raise AssertionError(f"Arama denemeleri sonuç vermedi: {last_error}")
 
     async def browse_url(self, url: str, action: str, selector: Optional[str] = None, text: Optional[str] = None) -> str:
         """
@@ -413,7 +557,8 @@ class Toolbox:
             await page.goto(url, wait_until="domcontentloaded")
             if action == "read":
                 html: str = await page.content()
-                return self._clean_html(html)
+                # BeautifulSoup senkron çalışır; paralel araç turlarını kilitlemesin.
+                return await asyncio.to_thread(self._clean_html, html)
             if action == "click" and selector:
                 await page.click(selector)
                 return "Seçiciye tıklandı."
@@ -427,18 +572,23 @@ class Toolbox:
     def fetch_raw(self, url: str) -> str:
         """
         Curl kullanarak hızlı HTTP çekimi yapar ve içeriği temizler.
+        JSON gövdeler HTML temizleyiciden geçirilmez (karakter kaybı olur);
+        kalıcı hatalar (--retry-all-errors) tekrar denenmez.
         """
         result: subprocess.CompletedProcess[str] = subprocess.run(
-            ["curl", "--fail", "--show-error", "--silent", "--location",
-             "--retry", "2", "--retry-all-errors", "--max-time", "15",
-             "--", url],
-            capture_output=True, text=True, timeout=50,
+            ["curl", "--fail", "--show-error", "--silent", "--location", "--compressed",
+             "--retry", "2", "--retry-delay", "1", "--retry-max-time", "20",
+             "--max-time", "15", "--", url],
+            capture_output=True, text=True, timeout=25,
         )
         if result.returncode != 0:
             raise ToolError(
                 f"HTTP çekimi başarısız: url={url}, çıkış={result.returncode}, stderr={result.stderr.strip()}",
                 "FETCH_FAILED", True,
             )
+        stripped: str = result.stdout.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            return _clip(result.stdout, SHELL_STDOUT_LIMIT)
         return self._clean_html(result.stdout)
 
     def cua_get_app(self, app_name: str) -> str: 
@@ -463,7 +613,7 @@ class Toolbox:
     
     def keyboard_type(self, text: str) -> str:
         pyautogui.write(text)
-        return f"Yazıldı: {text}"
+        return f"Yazıldı ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
     
     def keyboard_press(self, key: str) -> str:
         pyautogui.press(key)
@@ -506,14 +656,14 @@ class Toolbox:
                 temp_path = Path(source.name)
                 source.write(code)
             result: subprocess.CompletedProcess[str] = subprocess.run(
-                ["node", str(temp_path)], capture_output=True, text=True, timeout=30,
+                ["node", str(temp_path)], capture_output=True, text=True, timeout=20,
             )
             if result.returncode != 0:
                 raise ToolError(
                     f"JS çalıştırma başarısız: çıkış={result.returncode}, stderr={result.stderr.strip()}",
                     "JS_EXIT", True,
                 )
-            return f"STDOUT: {result.stdout}\\nSTDERR: {result.stderr}\\nÇıkış Kodu: 0"
+            return f"STDOUT: {_clip(result.stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(result.stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: 0"
         finally:
             if temp_path is not None and temp_path.exists():
                 temp_path.unlink()
@@ -548,7 +698,7 @@ class Toolbox:
             if destination.exists():
                 os.chmod(temp_path, destination.stat().st_mode & 0o777)
             os.replace(temp_path, destination)
-            if self.read_file(path) != content:
+            if self._read_full(path) != content:
                 raise ToolError(f"Dosya doğrulaması başarısız: {path}", "VERIFY_FAILED", False)
             return f"Dosya başarıyla yazıldı: {path}"
         finally:
@@ -556,16 +706,23 @@ class Toolbox:
                 temp_path.unlink()
     
     def read_file(self, path: str) -> str:
+        """
+        Dosya okur ve model için kısaltılmış içeriği döner. Doğrulama yolları
+        (_read_full) kırpma olmadan okur; aksi halde büyük dosya yazım doğrulaması
+        yanlışlıkla başarısız sayılır.
+        """
+        return _clip(self._read_full(path), FILE_READ_LIMIT)
+
+    def _read_full(self, path: str) -> str:
+        """Doğrulama için kırpılmamış tam dosya içeriği okur."""
         with open(path, 'r', encoding='utf-8') as source:
             return source.read()
     
     def self_modify(self, file_path: str, new_content: str) -> str:
-        self.read_file(file_path)
+        self._read_full(file_path)
+        # write_file zaten yazdıktan sonra doğrulama yapıp VERIFY_FAILED fırlatır;
+        # burada ikinci bir tam okuma gereksiz.
         self.write_file(file_path, new_content)
-        if self.read_file(file_path) != new_content:
-            raise ToolError(
-                f"Kaynak kod doğrulaması başarısız: {file_path}", "VERIFY_FAILED", False,
-            )
         return f"Kaynak kod yazıldı ve doğrulandı: {file_path}"
 
     async def close_browser(self) -> None:
