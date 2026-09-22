@@ -1,12 +1,14 @@
 import asyncio
 import re
 import threading
+from concurrent.futures import Future
 from queue import Empty, Queue
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import customtkinter as ctk
+from openai import AsyncOpenAI
 
-from main import RunOptions, run_agent_with_callback
+from main import STATE_FILE, RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 
 BG: str = "#0f0f1a"
 PANEL: str = "#171728"
@@ -22,7 +24,7 @@ WARNING: str = "#fbbf24"
 INFO: str = "#60a5fa"
 GOAL_COLOR: str = "#c4b5fd"
 
-BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "opencode", "claude", "openai")
+BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "opencode", "opencode-think", "claude", "openai")
 
 STATUS_STYLE: dict[str, Tuple[str, str]] = {
     "idle": (SUCCESS, "Hazır"),
@@ -32,8 +34,8 @@ STATUS_STYLE: dict[str, Tuple[str, str]] = {
     "stopped": (TEXT_MUTED, "Durduruldu"),
 }
 
-_THINKING_RE = re.compile(r"^\[(\d+)/(\d+)\] Model düşünüyor\.\.\. \(backend: (\w+)\)$")
-_BACKEND_SWITCH_RE = re.compile(r"'(\w+)' backend'ine yükselti")
+_THINKING_RE = re.compile(r"^\[(\d+)/(\d+)\] Model düşünüyor\.\.\. \(backend: ([\w-]+)\)$")
+_BACKEND_SWITCH_RE = re.compile(r"'([\w-]+)' backend'ine yükselti")
 
 
 def _classify_line(line: str) -> str:
@@ -48,7 +50,7 @@ def _classify_line(line: str) -> str:
         return "tool_call"
     if "-> Başarılı" in line:
         return "success"
-    if "-> Hata" in line or line.startswith("❌") or line.startswith("Kritik hata"):
+    if "-> Hata" in line or line.startswith(("❌", "Kritik hata", "Tamamlanamadı")):
         return "error"
     if "yükselti" in line or line.startswith("⚠️") or line.startswith("Uyarı:"):
         return "warning"
@@ -89,8 +91,14 @@ class OmniUI(ctk.CTk):
         self._build_control_bar()
 
         self.queue: Queue = Queue()
-        self.agent_thread: Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
+        self._agent_future: Optional[Future[RunReport]] = None
+        # Görevler tek bir kalıcı event loop'ta çalışır ve model istemcilerini paylaşır:
+        # her görev sıcak HTTP bağlantılarıyla başlar (TLS el sıkışması tekrarlanmaz).
+        self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+        threading.Thread(target=self._loop.run_forever, daemon=True).start()
+        self._clients: Dict[str, AsyncOpenAI] = create_model_clients()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(50, self._drain_queue)
 
     # --- Yerleşim ---
@@ -208,7 +216,7 @@ class OmniUI(ctk.CTk):
         if line.startswith("Tamamlandı:") or line.startswith("Zaman bütçesi") or line.startswith("Maksimum iterasyon"):
             self._set_status("idle")
             return
-        if line.startswith("Kritik hata") or line.startswith("❌"):
+        if line.startswith(("Kritik hata", "❌", "Tamamlanamadı")):
             self._set_status("error")
             return
         if "durduruldu" in line:
@@ -229,7 +237,7 @@ class OmniUI(ctk.CTk):
                 self._update_status_from_line(payload)
                 self._append_log(payload, _classify_line(payload))
             elif event == "done":
-                self.agent_thread = None
+                self._agent_future = None
                 self.entry.configure(state="normal")
                 self.backend_menu.configure(state="normal")
                 self.primary_btn.configure(text="🚀", state="normal")
@@ -238,7 +246,7 @@ class OmniUI(ctk.CTk):
     # --- Ajan tetikleme ---
 
     def _on_primary_button(self) -> None:
-        if self.agent_thread is not None and self.agent_thread.is_alive():
+        if self._agent_future is not None and not self._agent_future.done():
             self._stop_event.set()
             self.primary_btn.configure(state="disabled")
             self._append_log("⏹ Durdurma istendi, mevcut adım bitince duracak...", "warning")
@@ -260,24 +268,28 @@ class OmniUI(ctk.CTk):
         selected: str = self.backend_menu.get()
         requested_backend: Optional[str] = None if selected == "Otomatik" else selected
         self._stop_event = threading.Event()
-
-        self.agent_thread = threading.Thread(
-            target=self._run_agent_thread, args=(goal, requested_backend), daemon=True,
+        options: RunOptions = {
+            "requested_backend": requested_backend,
+            "should_stop": self._stop_event.is_set,
+            "state_file": STATE_FILE,
+        }
+        self._agent_future = asyncio.run_coroutine_threadsafe(
+            run_agent_with_callback(goal, self.log, options, self._clients), self._loop,
         )
-        self.agent_thread.start()
+        self._agent_future.add_done_callback(self._on_agent_done)
 
-    def _run_agent_thread(self, goal: str, requested_backend: Optional[str]) -> None:
-        """Async ajanı bir thread içinde çalıştıran wrapper."""
-        try:
-            asyncio.run(self._run_agent_async(goal, requested_backend))
-        except Exception as error:
+    def _on_agent_done(self, future: "Future[RunReport]") -> None:
+        """Görev bitince (event loop thread'inde) hatayı loglar ve arayüzü serbest bırakır."""
+        error: Optional[BaseException] = future.exception()
+        if error is not None:
             self.log(f"❌ Kritik Hata: {error}")
-        finally:
-            self.queue.put(("done", None))
+        self.queue.put(("done", None))
 
-    async def _run_agent_async(self, goal: str, requested_backend: Optional[str]) -> None:
-        options: RunOptions = {"requested_backend": requested_backend, "should_stop": self._stop_event.is_set}
-        await run_agent_with_callback(goal, callback=self.log, options=options)
+    def _on_close(self) -> None:
+        """Pencere kapanırken istemci bağlantılarını kapatıp event loop'u durdurur."""
+        asyncio.run_coroutine_threadsafe(close_model_clients(self._clients), self._loop).result(timeout=5)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self.destroy()
 
 
 if __name__ == "__main__":

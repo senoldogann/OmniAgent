@@ -9,37 +9,27 @@ from uuid import uuid4
 import pytest
 from openai import AsyncOpenAI
 
-from config import config
-from main import encode_image, execute_tool
-from state_manager import (
-    absorb_episode_lessons,
-    check_for_lessons,
-    clear_active_goal,
-    distill_lesson_pairs,
-    load_state,
-    normalize_error_pattern,
-    recall_similar_success,
-    record_episode,
-    save_state,
-    set_active_goal,
-)
-from tools import ToolError, Toolbox, _is_sensitive_path
+from config import BACKENDS, DEFAULT_BACKEND
+from main import _trim_old_turns, encode_image, execute_tool
+from state_manager import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
+from tools import ScreenGeometry, ToolError, Toolbox, _is_sensitive_path, model_to_points, points_to_model
 
 
 @pytest.mark.asyncio
 async def test_api_connectivity() -> None:
-    """İstenirse gerçek API erişimini sınar."""
+    """İstenirse varsayılan backend'e gerçek API erişimini sınar."""
     if os.environ.get("OMNI_LIVE_API_TEST") != "1":
         pytest.skip("Canlı API testi OMNI_LIVE_API_TEST=1 ile etkinleştirilir.")
-    api_key: str | None = config["API_KEY"]
-    if not api_key:
+    profile = BACKENDS[DEFAULT_BACKEND]
+    if not profile["api_key"]:
         pytest.skip("OpenCode API anahtarı bulunamadı.")
-    async with AsyncOpenAI(api_key=api_key, base_url=config["BASE_URL"]) as client:
+    async with AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"]) as client:
         response = await client.chat.completions.create(
-            model=config["MODEL"],
+            model=profile["model"],
             messages=[{"role": "user", "content": "Reply with OK"}],
             max_tokens=10,
             extra_headers={"x-opencode-session": str(uuid4())},
+            extra_body=profile["extra_body"],
         )
     assert response.choices
     assert response.choices[0].message.content
@@ -55,23 +45,28 @@ def test_shell_execution() -> None:
 
 
 def test_file_ops(tmp_path: Path) -> None:
-    """Dosya yazımını ve geri okumayı sınar."""
+    """Eksik üst dizinli dosya yazımını ve geri okumayı sınar."""
     toolbox: Toolbox = Toolbox()
-    path: Path = tmp_path / "omni_test_file.txt"
-    content: str = "Türkçe içerik"
+    path: Path = tmp_path / "yeni" / "alt" / "omni_test_file.txt"
+    content: str = "Türkçe içerik\r\nikinci satır"
     toolbox.write_file(str(path), content)
     assert toolbox.read_file(str(path)) == content
 
 
 def test_memory_roundtrip(tmp_path: Path) -> None:
-    """Belleğin atomik kaydını ve hedef temizliğini sınar."""
+    """Epizot kaydının atomik yazılıp geri okunduğunu ve dosya izinlerini sınar."""
     path: Path = tmp_path / "memory.json"
-    state = set_active_goal(load_state(str(path)), "örnek hedef")
+    metrics: EpisodeMetrics = {
+        "turns": 2, "tool_calls": 1, "elapsed_seconds": 3.5, "backend": "opencode",
+        "prompt_tokens": 100, "cached_tokens": 80, "completion_tokens": 20,
+    }
+    step = make_step_record("execute_shell", '{"command": "date"}', True, "STDOUT: ok")
+    state = record_episode(load_state(str(path)), "örnek hedef", [step], "tamam", True, metrics)
     save_state(str(path), state)
-    assert load_state(str(path))["active_goals"] == ["örnek hedef"]
+    loaded = load_state(str(path))
+    assert loaded["episodic_memory"][-1]["goal"] == "örnek hedef"
+    assert loaded["episodic_memory"][-1]["metrics"]["cached_tokens"] == 80
     assert path.stat().st_mode & 0o777 == 0o600
-    save_state(str(path), clear_active_goal(state))
-    assert load_state(str(path))["active_goals"] == []
 
 
 def test_corrupt_memory_is_preserved(tmp_path: Path) -> None:
@@ -113,7 +108,7 @@ def test_fetch_raw_keeps_url_literal() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_error_is_explicit() -> None:
-    """Araç çağrısı hatasını başarıdan ayırır."""
+    """Araç çağrısı hatasını başarıdan ayırır; şemada olmayan adlar (özel yöntemler) reddedilir."""
     call = SimpleNamespace(
         id="call-1",
         function=SimpleNamespace(name="execute_shell", arguments='{"command":"exit 7","use_sudo":false}'),
@@ -122,70 +117,17 @@ async def test_tool_error_is_explicit() -> None:
     assert result["tool_call_id"] == "call-1"
     assert result["ok"] is False
     assert result["error_type"] == "ToolError"
+    private = SimpleNamespace(id="call-2", function=SimpleNamespace(name="_read_full", arguments='{"path":"/etc/hosts"}'))
+    assert (await execute_tool(private, Toolbox(), {}))["error_type"] == "UnknownTool"
 
 
 def test_vision_capture(tmp_path: Path) -> None:
-    """Gerçek ekran görüntüsünün kaydedildiğini sınar."""
+    """Gerçek ekran görüntüsünün ortak koordinat uzayında kaydedildiğini sınar."""
     toolbox: Toolbox = Toolbox()
     path: Path = tmp_path / "vision.png"
     toolbox.take_screenshot(str(path))
     assert path.exists()
     assert len(encode_image(str(path))) > 0
-
-
-def test_normalize_error_pattern_strips_volatile_parts() -> None:
-    """Hata desenindeki yol/sayı/uuid gibi kararsız parçaların atıldığını sınar."""
-    a = normalize_error_pattern("SHELL_EXIT: /Users/dogan/a.py satır 4096 bulunamadı")
-    b = normalize_error_pattern("SHELL_EXIT: /Users/ali/b.py satır 8192 bulunamadı")
-    assert a == b
-
-
-def test_distill_lesson_pairs_from_recovery() -> None:
-    """Başarısız olup sonra toparlanan araçtan ders damıtıldığını sınar."""
-    steps = [
-        {"tool": "execute_shell", "result": {"ok": False, "error_type": "ToolError", "error": "kabuk komutu başarısız: exit=2"}},
-        {"tool": "web_search", "result": {"ok": True, "result": "sonuçlar"}},
-        {"tool": "execute_shell", "result": {"ok": True, "result": "STDOUT: tamam"}},
-    ]
-    pairs = distill_lesson_pairs(steps)
-    assert len(pairs) == 1
-    pattern, fix = pairs[0]
-    assert "execute_shell" in fix
-    assert "kabuk" in pattern
-
-
-def test_distill_lesson_pairs_without_recovery_is_empty() -> None:
-    """Hiç toparlanmayan hataların ders üretmediğini sınar (çözüm kanıtı yok)."""
-    steps = [{"tool": "find_and_click", "result": {"ok": False, "error_type": "ToolError", "error": "hedef yok"}}]
-    assert distill_lesson_pairs(steps) == []
-
-
-def test_absorb_episode_lessons_persists_and_recalls() -> None:
-    """Damıtılan dersin belleğe yazıldığını ve hata anında geri çağrıldığını sınar."""
-    state = load_state(str(Path("/tmp/omni_lesson_test.json")))
-    steps = [
-        {"tool": "web_search", "result": {"ok": False, "error_type": "ToolError", "error": "paket import edilemedi"}},
-        {"tool": "web_search", "result": {"ok": True, "result": "5 sonuç"}},
-    ]
-    state = absorb_episode_lessons(state, steps, success=True)
-    assert state["lessons_learned"]
-    hint = check_for_lessons(state, "ToolError: paket import edilemedi")
-    assert hint is not None and "web_search" in hint
-
-
-def test_recall_similar_success_uses_token_overlap() -> None:
-    """Benzer hedefli başarılı epizotlardan rota özeti döndüğünü sınar."""
-    state = load_state(str(Path("/tmp/omni_route_test.json")))
-    state = record_episode(
-        state,
-        "hava durumu raporu hazırla ve kaydet",
-        [{"tool": "web_search", "result": {"ok": True, "result": "sonuç"}}],
-        "Tamamlandı",
-        True,
-    )
-    recalled = recall_similar_success(state, "hava durumu raporu hazırla", limit=3)
-    assert recalled is not None
-    assert "web_search" in recalled
 
 
 @pytest.mark.asyncio
@@ -207,6 +149,28 @@ async def test_readonly_tool_calls_are_cached(tmp_path: Path) -> None:
         make_call("write_file", {"path": str(tmp_path / "omni_cache_probe.txt"), "content": "x"}), toolbox, cache,
     )
     assert cache == {}
+
+
+def test_trim_never_cuts_latest_turn() -> None:
+    """Paralel 5'li okumanın sonuçları model görmeden kırpılmaz; yalnızca eski turlar budanır."""
+    def turn(prefix: str) -> list:
+        calls = [{"id": f"{prefix}{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}} for i in range(5)]
+        return [{"role": "assistant", "tool_calls": calls}] + [
+            {"role": "tool", "tool_call_id": f"{prefix}{i}", "content": "x" * 1500} for i in range(5)
+        ]
+    messages = [{"role": "system", "content": "S"}, {"role": "user", "content": "hedef"}] + turn("a") + turn("b") + turn("c")
+    trimmed = _trim_old_turns(messages)
+    tool_lengths = [len(m["content"]) for m in trimmed if m["role"] == "tool"]
+    assert all(length < 1500 for length in tool_lengths[:5])
+    assert all(length == 1500 for length in tool_lengths[5:])
+    assert trimmed[1]["content"] == "hedef"
+
+
+def test_model_space_roundtrip() -> None:
+    """Retina nokta uzayı ile modelin gördüğü görüntü uzayı arasındaki dönüşümü sınar."""
+    geometry: ScreenGeometry = {"point_width": 1710, "point_height": 1112, "model_width": 1280, "model_height": 832}
+    assert model_to_points(1279, 831, geometry) == (1709, 1111)
+    assert points_to_model(855, 556, geometry) == (640, 416)
 
 
 def test_sensitive_path_macos_firmlink_false_positive() -> None:

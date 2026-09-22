@@ -1,0 +1,32 @@
+[project]
+name = "omniagent"
+version = "0.1.0"
+description = "Yerel macOS otomasyon ajanı: araç çağırma döngüsü, AX tabanlı GUI kontrolü, web ve kabuk araçları"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=3.17.0",
+    "playwright>=1.63.0",
+    "beautifulsoup4>=4.15.0",
+    "pyautogui>=0.9.54",
+    "pillow>=12.3.0",
+    "opencv-python>=5.0.0.93",
+    "numpy>=2.4.6",
+    "ddgs>=9.16.0",
+    "pyobjc-framework-ApplicationServices>=12.2.2",
+    "pyobjc-framework-Cocoa>=12.2.2",
+    "pyobjc-framework-Quartz>=12.2.2",
+    "customtkinter>=6.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.uv]
+# Düz modüllerden oluşan bir uygulama: paket olarak kurulmaz, yalnızca bağımlılıkları yönetilir
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

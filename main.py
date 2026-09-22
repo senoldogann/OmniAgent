@@ -3,26 +3,40 @@ import base64
 import json
 import logging
 import os
+import sys
 import time
 import uuid
+from datetime import date
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, Timeout
+from openai.types.chat import ChatCompletion
+from PIL import Image
 
-from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, BackendProfile, config
-from tools import Toolbox, ToolError
+from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER, SYSTEM_PROMPT, BackendProfile
+from tools import MODEL_SCREEN_MAX_EDGE, Toolbox, ToolError
 import state_manager as sm
 
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
 MAX_ITERATIONS: int = 25
-MAX_API_RETRIES: int = 3
 MAX_WALL_CLOCK_SECONDS: float = 600.0
-MAX_TOOL_MESSAGE_AGE: int = 4
+# Tam ayrıntıyla tutulan son model turu sayısı. Daha eski turların uzun araç çıktıları,
+# ekran görüntüleri ve uzun araç argümanları budanır. Yaş TUR ile ölçülür: son turun
+# sonuçları (paralel toplu okumalar dahil) model onları görmeden asla kırpılmaz.
+FULL_DETAIL_TURNS: int = 2
 TRIMMED_CONTENT_LIMIT: int = 400
 TRIMMED_ARGS_LIMIT: int = 120
+CALL_LABEL_ARGS_LIMIT: int = 100
 CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
-MAX_RESPONSE_TOKENS: int = 2048
+# SDK varsayılanı 600sn zaman aşımı + 2 gizli yeniden denemeydi: takılan tek bir çağrı tüm
+# görev bütçesini yiyebiliyor, yükseltme mantığı da SDK aynı backend'i tekrar denedikten
+# sonra devreye giriyordu. Yeniden denemeyi yalnızca bu döngü yönetir.
+MODEL_REQUEST_TIMEOUT_SECONDS: float = 60.0
+MODEL_CONNECT_TIMEOUT_SECONDS: float = 5.0
+TURKISH_WEEKDAYS: Tuple[str, ...] = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
+ENGLISH_WEEKDAYS: Tuple[str, ...] = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 
 class ToolResult(TypedDict, total=False):
@@ -38,254 +52,179 @@ class ToolResult(TypedDict, total=False):
 class RunOptions(TypedDict):
     requested_backend: Optional[str]
     should_stop: Callable[[], bool]
+    # Epizot kaydının yazılacağı bellek dosyası (benchmark ayrı dosya kullanır)
+    state_file: str
+
+
+class TokenUsage(TypedDict):
+    prompt_tokens: int
+    cached_tokens: int
+    completion_tokens: int
+
+
+class RunReport(TypedDict):
+    """Bir görevin sonucu ve ölçümleri."""
+    outcome: str
+    success: bool
+    metrics: sm.EpisodeMetrics
 
 
 def encode_image(path: str) -> str:
     """
-    Görüntü dosyasını JPEG base64 metnine çevirir. Retina PNG'leri megabaytla
-    gider; küçültüp JPEG'e çevirmek görsel token yükünü 10-20x azaltır.
+    Görüntüyü JPEG base64 metnine çevirir. take_screenshot görüntüyü zaten ortak
+    koordinat uzayında kaydeder; küçültme yalnızca başka kaynaklı büyük dosyalar için sınırdır.
     """
-    from io import BytesIO
-    from PIL import Image
     with Image.open(path) as source:
-        frame: Any = source.convert("RGB")
-        frame.thumbnail((1280, 1280))
-        buffer: BytesIO = BytesIO()
-        frame.save(buffer, format="JPEG", quality=70)
-        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+        frame: Image.Image = source.convert("RGB")
+    frame.thumbnail((MODEL_SCREEN_MAX_EDGE, MODEL_SCREEN_MAX_EDGE))
+    buffer: BytesIO = BytesIO()
+    frame.save(buffer, format="JPEG", quality=70)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def _function_schema(name: str, description: str, properties: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Tüm parametreleri zorunlu bir function-calling şeması kurar (isteğe bağlılar null alır). Saf."""
+    return {"type": "function", "function": {
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object", "properties": properties, "required": list(properties)},
+    }}
 
 
 def build_tool_schemas() -> List[Dict[str, Any]]:
-    """Toolbox araçlarının OpenAI function-calling şemasını döner."""
+    """
+    Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
+    hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu.
+    Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
+    """
     return [
-        {"type": "function", "function": {
-            "name": "execute_shell",
-            "description": "Sistem kabuğunda komut çalıştırır.",
-            "parameters": {"type": "object", "properties": {
-                "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
-                "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
-            }, "required": ["command", "use_sudo"]},
-        }},
-        {"type": "function", "function": {
-            "name": "process_list",
-            "description": "Sistemdeki aktif süreçlerin listesini döner.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }},
-        {"type": "function", "function": {
-            "name": "get_pointer_position",
-            "description": "Farenin mevcut ekran koordinatlarını döner.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }},
-        {"type": "function", "function": {
-            "name": "session_authority_status",
-            "description": "Mevcut oturumun sudo yetki durumunu kontrol eder.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }},
-        {"type": "function", "function": {
-            "name": "session_authority_end",
-            "description": "Yetki döngüsünü sonlandırır.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }},
-        {"type": "function", "function": {
-            "name": "deep_system_probe",
-            "description": "Sistem internals taraması yapar.",
-            "parameters": {"type": "object", "properties": {
-                "target": {"type": "string", "enum": ["process", "network"], "description": "Taranacak hedef."},
-            }, "required": ["target"]},
-        }},
-        {"type": "function", "function": {
-            "name": "read_file",
-            "description": "Bir dosyanın içeriğini okur.",
-            "parameters": {"type": "object", "properties": {
-                "path": {"type": "string", "description": "Okunacak dosyanın yolu."},
-            }, "required": ["path"]},
-        }},
-        {"type": "function", "function": {
-            "name": "write_file",
-            "description": "Bir dosyaya tam içerik yazar (atomik, doğrulamalı, yedekli).",
-            "parameters": {"type": "object", "properties": {
+        _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
+            "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
+            "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
+        }),
+        _function_schema("process_list", "Süreç sayısını ve CPU'ya göre en ağır 15 süreci döner.", {}),
+        _function_schema("read_file", "Bir dosyanın içeriğini okur (uzun dosyalar kısaltılır).", {
+            "path": {"type": "string", "description": "Okunacak dosyanın yolu."},
+        }),
+        _function_schema(
+            "write_file",
+            "Dosyaya tam içerik yazar: eksik üst dizinleri oluşturur, yazılanı doğrular, eski sürümü "
+            "yedekler. Başarı mesajı kanıttır; geri okuma yapma.",
+            {
                 "path": {"type": "string", "description": "Yazılacak dosyanın yolu."},
-                "content": {"type": "string", "description": "Dosyaya yazılacak tam içerik."},
-            }, "required": ["path", "content"]},
-        }},
-        {"type": "function", "function": {
-            "name": "web_search",
-            "description": "DuckDuckGo üzerinden web araması yapar.",
-            "parameters": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "Arama sorgusu."},
-            }, "required": ["query"]},
-        }},
-        {"type": "function", "function": {
-            "name": "browse_url",
-            "description": "Bir URL'ye gider ve okuma/tıklama/yazma etkileşimi kurar.",
-            "parameters": {"type": "object", "properties": {
-                "url": {"type": "string", "description": "Gidilecek URL."},
-                "action": {"type": "string", "enum": ["read", "click", "type"], "description": "Yapılacak işlem."},
-                "selector": {"type": "string", "description": "CSS seçici (click/type için gerekli)."},
-                "text": {"type": "string", "description": "Yazılacak metin (type için gerekli)."},
-            }, "required": ["url", "action"]},
-        }},
-        {"type": "function", "function": {
-            "name": "fetch_raw",
-            "description": "curl ile hızlı HTTP çekimi yapar ve metni temizler.",
-            "parameters": {"type": "object", "properties": {
-                "url": {"type": "string", "description": "Çekilecek URL."},
-            }, "required": ["url"]},
-        }},
-        {"type": "function", "function": {
-            "name": "find_and_click",
-            "description": "Ekranda bir görsel şablonu arar ve bulursa tıklar.",
-            "parameters": {"type": "object", "properties": {
-                "template_path": {"type": "string", "description": "Aranacak şablon görselinin yolu."},
-                "confidence": {"type": "number", "description": "0-1 arası eşleşme güven eşiği."},
-                "window_title": {"type": "string", "description": "Aramayı bu pencereyle sınırla (opsiyonel)."},
-            }, "required": ["template_path", "confidence"]},
-        }},
-        {"type": "function", "function": {
-            "name": "take_screenshot",
-            "description": "Ekran görüntüsü alır ve dosyaya kaydeder.",
-            "parameters": {"type": "object", "properties": {
-                "filename": {"type": "string", "description": "Kaydedilecek dosya yolu."},
-            }, "required": ["filename"]},
-        }},
-        {"type": "function", "function": {
-            "name": "cua_get_app",
-            "description": "Uygulamayı aktif hale getirir ve odaklanır.",
-            "parameters": {"type": "object", "properties": {
+                "content": {"type": "string", "description": "Dosyanın tam içeriği."},
+            },
+        ),
+        _function_schema("web_search", "DuckDuckGo üzerinden web araması yapar (ilk 5 sonuç).", {
+            "query": {"type": "string", "description": "Arama sorgusu."},
+        }),
+        _function_schema(
+            "fetch_raw",
+            "curl ile hızlı HTTP çekimi: JSON olduğu gibi, HTML temiz metin olarak döner. JavaScript "
+            "gerektirmeyen sayfalarda browse_url'den hızlıdır.",
+            {"url": {"type": "string", "description": "Çekilecek URL."}},
+        ),
+        _function_schema(
+            "browse_url",
+            "Kalıcı tarayıcı sekmesi: url verilirse gider (null: mevcut sayfada kalır), actions'ı sırayla "
+            "uygular, sonunda URL, başlık, sayfa metni ve seçicileriyle etkileşimli öğeleri döner. "
+            "'Alanı doldur → gönder → sonucu oku' akışını TEK çağrıda yap.",
+            {
+                "url": {"type": ["string", "null"], "description": "Gidilecek URL; mevcut sayfada kalmak için null."},
+                "actions": {
+                    "type": "array",
+                    "description": "Sırayla uygulanacak eylemler; yalnızca okumak için boş liste.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["click", "fill", "press"]},
+                            "selector": {"type": "string", "description": "Öğe seçicisi (dönen ÖĞELER listesinden)."},
+                            "value": {"type": ["string", "null"], "description": "fill için metin, press için tuş adı (örn. Enter); click için null."},
+                        },
+                        "required": ["action", "selector", "value"],
+                    },
+                },
+            },
+        ),
+        _function_schema("execute_js", "Node.js ile JavaScript kodu çalıştırır.", {
+            "code": {"type": "string", "description": "Çalıştırılacak JavaScript kodu."},
+        }),
+        _function_schema(
+            "take_screenshot",
+            "Ekran görüntüsü alır, kaydeder ve sana görsel olarak gösterir. Görüntü koordinatları "
+            "tıklama araçlarıyla aynı uzaydadır. Yavaş ve pahalıdır: önce cua_get_ax_state dene.",
+            {"filename": {"type": "string", "description": "Kaydedilecek .png veya .jpg dosya yolu."}},
+        ),
+        _function_schema("cua_get_app", "Uygulamayı başlatır veya öne getirir.", {
+            "app_name": {"type": "string", "description": "Uygulama adı (örn. Safari, Notes)."},
+        }),
+        _function_schema(
+            "cua_get_ax_state",
+            "Uygulamanın öndeki penceresindeki etkileşimli öğeleri (buton, alan, bağlantı, satır…) numara, "
+            "tür, etiket ve merkez koordinatıyla listeler. Ekran görüntüsünden çok daha hızlıdır.",
+            {"app_name": {"type": "string", "description": "Uygulama adı."}},
+        ),
+        _function_schema(
+            "cua_click",
+            "cua_get_ax_state listesindeki numaralı öğeye erişilebilirlik ile tıklar; metin alanlarını odaklar.",
+            {
                 "app_name": {"type": "string", "description": "Uygulama adı."},
-            }, "required": ["app_name"]},
-        }},
-        {"type": "function", "function": {
-            "name": "cua_click",
-            "description": "Uygulama içindeki bir erişilebilirlik (AX) elementine tıklar.",
-            "parameters": {"type": "object", "properties": {
+                "element_id": {"type": "integer", "description": "Son listedeki öğe numarası."},
+            },
+        ),
+        _function_schema(
+            "smart_click",
+            "Hibrit tıklama: önce AX öğe numarası, olmazsa görsel şablon (take_screenshot görüntüsünden "
+            "kırpılmış PNG) dener.",
+            {
                 "app_name": {"type": "string", "description": "Uygulama adı."},
-                "element_id": {"type": "integer", "description": "AX öğe numarası."},
-            }, "required": ["app_name", "element_id"]},
-        }},
-        {"type": "function", "function": {
-            "name": "cua_press_key",
-            "description": "Uygulama içinde bir tuşa basar.",
-            "parameters": {"type": "object", "properties": {
-                "app_name": {"type": "string", "description": "Uygulama adı."},
-                "key": {"type": "string", "description": "Basılacak tuş."},
-            }, "required": ["app_name", "key"]},
-        }},
-        {"type": "function", "function": {
-            "name": "cua_get_ax_state",
-            "description": "Uygulama penceresinin erişilebilirlik durumunu getirir.",
-            "parameters": {"type": "object", "properties": {
-                "app_name": {"type": "string", "description": "Uygulama adı."},
-            }, "required": ["app_name"]},
-        }},
-        {"type": "function", "function": {
-            "name": "mouse_click",
-            "description": "Belirtilen koordinata fare tıklaması yapar.",
-            "parameters": {"type": "object", "properties": {
-                "x": {"type": "integer", "description": "X koordinatı."},
-                "y": {"type": "integer", "description": "Y koordinatı."},
-                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Tıklama tuşu."},
-            }, "required": ["x", "y", "button"]},
-        }},
-        {"type": "function", "function": {
-            "name": "mouse_move",
-            "description": "Fareyi belirtilen koordinata taşır.",
-            "parameters": {"type": "object", "properties": {
-                "x": {"type": "integer", "description": "X koordinatı."},
-                "y": {"type": "integer", "description": "Y koordinatı."},
-            }, "required": ["x", "y"]},
-        }},
-        {"type": "function", "function": {
-            "name": "keyboard_type",
-            "description": "Aktif odakta metin yazar.",
-            "parameters": {"type": "object", "properties": {
-                "text": {"type": "string", "description": "Yazılacak metin."},
-            }, "required": ["text"]},
-        }},
-        {"type": "function", "function": {
-            "name": "keyboard_press",
-            "description": "Aktif odakta bir tuşa basar.",
-            "parameters": {"type": "object", "properties": {
-                "key": {"type": "string", "description": "Basılacak tuş."},
-            }, "required": ["key"]},
-        }},
-        {"type": "function", "function": {
-            "name": "execute_js",
-            "description": "Node.js ile bir JavaScript dosyasını çalıştırır.",
-            "parameters": {"type": "object", "properties": {
-                "code": {"type": "string", "description": "Çalıştırılacak JavaScript kodu."},
-            }, "required": ["code"]},
-        }},
-        {"type": "function", "function": {
-            "name": "self_modify",
-            "description": "Kendi kaynak kodunu okuyup doğrulayarak değiştirir.",
-            "parameters": {"type": "object", "properties": {
-                "file_path": {"type": "string", "description": "Değiştirilecek dosyanın yolu."},
-                "new_content": {"type": "string", "description": "Dosyanın yeni tam içeriği."},
-            }, "required": ["file_path", "new_content"]},
-        }},
-        {"type": "function", "function": {
-            "name": "smart_click",
-            "description": "Hibrit tıklama: önce erişilebilirlik (AX), sonra görsel şablon dener.",
-            "parameters": {"type": "object", "properties": {
-                "app_name": {"type": "string", "description": "Uygulama adı."},
-                "element_id": {"type": "integer", "description": "AX öğe numarası (opsiyonel)."},
-                "template_path": {"type": "string", "description": "Görsel şablon yolu (opsiyonel)."},
-                "confidence": {"type": "number", "description": "Görsel eşleşme güven eşiği."},
-            }, "required": ["app_name"]},
-        }},
-        {"type": "function", "function": {
-            "name": "get_window_bounds",
-            "description": "Belirtilen pencerenin ekran sınırlarını (x, y, w, h) döner.",
-            "parameters": {"type": "object", "properties": {
-                "window_title": {"type": "string", "description": "Pencere başlığı."},
-            }, "required": ["window_title"]},
-        }},
-        {"type": "function", "function": {
-            "name": "run_action_sequence",
-            "description": (
-                "Bir dizi fare/klavye eylemini (click/move/type/press) TEK çağrıda sırayla "
-                "çalıştırır. 'Alana tıkla, metni yaz, enter'a bas' gibi zincirler için her adımı "
-                "ayrı bir araç çağrısı yapmak yerine bunu kullan — daha az model turu, daha hızlı."
-            ),
-            "parameters": {"type": "object", "properties": {
+                "element_id": {"type": ["integer", "null"], "description": "AX öğe numarası veya null."},
+                "template_path": {"type": ["string", "null"], "description": "Şablon görsel yolu veya null."},
+                "confidence": {"type": "number", "description": "Şablon eşleşme eşiği (0-1, genelde 0.8)."},
+            },
+        ),
+        _function_schema(
+            "run_action_sequence",
+            "Fare/klavye eylemlerini TEK çağrıda sırayla çalıştırır. click/move: x,y (ekran görüntüsü/AX "
+            "uzayı); type: text (her Unicode metin, Türkçe dahil); press: key ('enter', 'tab', 'escape', "
+            "'cmd+c', 'cmd+shift+t'); wait: seconds (en çok 5).",
+            {
                 "steps": {
                     "type": "array",
                     "description": "Sırayla çalıştırılacak eylemler.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["click", "move", "type", "press"]},
-                            "x": {"type": "integer", "description": "click/move için X koordinatı."},
-                            "y": {"type": "integer", "description": "click/move için Y koordinatı."},
-                            "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "click için tuş (belirtilmezse left)."},
-                            "text": {"type": "string", "description": "type için yazılacak metin."},
-                            "key": {"type": "string", "description": "press için tuş adı."},
+                            "action": {"type": "string", "enum": ["click", "move", "type", "press", "wait"]},
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                            "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                            "text": {"type": "string"},
+                            "key": {"type": "string"},
+                            "seconds": {"type": "number"},
                         },
                         "required": ["action"],
                     },
                 },
-            }, "required": ["steps"]},
-        }},
+            },
+        ),
     ]
 
 
-# Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir — yan etkisi yoktur.
-# Canlı durum (imleç, pencere, yetki) önbelleklenmez: anında bayatlar ve yanlış
-# tıklamaya yol açar. Yazma/eylem araçları ASLA önbelleklenmez ve her başarılı
-# yan etkili çağrıdan sonra önbellek tamamen temizlenir.
-_CACHEABLE_TOOLS: frozenset[str] = frozenset({
-    "process_list", "deep_system_probe",
-    "read_file", "web_search", "fetch_raw",
-})
+# Modelin çağırabileceği adlar: getattr ile Toolbox'ın özel yöntemlerine
+# (_read_full, close_browser…) ulaşılmasın.
+TOOL_NAMES: frozenset[str] = frozenset(schema["function"]["name"] for schema in build_tool_schemas())
 
-_MUTATING_TOOLS: frozenset[str] = frozenset({
-    "write_file", "self_modify", "execute_shell", "take_screenshot",
-    "execute_js", "session_authority_end",
-    "mouse_click", "mouse_move", "keyboard_type", "keyboard_press",
-    "cua_click", "cua_press_key", "cua_get_app",
-    "find_and_click", "smart_click", "run_action_sequence",
-    "browse_url",
+# Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
+# önbelleklenmez; her başarılı yan etkili çağrıdan sonra önbellek tamamen temizlenir.
+_CACHEABLE_TOOLS: frozenset[str] = frozenset({"process_list", "read_file", "web_search", "fetch_raw"})
+
+# Yan etkili araçlar model sırasıyla SERİ çalışır (aynı anda iki tıklama/yazma çakışmasın,
+# paralel bir okuma yazmadan önce bayat sonuç önbelleğe girmesin, eylem→gözlem sırası
+# korunsun); aralarındaki bağımsız salt okunur bloklar gerçek paralellikle çalışır.
+_SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
+    "execute_shell", "write_file", "execute_js", "take_screenshot", "browse_url",
+    "cua_get_app", "cua_click", "smart_click", "run_action_sequence",
 })
 
 
@@ -304,6 +243,11 @@ async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]
             "tool_call_id": call.id, "ok": False,
             "error_type": "JSONDecodeError", "error": f"Araç argümanları çözümlenemedi: {error}",
         }
+    if name not in TOOL_NAMES:
+        return {
+            "tool_call_id": call.id, "ok": False,
+            "error_type": "UnknownTool", "error": f"Bilinmeyen araç: {name}. Geçerli araçlar: {', '.join(sorted(TOOL_NAMES))}",
+        }
 
     cache_key: Optional[str] = None
     if name in _CACHEABLE_TOOLS:
@@ -311,13 +255,7 @@ async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]
         if cache_key in cache:
             return {**cache[cache_key], "tool_call_id": call.id}
 
-    method: Optional[Callable[..., Any]] = getattr(toolbox, name, None)
-    if method is None or not callable(method):
-        return {
-            "tool_call_id": call.id, "ok": False,
-            "error_type": "UnknownTool", "error": f"Bilinmeyen araç: {name}",
-        }
-
+    method: Callable[..., Any] = getattr(toolbox, name)
     try:
         if asyncio.iscoroutinefunction(method):
             result: Any = await method(**arguments)
@@ -335,52 +273,36 @@ async def execute_tool(call: Any, toolbox: Toolbox, cache: Dict[str, ToolResult]
             "tool_call_id": call.id, "ok": False,
             "error_type": "TypeError", "error": f"Geçersiz argümanlar ({name}): {error}",
         }
-    except Exception as error:  # Araç sınırı: rastgele üçüncü taraf hatalarını döngüyü çökertmeden yakala.
+    except Exception as error:  # Araç sınırı: üçüncü taraf hataları döngüyü çökertmeden modele raporlanır.
+        logging.warning("Araç beklenmeyen hata verdi", extra={"tool": name, "error_type": type(error).__name__})
         outcome = {
             "tool_call_id": call.id, "ok": False,
             "error_type": type(error).__name__, "error": str(error),
         }
 
-    if outcome.get("ok") and name in _MUTATING_TOOLS:
+    if outcome.get("ok") and name in _SIDE_EFFECT_TOOLS:
         cache.clear()
     if cache_key is not None and outcome.get("ok"):
         cache[cache_key] = outcome
     return outcome
 
 
-# Fiziksel fare/klavye eylemleri paralelleştirilemez: aynı anda iki tıklama/yazma
-# yarış durumu yaratıp yanlış elemente etki edebilir. Bunlar model bir turda birden
-# fazlasını döndürürse orijinal sırayla SERİ çalışır; geri kalan (salt okunur/bağımsız)
-# çağrılar gerçek paralellikle çalışır. Yan etkili araçlar da (execute_shell, write_file
-# vb.) seri tutulur ki paralel bir okuma yazmadan önce bayat sonuç önbelleğe girmesin
-# ve eylem->gözlem sırası bozulmasın.
-_SEQUENTIAL_TOOLS: frozenset[str] = frozenset({
-    "mouse_click", "mouse_move", "keyboard_type", "keyboard_press",
-    "cua_click", "cua_press_key", "cua_get_app", "find_and_click",
-    "smart_click", "run_action_sequence",
-})
-
-
 async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox, cache: Dict[str, ToolResult]) -> List[ToolResult]:
     """
     Bir turdaki tüm araç çağrılarını MODELİN DÖNDÜRDÜĞÜ SIRAYI koruyarak çalıştırır:
-    yan etkili/fiziksel çağrılar seri, aralarındaki bağımsız salt okunur bloklar
-    paralel. Böylece 'tıkla -> ekran görüntüsü al' gibi eylem-gözlem çiftlerinde
-    gözlem her zaman eylemden SONRA gelir (yarış yok).
+    yan etkili çağrılar seri, aralarındaki bağımsız salt okunur bloklar paralel. Böylece
+    'tıkla -> ekran görüntüsü al' gibi eylem-gözlem çiftlerinde gözlem her zaman
+    eylemden SONRA gelir (yarış yok).
     """
     results: List[Optional[ToolResult]] = [None] * len(calls)
     index: int = 0
     while index < len(calls):
-        name: str = calls[index].function.name
-        if name in _MUTATING_TOOLS or name in _SEQUENTIAL_TOOLS:
+        if calls[index].function.name in _SIDE_EFFECT_TOOLS:
             results[index] = await execute_tool(calls[index], toolbox, cache)
             index += 1
             continue
         stop: int = index
-        while stop < len(calls):
-            nxt: str = calls[stop].function.name
-            if nxt in _MUTATING_TOOLS or nxt in _SEQUENTIAL_TOOLS:
-                break
+        while stop < len(calls) and calls[stop].function.name not in _SIDE_EFFECT_TOOLS:
             stop += 1
         group: List[ToolResult] = list(await asyncio.gather(
             *(execute_tool(calls[k], toolbox, cache) for k in range(index, stop))
@@ -390,61 +312,174 @@ async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox, cache: Dict[st
     return [r for r in results if r is not None]
 
 
-def _tool_result_to_message(call: Any, result: ToolResult, hint: Optional[str]) -> Dict[str, Any]:
-    """Araç sonucunu modele geri gönderilecek 'tool' mesajına çevirir."""
+def _call_label(call: Any) -> str:
+    """
+    Sonucun hangi çağrıya ait olduğunu gösteren kısa etiket. Paralel toplu sonuçlar yalnızca
+    tool_call_id ile eşleşince hızlı model onları karıştırabiliyordu (ölçümde 5 dosyalık
+    okumada kodlar yanlış sıralandı/atlandı). Saf fonksiyon.
+    """
+    arguments: str = " ".join((call.function.arguments or "").split())
+    return f"[{call.function.name} {arguments[:CALL_LABEL_ARGS_LIMIT]}]"
+
+
+def _tool_result_to_message(call: Any, result: ToolResult) -> Dict[str, Any]:
+    """Araç sonucunu, başında çağrı etiketiyle modele geri gönderilecek 'tool' mesajına çevirir."""
     if result.get("ok"):
         content: str = result.get("result", "")
     else:
         content = f"HATA [{result.get('error_type')}]: {result.get('error')}"
-        if hint:
-            content += f"\nBİLİNEN ÇÖZÜM (benzer geçmiş hatadan): {hint}"
-    return {"role": "tool", "tool_call_id": call.id, "content": content}
+    return {"role": "tool", "tool_call_id": call.id, "content": f"{_call_label(call)}\n{content}"}
 
 
-def _trim_old_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _assistant_entry(message: Any) -> Dict[str, Any]:
     """
-    Yaş penceresi (son MAX_TOOL_MESSAGE_AGE ARAÇ mesajı) dışında kalan:
-      1) uzun araç sonuçlarını kısaltır,
-      2) görsel (ekran görüntüsü) içeriklerini metin notuna indirger,
-      3) assistant tool_calls argümanlarını budar (write_file içeriği gibi
-         devasa JSON'lar her tur tekrar tekrar gönderilmesin).
-    Saf fonksiyon: girdiyi değiştirmez, yeni bir liste döner. Yaş penceresi
-    ham mesaj sayısına değil ARAÇ mesajı sayısına göre sayılır: paralel bir
-    tur 5 sonuç ürettiğinde 4'lü pencere neredeyse tüm toplu hâli tam boy
-    tutup şişirmesin diye.
+    Assistant yanıtını geçmiş için {role, content, tool_calls} biçiminde normalize eder.
+    Sağlayıcıya özel alanlar (örn. qwen'in reasoning_content'i) her turda tekrar
+    gönderilmesin ve yükseltmede başka bir API'ye taşınmasın diye atılır. Saf.
     """
-    tool_age: int = 0
-    cutoff: int = len(messages)
-    for index in range(len(messages) - 1, -1, -1):
-        if messages[index].get("role") == "tool":
-            tool_age += 1
-            if tool_age >= MAX_TOOL_MESSAGE_AGE:
-                cutoff = index + 1
-                break
+    entry: Dict[str, Any] = {"role": "assistant"}
+    if message.content:
+        entry["content"] = message.content
+    if message.tool_calls:
+        entry["tool_calls"] = [
+            {"id": call.id, "type": "function",
+             "function": {"name": call.function.name, "arguments": call.function.arguments or ""}}
+            for call in message.tool_calls
+        ]
+    return entry
 
-    trimmed: List[Dict[str, Any]] = []
-    for index, entry in enumerate(messages):
-        content: Any = entry.get("content")
-        if index >= cutoff:
-            trimmed.append(entry)
-            continue
-        if entry.get("role") == "tool" and isinstance(content, str) and len(content) > TRIMMED_CONTENT_LIMIT:
-            trimmed.append({**entry, "content": content[:TRIMMED_CONTENT_LIMIT] + " …[eski çıktı kısaltıldı]"})
-        elif isinstance(content, list) and any(
-            isinstance(part, dict) and part.get("type") == "image_url" for part in content
-        ):
-            trimmed.append({**entry, "content": "[eski ekran görüntüsü bağlamdan çıkarıldı]"})
-        elif entry.get("role") == "assistant" and entry.get("tool_calls"):
-            slim_calls: List[Dict[str, Any]] = [
-                {**call, "function": {**call["function"], "arguments": "{}"}}
-                if len(str(call.get("function", {}).get("arguments", ""))) > TRIMMED_ARGS_LIMIT
-                else call
-                for call in entry["tool_calls"]
-            ]
-            trimmed.append({**entry, "tool_calls": slim_calls})
-        else:
-            trimmed.append(entry)
-    return trimmed
+
+def _trim_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """Eski bir mesajın büyük parçalarını (araç çıktısı, görsel, uzun argüman) budar. Saf."""
+    content: Any = entry.get("content")
+    if entry.get("role") == "tool" and isinstance(content, str) and len(content) > TRIMMED_CONTENT_LIMIT:
+        return {**entry, "content": content[:TRIMMED_CONTENT_LIMIT] + " …[eski çıktı kısaltıldı]"}
+    if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "image_url" for part in content):
+        return {**entry, "content": "[eski ekran görüntüsü bağlamdan çıkarıldı]"}
+    if entry.get("role") == "assistant" and entry.get("tool_calls"):
+        return {**entry, "tool_calls": [
+            {**call, "function": {**call["function"], "arguments": "{}"}}
+            if len(str(call["function"].get("arguments", ""))) > TRIMMED_ARGS_LIMIT
+            else call
+            for call in entry["tool_calls"]
+        ]}
+    return entry
+
+
+def _trim_old_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Son FULL_DETAIL_TURNS assistant turundan (ve sonrasındaki araç sonuçlarından) önceki
+    mesajları budar. Yaş tur ile ölçülür: en son turun sonuçları model onları görmeden
+    kırpılmaz (eski araç-mesajı sayacı paralel 5'li okumada ilk 2 sonucu kesiyordu).
+    Pencere tur tur kaydığı için önceki önek bayt bayt aynı kalır (önek önbelleği bozulmaz).
+    Saf fonksiyon: yeni liste döner.
+    """
+    assistant_indices: List[int] = [i for i, entry in enumerate(messages) if entry.get("role") == "assistant"]
+    if len(assistant_indices) <= FULL_DETAIL_TURNS:
+        return messages
+    cutoff: int = assistant_indices[-FULL_DETAIL_TURNS]
+    return [_trim_entry(entry) if index < cutoff else entry for index, entry in enumerate(messages)]
+
+
+def build_system_prompt(today: date) -> str:
+    """
+    Sabit sistem talimatının SONUNA günün tarihini ekler (önek önbelleği korunur). Ev dizini
+    bilerek eklenmez: ölçümde modeli istenmeyen ~/output.txt dosyaları yazmaya itti. Saf.
+    """
+    weekday: int = today.weekday()
+    return (
+        SYSTEM_PROMPT
+        + f"\n### TODAY\n- Date: {today.isoformat()} ({TURKISH_WEEKDAYS[weekday]} / {ENGLISH_WEEKDAYS[weekday]}).\n"
+    )
+
+
+def next_quality_backend(current: str, available: frozenset[str]) -> Optional[str]:
+    """
+    Art arda başarısız araç turlarında çıkılacak sonraki backend: QUALITY_LADDER'daki bir
+    sonraki kullanılabilir basamak (merdiven dışındaki backend'ler doğrudan
+    ESCALATION_BACKEND'e çıkar). Çıkılacak basamak yoksa None. Saf fonksiyon.
+    """
+    if current in QUALITY_LADDER:
+        later: Tuple[str, ...] = QUALITY_LADDER[QUALITY_LADDER.index(current) + 1:]
+    else:
+        later = (ESCALATION_BACKEND,) if current != ESCALATION_BACKEND else ()
+    return next((name for name in later if name in available), None)
+
+
+def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, str, str]:
+    """
+    Model çağrısı deneme planı: ilk iki deneme aynı backend'de (geçici bağlantı/5xx/429),
+    son deneme farklı sağlayıcıda (ESCALATION_BACKEND kullanılabiliyorsa). Saf fonksiyon.
+    """
+    fallback: str = ESCALATION_BACKEND if ESCALATION_BACKEND in available else backend
+    return (backend, backend, fallback)
+
+
+def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str]:
+    """
+    Araç çağrısız son yanıtın gerçekten tamamlanmış bir cevap olup olmadığına karar verir:
+    token sınırında kesilen, filtrelenen ya da boş yanıtlar başarı sayılmaz. Saf fonksiyon.
+    """
+    if finish_reason == "length":
+        return False, "yanıt max_tokens sınırında kesildi"
+    if finish_reason == "content_filter":
+        return False, "yanıt içerik filtresine takıldı"
+    if not content.strip():
+        return False, "model boş yanıt döndü"
+    return True, ""
+
+
+def token_usage(response: ChatCompletion) -> TokenUsage:
+    """Yanıttaki token kullanımını (önbellekten okunan girdi dahil) çıkarır. Saf."""
+    usage: Any = response.usage
+    if usage is None:
+        return {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+    details: Any = usage.prompt_tokens_details
+    cached: int = int(details.cached_tokens or 0) if details is not None else 0
+    return {"prompt_tokens": int(usage.prompt_tokens), "cached_tokens": cached, "completion_tokens": int(usage.completion_tokens)}
+
+
+def add_usage(total: TokenUsage, turn: TokenUsage) -> TokenUsage:
+    """İki token kullanımını toplar. Saf."""
+    return {
+        "prompt_tokens": total["prompt_tokens"] + turn["prompt_tokens"],
+        "cached_tokens": total["cached_tokens"] + turn["cached_tokens"],
+        "completion_tokens": total["completion_tokens"] + turn["completion_tokens"],
+    }
+
+
+def create_model_clients() -> Dict[str, AsyncOpenAI]:
+    """Anahtarı olan her backend için zaman aşımı sınırlı, SDK içi yeniden denemesiz istemci kurar."""
+    timeout: Timeout = Timeout(MODEL_REQUEST_TIMEOUT_SECONDS, connect=MODEL_CONNECT_TIMEOUT_SECONDS)
+    return {
+        name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"], timeout=timeout, max_retries=0)
+        for name, profile in BACKENDS.items()
+        if profile["api_key"]
+    }
+
+
+async def close_model_clients(clients: Dict[str, AsyncOpenAI]) -> None:
+    """İstemcilerin bağlantı havuzlarını kapatır."""
+    await asyncio.gather(*(client.close() for client in clients.values()))
+
+
+async def _request_completion(
+    client: AsyncOpenAI, profile: BackendProfile, messages: List[Dict[str, Any]],
+    tool_schemas: List[Dict[str, Any]], session_id: str,
+) -> ChatCompletion:
+    """Profilin modeli, token sınırı, başlıkları ve ek gövdesiyle tek bir tamamlama isteği yapar."""
+    headers: Dict[str, str] = dict(profile["extra_headers"])
+    if profile["session_header"] is not None:
+        headers[profile["session_header"]] = session_id
+    return await client.chat.completions.create(
+        model=profile["model"],
+        messages=messages,
+        tools=tool_schemas,
+        tool_choice="auto",
+        max_tokens=profile["max_tokens"],
+        extra_headers=headers,
+        extra_body=profile["extra_body"],
+    )
 
 
 async def _call_model_with_retries(
@@ -453,99 +488,93 @@ async def _call_model_with_retries(
     tool_schemas: List[Dict[str, Any]],
     session_id: str,
     backend: str,
-) -> Tuple[Any, str]:
+) -> Tuple[ChatCompletion, str]:
     """
-    Model çağrısını yeniden deneme politikasıyla yapar. İlk deneme verilen backend'de,
-    kalan denemeler (ESCALATION_BACKEND kullanılabilirse ve zaten o değilse) daha güçlü
-    ESCALATION_BACKEND'de yapılır — hız için ucuz/varsayılan model önce denenir, ısrarlı
-    hata/aksama durumunda otomatik olarak daha güçlü modele geçilir. Hangi backend'in
-    gerçekten yanıt verdiğini de döner ki çağıran taraf mevcut backend'i güncelleyebilsin.
+    Model çağrısını attempt_plan'a göre yapar ve yanıt veren backend'i de döner. Kalıcı
+    istemci hataları (400/401/402/403…) yeniden denenmez. Zaman aşımında aynı backend'i bir
+    kez daha beklemek boşa gider: doğrudan son (farklı sağlayıcı) denemeye atlanır.
     """
+    plan: Tuple[str, str, str] = attempt_plan(backend, frozenset(clients))
     last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_API_RETRIES + 1):
-        escalate: bool = attempt > 1 and backend != ESCALATION_BACKEND and ESCALATION_BACKEND in clients
-        active_backend: str = ESCALATION_BACKEND if escalate else backend
-        client: AsyncOpenAI = clients[active_backend]
-        profile: BackendProfile = BACKENDS[active_backend]
-        headers: Dict[str, str] = dict(profile["extra_headers"])
-        if active_backend == "opencode":
-            headers["x-opencode-session"] = session_id
+    attempt: int = 0
+    while attempt < len(plan):
+        active: str = plan[attempt]
         try:
-            response: Any = await client.chat.completions.create(
-                model=profile["model"],
-                messages=messages,
-                tools=tool_schemas,
-                tool_choice="auto",
-                max_tokens=MAX_RESPONSE_TOKENS,
-                extra_headers=headers,
+            response: ChatCompletion = await _request_completion(
+                clients[active], BACKENDS[active], messages, tool_schemas, session_id,
             )
-            return response, active_backend
-        except Exception as error:
-            status: Optional[int] = getattr(error, "status_code", None)
-            # 400/401/403 gibi kalıcı istemci hatalarını yeniden denemek zaman ve
-            # backend yükseltmesi israfıdır; yalnızca 5xx ve 429 (rate limit) denenir.
+            return response, active
+        except (APIStatusError, APIConnectionError) as error:
+            status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
             if status is not None and status < 500 and status != 429:
                 raise
             last_error = error
             logging.warning(
                 "Model çağrısı başarısız, yeniden deneniyor",
-                extra={
-                    "attempt": attempt, "max_attempts": MAX_API_RETRIES,
-                    "backend": active_backend, "error_type": type(error).__name__,
-                },
+                extra={"attempt": attempt + 1, "max_attempts": len(plan), "backend": active,
+                       "status_code": status, "error_type": type(error).__name__},
             )
-            if attempt < MAX_API_RETRIES:
-                await asyncio.sleep(2 ** (attempt - 1))
+            timed_out: bool = isinstance(error, APITimeoutError)
+            attempt = len(plan) - 1 if timed_out and attempt < len(plan) - 1 else attempt + 1
+            if attempt < len(plan):
+                await asyncio.sleep(0.5 * attempt)
     assert last_error is not None
     raise last_error
 
 
-async def run_agent_with_callback(goal: str, callback: Callable[[str], None], options: RunOptions) -> str:
-    """Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; ilerlemeyi callback'e bildirir."""
-    clients: Dict[str, AsyncOpenAI] = {
-        name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"])
-        for name, profile in BACKENDS.items()
-        if profile["api_key"]
+async def _screenshot_observation(call: Any) -> Dict[str, Any]:
+    """Başarılı bir ekran görüntüsünü modele gidecek görsel gözlem mesajına çevirir."""
+    arguments: Dict[str, Any] = json.loads(call.function.arguments or "{}")
+    image_b64: str = await asyncio.to_thread(encode_image, str(Path(arguments["filename"]).expanduser()))
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü (koordinatlar tıklama araçlarıyla aynı uzayda)."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ],
     }
+
+
+async def run_agent_with_callback(
+    goal: str, callback: Callable[[str], None], options: RunOptions, clients: Dict[str, AsyncOpenAI],
+) -> RunReport:
+    """
+    Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; ilerlemeyi ve tur başına
+    süre/token ölçümlerini callback'e bildirir. İstemciler çağırana aittir (kapatılmaz),
+    böylece arayüz görevler arasında sıcak bağlantıları yeniden kullanır.
+    """
     if DEFAULT_BACKEND not in clients:
         raise RuntimeError(
             f"Varsayılan backend '{DEFAULT_BACKEND}' için API anahtarı bulunamadı: "
             "~/.local/share/opencode/auth.json içinde 'opencode-go' girdisi yok."
         )
     callback(f"Kullanılabilir modeller: {', '.join(sorted(clients))}")
+    available: frozenset[str] = frozenset(clients)
 
     backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
-    requested_backend: str = backend_override if backend_override else DEFAULT_BACKEND
-    if requested_backend not in clients:
-        callback(f"Uyarı: '{requested_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak.")
-        requested_backend = DEFAULT_BACKEND
+    current_backend: str = backend_override if backend_override else DEFAULT_BACKEND
+    if current_backend not in available:
+        callback(f"Uyarı: '{current_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak.")
+        current_backend = DEFAULT_BACKEND
 
     toolbox: Toolbox = Toolbox()
     session_id: str = str(uuid.uuid4())
-    state: sm.StateDict = sm.load_state(STATE_FILE)
-
-    # Benzer geçmiş başarılı görevlerden rota önerisi al (epizodik bellek hatırlaması).
-    known_route: Optional[str] = sm.recall_similar_success(state, goal, limit=3)
-    system_content: str = config["SYSTEM_PROMPT"]
-    if known_route:
-        system_content += (
-            "\n\n### BİLİNEN ROTA (benzer geçmiş görevlerden)\n"
-            "Aşağıdaki bilgi YALNIZCA araç sırası içindir. Hedef metnindeki yol ve dosya "
-            "adlarını ASLA değiştirme; eski görevin yollarını kullanma.\n" + known_route
-        )
-
+    state: sm.StateDict = sm.load_state(options["state_file"])
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_content},
+        {"role": "system", "content": build_system_prompt(date.today())},
         {"role": "user", "content": goal},
     ]
     tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
-    steps: List[Dict[str, Any]] = []
+    steps: List[sm.StepRecord] = []
     outcome: str = ""
     success: bool = False
     start_time: float = time.monotonic()
-    current_backend: str = requested_backend
-    consecutive_tool_failures: int = 0
+    consecutive_failed_turns: int = 0
     tool_cache: Dict[str, ToolResult] = {}
+    turns: int = 0
+    tool_call_count: int = 0
+    usage: TokenUsage = {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}
+    metrics: sm.EpisodeMetrics
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
@@ -553,82 +582,79 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
                 outcome = "Kullanıcı tarafından durduruldu."
                 callback(outcome)
                 break
-
-            elapsed: float = time.monotonic() - start_time
-            if elapsed > MAX_WALL_CLOCK_SECONDS:
+            if time.monotonic() - start_time > MAX_WALL_CLOCK_SECONDS:
                 outcome = f"Zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı, görev tamamlanamadı."
                 callback(outcome)
                 break
 
-            messages = _trim_old_tool_messages(messages)
+            messages = _trim_old_turns(messages)
             callback(f"[{iteration}/{MAX_ITERATIONS}] Model düşünüyor... (backend: {current_backend})")
-            response: Any
-            used_backend: str
+            model_started: float = time.monotonic()
             response, used_backend = await _call_model_with_retries(
-                clients, messages, tool_schemas, session_id, current_backend
+                clients, messages, tool_schemas, session_id, current_backend,
+            )
+            turns += 1
+            turn_usage: TokenUsage = token_usage(response)
+            usage = add_usage(usage, turn_usage)
+            callback(
+                f"  ⏱ model {time.monotonic() - model_started:.1f}sn · girdi {turn_usage['prompt_tokens']} "
+                f"(önbellek {turn_usage['cached_tokens']}) · çıktı {turn_usage['completion_tokens']} token"
             )
             if used_backend != current_backend:
                 callback(f"  -> API hatası nedeniyle '{used_backend}' backend'ine yükseltildi.")
                 current_backend = used_backend
-            message: Any = response.choices[0].message
-            messages.append(message.model_dump(exclude_none=True))
+            choice: Any = response.choices[0]
+            message: Any = choice.message
+            messages.append(_assistant_entry(message))
 
             if not message.tool_calls:
                 outcome = message.content or ""
-                success = True
-                callback(f"Tamamlandı: {outcome}")
+                success, reason = final_verdict(outcome, choice.finish_reason)
+                callback(f"Tamamlandı: {outcome}" if success else f"Tamamlanamadı: {reason}. Son yanıt: {outcome[:300]}")
                 break
 
+            if choice.finish_reason == "length":
+                callback("  -> Uyarı: yanıt max_tokens sınırında kesildi; araç argümanları eksik olabilir.")
+            tool_call_count += len(message.tool_calls)
             for call in message.tool_calls:
-                shown_args: str = call.function.arguments or ""
-                callback(f"Araç çağrısı: {call.function.name}({shown_args[:TRIMMED_ARGS_LIMIT]})")
+                callback(f"Araç çağrısı: {call.function.name}({(call.function.arguments or '')[:TRIMMED_ARGS_LIMIT]})")
 
-            # Bağımsız araç çağrıları paralel, fiziksel/yan etkili eylemler model
-            # sırasına sadık kalarak seri çalışır.
+            tools_started: float = time.monotonic()
             results: List[ToolResult] = await _execute_tool_calls(message.tool_calls, toolbox, tool_cache)
+            callback(f"  ⏱ araçlar {time.monotonic() - tools_started:.1f}sn")
 
             failures_in_turn: int = 0
             pending_shots: List[Any] = []
             for call, result in zip(message.tool_calls, results):
-                steps.append({"tool": call.function.name, "result": result})
-                hint: Optional[str] = None
-                if result.get("ok"):
-                    callback(f"  -> Başarılı ({call.function.name}): {str(result.get('result', ''))[:300]}")
+                ok: bool = bool(result.get("ok"))
+                detail: str = str(result.get("result", "")) if ok else f"{result.get('error_type')}: {result.get('error')}"
+                steps.append(sm.make_step_record(call.function.name, call.function.arguments or "", ok, detail))
+                if ok:
+                    callback(f"  -> Başarılı ({call.function.name}): {detail[:300]}")
+                    if call.function.name == "take_screenshot":
+                        pending_shots.append(call)
                 else:
                     failures_in_turn += 1
-                    error_text: str = f"{result.get('error_type')}: {result.get('error')}"
-                    callback(f"  -> Hata ({call.function.name}): {error_text}")
-                    hint = sm.check_for_lessons(state, error_text)
-                    if hint:
-                        callback(f"  -> Bilinen ders uygulanıyor: {hint}")
-                messages.append(_tool_result_to_message(call, result, hint))
+                    callback(f"  -> Hata ({call.function.name}): {detail}")
+                messages.append(_tool_result_to_message(call, result))
 
-                if result.get("ok") and call.function.name == "take_screenshot":
-                    pending_shots.append(call)
-
-            # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: OpenAI uyumlu
-            # API'lerde tool sonuçlarının assistant tool_calls'ı kesintisiz izlemesi
-            # gerekir; araya user mesajı sıkıştırmak 400'e ve boşa giden yeniden
-            # denemelere yol açar.
+            # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: tool sonuçları assistant
+            # tool_calls'ı kesintisiz izlemeli; araya user mesajı 400'e yol açar.
             for shot_call in pending_shots:
-                await _attach_screenshot_observation(messages, shot_call, callback)
+                try:
+                    messages.append(await _screenshot_observation(shot_call))
+                except (OSError, KeyError, ValueError) as error:
+                    logging.warning("Ekran görüntüsü modele eklenemedi", extra={"error_type": type(error).__name__})
+                    callback(f"  -> Not: ekran görüntüsü modele iliştirilemedi ({type(error).__name__}: {error}).")
 
-            # Yükseltme sayacı TUR bazlıdır: tek turdaki iki bağımsız hata (örn. iki
-            # yanlış yol) ajanı kalıcı olarak yavaş backend'e düşürmesin; turda herhangi
-            # bir başarı varsa sayaç sıfırlanır.
-            if failures_in_turn == len(results) and failures_in_turn > 0:
-                consecutive_tool_failures += 1
-            elif failures_in_turn < len(results):
-                consecutive_tool_failures = 0
-
-            if (
-                consecutive_tool_failures >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD
-                and current_backend != ESCALATION_BACKEND
-                and ESCALATION_BACKEND in clients
-            ):
-                callback(f"  -> Art arda {consecutive_tool_failures} araç hatası, '{ESCALATION_BACKEND}' backend'ine yükseltiliyor.")
-                current_backend = ESCALATION_BACKEND
-                consecutive_tool_failures = 0
+            # Yükseltme sayacı TUR bazlıdır: turda herhangi bir başarı varsa sıfırlanır.
+            consecutive_failed_turns = consecutive_failed_turns + 1 if failures_in_turn == len(results) else 0
+            if consecutive_failed_turns >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD:
+                upgraded: Optional[str] = next_quality_backend(current_backend, available)
+                if upgraded is not None:
+                    callback(f"  -> Art arda {consecutive_failed_turns} başarısız tur, '{upgraded}' backend'ine yükseltiliyor.")
+                    current_backend = upgraded
+                consecutive_failed_turns = 0
         else:
             outcome = f"Maksimum iterasyon sayısına ({MAX_ITERATIONS}) ulaşıldı, görev tamamlanamadı."
             callback(outcome)
@@ -637,42 +663,33 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None], op
         callback(outcome)
         raise
     finally:
-        state = sm.record_episode(state, goal, steps, outcome, success)
-        # Epizottaki hata->toparlanma desenlerinden ders damıt: ajan her görevde
-        # kendi hatalarından öğrenir ve bir sonraki görevde çözümleri enjekte edilir.
-        state = sm.absorb_episode_lessons(state, steps, success)
-        sm.save_state(STATE_FILE, state)
+        metrics = {
+            "turns": turns, "tool_calls": tool_call_count,
+            "elapsed_seconds": round(time.monotonic() - start_time, 2), "backend": current_backend,
+            "prompt_tokens": usage["prompt_tokens"], "cached_tokens": usage["cached_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+        }
+        sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
         await toolbox.close_browser()
-        await asyncio.gather(*(c.close() for c in clients.values()))
 
-    return outcome
+    callback(
+        f"Özet: {turns} tur · {tool_call_count} araç · {metrics['elapsed_seconds']:.1f}sn · girdi {usage['prompt_tokens']} "
+        f"(önbellek {usage['cached_tokens']}) · çıktı {usage['completion_tokens']} token"
+    )
+    return {"outcome": outcome, "success": success, "metrics": metrics}
 
 
-async def _attach_screenshot_observation(messages: List[Dict[str, Any]], call: Any, callback: Callable[[str], None]) -> None:
-    """Başarılı bir ekran görüntüsünü modele görsel gözlem olarak ekler (en iyi çaba)."""
+async def run_agent(goal: str) -> RunReport:
+    """Hedefi konsola log basarak çalıştırır (CLI)."""
+    clients: Dict[str, AsyncOpenAI] = create_model_clients()
     try:
-        arguments: Dict[str, Any] = json.loads(call.function.arguments or "{}")
-        image_b64: str = await asyncio.to_thread(encode_image, arguments["filename"])
-        messages.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-            ],
-        })
-    except Exception as error:
-        logging.warning("Ekran görüntüsü modele eklenemedi", extra={"error_type": type(error).__name__})
-        callback(f"  -> Not: ekran görüntüsü modele iliştirilemedi ({type(error).__name__}).")
-
-
-async def run_agent(goal: str) -> str:
-    """Hedefi konsola log basarak çalıştırır."""
-    options: RunOptions = {"requested_backend": None, "should_stop": lambda: False}
-    return await run_agent_with_callback(goal, callback=print, options=options)
+        options: RunOptions = {"requested_backend": None, "should_stop": lambda: False, "state_file": STATE_FILE}
+        return await run_agent_with_callback(goal, print, options, clients)
+    finally:
+        await close_model_clients(clients)
 
 
 if __name__ == "__main__":
-    import sys
     cli_goal: str = " ".join(sys.argv[1:]).strip()
     if not cli_goal:
         print("Kullanım: python3 main.py <hedef metni>")
