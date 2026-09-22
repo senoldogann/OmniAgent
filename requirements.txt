@@ -1,0 +1,13 @@
+openai
+playwright
+beautifulsoup4
+pyautogui
+pillow
+opencv-python
+numpy
+duckduckgo-search
+pyobjc-framework-ApplicationServices
+pyobjc-framework-Quartz
+customtkinter
+pytest
+pytest-asyncio

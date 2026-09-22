@@ -1,0 +1,226 @@
+================================================================================
+ PYTHON SURUMLERI ENVANTERI
+================================================================================
+ Host      : dogans-Air (Darwin 25.6.0, arm64 / Apple M-series T8132)
+ macOS     : 26.6.2 (Build 25G83)
+ Kullanici : dogan  |  CWD: /Users/dogan/Desktop/OmniAgent
+ Tarih     : 2026-09-22
+ Yontem    : PATH cozumleme + Cellar/opt/uv/pyenv/venv/CLT/Xcode taramasi
+             + her binary icin `-V` / `-VV` CALISTIRILARAK dogrulama
+             + SHA-256 hash ve inode karsilastirmasi ile gercek sayim
+ ------------------------------------------------------------------------------
+ TOPLAM    : 30 yorumlayici YOLU
+             -> 12 gercek dosya (symlink/alias/venv cozuldukce, realpath ile)
+             -> 3 uv alias cifti ayni inode-u paylasir (python3 -> python3.1x)
+             -> 12 BENZERSIZ binary (SHA-256 ile kanitlandi)
+             ->  7 BENZERSIZ surum: 3.9.6 / 3.11.15 / 3.11.16 / 3.12.13
+                                   3.13.12 / 3.14.3 / 3.14.7
+             Python 2: YOK
+================================================================================
+
+
+[ OZET ]
+  Surum        Yol sayisi   Dagitim kanali
+  ----------   ----------   --------------------------------------------------
+  Python 3.9   3            Apple sistem (/usr/bin) + Xcode + CommandLineTools
+  Python 3.11  4            Homebrew (3.11.15, 3.11.16) + pyenv + pip
+  Python 3.12  2            uv standalone (alias x2)
+  Python 3.13  3            Homebrew + uv standalone (alias x2)
+  Python 3.14  5            Homebrew (3.14.3, 3.14.7) + uv standalone (alias x2)
+  ----------   ----------
+  TOPLAM       30 yorumlayici yolu (venv+symlink dahil) -> 12 gercek binary
+  Not: "yol" farki symlink/alias/venv tekrarlarindan gelir; derleme cesidi 12dir.
+
+  VARSAYILAN `python3` : /opt/homebrew/bin/python3   ->  Python 3.14.7
+  EN YENIK             : Python 3.14.7   (Homebrew, 05 Agu 2026 derleme)
+  EN ESKI              : Python 3.9.6    (Apple sistem derlemesi)
+  AKTIF pyenv global   : "system"        -> 3.9.6   (PATH'te brew oncedir, etkisiz)
+  UYARI                : kabukta `python` komutu YOK, yalnizca `python3`
+                         (command -v python -> bos, dogrulandi)
+
+
+================================================================================
+ 1) APPLESYSTEM / macOS  —  Python 3.9.6
+================================================================================
+  /usr/bin/python3
+      -> Python 3.9.6 (default, Aug 25 2026, 21:26:21)
+         [Clang 21.0.0 (clang-2100.3.34.2)]
+      NOT: Apple Silicon'da dyld shared cache shimi (dev inode numarasi).
+
+  /Applications/Xcode.app/Contents/Developer/Library/Frameworks/
+    Python3.framework/Versions/3.9/bin/python3.9
+      -> Python 3.9.6 (default, Aug 25 2026, 21:26:21)
+         [Clang 21.0.0 (clang-2100.3.34.2)]
+
+  /Library/Developer/CommandLineTools/Library/Frameworks/
+    Python3.framework/Versions/3.9/bin/python3.9
+      -> Python 3.9.6 (default, Jan  9 2026, 11:03:41)
+         [Clang 17.0.0 (clang-1700.6.4.2)]
+      NOT: CLT derlemesi ESKI Clang -> farkli SHA-256, ayri gercek binary.
+      Ayrica: Versions/Current -> 3.9 (symlink)
+
+
+================================================================================
+ 2) HOMEBREW  —  /opt/homebrew  (Cellar)
+================================================================================
+  python@3.11   [brew list --versions: 3.11.15  3.11.16]
+    /opt/homebrew/Cellar/python@3.11/3.11.16/bin/python3.11    -> 3.11.16  *LINKED*
+        Python 3.11.16 (main, Aug 12 2026, 23:03:19) [Clang 21.0.0 (clang-2100.1.1.101)]
+        symlink: /opt/homebrew/bin/python3.11
+    /opt/homebrew/Cellar/python@3.11/3.11.15/bin/python3.11    -> 3.11.15   [UNLINKED - gecmis]
+
+  python@3.13   [brew list --versions: 3.13.12_1]
+    /opt/homebrew/Cellar/python@3.13/3.13.12_1/bin/python3.13  -> 3.13.12  *LINKED*
+        Python 3.13.12 (main, Feb  3 2026, 17:53:27) [Clang 17.0.0 (clang-1700.6.3.2)]
+        symlink: /opt/homebrew/bin/python3.13
+
+  python@3.14   [brew list --versions: 3.14.7  3.14.3_1]
+    /opt/homebrew/Cellar/python@3.14/3.14.7/bin/python3.14     -> 3.14.7   *LINKED*
+        Python 3.14.7 (main, Aug  5 2026, 10:29:49) [Clang 21.0.0 (clang-2100.1.1.101)]
+        symlink: /opt/homebrew/bin/python3.14  VE  /opt/homebrew/bin/python3
+    /opt/homebrew/Cellar/python@3.14/3.14.3_1/bin/python3.14   -> 3.14.3    [UNLINKED - gecmis]
+
+  => VARSAYILAN `python3` = 3.14.7  (brew)
+
+  Destek paketleri (yorumlayici DEGIL - sayima dahil edilmedi):
+    /opt/homebrew/Cellar/python-tk@3.11   3.11.16   (Tkinter destegi)
+    /opt/homebrew/Cellar/python-tk@3.14   3.14.7    (Tkinter destegi)
+    /opt/homebrew/bin/idle3, pip3, python3-config, python3.1{1,3,4}-config
+    /opt/homebrew/bin/python-build        (pyenv 2.6.26'nin builtin builder'i)
+    /opt/homebrew/opt/python@3            -> python@3.14 (alias)
+
+
+================================================================================
+ 3) UV  —  bagimsiz (standalone) CPython indirmeleri
+================================================================================
+  uv calistirilabilir : /Users/dogan/.local/bin/uv
+  ~/.local/share/uv/python/
+    cpython-3.12.13-macos-aarch64-none/bin/python3   -> 3.12.13   [GERCEK]
+    cpython-3.12-macos-aarch64-none/bin/python3      -> 3.12.13   [AYNI INODE - alias]
+    cpython-3.13.12-macos-aarch64-none/bin/python3   -> 3.13.12   [GERCEK]
+    cpython-3.13-macos-aarch64-none/bin/python3      -> 3.13.12   [AYNI INODE - alias]
+    cpython-3.14.3-macos-aarch64-none/bin/python3    -> 3.14.3    [GERCEK]
+    cpython-3.14-macos-aarch64-none/bin/python3      -> 3.14.3    [AYNI INODE - alias]
+        Python 3.14.3 (main, Mar  3 2026, 15:46:55) [Clang 21.1.4]
+    => 3 ayrilabilir derleme / 6 yol. uv derlemeleri brew'dan bagimsiz (farkli hash).
+
+  ~/.local/bin/python3.14
+    -> symlink -> uv cpython-3.14-macos-aarch64-none   =>  Python 3.14.3
+    !!! PATH TUZAGI: PATH'te /opt/homebrew/bin, ~/.local/bin'den once gelir.
+        `python3.14`  -> brew 3.14.7
+        tam yolla     -> uv   3.14.3
+
+  uv'nun "download available" listesi (KURULU DEGIL, sayilmedi):
+    3.15.0a6 (+freethreaded), 3.14.3+freethreaded, 3.13.12+freethreaded,
+    3.11.15, 3.10.20, 3.9.25, 3.8.20, pypy-3.11.13, pypy-3.10.16, pypy-3.9.19
+
+
+================================================================================
+ 4) PYENV
+================================================================================
+  pyenv calistirilabilir : /opt/homebrew/bin/pyenv     (brew pyenv 2.6.26)
+  PYENV_ROOT             : /Users/dogan/.pyenv
+  global versiyonu       : "system"  ->  /usr/bin/python3 (3.9.6)
+                           (pyenv shim'leri PATH'te yok -> fiilen etkisiz)
+
+  Yuklu versiyonlar (1):
+    /Users/dogan/.pyenv/versions/3.11.15/bin/python3.11   -> 3.11.15
+        Python 3.11.15 (main, Mar 20 2026, 14:15:02) [Clang 17.0.0 (clang-1700.6.4.2)]
+        NOT: brew'un 3.11.15'i ile ayni surum AMA FARKLI SHA-256 -> ayri derleme.
+        Ek yollar: .../bin/python, .../bin/python3, pip, pip3, pip3.11
+
+
+================================================================================
+ 5) SANAL ORTAMLAR (venv)  —  taban yorumlayicilari (pyvenv.cfg okundu)
+================================================================================
+  /Users/dogan/Desktop/toiminimi-otomasyon/.venv     base: brew python@3.13  -> 3.13.12
+  /Users/dogan/Desktop/ev_izleme/venv                 base: brew python@3.14  ->  3.14.3
+  /Users/dogan/computeruse-lux/.venv                  base: uv cpython-3.14   ->  3.14.3 (CPython)
+  /Users/dogan/computeruse-mine/.venv                 base: uv cpython-3.14   ->  3.14.3 (CPython)
+  /Users/dogan/.hermes/hermes-agent/venv              base: brew python@3.11  -> 3.11.15 (CPython)
+  /Users/dogan/.local/share/codex-router/.venv        base: uv cpython-3.12   -> 3.12.13 (CPython)
+  /Users/dogan/Desktop/captcha-blocker/venv           pyvenv.cfg okunamadi;
+                                                      site-packages/lib/python3.14
+                                                      -> 3.14.x (SeleniumBase surumu calisiyor)
+  => 7 venv, yeni derleme EKLEMIYOR (hepsi 1-4. bolumdeki tabanlari paylasiyor).
+
+
+================================================================================
+ 6) HALA CALISAN PYTHONSURECLERI (anlik ps ciktilari)
+================================================================================
+  PID  1535   /Users/dogan/.local/share/codex-router/.venv/bin/python
+  PID 24819   .../captcha-blocker/venv/lib/python3.14/site-packages/seleniumbase/drivers/uc_driver
+  PID 78563   /opt/homebrew/Cellar/python@3.14/3.14.7/.../Resources/Python.app/Contents/MacOS/Python
+  PID 78630   /opt/homebrew/Cellar/python@3.14/3.14.7/.../Resources/Python.app/Contents/MacOS/Python
+  PID 79046   /opt/homebrew/Cellar/python@3.14/3.14.7/.../Resources/Python.app/Contents/MacOS/Python
+
+
+================================================================================
+ 7) KANIT: SHA-256 / INODE MATRISI  (12 benzersiz binary)
+================================================================================
+  hash(ilk10)   inode        surum
+  -----------   ----------   -------------------------------------
+  b8763cf250    1152921500312571562   3.9.6   /usr/bin/python3        (dyld shim)
+  dff5950351    111891389    3.9.6   Xcode.app Python3.framework
+  6b24be8ba0    270285       3.9.6   CommandLineTools Python3.framework
+  900bc5cd52    95993321     3.11.15 brew Cellar (unlinked)
+  a0d2bdbdc8    10585978     3.11.15 pyenv   (AYNI surum, FARKLI derleme)
+  3494e1ea84    114086091    3.11.16 brew Cellar (linked)
+  eb9d74b9c7    74654897     3.12.13 uv      (alias ile 2 yol, 1 inode)
+  298e126aaf    94800679     3.13.12 brew Cellar
+  3db3822b1b    88186105     3.13.12 uv      (alias ile 2 yol, 1 inode)
+  cbf8410962    2435056      3.14.3  brew Cellar (unlinked)
+  5e7cec3fb6    6280974      3.14.3  uv      (alias ile 2 yol, 1 inode)
+  87d4df53fd    114194704    3.14.7  brew Cellar (linked, VARSAYILAN)
+  => 30 yol = 12 gercek dosya = 12 benzersiz hash (3 uv alias cifti ayni inode-u paylasir).
+
+
+================================================================================
+ 8) TARAMADA BULUNAMAYANLAR
+================================================================================
+  Python 2.x       : YOK (python, python2, python2.7, idle(python2) yok)
+  `python` komutu  : PATH'te YOK -> python3 (3.14.7) kullanin veya:
+                       ln -s /opt/homebrew/bin/python3 ~/.local/bin/python
+  conda / mamba    : YOK (~/{miniconda3,anaconda3,miniforge3}, /opt/... tarandi)
+  pipx             : YOK
+  PyPy             : YOK (yalnizca uv indirme adayi)
+  Python.framework : /Library/Frameworks ve ~/Library/Frameworks -> BOŞ
+                       (Homebrew framework'leri Cellar icinde tasir)
+  /pkg/env/global/bin            : bos
+  /opt/python*                   : yok
+  Calisan baska python derlemesi : sadece 3.14.7 + venv'ler (bkz. bolum 6)
+
+
+================================================================================
+ 9) HIZLI ERISIM TABLOSU
+================================================================================
+  Surum     Yol
+  -------   ------------------------------------------------------------------
+  3.14.7    /opt/homebrew/bin/python3            <<< VARSAYILAN `python3`
+  3.14.7    /opt/homebrew/bin/python3.14
+  3.14.7    /opt/homebrew/Cellar/python@3.14/3.14.7/bin/python3.14
+  3.14.3    /opt/homebrew/Cellar/python@3.14/3.14.3_1/bin/python3.14
+  3.14.3    /Users/dogan/.local/bin/python3.14
+  3.14.3    /Users/dogan/.local/share/uv/python/cpython-3.14-macos-aarch64-none/bin/python3
+  3.14.3    /Users/dogan/.local/share/uv/python/cpython-3.14.3-macos-aarch64-none/bin/python3
+  3.13.12   /opt/homebrew/bin/python3.13
+  3.13.12   /opt/homebrew/Cellar/python@3.13/3.13.12_1/bin/python3.13
+  3.13.12   /Users/dogan/.local/share/uv/python/cpython-3.13-macos-aarch64-none/bin/python3
+  3.13.12   /Users/dogan/.local/share/uv/python/cpython-3.13.12-macos-aarch64-none/bin/python3
+  3.12.13   /Users/dogan/.local/share/uv/python/cpython-3.12-macos-aarch64-none/bin/python3
+  3.12.13   /Users/dogan/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3
+  3.11.16   /opt/homebrew/bin/python3.11
+  3.11.16   /opt/homebrew/Cellar/python@3.11/3.11.16/bin/python3.11
+  3.11.15   /Users/dogan/.pyenv/versions/3.11.15/bin/python3.11
+  3.11.15   /opt/homebrew/Cellar/python@3.11/3.11.15/bin/python3.11
+  3.9.6     /usr/bin/python3                       <<< macOS sistem
+  3.9.6     /Applications/Xcode.app/.../Versions/3.9/bin/python3.9
+  3.9.6     /Library/Developer/CommandLineTools/.../Versions/3.9/bin/python3.9
+  ==============================================================================
+  ORTAK KULLANIM ONERISI
+    Genel/son            : python3            (3.14.7)
+    Proje - uv           : uv run --python 3.12 .
+    Proje - pyenv        : pyenv local 3.11.15 && pyenv init -
+    Eski kod uyumu       : /usr/bin/python3   (3.9.6, Apple)
+    Temizlik adayi       : brew cleanup  (eski 3.11.15 / 3.14.3_1 Cellar'lari)
+================================================================================
