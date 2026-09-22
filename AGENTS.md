@@ -53,6 +53,22 @@ Projenin "God-tier" seviyesine çıkarılması için `@Chatgpt-System` pluginind
 - **Tipleme:** `TypedDict`, `Optional`, `Union` gibi yapılarla katı tipleme (strict typing) uygulanacaktır.
 - **Sadelik:** DRY, KISS ve YAGNI prensiplerine sadık kalınacaktır.
 
+## ⚡ Performans Notları
+- Bağımsız araç çağrıları `main.py` içinde gerçek paralellikte çalışır (`asyncio.gather`);
+  fiziksel fare/klavye eylemleri (`mouse_click`, `keyboard_type`, `cua_click`, `smart_click`,
+  `run_action_sequence`) yarış durumunu önlemek için model hangi sırayla döndürdüyse o
+  sırayla seri çalışır — aynı anda iki tıklama/yazma asla çakışmaz.
+- `run_action_sequence`, çok adımlı fare/klavye zincirlerini ("tıkla → yaz → enter") TEK
+  model turunda bitirir; her adım için ayrı LLM round-trip'i gerekmez.
+- `pyautogui.PAUSE` 0.1sn'den 0.02sn'ye düşürüldü — uzun `keyboard_type` çağrılarında
+  karakter başına binen gizli gecikmeyi azaltır.
+- Uzun görevlerde eski araç çıktıları otomatik kısaltılır (`_trim_old_tool_messages`) ve
+  10 dakikalık bir zaman bütçesi vardır (`MAX_WALL_CLOCK_SECONDS`) — tam otonom/gözetimsiz
+  çalışırken bağlamın sınırsız büyümesini ve döngünün sınırsız sürmesini önler.
+- Bu yaklaşımlar `~/Desktop/chatgpt-system`'daki native computer-use runtime'ının ölçülmüş
+  tasarım derslerinden (tek seferlik fiziksel eylem hattı, toplu `computer_run`, opt-in
+  doğrulama) esinlenildi — kod taşınmadı, sadece prensipler uygulandı.
+
 ## 🎯 Hedefler
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (`process_list`, `get_pointer_position`, `session_authority_status/end`)
 - [x] Ajanın kendi yetki seviyesini yönetebildiği bir güvenlik katmanı eklemek. (bkz. 🛡️ Güvenlik Rayları — yol koruması, yıkıcı komut engeli, sözdizimi doğrulaması, yedekleme)

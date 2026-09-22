@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import os
 import json
@@ -13,6 +14,11 @@ import pyautogui
 from PIL import ImageGrab
 from bs4 import BeautifulSoup
 from typing import Any, Dict, List, Optional, Tuple
+
+# pyautogui varsayılanı her çağrıdan sonra 0.1sn bekler (FAILSAFE tepki payı için).
+# Bunu tam sıfırlamak yerine düşürüyoruz: uzun bir keyboard_type çağrısı karakter
+# başına bu bekleme payını taşıdığı için varsayılanla saniyelerce sürebiliyor.
+pyautogui.PAUSE = 0.02
 
 # Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı
 class ToolError(Exception):
@@ -163,18 +169,21 @@ class Toolbox:
         self.browser_context: Optional[BrowserContext] = None
         self.cua: CUA = CUA()
         self._authority_active: bool = False
+        self._browser_lock: asyncio.Lock = asyncio.Lock()
 
     async def _get_browser(self) -> BrowserContext:
         """
         Tarayıcı bağlamını başlatır veya mevcut olanı döner.
+        Paralel araç çağrıları aynı anda tetiklerse çift başlatmayı önlemek için kilitlidir.
         """
-        if self.browser_context is None:
-            self.playwright_instance = await async_playwright().start()
-            self.browser = await self.playwright_instance.chromium.launch(headless=True)
-            self.browser_context = await self.browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        return self.browser_context
+        async with self._browser_lock:
+            if self.browser_context is None:
+                self.playwright_instance = await async_playwright().start()
+                self.browser = await self.playwright_instance.chromium.launch(headless=True)
+                self.browser_context = await self.browser.new_context(
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            return self.browser_context
 
     def _clean_html(self, html: str) -> str:
         """
@@ -441,6 +450,34 @@ class Toolbox:
         pyautogui.press(key)
         return f"Tuşa basıldı: {key}"
     
+    def run_action_sequence(self, steps: List[Dict[str, Any]]) -> str:
+        """
+        Bir dizi fare/klavye eylemini (click/move/type/press) TEK araç çağrısında
+        sırayla çalıştırır. Her adım için ayrı bir model turu (ve dolayısıyla ayrı
+        bir LLM round-trip'i) gerekmesini önler — "tıkla, yaz, enter'a bas" gibi
+        zincirler tek çağrıda biter.
+        """
+        executed: List[str] = []
+        for index, step in enumerate(steps):
+            action: object = step.get("action")
+            try:
+                if action == "click":
+                    executed.append(self.mouse_click(int(step["x"]), int(step["y"]), str(step.get("button", "left"))))
+                elif action == "move":
+                    executed.append(self.mouse_move(int(step["x"]), int(step["y"])))
+                elif action == "type":
+                    executed.append(self.keyboard_type(str(step["text"])))
+                elif action == "press":
+                    executed.append(self.keyboard_press(str(step["key"])))
+                else:
+                    raise ToolError(f"Bilinmeyen eylem türü: {action}", "INVALID_ACTION", False)
+            except (KeyError, TypeError, ValueError) as error:
+                raise ToolError(
+                    f"Eylem {index} ({action}) geçersiz parametrelerle başarısız: {error}",
+                    "INVALID_ACTION_PARAMS", False,
+                ) from error
+        return "Eylem dizisi tamamlandı:\n" + "\n".join(executed)
+
     def execute_js(self, code: str) -> str:
         temp_path: Optional[Path] = None
         try:
@@ -550,5 +587,6 @@ class Toolbox:
             "execute_js": "Node.js ile JS çalıştırır.",
             "self_modify": "Kendi kaynak kodunu değiştirir.",
             "smart_click": "Hibrit tıklama protokolünü (AX -> Görsel -> Koordinat) kullanır.",
-            "get_window_bounds": "Belirtilen pencerenin ekran sınırlarını döner."
+            "get_window_bounds": "Belirtilen pencerenin ekran sınırlarını döner.",
+            "run_action_sequence": "Fare/klavye eylemler dizisini tek çağrıda sırayla çalıştırır."
         }

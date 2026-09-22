@@ -2,9 +2,10 @@ import asyncio
 import base64
 import json
 import logging
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 from openai import AsyncOpenAI
 
@@ -15,6 +16,9 @@ import state_manager as sm
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
 MAX_ITERATIONS: int = 25
 MAX_API_RETRIES: int = 3
+MAX_WALL_CLOCK_SECONDS: float = 600.0
+MAX_TOOL_MESSAGE_AGE: int = 6
+TRIMMED_CONTENT_LIMIT: int = 400
 
 
 class ToolResult(TypedDict, total=False):
@@ -219,6 +223,32 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
                 "window_title": {"type": "string", "description": "Pencere başlığı."},
             }, "required": ["window_title"]},
         }},
+        {"type": "function", "function": {
+            "name": "run_action_sequence",
+            "description": (
+                "Bir dizi fare/klavye eylemini (click/move/type/press) TEK çağrıda sırayla "
+                "çalıştırır. 'Alana tıkla, metni yaz, enter'a bas' gibi zincirler için her adımı "
+                "ayrı bir araç çağrısı yapmak yerine bunu kullan — daha az model turu, daha hızlı."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "Sırayla çalıştırılacak eylemler.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["click", "move", "type", "press"]},
+                            "x": {"type": "integer", "description": "click/move için X koordinatı."},
+                            "y": {"type": "integer", "description": "click/move için Y koordinatı."},
+                            "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "click için tuş (belirtilmezse left)."},
+                            "text": {"type": "string", "description": "type için yazılacak metin."},
+                            "key": {"type": "string", "description": "press için tuş adı."},
+                        },
+                        "required": ["action"],
+                    },
+                },
+            }, "required": ["steps"]},
+        }},
     ]
 
 
@@ -264,13 +294,70 @@ async def execute_tool(call: Any, toolbox: Toolbox) -> ToolResult:
         }
 
 
-def _tool_result_to_message(call: Any, result: ToolResult) -> Dict[str, Any]:
+# Fiziksel fare/klavye eylemleri paralelleştirilemez: aynı anda iki tıklama/yazma
+# yarış durumu yaratıp yanlış elemente etki edebilir. Bunlar model bir turda birden
+# fazlasını döndürürse orijinal sırayla SERİ çalışır; geri kalan (salt okunur/bağımsız)
+# çağrılar gerçek paralellikle çalışır.
+_SEQUENTIAL_TOOLS: frozenset[str] = frozenset({
+    "mouse_click", "mouse_move", "keyboard_type", "keyboard_press",
+    "cua_click", "cua_press_key", "cua_get_app", "find_and_click",
+    "smart_click", "run_action_sequence",
+})
+
+
+async def _execute_tool_calls(calls: List[Any], toolbox: Toolbox) -> List[ToolResult]:
+    """Bir turdaki tüm araç çağrılarını, fiziksel eylemleri seri tutarak çalıştırır."""
+    concurrent_indices: List[int] = [i for i, c in enumerate(calls) if c.function.name not in _SEQUENTIAL_TOOLS]
+    sequential_indices: List[int] = [i for i, c in enumerate(calls) if c.function.name in _SEQUENTIAL_TOOLS]
+
+    async def run_sequential() -> List[Tuple[int, ToolResult]]:
+        outcomes: List[Tuple[int, ToolResult]] = []
+        for i in sequential_indices:
+            outcomes.append((i, await execute_tool(calls[i], toolbox)))
+        return outcomes
+
+    async def run_concurrent() -> List[Tuple[int, ToolResult]]:
+        if not concurrent_indices:
+            return []
+        outcomes = await asyncio.gather(*(execute_tool(calls[i], toolbox) for i in concurrent_indices))
+        return list(zip(concurrent_indices, outcomes))
+
+    sequential_results, concurrent_results = await asyncio.gather(run_sequential(), run_concurrent())
+    by_index: Dict[int, ToolResult] = dict(sequential_results + concurrent_results)
+    return [by_index[i] for i in range(len(calls))]
+
+
+def _tool_result_to_message(call: Any, result: ToolResult, hint: Optional[str]) -> Dict[str, Any]:
     """Araç sonucunu modele geri gönderilecek 'tool' mesajına çevirir."""
     if result.get("ok"):
         content: str = result.get("result", "")
     else:
         content = f"HATA [{result.get('error_type')}]: {result.get('error')}"
+        if hint:
+            content += f"\nBİLİNEN ÇÖZÜM (benzer geçmiş hatadan): {hint}"
     return {"role": "tool", "tool_call_id": call.id, "content": content}
+
+
+def _trim_old_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Son MAX_TOOL_MESSAGE_AGE mesajın dışında kalan uzun araç sonuçlarını kısaltır.
+    Saf fonksiyon: girdiyi değiştirmez, yeni bir liste döner. Bağlamın turlar
+    ilerledikçe sınırsız büyümesini (ve her turu giderek yavaşlatmasını) önler.
+    """
+    cutoff: int = len(messages) - MAX_TOOL_MESSAGE_AGE
+    trimmed: List[Dict[str, Any]] = []
+    for index, entry in enumerate(messages):
+        content: Any = entry.get("content")
+        if (
+            index < cutoff
+            and entry.get("role") == "tool"
+            and isinstance(content, str)
+            and len(content) > TRIMMED_CONTENT_LIMIT
+        ):
+            trimmed.append({**entry, "content": content[:TRIMMED_CONTENT_LIMIT] + " …[eski çıktı kısaltıldı]"})
+        else:
+            trimmed.append(entry)
+    return trimmed
 
 
 async def _call_model_with_retries(
@@ -329,9 +416,17 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
     steps: List[Dict[str, Any]] = []
     outcome: str = ""
     success: bool = False
+    start_time: float = time.monotonic()
 
     try:
         for iteration in range(1, MAX_ITERATIONS + 1):
+            elapsed: float = time.monotonic() - start_time
+            if elapsed > MAX_WALL_CLOCK_SECONDS:
+                outcome = f"Zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı, görev tamamlanamadı."
+                callback(outcome)
+                break
+
+            messages = _trim_old_tool_messages(messages)
             callback(f"[{iteration}/{MAX_ITERATIONS}] Model düşünüyor...")
             response: Any = await _call_model_with_retries(client, messages, tool_schemas, session_id)
             message: Any = response.choices[0].message
@@ -345,13 +440,22 @@ async def run_agent_with_callback(goal: str, callback: Callable[[str], None]) ->
 
             for call in message.tool_calls:
                 callback(f"Araç çağrısı: {call.function.name}({call.function.arguments})")
-                result: ToolResult = await execute_tool(call, toolbox)
+
+            # Bağımsız araç çağrıları paralel, fiziksel GUI eylemleri sıralı çalışır.
+            results: List[ToolResult] = await _execute_tool_calls(message.tool_calls, toolbox)
+
+            for call, result in zip(message.tool_calls, results):
                 steps.append({"tool": call.function.name, "result": result})
+                hint: Optional[str] = None
                 if result.get("ok"):
-                    callback(f"  -> Başarılı: {str(result.get('result', ''))[:300]}")
+                    callback(f"  -> Başarılı ({call.function.name}): {str(result.get('result', ''))[:300]}")
                 else:
-                    callback(f"  -> Hata: {result.get('error_type')}: {result.get('error')}")
-                messages.append(_tool_result_to_message(call, result))
+                    error_text: str = f"{result.get('error_type')}: {result.get('error')}"
+                    callback(f"  -> Hata ({call.function.name}): {error_text}")
+                    hint = sm.check_for_lessons(state, error_text)
+                    if hint:
+                        callback(f"  -> Bilinen ders uygulanıyor: {hint}")
+                messages.append(_tool_result_to_message(call, result, hint))
 
                 if result.get("ok") and call.function.name == "take_screenshot":
                     _attach_screenshot_observation(messages, call, callback)
