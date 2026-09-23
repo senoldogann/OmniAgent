@@ -1,10 +1,24 @@
-# OmniAgent — Devir Notu (2026-09-23)
+# OmniAgent — Devir Notu (2026-09-24)
 
 Kurallar, mimari ve performans kararlarının tek kaynağı `AGENTS.md`'dir; bu not yalnızca
 kaldığı yerden devam etmek için gereken durumu içerir.
 
-## Durum
-- Dal: `perf/hiz-dogruluk-arayuz`, son commit `e019aaf`. Açık Chrome yolunun GUI hızlandırması
+## Güncel model durumu
+- `99041f8` ile varsayılan model yerel Ollama API'sinden `gemma4:cloud` oldu. Bu makinede
+  `gemma4:cloud` ve `gpt-oss:20b-cloud` kurulu; ikinci model
+  `OMNI_OLLAMA_CLOUD_MODEL=gpt-oss:20b-cloud` ile seçilebilir. ChatGPT oturumlu GPT-6-Luna
+  (`openai`) ve OpenCode Muse Spark Contributor Free (`zen-free`) yedektir.
+- `ollama-cloud` 9 temel senaryoda 27/27 başarı, 4,2 sn medyan; uzun araştırma 8,3 sn,
+  kontrollü durgunluk testi 12,1 sn verdi. Son tam test koşusu 168 geçti, 7 atlandı.
+- `browse_url` ayrı ve görünmeyen Chromium kullanır; açık Google Chrome için
+  `chrome_active_tab` yolu istenir. Model istemlerinin CLI süreç argümanlarında görünmesini
+  önlemek için Codex ve OpenCode stdin kullanır; CLI süreçleri 45 sn sınırı ve iptal temizliğiyle
+  çalışır. Ücretsiz OpenCode eşzamanlı yük testinde takıldığı için geçerli hız sonucu yoktur.
+- Başka ajan aynı çalışma ağacında Fast Loop/benchmark dosyalarını düzenliyor; bu dosyaları
+  sürüm kontrolüne alırken ve UI sürecini yeniden başlatırken aktif çalışmasını koru.
+
+## 23 Eylül durumu (tarihsel)
+- Dal: `perf/hiz-dogruluk-arayuz`, o günkü son commit `e019aaf`. Açık Chrome yolunun GUI hızlandırması
   (eylem turu sonunda otomatik gözlem, sabit uyku yerine ekran durulma beklemesi, 1000×1000
   koordinat uzayı ve `point: [x, y]` argümanı, tek çağrıda ara/gönder `cua_submit_text`, sekme
   bulma düzeltmesi, `ssl.SSLError` yeniden denemesi, `chrome_ilan` GUI senaryosu) commit
