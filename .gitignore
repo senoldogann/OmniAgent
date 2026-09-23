@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .omni_backups/
 cognitive_memory.json
+user_memory.json
 *.png
 lessons.json
 python_versions.txt

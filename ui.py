@@ -5,6 +5,7 @@ import webbrowser
 import json
 import math
 import threading
+from io import BytesIO
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -15,14 +16,19 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 
 import customtkinter as ctk
 from openai import AsyncOpenAI
+from PIL import Image
 
 from config import BACKENDS, DEFAULT_BACKEND
 from events import AgentEvent, compact_count, tool_label
-from main import STATE_FILE, RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
+from main import (
+    RUN_MODE_PROFILES, STATE_FILE, RunOptions, RunReport, close_model_clients,
+    create_model_clients, run_agent_with_callback,
+)
 from state_manager import EpisodeMetrics
 from markdown_render import render_markdown
 from conversation import Exchange, make_exchange, trim_history
 from capabilities import CapabilityService
+from voice import VoiceInput, VoiceInputError
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
@@ -44,7 +50,45 @@ WARNING: str = "#FFC107"
 INFO: str = "#B1B9F9"
 
 MONO_FAMILY: str = "Menlo"
-BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "opencode", "minimax", "opencode-think", "claude", "openai")
+BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "zen-free", "openai", "opencode", "minimax", "opencode-think", "claude")
+RUN_MODE_CHOICES: Tuple[str, ...] = tuple(
+    profile["label"] for profile in RUN_MODE_PROFILES.values()
+)
+RUN_MODE_KEYS: Dict[str, str] = {
+    profile["label"]: key for key, profile in RUN_MODE_PROFILES.items()
+}
+VOICE_MAX_SECONDS: int = 55
+
+MICROPHONE_SVG: str = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect x="9" y="3" width="6" height="11" rx="3" stroke="ICON_COLOR" stroke-width="1.8"/>
+  <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7" stroke="ICON_COLOR" stroke-width="1.8" stroke-linecap="round"/>
+</svg>
+"""
+COPY_SVG: str = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect x="8" y="8" width="11" height="12" rx="2" stroke="ICON_COLOR" stroke-width="1.8"/>
+  <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2" stroke="ICON_COLOR" stroke-width="1.8" stroke-linecap="round"/>
+</svg>
+"""
+
+
+def _svg_ctk_image(svg: str, color: str, size: int = 20) -> ctk.CTkImage:
+    """macOS SVG verisini CTkImage'a çevirir; ikon yüklenemezse sessiz boş yedeğe düşer."""
+    rendered: str = svg.replace("ICON_COLOR", color)
+    try:
+        import AppKit
+        encoded: bytes = rendered.encode("utf-8")
+        data = AppKit.NSData.dataWithBytes_length_(encoded, len(encoded))
+        native = AppKit.NSImage.alloc().initWithData_(data)
+        tiff = native.TIFFRepresentation()
+        image: Image.Image = Image.open(BytesIO(tiff)).convert("RGBA")
+    except Exception:
+        image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    image.thumbnail((size, size), getattr(Image, "Resampling", Image).LANCZOS)
+    image = image.copy()
+    return ctk.CTkImage(light_image=image, dark_image=image, size=(size, size))
+
 SPINNER_FRAMES: Tuple[str, ...] = ("·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢")
 
 FRAME_MS: int = 16
@@ -180,6 +224,10 @@ class OmniUI(ctk.CTk):
         self.bind("<Map>", lambda event: self.after_idle(self._style_native_titlebar)
                   if event.widget is self else None, add="+")
         self._ui_family: str = tkfont.nametofont("TkDefaultFont").actual("family")
+        self._voice_icon: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_DIM)
+        self._voice_icon_active: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT)
+        self._voice_icon_busy: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_FAINT)
+        self._copy_icon: ctk.CTkImage = _svg_ctk_image(COPY_SVG, TEXT_DIM)
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -196,6 +244,15 @@ class OmniUI(ctk.CTk):
         self._active_goal: str = ""
         self._input_futures: Dict[str, asyncio.Future] = {}
         self._input_windows: Dict[str, ctk.CTkToplevel] = {}
+        self._voice_queue: "Queue[Tuple[str, str]]" = Queue()
+        self._voice_base_text: str = ""
+        self._voice_partial_text: str = ""
+        self._voice = VoiceInput(
+            self._queue_voice_text,
+            self._queue_voice_state,
+            max_seconds=VOICE_MAX_SECONDS,
+            on_partial=self._queue_voice_partial,
+        )
         self._region_seq: int = 0
         # Akan bölgeler: bekleyen metin, metin etiketi, imleç var mı, model hâlâ yazıyor mu
         self._pending_text: Dict[str, str] = {}
@@ -269,12 +326,18 @@ class OmniUI(ctk.CTk):
             header, text=self._model_text(DEFAULT_BACKEND), text_color=TEXT_FAINT,
             font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
-        self.model_label.grid(row=0, column=3, padx=(0, 12))
+        self.model_label.grid(row=0, column=3, padx=(0, 8))
+        self.copy_btn: ctk.CTkButton = ctk.CTkButton(
+            header, text="", image=self._copy_icon, width=30, height=28, corner_radius=8,
+            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
+            border_color=BORDER, command=self._copy_transcript, cursor="hand2",
+        )
+        self.copy_btn.grid(row=0, column=4, padx=(0, 6))
         ctk.CTkButton(
             header, text="Temizle", width=64, height=26, corner_radius=8, fg_color="transparent",
             hover_color=SURFACE_RAISED, border_width=1, border_color=BORDER, text_color=TEXT_DIM,
             font=self._ui_font(12, "normal"), command=self._clear_transcript,
-        ).grid(row=0, column=4)
+        ).grid(row=0, column=5)
 
     def _build_transcript(self) -> None:
         frame: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -377,6 +440,15 @@ class OmniUI(ctk.CTk):
         )
         self.entry.grid(row=0, column=1, sticky="ew", pady=8)
         self.entry.bind("<Return>", lambda event: self._on_primary_button())
+        self.mode_menu: ctk.CTkOptionMenu = ctk.CTkOptionMenu(
+            composer, values=list(RUN_MODE_CHOICES), width=82, height=28, corner_radius=8,
+            fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
+            dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED, dropdown_text_color=TEXT,
+            text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
+            dropdown_font=ctk.CTkFont(family=MONO_FAMILY, size=11),
+        )
+        self.mode_menu.set(RUN_MODE_CHOICES[0])
+        self.mode_menu.grid(row=0, column=2, padx=(6, 4))
         self.backend_menu: ctk.CTkOptionMenu = ctk.CTkOptionMenu(
             composer, values=list(BACKEND_CHOICES), width=126, height=28, corner_radius=8,
             fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
@@ -385,13 +457,19 @@ class OmniUI(ctk.CTk):
             dropdown_font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
         self.backend_menu.set("Otomatik")
-        self.backend_menu.grid(row=0, column=2, padx=(6, 6))
+        self.backend_menu.grid(row=0, column=3, padx=(4, 6))
+        self.voice_btn: ctk.CTkButton = ctk.CTkButton(
+            composer, text="", image=self._voice_icon, width=34, height=34, corner_radius=17,
+            fg_color=SURFACE_RAISED, hover_color=SURFACE_RAISED, text_color=TEXT_DIM,
+            command=self._toggle_voice, cursor="hand2",
+        )
+        self.voice_btn.grid(row=0, column=4, padx=(0, 6))
         self.primary_btn: ctk.CTkButton = ctk.CTkButton(
             composer, text="↑", width=34, height=34, corner_radius=17, fg_color=ACCENT, hover_color=ACCENT_HOVER,
             text_color=BG, font=ctk.CTkFont(family=self._ui_family, size=17, weight="bold"),
             command=self._on_primary_button,
         )
-        self.primary_btn.grid(row=0, column=3, padx=(0, 10))
+        self.primary_btn.grid(row=0, column=5, padx=(0, 10))
 
     def _build_footer(self) -> None:
         footer: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -720,6 +798,20 @@ class OmniUI(ctk.CTk):
                 self._handle_event(item["event"])
             if item["done"]:
                 self._on_run_done(item["error"], item["report"])
+        # Ses callback'leri Tk thread'inde doğrudan çalışmaz; aynı kare döngüsünde
+        #Queue'dan alınır. Böylece PyObjC callback'i UI'yi yarıda bırakamaz.
+        for _ in range(20):
+            try:
+                voice_kind, voice_value = self._voice_queue.get_nowait()
+            except Empty:
+                break
+            if voice_kind == "text":
+                self._insert_voice_text(voice_value)
+            elif voice_kind == "partial":
+                self._insert_voice_partial(voice_value)
+            else:
+                self._set_voice_state(voice_kind, voice_value)
+            processed += 1
         changed: bool = self._typewriter_step() or processed > 0
         if now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL:
             self._last_running_refresh = now
@@ -747,6 +839,113 @@ class OmniUI(ctk.CTk):
             return
         self._send_goal()
 
+    def _queue_voice_text(self, text: str) -> None:
+        """Kesin ses sonucunu UI kuyruğuna aktarır."""
+        self._voice_queue.put(("text", text))
+
+    def _queue_voice_partial(self, text: str) -> None:
+        """Ara Speech sonucunu UI kuyruğuna aktarır."""
+        self._voice_queue.put(("partial", text))
+
+    def _queue_voice_state(self, state: str, message: str) -> None:
+        """Ses motoru durumunu Tk thread'ine aktarır."""
+        self._voice_queue.put((state, message))
+
+    def _copy_transcript(self) -> None:
+        """Transkriptte görünen sohbeti tek dokunuşla panoya kopyalar."""
+        transcript: str = self._text.get("1.0", "end-1c")
+        if not transcript.strip():
+            return
+        self.clipboard_clear()
+        self.clipboard_append(transcript)
+        self.update_idletasks()
+        self.copy_btn.configure(
+            fg_color=SUCCESS, hover_color=SUCCESS, border_color=SUCCESS,
+        )
+        self.after(900, self._restore_copy_button)
+
+    def _restore_copy_button(self) -> None:
+        """Kopyalama geri bildirimini eski SVG buton görünümüne döndürür."""
+        try:
+            self.copy_btn.configure(
+                fg_color="transparent", hover_color=SURFACE_RAISED, border_color=BORDER,
+            )
+        except tk.TclError:
+            return
+
+    def _replace_entry_text(self, text: str, disabled: bool = False) -> None:
+        """Entry'yi programatik olarak günceller; ses sırasında kullanıcı yazımını kilitler."""
+        self.entry.configure(state="normal")
+        self.entry.delete(0, "end")
+        self.entry.insert(0, text)
+        if disabled:
+            self.entry.configure(state="disabled")
+
+    def _restore_voice_draft(self) -> None:
+        """Hatalı/iptal edilen oturumda ara metni eski composer içeriğine geri alır."""
+        self._replace_entry_text(self._voice_base_text)
+        self._voice_partial_text = ""
+
+    def _toggle_voice(self) -> None:
+        """Mikrofonu aç/kapat; tanıma sonucu otomatik gönderilmez, önce düzenlenebilir."""
+        if self._agent_future is not None and not self._agent_future.done():
+            return
+        try:
+            if self._voice.active:
+                if self._voice.recording:
+                    self._voice.stop()
+                return
+            self._voice_base_text = self.entry.get()
+            self._voice_partial_text = ""
+            self._voice.start()
+        except VoiceInputError as error:
+            self._set_voice_state("error", str(error))
+
+    def _set_voice_state(self, state: str, message: str) -> None:
+        """Sesli giriş durumunu composer düğmesine ve transkripte yansıtır."""
+        if state == "recording":
+            self.voice_btn.configure(image=self._voice_icon_active, fg_color=ERROR, hover_color=ERROR,
+                                     text_color=TEXT, state="normal")
+            self.entry.configure(state="disabled")
+        elif state in ("requesting", "transcribing"):
+            self.voice_btn.configure(image=self._voice_icon_busy, state="disabled")
+            self.entry.configure(state="disabled")
+        else:
+            self.voice_btn.configure(image=self._voice_icon, fg_color=SURFACE_RAISED, hover_color=SURFACE_RAISED,
+                                     text_color=TEXT_DIM, state="normal")
+            self.entry.configure(state="normal")
+        if state in ("error", "recording_timeout", "idle"):
+            self._restore_voice_draft()
+        if state in ("error", "recording_timeout"):
+            text: str = message or "Sesli giriş tamamlanamadı."
+            self._text.configure(state="normal")
+            self._new_region([(f"🎙 {text}\n", ("notice_warning",))])
+            self._text.configure(state="disabled")
+            self.entry.focus_set()
+
+    def _insert_voice_partial(self, text: str) -> None:
+        """Speech'in kümülatif ara sonucunu composer'da canlı olarak gösterir."""
+        transcript: str = text.strip()
+        self._voice_partial_text = transcript
+        if not transcript:
+            self._replace_entry_text(self._voice_base_text, disabled=True)
+            return
+        separator: str = " " if self._voice_base_text and not self._voice_base_text.endswith((" ", "\n")) else ""
+        self._replace_entry_text(self._voice_base_text + separator + transcript, disabled=True)
+
+    def _insert_voice_text(self, text: str) -> None:
+        """Kesin tanımayı composer'a yazar ve oturum başındaki metni korur."""
+        transcript: str = text.strip()
+        if transcript:
+            separator: str = " " if self._voice_base_text and not self._voice_base_text.endswith((" ", "\n")) else ""
+            rendered: str = self._voice_base_text + separator + transcript
+        else:
+            rendered = self._voice_base_text
+        self._replace_entry_text(rendered)
+        self._voice_base_text = rendered
+        self._voice_partial_text = ""
+        self.entry.focus_set()
+
     def _request_stop(self) -> None:
         if self._agent_future is not None and not self._agent_future.done():
             self._stop_event.set()
@@ -762,6 +961,11 @@ class OmniUI(ctk.CTk):
         goal: str = self.entry.get().strip()
         if not goal:
             return
+        if self._voice.active:
+            self._voice.cancel()
+            # Eski oturumun idle callback'i yeni görev composer'ına yazmasın.
+            self._voice_base_text = ""
+            self._voice_partial_text = ""
         self._active_goal = goal
         self.entry.delete(0, "end")
         self._text.configure(state="normal")
@@ -775,8 +979,11 @@ class OmniUI(ctk.CTk):
         self._run_started_at = time.monotonic()
         self._activity_verb = "Düşünüyor"
         self.backend_menu.configure(state="disabled")
+        self.mode_menu.configure(state="disabled")
+        self.voice_btn.configure(state="disabled")
         self.primary_btn.configure(text="■", fg_color=SURFACE_RAISED, hover_color=BORDER, text_color=TEXT)
         selected: str = self.backend_menu.get()
+        selected_mode: str = RUN_MODE_KEYS.get(self.mode_menu.get(), "normal")
         self._stop_event = threading.Event()
         options: RunOptions = {
             "requested_backend": None if selected == "Otomatik" else selected,
@@ -785,6 +992,7 @@ class OmniUI(ctk.CTk):
             "history": trim_history(self._history),
             "integrations": self._integrations,
             "answer": self._request_input,
+            "run_mode": selected_mode,
         }
         self._agent_future = asyncio.run_coroutine_threadsafe(
             run_agent_with_callback(goal, self._post, options, self._clients), self._loop,
@@ -873,6 +1081,11 @@ class OmniUI(ctk.CTk):
             self._new_region([(f"⚠ Kritik hata: {error}\n", ("notice_error",))])
         self._end_live_regions()
         self.backend_menu.configure(state="normal")
+        self.mode_menu.configure(state="normal")
+        self.voice_btn.configure(
+            text="", image=self._voice_icon, fg_color=SURFACE_RAISED,
+            hover_color=SURFACE_RAISED, text_color=TEXT_DIM, state="normal",
+        )
         self.primary_btn.configure(text="↑", fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=BG)
         self._set_activity_idle()
         self.entry.focus_set()
@@ -897,7 +1110,8 @@ class OmniUI(ctk.CTk):
         self.stats_label.configure(text="")
 
     def _on_close(self) -> None:
-        """Pencere kapanırken istemci bağlantılarını kapatıp event loop'u durdurur."""
+        """Pencere kapanırken ses/istemci kaynaklarını kapatıp event loop'u durdurur."""
+        self._voice.cancel()
         self._stop_event.set()
         async def close_connections() -> None:
             if self._agent_future is not None and not self._agent_future.done():

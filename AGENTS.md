@@ -10,9 +10,11 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   üzerine yazmadan önce `.omni_backups/` içine zaman damgalı yedek alır; eksik üst dizinleri
   oluşturur ve bunu sonuçta açıkça bildirir (yazım hatalı bir yol sessizce dizin açmasın).
 - `execute_shell`: bilinen yıkıcı komut kalıplarını (`rm -rf /`, `mkfs`, fork bomb, disk
-  biçimlendirme vb.) ve korunan yollara `>`/`>>`/`tee` yönlendirmesini engeller; `sudo`
-  çağrıları yapılandırılmış log ile kaydedilir ve parolasız (`-n`) olmayan sudo oturumlarında
-  güvenli şekilde başarısız olur.
+  biçimlendirme vb.), çözülemeyen kabuk değişkeni hedeflerini ve korunan yollara `>`/`>>`/`tee`
+  yönlendirmesini engeller; `sudo` çağrıları yapılandırılmış log ile kaydedilir ve parolasız (`-n`)
+  olmayan sudo oturumlarında güvenli şekilde başarısız olur.
+- `fetch_raw`: yalnızca `http`/`https` adreslerini kabul eder; `file://` ve yönlendirme ile yerel
+  dosya okuma olasılığı kapatılır.
 - Model yalnızca `main.build_tool_schemas` içindeki araç adlarını çağırabilir; `Toolbox`'ın
   özel yöntemlerine (`_read_full`, `close_browser`…) erişemez.
 - GUI araçları erişilebilirlik veya ekran kaydı izni yoksa açık hata verir (macOS izinsiz
@@ -32,9 +34,13 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 ## 🛠️ @Chatgpt-System Plugin Entegrasyonu
 `@Chatgpt-System` pluginindeki yetenekler `Toolbox` yapısına şu hâlleriyle entegre edildi:
 1. **Süreç Yönetimi:** `process_list` aracı (süreç sayısı + CPU'ya göre en ağır 15 süreç).
-2. **Koordinat Takibi:** tek ortak koordinat uzayı. Ekran görüntüsü, AX öğe listesi ve bütün
-   tıklama/taşıma koordinatları aynı uzaydadır (uzun kenar `MODEL_SCREEN_MAX_EDGE`); Retina
-   piksel ↔ nokta dönüşümünü araçlar yapar. Ayrı imleç konumu aracı araç diyetiyle kaldırıldı.
+2. **Koordinat Takibi:** tek ortak koordinat uzayı: 1000×1000 kare (`MODEL_SCREEN_SIZE`, ekran
+   oranı korunmaz). Ekran görüntüsü, AX öğe listesi ve bütün tıklama/taşıma noktaları
+   (`point: [x, y]`) bu uzaydadır; Retina piksel ↔ nokta dönüşümünü araçlar yapar. qwen
+   koordinatı 0-1000 normalize, Claude/GPT görüntü pikseli verir; kare görüntüde ikisi aynı
+   sayıdır. Ölçüm: 1280×832 görüntü + ayrı x/y alanlarıyla 10 tıklamada 1 isabet ve 7 bozuk
+   argüman (`"x": [x, y]`); kare görüntü + `point` ile 10/10 isabet, 0 bozuk. Ayrı imleç
+   konumu aracı araç diyetiyle kaldırıldı.
 3. **Oturum ve Yetki:** etkisiz `session_authority_*` araçları kaldırıldı; sudo durumu
    `execute_shell` ile `sudo -n true` çalıştırılarak denetlenir.
 
@@ -65,22 +71,44 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   listeler (Chrome ~150ms, Notlar ~650ms); `cua_click` AXPress ile tıklar. Ekran görüntüsü
   yalnızca AX yetmediğinde gerekir. Metin, klavye düzeninden bağımsız Unicode olaylarıyla yazılır
   (Türkçe/Fince karakterler ve emoji doğrulandı; pyautogui bunları sessizce atlıyordu).
+- **Eylem → gözlem:** `take_screenshot`, son ekran girdisinden sonra sabit uyku yerine ekranın
+  durulmasını bekler: girdi öncesi kareye göre tepki (≤1 sn), ardından 0,45 sn sakinlik, en çok
+  3 sn. Karşılaştırma son değişim karesine göredir; yükleme iskeletinin düşük kontrastlı
+  parıltısı ancak böyle yakalandı. Yakalama Quartz + CoreGraphics ile ~55 ms (screencapture alt
+  süreci ~260 ms idi).
+- **Açık Chrome yolu:** eylem içeren her tur, görüntü istenmediyse ekran durulunca otomatik
+  gözlemle biter (ayrı "ekran görüntüsü al" turu yok). `chrome_active_tab` aynı kökenli sekmeyi
+  kimlikle bulup yüklenmesini bekler; ara/gönder tek `cua_submit_text` çağrısıdır. Chrome AX
+  ağacı web içeriğini vermediği (`AXManualAccessibility` desteklenmiyor, `AXEnhancedUserInterface`
+  ayarlanamıyor) için AX araçları bu yolda kapalıdır. `benchmark.py --only chrome_ilan
+  --concurrency 1` (2026-09-23): önce 1/2 başarı, medyan 73 sn, 14-24 tur → sonra 3/3, medyan
+  30 sn, 6 tur. Uzun görevlerde model artık her araç turunda kısa `STATE:` çalışma kaydı
+  tutmaya yönlendirilir; aynı tam Chrome URL'sinin ikinci ve sonraki başarılı açılışlarında
+  yeniden gezinme uyarısı alır.
 - **Bağlam:** son `FULL_DETAIL_TURNS` turdan eski uzun araç çıktıları, görseller ve argümanlar
   budanır (`_trim_old_turns`). Yaş TUR ile ölçülür, son tur asla kırpılmaz; pencere tur tur
   kaydığı için önek bayt bayt aynı kalır ve sağlayıcı önek önbelleği isabet eder (~%70).
-  Modelin `reasoning_content`'i geçmişe eklenmez.
+  Eski multimodal gözlemde görüntü atılırken aynı mesajdaki metinsel kısım korunur; böylece
+  `STATE`/gözlem metni görselle birlikte kaybolmaz. Modelin `reasoning_content`'i geçmişe
+  eklenmez. 60 bin önbelleksiz giriş tokenı veya 24 araç çağrısından sonra tek seferlik yumuşak
+  bütçe uyarısı yeni/opsiyonel keşfi kesip hesaplama, yazma, doğrulama ve cleanup gibi zorunlu
+  teslim adımlarına öncelik verir; görevi kendiliğinden abort etmez.
 - **Zaman sınırları:** model isteği 60sn (bağlantı 5sn) ve SDK içi yeniden deneme kapalıdır
-  (SDK varsayılanı 600sn + 2 gizli deneme idi); görev başına 10dk (`MAX_WALL_CLOCK_SECONDS`)
-  ve 25 tur.
+  (SDK varsayılanı 600sn + 2 gizli deneme idi); composer'da Normal 25 tur/10dk,
+  Uzun 50 tur/20dk, Otonom 100 tur/45dk bütçeleri sunar. Dört ardışık tamamen başarısız
+  araç turu ilerleme yok sayılır.
 - **Akış:** model yanıtı `stream=True` ile alınır. Metin, düşünme metni, araç çağrısı
   önizlemesi (komut model yazarken harf harf) ve komut çıktısı (`run_streaming_process`,
   satır satır) `events.py`'deki tipli olaylarla yayınlanır; yarıda kesilen akış yeniden
   denenirse önce `stream_reset` gelir. Durdurma isteği model akışını ve çalışan komutu (süreç
   grubuyla) anında keser.
 - **Bellek:** `cognitive_memory.json` son 30 görevi ölçümleriyle kaydeder ve modele geri
-  enjekte EDİLMEZ. Otomatik ders/rota enjeksiyonu ölçümde zararlı bulundu (alakasız "çözümler",
-  başka görevlerin yolları, "görev belirtilmedi" yanıtları) ve kaldırıldı; macOS'a özgü bilinen
-  tuzaklar `SYSTEM_PROMPT` içindeki sabit ENVIRONMENT bloğundadır.
+  enjekte EDİLMEZ. `user_memory.json` ise yalnızca kullanıcının açıkça istediği tercih, sık yol
+  ve karar kayıtlarını atomik olarak tutar; `user_memory` aracı olmadan okunmaz, her görevde
+  otomatik olarak enjekte edilmez ve parola/token/API anahtarı gibi gizli bilgileri reddeder.
+  Otomatik ders/rota enjeksiyonu ölçümde zararlı bulundu (alakasız "çözümler", başka görevlerin
+  yolları, "görev belirtilmedi" yanıtları) ve kaldırıldı; macOS'a özgü bilinen tuzaklar
+  `SYSTEM_PROMPT` içindeki sabit ENVIRONMENT bloğundadır.
 
 ## 🖥️ Arayüz (ui.py)
 - Yalnızca `events.py` olaylarını tüketir; log metni ayrıştırılmaz. Olaylar ajan thread'lerinden
@@ -91,7 +119,10 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 - Animasyonlar: daktilo akışı, yanıp sönen imleç ve çalışan araç işareti, yıldız spinner'lı ve
   parıltılı durum satırı (süre, token, "esc ile durdur").
 - Görevler kalıcı bir event loop'ta paylaşımlı model istemcileriyle çalışır; `Esc` durdurur,
-  `⌘K` temizler.
+  `⌘K` temizler. Composer'da Normal/Uzun/Otonom bütçe profili ve macOS yerel mikrofon
+  düğmesi bulunur; mikrofon SVG ikonludur, `AVAudioEngine` buffer'ları konuşma sırasında
+  partial metni composer'a akıtır ve stop sonrası final sonucu otomatik gönderilmez. Header'daki
+  SVG kopyala düğmesi görünen transcript'in tamamını panoya alır.
 
 ## 🔀 Çoklu Model Backend'i (config.py: BACKENDS)
 - Dört profil: `opencode` (varsayılan, qwen3.8-flash, düşünme kapalı), `opencode-think` (aynı
@@ -99,8 +130,12 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   `openai` (gpt-5-mini). Hepsi opencode'un auth.json'ındaki anahtarları kullanır.
 - **Kalite merdiveni:** art arda `CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD` (2) tamamen başarısız
   araç turunda `QUALITY_LADDER` boyunca çıkılır: `opencode` → `opencode-think` → `claude`.
-- **API hataları:** ilk iki deneme aynı backend'de (5xx/429/bağlantı), son deneme `claude`'da;
-  zaman aşımında doğrudan `claude`'a atlanır; kalıcı 4xx hataları yeniden denenmez.
+- **API hataları:** ilk iki deneme aynı backend'de (5xx/429/bağlantı; akıştan sarılmadan yükselen
+  `ssl.SSLError` dahil), son deneme `claude`'da; zaman aşımında doğrudan `claude`'a atlanır;
+  kalıcı 4xx hataları yeniden denenmez. API hatası nedeniyle kullanılan farklı backend yalnız
+  o model turunun fallback'idir; sonraki tur tercih edilen/mevcut backend yeniden denenir.
+  Kalıcı backend değişimi yalnız art arda başarısız araç turlarındaki kalite merdiveniyle olur.
+  Böylece geçici ağ hatası uzun görevi Claude'un 2048 `max_tokens` sınırına kilitlemez.
 - **Önbellek:** `claude` profili `cache_control` gönderir (OpenRouter'da Anthropic önek önbelleği
   yalnızca bununla açılır); opencode öneki kendiliğinden önbellekler.
 - **Manuel seçim:** `OMNI_BACKEND=<profil>` ya da arayüzdeki seçim (anahtar yoksa varsayılana
@@ -112,6 +147,8 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 ## 🎯 Hedefler
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (bkz. Plugin Entegrasyonu)
 - [x] Ajanın kendi yetki seviyesini yönetebildiği bir güvenlik katmanı eklemek. (bkz. 🛡️ Güvenlik Rayları)
+- [x] Açıkça istenen tercih, yol ve kararları atomik `user_memory.json` deposunda tutup otomatik
+  enjeksiyon yapmadan hatırlama/arama/silme akışı eklemek.
 - [x] Vizyon ve koordinat sistemini hibrit hale getirmek. (`smart_click`: AX → görsel şablon; tek ortak koordinat uzayı)
 - [x] Ajan döngüsünü canlı hedeflerle ölçüp hız/doğruluk sınırlarını ayarlamak.
   (2026-09-23, `benchmark.py`, 9 senaryo × 3 koşu: başarı 19/27 → 27/27, medyan 17,3sn → 4,5sn.)

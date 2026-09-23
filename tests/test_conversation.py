@@ -11,6 +11,24 @@ from conversation import make_exchange, to_messages, tool_digest, trim_history
 from state_manager import make_step_record
 
 
+def test_run_mode_budgets_are_bounded_and_overridable() -> None:
+    base = {"requested_backend": None, "should_stop": lambda: False,
+            "state_file": "/tmp/omni-test-memory.json", "history": []}
+    assert main.resolve_run_limits(base) == ("normal", main.MAX_ITERATIONS, main.MAX_WALL_CLOCK_SECONDS)
+    assert main.resolve_run_limits({**base, "run_mode": "extended"}) == ("extended", 50, 1200.0)
+    assert main.resolve_run_limits({**base, "run_mode": "autonomous"}) == ("autonomous", 100, 2700.0)
+    assert main.resolve_run_limits({**base, "run_mode": "extended", "max_iterations": 7}) == ("extended", 7, 1200.0)
+
+
+def test_run_mode_rejects_invalid_budget() -> None:
+    base = {"requested_backend": None, "should_stop": lambda: False,
+            "state_file": "/tmp/omni-test-memory.json", "history": []}
+    with pytest.raises(ValueError):
+        main.resolve_run_limits({**base, "run_mode": "unknown"})
+    with pytest.raises(ValueError):
+        main.resolve_run_limits({**base, "max_iterations": 0})
+
+
 def test_empty_history_and_order() -> None:
     assert to_messages([]) == []
     history = [make_exchange("ilk", "bir", []), make_exchange("ikinci", "iki", [])]

@@ -18,4 +18,36 @@ Kalıcı katalog `~/Library/Application Support/OmniAgent/catalog.json` dosyası
 
 Sabit sürümlü Python paketleri ana ajan ortamından ayrı sanal ortama; Node paketleri ayrı dizine kurulur. Kurulum görev başına bir kez denenir ve 60 saniyeyle sınırlıdır. Hazır stdio/Streamable HTTP MCP bağlantıları uygulama oturumunda yeniden kullanılır. Güvenilir skill metni yalnız görevle ilgili yardımcı bilgi olarak modele verilir; sistem istemini veya hesap yetkisini değiştirmez.
 
+## Composer modları ve sesli giriş
+
+Composer'da üç açık görev profili bulunur:
+
+- **Normal**: 25 model turu / 10 dakika (varsayılan).
+- **Uzun**: 50 model turu / 20 dakika.
+- **Otonom**: 100 model turu / 45 dakika.
+
+Otonom mod yalnızca bütçeyi genişletir; dosya, shell ve GUI güvenlik raylarını kapatmaz.
+Dört ardışık tamamen başarısız araç turunda ajan ilerleme yok sayarak durur.
+
+Mikrofon düğmesi macOS'un Speech framework'ünü ve `AVAudioEngine` canlı buffer
+akışını kullanır. Gizlilik için ağ fallback'i yoktur: seçili dilde `supportsOnDeviceRecognition`
+desteklenmiyorsa sesli giriş açık hatayla devre dışı kalır ve Speech request'i
+`requiresOnDeviceRecognition=true` ile çalışır. İzin API'lerine girmeden önce
+`NSMicrophoneUsageDescription` ve `NSSpeechRecognitionUsageDescription` runtime'da doğrulanır;
+eksik metadata crash riski yerine kullanıcıya hata olarak gösterilir. Kayıt 55 saniyeyle sınırlıdır.
+İlk kullanımda mikrofon ve konuşma tanıma izinleri istenir. Konuşma sürerken partial sonuçlar composer'a yazılır, düğmeye tekrar basılınca
+buffer akışı durur ve final sonuç taslağa eklenir; otomatik gönderilmez. Geçici ses dosyası
+oluşturulmaz. Mikrofon düğmesi ve transcript kopyalama düğmesi SVG ikon kullanır.
+Paketlenmiş veya Python.app tabanlı runtime'ın Info.plist dosyasında bu iki privacy anahtarı bulunmalıdır.
+
+## Kalıcı kullanıcı hafızası
+
+`user_memory` aracı, kullanıcı açıkça istediği kısa tercih, sık kullanılan yol veya kalıcı kararı
+`user_memory.json` dosyasına atomik olarak yazar. Görevler arasında hatırlanabilir; ancak kayıtlar
+otomatik olarak model istemine enjekte edilmez, yalnızca model gerektiğinde arar. `remember` ve
+`forget` işlemleri yalnız mevcut kullanıcı hedefi açıkça kalıcı hafıza değişikliği istediğinde
+runtime tarafından açılır; prompt talimatı tek güvenlik sınırı değildir. Parola/token/API anahtarı
+tespiti best-effort bir denylist/desen filtresidir ve evrensel secret scanner garantisi vermez.
+`recall` hafızayı değiştirmediği için mutation capability olmadan kullanılabilir.
+
 Test: `OMNI_UI_TEST=1 .venv/bin/python -m pytest -q`. Hız karşılaştırması için `benchmark.py --runs 3 --json ...` kullanılır.

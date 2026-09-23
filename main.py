@@ -3,7 +3,11 @@ import base64
 import json
 import logging
 import os
+import re
+import shutil
+import ssl
 import sys
+import tempfile
 import time
 import uuid
 from datetime import date
@@ -16,8 +20,9 @@ from openai.types import CompletionUsage
 from PIL import Image
 
 from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER, SYSTEM_PROMPT, BackendProfile
+from cli_backends import CliModelError, run_cli_model
 from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
-from tools import MODEL_SCREEN_MAX_EDGE, TOOL_RUNTIME, Toolbox, ToolError
+from tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, Toolbox, ToolError
 import state_manager as sm
 from conversation import Exchange, make_exchange, to_messages
 from capabilities import CapabilityService, DISCOVERY_SCHEMA, discovery_entry, validate_arguments
@@ -29,6 +34,20 @@ from integration_runtime import (
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
 MAX_ITERATIONS: int = 25
 MAX_WALL_CLOCK_SECONDS: float = 600.0
+# Uzun görevler sabit 25 tur sınırına takılmasın; her profil hâlâ açık ve sınırlı bir bütçedir.
+# Otonom profil güvenlik rayları kapatmaz; yalnızca tur/zaman bütçesini genişletir.
+class RunModeProfile(TypedDict):
+    label: str
+    max_iterations: int
+    max_wall_clock_seconds: float
+
+
+RUN_MODE_PROFILES: Dict[str, RunModeProfile] = {
+    "normal": {"label": "Normal", "max_iterations": 25, "max_wall_clock_seconds": 600.0},
+    "extended": {"label": "Uzun", "max_iterations": 50, "max_wall_clock_seconds": 1200.0},
+    "autonomous": {"label": "Otonom", "max_iterations": 100, "max_wall_clock_seconds": 2700.0},
+}
+NO_PROGRESS_LIMIT: int = 4
 # Tam ayrıntıyla tutulan son model turu sayısı. Daha eski turların uzun araç çıktıları,
 # ekran görüntüleri ve uzun araç argümanları budanır. Yaş TUR ile ölçülür: son turun
 # sonuçları (paralel toplu okumalar dahil) model onları görmeden asla kırpılmaz.
@@ -39,6 +58,14 @@ CALL_LABEL_ARGS_LIMIT: int = 100
 # Arayüze giden araç sonucu metninin üst sınırı (özet gösterimi için yeterli)
 EVENT_RESULT_LIMIT: int = 4000
 CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
+# Bunlar sert kesme değil, modeli zorunlu kalan işe yönelten yumuşak bütçe eşikleridir.
+# Toplam prompt token yerine önbelleksiz giriş kullanılır; önek önbelleği isabetleri gereksiz
+# alarm üretmesin. Uzun GUI araştırmasında 24 araç / 60k yeni girişten sonra yeni keşif yerine
+# kayıtlı STATE kullanılarak teslim adımlarına öncelik verilir.
+SOFT_UNCACHED_PROMPT_TOKEN_BUDGET: int = 60_000
+SOFT_TOOL_CALL_BUDGET: int = 24
+MAX_FINAL_LENGTH_RECOVERIES: int = 1
+
 # SDK varsayılanı 600sn zaman aşımı + 2 gizli yeniden denemeydi: takılan tek bir çağrı tüm
 # görev bütçesini yiyebiliyor, yükseltme mantığı da SDK aynı backend'i tekrar denedikten
 # sonra devreye giriyordu. Yeniden denemeyi yalnızca bu döngü yönetir. Akışta zaman aşımı
@@ -80,9 +107,14 @@ class RunOptions(TypedDict):
     should_stop: Callable[[], bool]
     # Epizot kaydının yazılacağı bellek dosyası (benchmark ayrı dosya kullanır)
     state_file: str
+    # Kullanıcı tercihleri için ayrı, atomik JSON deposu; verilmezse state_file ile aynı klasörde olur.
+    memory_file: NotRequired[str]
     history: List[Exchange]
     integrations: NotRequired[CapabilityService]
     answer: NotRequired[AnswerSink]
+    run_mode: NotRequired[str]
+    max_iterations: NotRequired[int]
+    max_wall_clock_seconds: NotRequired[float]
 
 
 class RunReport(TypedDict):
@@ -100,10 +132,18 @@ def encode_image(path: str) -> str:
     """
     with Image.open(path) as source:
         frame: Image.Image = source.convert("RGB")
-    frame.thumbnail((MODEL_SCREEN_MAX_EDGE, MODEL_SCREEN_MAX_EDGE))
+    frame.thumbnail((MODEL_SCREEN_SIZE, MODEL_SCREEN_SIZE))
     buffer: BytesIO = BytesIO()
     frame.save(buffer, format="JPEG", quality=70)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+# Ekran noktası tek [x, y] alanıdır: ayrı x/y tamsayı alanlarında qwen, yerel biçimi olan
+# [x, y]'yi x alanına yazıyordu (ölçümde 10 çağrının 7'si bozuk; point ile 0/10).
+POINT_SCHEMA: Dict[str, Any] = {
+    "type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2,
+    "description": "[x, y]: 1000×1000 ekran görüntüsündeki nokta.",
+}
 
 
 def _function_schema(name: str, description: str, properties: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -140,6 +180,21 @@ def active_chrome_session_goal(goal: Optional[str]) -> bool:
     ) and not any(term in lowered for term in ("chrome kullanma", "do not use chrome"))
 
 
+_MEMORY_MUTATION_PATTERNS: Tuple[re.Pattern[str], ...] = tuple(re.compile(pattern, re.IGNORECASE) for pattern in (
+    r"\bhatırla\b",
+    r"\bunut\b",
+    r"\bremember\b",
+    r"\bforget\b",
+    r"\b(?:hafızaya|hafizaya|belleğe|bellege)\s+(?:kaydet|ekle|yaz)\b",
+    r"\bkalıcı\s+(?:hafızaya|hafizaya|belleğe|bellege)\s+(?:kaydet|ekle|yaz)\b",
+))
+
+
+def memory_mutation_requested(goal: str) -> bool:
+    """Kalıcı kullanıcı hafızasını değiştirmek için açık kullanıcı niyeti var mı? Saf."""
+    return any(pattern.search(goal) is not None for pattern in _MEMORY_MUTATION_PATTERNS)
+
+
 def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
@@ -152,6 +207,18 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
         }),
         _function_schema("process_list", "Süreç sayısını ve CPU'ya göre en ağır 15 süreci döner.", {}),
+        _function_schema(
+            "user_memory",
+            "Kullanıcının açıkça belirttiği kalıcı tercih, sık kullanılan yol veya kararı saklar; "
+            "gerektiğinde arar veya siler. Parola, token ve API anahtarı saklamaz.",
+            {
+                "action": {"type": "string", "enum": ["remember", "recall", "forget"]},
+                "key": {"type": ["string", "null"], "description": "Tercih/yol/karar anahtarı."},
+                "value": {"type": ["string", "null"], "description": "remember işleminde saklanacak kısa değer."},
+                "query": {"type": ["string", "null"], "description": "recall işleminde arama metni; boşsa tüm kayıtlar."},
+                "category": {"type": ["string", "null"], "enum": ["preference", "path", "decision", None]},
+            },
+        ),
         _function_schema("read_file", "Bir dosyanın içeriğini okur (uzun dosyalar kısaltılır).", {
             "path": {"type": "string", "description": "Okunacak dosyanın yolu."},
         }),
@@ -200,8 +267,9 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
         }),
         _function_schema(
             "take_screenshot",
-            "Ekran görüntüsü alır, kaydeder ve sana görsel olarak gösterir. Görüntü koordinatları "
-            "tıklama araçlarıyla aynı uzaydadır. Yavaş ve pahalıdır: önce cua_get_ax_state dene.",
+            "Ekranın 1000×1000 görüntüsünü alır, kaydeder ve sana görsel olarak gösterir; görüntüdeki "
+            "noktalar tıklama araçlarına aynen verilir. Son fare/klavye eyleminden sonra ekran durulana kadar "
+            "kendisi bekler: öncesine bekleme ekleme. Pahalıdır: önce cua_get_ax_state dene.",
             {"filename": {"type": "string", "description": "Kaydedilecek .png veya .jpg dosya yolu."}},
         ),
         _function_schema("cua_get_app", "Uygulamayı başlatır veya öne getirir.", {
@@ -234,9 +302,9 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
         ),
         _function_schema(
             "run_action_sequence",
-            "Fare/klavye eylemlerini TEK çağrıda sırayla çalıştırır. click/move: x,y (ekran görüntüsü/AX "
-            "uzayı); type: text (her Unicode metin, Türkçe dahil); press: key ('enter', 'tab', 'escape', "
-            "'cmd+c', 'cmd+shift+t'); wait: seconds (en çok 5).",
+            "Fare/klavye eylemlerini TEK çağrıda sırayla çalıştırır. click/move: point [x, y] (ekran "
+            "görüntüsü/AX uzayı); type: text (her Unicode metin, Türkçe dahil); press: key ('enter', 'tab', "
+            "'escape', 'cmd+c', 'cmd+shift+t'); wait: seconds (en çok 5).",
             {
                 "steps": {
                     "type": "array",
@@ -245,8 +313,7 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
                         "type": "object",
                         "properties": {
                             "action": {"type": "string", "enum": ["click", "move", "type", "press", "wait"]},
-                            "x": {"type": "integer"},
-                            "y": {"type": "integer"},
+                            "point": POINT_SCHEMA,
                             "button": {"type": "string", "enum": ["left", "right", "middle"]},
                             "text": {"type": "string"},
                             "key": {"type": "string"},
@@ -261,18 +328,38 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
     if active_chrome_session_goal(goal):
         # Kullanıcının açık oturumu istendiğinde gizli Playwright/API yolu ve CDP
         # araştırmasına yol açan kabuk/Node araçları bu görevden çıkarılır.
+        # Chrome AX ağacı sayfa içeriğini değil yalnız tarayıcı çubuğunu gösterdiği için AX
+        # araçları canlı ölçümde yalnız boşa tur harcattı; öne getirme chrome_active_tab'dadır.
         excluded = {
             "browse_url", "discover_capabilities", "fetch_raw", "web_search",
             "execute_shell", "execute_js", "process_list",
+            "run_action_sequence", "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
         }
         schemas = [entry for entry in schemas if entry["function"]["name"] not in excluded]
         schemas.append(_function_schema(
             "chrome_active_tab",
-            "Kullanıcının zaten açık Google Chrome penceresindeki etkin sekmeyi kullanır. "
-            "url verilirse AYNI görünür sekmeye gider; null ise yalnız adresi/başlığı okur. "
-            "Giriş yapılmış Chrome profilini korur, ayrı tarayıcı açmaz.",
+            "Kullanıcının açık Google Chrome penceresini kullanır. URL verilirse aynı sitedeki "
+            "mevcut sekmeyi bulur ve görünür kılar; yoksa etkin sekmeye gider; sayfanın yüklenmesini bekler. "
+            "Null ise etkin sekmeyi okur. Giriş yapılmış Chrome profilini korur, ayrı tarayıcı açmaz.",
             {"url": {"type": ["string", "null"], "description": "Gidilecek http(s) adresi; mevcut sekmeyi okumak için null."}},
         ))
+        schemas.extend([
+            _function_schema("cua_click_point", "Son ekran görüntüsündeki noktaya sol tıklar.", {
+                "point": POINT_SCHEMA,
+            }),
+            _function_schema("cua_type_text", "Odaklı alana Unicode metin yazar.", {
+                "text": {"type": "string"},
+            }),
+            _function_schema("cua_press_key", "Tuşa/kısayola basar: enter, tab, escape, cmd+a gibi.", {
+                "key": {"type": "string"},
+            }),
+            _function_schema(
+                "cua_submit_text",
+                "point'teki alana tıklar, içeriğini text ile değiştirir ve Enter'a basar. Arama kutusu "
+                "veya tek alanlı gönderim için tıkla/yaz/Enter yerine bunu kullan.",
+                {"point": POINT_SCHEMA, "text": {"type": "string"}},
+            ),
+        ])
     if goal is not None and camera_photo_goal(goal):
         schemas.append(_function_schema(
             "capture_photo",
@@ -302,8 +389,17 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({"process_list", "read_file", "web_
 _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "execute_shell", "write_file", "execute_js", "take_screenshot", "browse_url",
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
-    "chrome_active_tab",
+    "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
+    "user_memory",
 })
+
+# Açık Chrome yolunda ekranı değiştiren araçlar. Bunlardan sonra görüntü alınmadıysa tur
+# sonunda ekran kendiliğinden gözlenir: canlı kayıtta her tıklama ayrı bir "ekran görüntüsü
+# al" turu ve 2 sn sabit bekleme gerektiriyordu (22 tur, 100 sn).
+_SCREEN_ACTION_TOOLS: frozenset[str] = frozenset({
+    "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
+})
+AUTO_OBSERVATION_PREVIEW: str = "otomatik gözlem"
 
 
 def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
@@ -411,12 +507,11 @@ def result_text(result: ToolResult) -> str:
 
 
 async def _run_tool_with_events(
-    index: int, call: ToolCallDraft, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
-    should_stop: Callable[[], bool],
+    index: int, call: ToolCallDraft, preview: str, toolbox: Toolbox, cache: Dict[str, ToolResult],
+    emit: EventSink, should_stop: Callable[[], bool],
 ) -> ToolResult:
-    """Aracı çalıştırır; başlangıcını ve bitişini (süre + sonuç) olay olarak yayınlar."""
-    emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
-          "preview": preview_arguments(call["name"], call["arguments"])})
+    """Aracı çalıştırır; başlangıcını (önizlemeyle) ve bitişini (süre + sonuç) olay olarak yayınlar."""
+    emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"], "preview": preview})
     started: float = time.monotonic()
     result: ToolResult = await execute_tool(call, toolbox, cache, emit, should_stop)
     emit({"kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
@@ -441,17 +536,20 @@ async def _execute_tool_calls(
     eylemden SONRA gelir (yarış yok).
     """
     results: List[Optional[ToolResult]] = [None] * len(calls)
+    previews: List[str] = [preview_arguments(call["name"], call["arguments"]) for call in calls]
     index: int = 0
     while index < len(calls):
         if _is_side_effect(calls[index]["name"]):
-            results[index] = await _run_tool_with_events(index, calls[index], toolbox, cache, emit, should_stop)
+            results[index] = await _run_tool_with_events(
+                index, calls[index], previews[index], toolbox, cache, emit, should_stop)
             index += 1
             continue
         stop: int = index
         while stop < len(calls) and not _is_side_effect(calls[stop]["name"]):
             stop += 1
         group: List[ToolResult] = list(await asyncio.gather(
-            *(_run_tool_with_events(k, calls[k], toolbox, cache, emit, should_stop) for k in range(index, stop))
+            *(_run_tool_with_events(k, calls[k], previews[k], toolbox, cache, emit, should_stop)
+              for k in range(index, stop))
         ))
         results[index:stop] = group
         index = stop
@@ -477,6 +575,37 @@ def _tool_result_to_message(call: ToolCallDraft, result: ToolResult) -> Dict[str
     return {"role": "tool", "tool_call_id": call["id"], "content": f"{_call_label(call)}\n{content}"}
 
 
+def update_chrome_visits(
+    visits: Dict[str, int], call: ToolCallDraft, result: ToolResult,
+) -> Tuple[Dict[str, int], Optional[str]]:
+    """
+    Başarılı chrome_active_tab URL ziyaretlerini yan etkisiz biçimde sayar. Aynı tam URL ikinci
+    kez açıldığında modele kısa bir durum uyarısı üretir; çağrıyı engellemez çünkü hedef final
+    revalidation isteyebilir. Böylece meşru doğrulama mümkün kalırken kör tekrar görünür olur.
+    """
+    updated: Dict[str, int] = dict(visits)
+    if call["name"] != "chrome_active_tab" or not result.get("ok"):
+        return updated, None
+    try:
+        arguments: object = json.loads(call["arguments"] or "{}")
+    except json.JSONDecodeError:
+        return updated, None
+    if not isinstance(arguments, dict):
+        return updated, None
+    url: object = arguments.get("url")
+    if not isinstance(url, str) or not url:
+        return updated, None
+    count: int = updated.get(url, 0) + 1
+    updated[url] = count
+    if count == 1:
+        return updated, None
+    return updated, (
+        f"STATE uyarısı: {url} bu görevde {count}. kez başarıyla açıldı. "
+        "Hedef açıkça yeniden doğrulama istemiyorsa ve gereken bilgi STATE içinde kayıtlıysa "
+        "bu sayfayı tekrar dolaşma; eksik zorunlu adıma geç."
+    )
+
+
 def _assistant_entry(turn: ModelTurn) -> Dict[str, Any]:
     """
     Model turunu geçmiş için {role, content, tool_calls} biçiminde kurar. Düşünme metni
@@ -499,7 +628,17 @@ def _trim_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     if entry.get("role") == "tool" and isinstance(content, str) and len(content) > TRIMMED_CONTENT_LIMIT:
         return {**entry, "content": content[:TRIMMED_CONTENT_LIMIT] + " …[eski çıktı kısaltıldı]"}
     if isinstance(content, list) and any(isinstance(part, dict) and part.get("type") == "image_url" for part in content):
-        return {**entry, "content": "[eski ekran görüntüsü bağlamdan çıkarıldı]"}
+        # Görseli atarken aynı mesajdaki metinsel gözlem/STATE bilgisini koru. Önceki davranış
+        # image_url gördüğü anda bütün multimodal mesajı tek placeholder'a çeviriyor, böylece
+        # görselle birlikte yazılmış dayanıklı gerçekleri de siliyordu.
+        text_parts: List[str] = [
+            str(part.get("text"))
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text" and part.get("text")
+        ]
+        preserved: str = "\n".join(text_parts)
+        marker: str = "[eski ekran görüntüsü bağlamdan çıkarıldı]"
+        return {**entry, "content": f"{preserved}\n{marker}" if preserved else marker}
     if entry.get("role") == "assistant" and entry.get("tool_calls"):
         return {**entry, "tool_calls": [
             {**call, "function": {**call["function"], "arguments": "{}"}}
@@ -541,10 +680,17 @@ def build_system_prompt(today: date, goal: Optional[str] = None) -> str:
         "\n### USER'S OPEN CHROME SESSION\n"
         "- Use chrome_active_tab and the visible Chrome GUI. Never use browse_url, "
         "API/MCP discovery, shell, Node or CDP for this goal.\n"
-        "- Open the requested URL in the current Chrome tab with chrome_active_tab. "
-        "If Chrome AX omits page content, use take_screenshot immediately; do not keep probing.\n"
-        "- Batch chrome_active_tab + take_screenshot in one tool turn. After an action, "
-        "observe the changed page without fixed sleeps. A click alone is not proof of completion.\n"
+        "- chrome_active_tab opens the URL in the matching open tab and waits for it to load.\n"
+        "- Search or submit a single field with ONE cua_submit_text call (click + replace text + "
+        "enter). Otherwise use cua_click_point (coordinates from the latest screenshot), "
+        "cua_type_text and cua_press_key; put every step you can already locate in ONE turn.\n"
+        "- After a turn with actions you automatically receive a screenshot taken once the screen "
+        "settles. Do not call take_screenshot after actions and never wait.\n"
+        "- To inspect several items already visible, return cua_click_point + take_screenshot "
+        "pairs for all of them in ONE turn; each screenshot waits for its page to settle.\n"
+        f"- Screenshots leave the context after {FULL_DETAIL_TURNS} turns: in the turn you read a needed "
+        "value (code, name, number), also write it in your reply text.\n"
+        "- A click alone is not proof: finish only when a screenshot shows the result.\n"
         if active_chrome_session_goal(goal) else ""
     )
     return (
@@ -572,7 +718,10 @@ def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, str, str
     Model çağrısı deneme planı: ilk iki deneme aynı backend'de (geçici bağlantı/5xx/429),
     son deneme farklı sağlayıcıda (ESCALATION_BACKEND kullanılabiliyorsa). Saf fonksiyon.
     """
-    fallback: str = ESCALATION_BACKEND if ESCALATION_BACKEND in available else backend
+    if backend == "openai" and "zen-free" in available:
+        fallback: str = "zen-free"
+    else:
+        fallback = ESCALATION_BACKEND if ESCALATION_BACKEND in available else backend
     return (backend, backend, fallback)
 
 
@@ -588,6 +737,22 @@ def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str
     if not content.strip():
         return False, "model boş yanıt döndü"
     return True, ""
+
+
+def resolve_run_limits(options: RunOptions) -> Tuple[str, int, float]:
+    """Görev profilini ve geçersiz override'ları güvenli biçimde çözer. Saf fonksiyon."""
+    mode: str = options.get("run_mode", "normal")
+    if mode not in RUN_MODE_PROFILES:
+        raise ValueError(f"Bilinmeyen görev modu: {mode}")
+    profile: RunModeProfile = RUN_MODE_PROFILES[mode]
+    # Testlerin ve mevcut çağıranların MAX_ITERATIONS monkeypatch davranışını koruyoruz.
+    default_iterations: int = MAX_ITERATIONS if mode == "normal" else profile["max_iterations"]
+    default_wall_clock: float = MAX_WALL_CLOCK_SECONDS if mode == "normal" else profile["max_wall_clock_seconds"]
+    max_iterations: int = int(options.get("max_iterations", default_iterations))
+    max_wall_clock: float = float(options.get("max_wall_clock_seconds", default_wall_clock))
+    if max_iterations < 1 or max_wall_clock <= 0:
+        raise ValueError("Görev bütçesi pozitif olmalı")
+    return mode, max_iterations, max_wall_clock
 
 
 def token_usage(usage: Optional[CompletionUsage]) -> TokenUsage:
@@ -606,6 +771,24 @@ def add_usage(total: TokenUsage, turn: TokenUsage) -> TokenUsage:
         "cached_tokens": total["cached_tokens"] + turn["cached_tokens"],
         "completion_tokens": total["completion_tokens"] + turn["completion_tokens"],
     }
+
+
+def budget_pressure_message(usage: TokenUsage, tool_call_count: int) -> Optional[str]:
+    """Uzun görevin bütçe baskısını kısa, eyleme dönük bir model mesajına çevirir. Saf fonksiyon."""
+    uncached: int = max(0, usage["prompt_tokens"] - usage["cached_tokens"])
+    reasons: List[str] = []
+    if uncached >= SOFT_UNCACHED_PROMPT_TOKEN_BUDGET:
+        reasons.append(f"{uncached} önbelleksiz giriş tokenı")
+    if tool_call_count >= SOFT_TOOL_CALL_BUDGET:
+        reasons.append(f"{tool_call_count} araç çağrısı")
+    if not reasons:
+        return None
+    return (
+        "ÇALIŞMA BÜTÇESİ UYARISI: " + ", ".join(reasons) + ". "
+        "Görevi bırakma; yeni/opsiyonel keşfi ve gereksiz tekrar kontrollerini durdur. "
+        "STATE içindeki doğrulanmış bilgileri yeniden kullan ve kalan zorunlu hesaplama, yazma, "
+        "final doğrulama ve cleanup adımlarını en kısa yoldan tamamla."
+    )
 
 
 def merge_tool_call_delta(
@@ -627,23 +810,28 @@ def merge_tool_call_delta(
     return padded[:index] + [updated] + padded[index + 1:]
 
 
-def create_model_clients() -> Dict[str, AsyncOpenAI]:
-    """Anahtarı olan her backend için zaman aşımı sınırlı, SDK içi yeniden denemesiz istemci kurar."""
+def create_model_clients() -> Dict[str, Optional[AsyncOpenAI]]:
+    """API istemcilerini ve oturumlu CLI modellerinin kullanılabilirliğini kurar."""
     timeout: Timeout = Timeout(MODEL_REQUEST_TIMEOUT_SECONDS, connect=MODEL_CONNECT_TIMEOUT_SECONDS)
-    return {
+    clients: Dict[str, Optional[AsyncOpenAI]] = {
         name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"], timeout=timeout, max_retries=0)
         for name, profile in BACKENDS.items()
         if profile["api_key"]
     }
+    if shutil.which("opencode"):
+        clients["zen-free"] = None
+    if shutil.which("codex"):
+        clients["openai"] = None
+    return clients
 
 
-async def close_model_clients(clients: Dict[str, AsyncOpenAI]) -> None:
-    """İstemcilerin bağlantı havuzlarını kapatır."""
-    await asyncio.gather(*(client.close() for client in clients.values()))
+async def close_model_clients(clients: Dict[str, Optional[AsyncOpenAI]]) -> None:
+    """API bağlantı havuzlarını kapatır; oturumlu CLI modellerinde havuz yoktur."""
+    await asyncio.gather(*(client.close() for client in clients.values() if client is not None))
 
 
 async def _stream_completion(
-    client: AsyncOpenAI, profile: BackendProfile, messages: List[Dict[str, Any]],
+    client: Optional[AsyncOpenAI], profile: BackendProfile, messages: List[Dict[str, Any]],
     tool_schemas: List[Dict[str, Any]], session_id: str, emit: EventSink, should_stop: Callable[[], bool],
 ) -> ModelTurn:
     """
@@ -651,6 +839,11 @@ async def _stream_completion(
     yayınlanır (arayüzde komut harf harf belirir). Durdurma istenirse akış hemen kapatılır ve
     tur finish_reason='stopped' ile döner.
     """
+    if profile["provider"] in ("codex-cli", "opencode-cli"):
+        provider: str = "codex" if profile["provider"] == "codex-cli" else "opencode"
+        return await run_cli_model(provider, profile["model"], messages, tool_schemas, emit, should_stop)
+    if client is None:
+        raise CliModelError("API istemcisi bulunamadı.")
     headers: Dict[str, str] = dict(profile["extra_headers"])
     if profile["session_header"] is not None:
         headers[profile["session_header"]] = session_id
@@ -708,7 +901,7 @@ async def _stream_completion(
 
 
 async def _call_model_with_retries(
-    clients: Dict[str, AsyncOpenAI],
+    clients: Dict[str, Optional[AsyncOpenAI]],
     messages: List[Dict[str, Any]],
     tool_schemas: List[Dict[str, Any]],
     session_id: str,
@@ -739,7 +932,9 @@ async def _call_model_with_retries(
                 clients[active], BACKENDS[active], messages, tool_schemas, session_id, tracking_emit, should_stop,
             )
             return turn, active
-        except (APIStatusError, APIConnectionError) as error:
+        # ssl.SSLError (ör. SSLV3_ALERT_BAD_RECORD_MAC) SDK tarafından sarılmadan akış okumasından
+        # yükselebiliyor; geçici bağlantı hatası gibi yeniden denenir (canlı ölçümde görevi bitirdi).
+        except (APIStatusError, APIConnectionError, ssl.SSLError, CliModelError) as error:
             status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
             if status is not None and status < 500 and status != 429:
                 raise
@@ -753,7 +948,8 @@ async def _call_model_with_retries(
                 emit({"kind": "stream_reset", "reason": f"{type(error).__name__} ({active}), yeniden deneniyor"})
                 emitted[0] = False
             timed_out: bool = isinstance(error, APITimeoutError)
-            attempt = len(plan) - 1 if timed_out and attempt < len(plan) - 1 else attempt + 1
+            cli_failed: bool = isinstance(error, CliModelError)
+            attempt = len(plan) - 1 if (timed_out or cli_failed) and attempt < len(plan) - 1 else attempt + 1
             if attempt < len(plan):
                 runtime = CURRENT_RUNTIME.get()
                 if runtime is not None:
@@ -771,14 +967,56 @@ async def _screenshot_observation(call: ToolCallDraft) -> Dict[str, Any]:
     return {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü (koordinatlar tıklama araçlarıyla aynı uzayda)."},
+            {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü (koordinatlar tıklama araçlarıyla aynı uzayda). "
+                                     f"Görüntü {FULL_DETAIL_TURNS} tur sonra bağlamdan silinir: gereken değerleri "
+                                     "(kod, ad, sayı) bu turdaki yanıt metnine yaz."},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
         ],
     }
 
 
+def needs_action_observation(calls: List[ToolCallDraft], results: List[ToolResult]) -> bool:
+    """
+    Turdaki son başarılı ekran eyleminden sonra başarılı bir take_screenshot yoksa True:
+    model eylemin sonucunu görmek için ayrı bir tur harcamasın. Saf fonksiyon.
+    """
+    pairs: List[Tuple[ToolCallDraft, ToolResult]] = list(zip(calls, results, strict=True))
+    acted: List[int] = [
+        index for index, (call, result) in enumerate(pairs)
+        if call["name"] in _SCREEN_ACTION_TOOLS and result.get("ok")
+    ]
+    if not acted:
+        return False
+    return not any(call["name"] == "take_screenshot" and result.get("ok") for call, result in pairs[acted[-1] + 1:])
+
+
+async def _observe_after_actions(
+    call_id: str, index: int, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
+    should_stop: Callable[[], bool],
+) -> Tuple[Dict[str, Any], sm.StepRecord]:
+    """
+    Eylem turunun sonunda take_screenshot'ı model yerine çalıştırır (ekran durulunca) ve
+    görüntüyü gözlem mesajı olarak döner; geçici dosya modele eklendikten sonra silinir.
+    Başarısız gözlem modele açık metinle bildirilir.
+    """
+    path: Path = Path(tempfile.gettempdir()) / f"omni-{call_id}.png"
+    call: ToolCallDraft = {"id": call_id, "name": "take_screenshot", "arguments": json.dumps({"filename": str(path)})}
+    result: ToolResult = await _run_tool_with_events(
+        index, call, AUTO_OBSERVATION_PREVIEW, toolbox, cache, emit, should_stop)
+    step: sm.StepRecord = sm.make_step_record(call["name"], call["arguments"], bool(result.get("ok")), result_text(result))
+    if not result.get("ok"):
+        return {"role": "user", "content": f"Otomatik gözlem alınamadı: {result_text(result)}"}, step
+    try:
+        return await _screenshot_observation(call), step
+    except (OSError, ValueError) as error:
+        logging.warning("Otomatik gözlem modele eklenemedi", extra={"error_type": type(error).__name__})
+        return {"role": "user", "content": f"Otomatik gözlem modele eklenemedi: {type(error).__name__}: {error}"}, step
+    finally:
+        path.unlink(missing_ok=True)
+
+
 async def run_agent_with_callback(
-    goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
+    goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, Optional[AsyncOpenAI]],
 ) -> RunReport:
     """
     Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; model yanıtını, araç
@@ -792,6 +1030,7 @@ async def run_agent_with_callback(
         initial_metrics: sm.EpisodeMetrics = {
             "turns": 0, "tool_calls": 0, "elapsed_seconds": 0.0, "backend": backend,
             "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
+            "model_seconds": 0.0, "tool_seconds": 0.0,
         }
         emit({"kind": "notice", "level": "error", "text": failure})
         emit({"kind": "run_finished", "success": False, "outcome": failure,
@@ -799,23 +1038,35 @@ async def run_agent_with_callback(
         return {"outcome": failure, "success": False, "metrics": initial_metrics,
                 "exchange": make_exchange(goal, failure, [])}
 
-    if DEFAULT_BACKEND not in clients:
+    try:
+        run_mode, max_iterations, max_wall_clock = resolve_run_limits(options)
+    except ValueError as error:
+        return startup_failure(error, DEFAULT_BACKEND)
+    if not clients:
         return startup_failure(RuntimeError(
-            f"Varsayılan backend '{DEFAULT_BACKEND}' için API anahtarı bulunamadı: "
-            "~/.local/share/opencode/auth.json içinde 'opencode-go' girdisi yok."
+            "Kullanılabilir model yok: OpenCode veya Codex CLI kurulumu ve oturumu gerekli."
         ), DEFAULT_BACKEND)
     available: frozenset[str] = frozenset(clients)
     backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
-    current_backend: str = backend_override if backend_override else DEFAULT_BACKEND
+    current_backend: str = backend_override if backend_override else (
+        DEFAULT_BACKEND if DEFAULT_BACKEND in available else next(iter(clients))
+    )
     if current_backend not in available:
         emit({"kind": "notice", "level": "warning",
               "text": f"'{current_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak."})
         current_backend = DEFAULT_BACKEND
-    emit({"kind": "run_started", "goal": goal, "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
+    emit({"kind": "run_started", "goal": goal, "backend": current_backend, "model": BACKENDS[current_backend]["model"],
+          "run_mode": run_mode, "max_turns": max_iterations, "max_wall_clock_seconds": max_wall_clock})
 
     service: Optional[CapabilityService] = None
     try:
-        toolbox: Toolbox = Toolbox()
+        memory_file: str = options.get("memory_file") or str(
+            Path(options["state_file"]).with_name("user_memory.json")
+        )
+        toolbox: Toolbox = Toolbox(
+            memory_file=memory_file,
+            allow_memory_mutation=memory_mutation_requested(goal),
+        )
         session_id: str = str(uuid.uuid4())
         state: sm.StateDict = sm.load_state(options["state_file"])
         messages: List[Dict[str, Any]] = (
@@ -837,13 +1088,18 @@ async def run_agent_with_callback(
         return startup_failure(error, current_backend)
     runtime_token = CURRENT_RUNTIME.set(runtime)
     service_token = CURRENT_SERVICE.set(service)
+    chrome_session: bool = active_chrome_session_goal(goal)
     steps: List[sm.StepRecord] = []
     outcome: str = ""
     reason: str = ""
     success: bool = False
     start_time: float = time.monotonic()
     consecutive_failed_turns: int = 0
+    no_progress_turns: int = 0
     tool_cache: Dict[str, ToolResult] = {}
+    chrome_visits: Dict[str, int] = {}
+    budget_warning_sent: bool = False
+    final_length_recoveries: int = 0
     turns: int = 0
     tool_call_count: int = 0
     usage: TokenUsage = ZERO_USAGE
@@ -852,20 +1108,27 @@ async def run_agent_with_callback(
     metrics: sm.EpisodeMetrics
 
     try:
-        for iteration in range(1, MAX_ITERATIONS + 1):
+        for iteration in range(1, max_iterations + 1):
             if options["should_stop"]():
                 outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
-            if time.monotonic() - start_time - runtime.metrics["user_wait_seconds"] > MAX_WALL_CLOCK_SECONDS:
-                outcome, reason = "", f"zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı"
+            if time.monotonic() - start_time - runtime.metrics["user_wait_seconds"] > max_wall_clock:
+                outcome, reason = "", f"zaman bütçesi ({max_wall_clock:.0f}sn) aşıldı"
                 break
+
+            if not budget_warning_sent:
+                budget_note: Optional[str] = budget_pressure_message(usage, tool_call_count)
+                if budget_note is not None:
+                    messages.append({"role": "user", "content": budget_note})
+                    emit({"kind": "notice", "level": "warning", "text": budget_note})
+                    budget_warning_sent = True
 
             runtime.published = dict(runtime.selected)
             tool_schemas = build_tool_schemas(goal) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)
-            emit({"kind": "turn_started", "turn": iteration, "max_turns": MAX_ITERATIONS,
+            emit({"kind": "turn_started", "turn": iteration, "max_turns": max_iterations,
                   "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
             model_started: float = time.monotonic()
             try:
@@ -881,8 +1144,7 @@ async def run_agent_with_callback(
                   "seconds": round(model_elapsed, 2), "usage": turn["usage"]})
             if used_backend != current_backend:
                 emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
-                      "reason": "API hatası"})
-                current_backend = used_backend
+                      "reason": f"API hatası; yalnız bu tur için geçici fallback, sonraki tur {current_backend} yeniden denenecek"})
             if turn["finish_reason"] == "stopped":
                 outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
@@ -891,6 +1153,22 @@ async def run_agent_with_callback(
             if not turn["tool_calls"]:
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
+                if (
+                    not success
+                    and turn["finish_reason"] == "length"
+                    and final_length_recoveries < MAX_FINAL_LENGTH_RECOVERIES
+                ):
+                    final_length_recoveries += 1
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Önceki araçsız yanıt max_tokens sınırında kesildi. STATE'i ve mevcut "
+                            "sonuçları kullanarak eksik zorunlu kısmı tamamla; yöntem anlatma ve "
+                            "gereksiz yeni araştırma yapma. Final yanıtı kısa tut."
+                        ),
+                    })
+                    outcome, reason = "", ""
+                    continue
                 break
 
             if turn["finish_reason"] == "length":
@@ -907,6 +1185,7 @@ async def run_agent_with_callback(
 
             failures_in_turn: int = 0
             pending_shots: List[ToolCallDraft] = []
+            duplicate_navigation_notes: List[str] = []
             for call, result in zip(turn["tool_calls"], results, strict=True):
                 ok: bool = bool(result.get("ok"))
                 steps.append(sm.make_step_record(call["name"], call["arguments"], ok, result_text(result)))
@@ -915,6 +1194,9 @@ async def run_agent_with_callback(
                 if not ok:
                     failures_in_turn += 1
                 messages.append(_tool_result_to_message(call, result))
+                chrome_visits, duplicate_note = update_chrome_visits(chrome_visits, call, result)
+                if duplicate_note is not None:
+                    duplicate_navigation_notes.append(duplicate_note)
 
             # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: tool sonuçları assistant
             # tool_calls'ı kesintisiz izlemeli; araya user mesajı 400'e yol açar.
@@ -926,8 +1208,36 @@ async def run_agent_with_callback(
                     emit({"kind": "notice", "level": "warning",
                           "text": f"Ekran görüntüsü modele iliştirilemedi ({type(error).__name__}: {error})."})
 
+            # Açık Chrome yolunda eylem turu kendi gözlemiyle biter: model sonucu görmek için
+            # ayrı bir "ekran görüntüsü al" turu harcamaz.
+            if chrome_session and needs_action_observation(turn["tool_calls"], results):
+                observation_started: float = time.monotonic()
+                try:
+                    observation, observation_step = await _observe_after_actions(
+                        f"otomatik-gozlem-{session_id[:8]}-{iteration}", len(turn["tool_calls"]),
+                        toolbox, tool_cache, emit, options["should_stop"],
+                    )
+                finally:
+                    tool_seconds += time.monotonic() - observation_started
+                steps.append(observation_step)
+                messages.append(observation)
+
+            if duplicate_navigation_notes:
+                messages.append({"role": "user", "content": "\n".join(duplicate_navigation_notes)})
+            if turn["finish_reason"] == "length":
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Bu araç çağrısı turu max_tokens sınırında kesildi. Başarılı çağrıları STATE'e "
+                        "işlenmiş kabul et; eksik/başarısız çağrıları yalnız zorunluysa yeniden oluştur. "
+                        "Aynı hedefleri baştan dolaşma ve kalan teslim adımlarına öncelik ver."
+                    ),
+                })
+
             # Yükseltme sayacı TUR bazlıdır: turda herhangi bir başarı varsa sıfırlanır.
-            consecutive_failed_turns = consecutive_failed_turns + 1 if failures_in_turn == len(results) else 0
+            all_failed: bool = bool(results) and failures_in_turn == len(results)
+            consecutive_failed_turns = consecutive_failed_turns + 1 if all_failed else 0
+            no_progress_turns = no_progress_turns + 1 if all_failed else 0
             if consecutive_failed_turns >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD:
                 upgraded: Optional[str] = next_quality_backend(current_backend, available)
                 if upgraded is not None:
@@ -935,8 +1245,12 @@ async def run_agent_with_callback(
                           "reason": f"art arda {consecutive_failed_turns} başarısız tur"})
                     current_backend = upgraded
                 consecutive_failed_turns = 0
+            if no_progress_turns >= NO_PROGRESS_LIMIT:
+                reason = f"ilerleme yok: {NO_PROGRESS_LIMIT} ardışık tamamen başarısız araç turu"
+                emit({"kind": "notice", "level": "warning", "text": reason})
+                break
         else:
-            reason = f"maksimum iterasyon sayısına ({MAX_ITERATIONS}) ulaşıldı"
+            reason = f"maksimum iterasyon sayısına ({max_iterations}) ulaşıldı"
     except Exception as error:
         outcome, reason = f"Kritik hata: {error}", f"kritik hata: {error}"
         emit({"kind": "notice", "level": "error", "text": outcome})
@@ -987,7 +1301,9 @@ async def run_agent_with_callback(
 def print_event(event: AgentEvent) -> None:
     """Olayları terminale akış olarak basar (CLI): metin harf harf, komut çıktısı satır satır."""
     if event["kind"] == "run_started":
-        print(f"› {event['goal']}\n  ({event['backend']} · {event['model']})")
+        mode: str = event.get("run_mode", "normal")
+        max_turns: int = event.get("max_turns", MAX_ITERATIONS)
+        print(f"› {event['goal']}\n  ({event['backend']} · {event['model']} · {mode} · en çok {max_turns} tur)")
     elif event["kind"] == "text_delta":
         sys.stdout.write(event["text"])
         sys.stdout.flush()
@@ -1019,7 +1335,7 @@ def print_event(event: AgentEvent) -> None:
 
 async def run_agent(goal: str) -> RunReport:
     """Hedefi terminale akış olarak basarak çalıştırır (CLI)."""
-    clients: Dict[str, AsyncOpenAI] = create_model_clients()
+    clients: Dict[str, Optional[AsyncOpenAI]] = create_model_clients()
     try:
         options: RunOptions = {"requested_backend": None, "should_stop": lambda: False, "state_file": STATE_FILE, "history": []}
         return await run_agent_with_callback(goal, print_event, options, clients)

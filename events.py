@@ -5,7 +5,7 @@ bu tipli olayları tüketir.
 """
 import json
 import re
-from typing import Callable, Dict, Literal, Optional, TypedDict, Union
+from typing import Callable, Dict, Literal, NotRequired, Optional, TypedDict, Union
 
 from state_manager import EpisodeMetrics
 
@@ -26,6 +26,9 @@ class RunStarted(TypedDict):
     goal: str
     backend: str
     model: str
+    run_mode: NotRequired[str]
+    max_turns: NotRequired[int]
+    max_wall_clock_seconds: NotRequired[float]
 
 
 class TurnStarted(TypedDict):
@@ -143,7 +146,9 @@ TOOL_LABELS: Dict[str, str] = {
     "execute_shell": "Kabuk", "process_list": "Süreçler", "read_file": "Oku", "write_file": "Yaz",
     "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "chrome_active_tab": "Chrome sekmesi", "execute_js": "Node",
     "take_screenshot": "Ekran", "cua_get_app": "Uygulama", "cua_get_ax_state": "Arayüz ağacı",
-    "cua_click": "Tıkla", "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
+    "cua_click": "Tıkla", "cua_click_point": "Noktaya tıkla",
+    "cua_type_text": "Yaz", "cua_press_key": "Tuş", "cua_submit_text": "Yaz ve gönder",
+    "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
     "capture_photo": "Fotoğraf çek",
 }
 
@@ -152,7 +157,9 @@ _PREVIEW_KEYS: Dict[str, str] = {
     "discover_capabilities": "query", "outlook_restore": "operation_id",
     "execute_shell": "command", "read_file": "path", "write_file": "path", "web_search": "query",
     "fetch_raw": "url", "browse_url": "url", "chrome_active_tab": "url", "execute_js": "code", "take_screenshot": "filename",
-    "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name", "smart_click": "app_name",
+    "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name",
+    "cua_type_text": "text", "cua_press_key": "key", "cua_submit_text": "text",
+    "smart_click": "app_name",
 }
 
 
@@ -185,6 +192,10 @@ def preview_arguments(name: str, arguments: str) -> str:
     """Araç çağrısının insan okunur önizlemesi; model argümanı yazarken de çalışır. Saf."""
     if name == "run_action_sequence":
         return " → ".join(re.findall(r'"action"\s*:\s*"(\w+)"', arguments[:PREVIEW_SCAN_LIMIT]))
+    if name == "cua_click_point":
+        point: Optional[re.Match[str]] = re.search(
+            r'"point"\s*:\s*\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]', arguments[:PREVIEW_SCAN_LIMIT])
+        return f"{point.group(1)}, {point.group(2)}" if point else ""
     if name == "browse_url" and re.search(r'"url"\s*:\s*null', arguments[:PREVIEW_SCAN_LIMIT]):
         return "mevcut sayfa"
     if name not in _PREVIEW_KEYS:

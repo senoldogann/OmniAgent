@@ -15,7 +15,9 @@ from tools import TOOL_RUNTIME, ToolError, Toolbox, run_streaming_process
     "rm -rf ~/", "rm -rf $HOME/", "rm -rf ${HOME}/",
     "rm -rf / ; echo x", "rm -rf /Users/alice",
     "rm --recursive --force --no-preserve-root /tmp/harmless",
-    "sudo -n rm -rf /", "echo önce; rm -r -f /",
+    "sudo -n rm -rf /", "sudo -u root rm -rf /", "sudo --user=root rm -rf /",
+    "echo önce; rm -r -f /", "rm -rf $TARGET/", "env TARGET=/ rm -rf $TARGET",
+    "sh -c 'rm -rf /'", "sudo -u root sh -c 'rm -rf /'", "env -S 'rm -rf /'",
 ])
 def test_catastrophic_targets_blocked_without_execution(command, monkeypatch):
     monkeypatch.setattr(tools, "run_streaming_process",
@@ -30,7 +32,8 @@ def test_catastrophic_targets_blocked_without_execution(command, monkeypatch):
     "printf x | tee ~/.zshrc", "printf x | tee -a ~/.ssh/config",
     "sed -i '' 's/a/b/' ~/.zshrc", "sed -i.bak 's/a/b/' ~/.zshrc",
     "cp /tmp/source ~/.zshrc", "mv /tmp/source ~/.zshrc",
-    "cp -t ~/.ssh /tmp/source", "echo x > /etc/hosts",
+    "cp -t ~/.ssh /tmp/source", "echo x > /etc/hosts", "echo x > $CONFIG",
+    "cp /tmp/source $DEST", "sh -c 'echo x > ~/.zshrc'",
 ])
 def test_sensitive_write_targets_blocked_without_execution(command, monkeypatch):
     monkeypatch.delenv("OMNI_ALLOW_SENSITIVE_WRITE", raising=False)

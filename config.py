@@ -51,16 +51,26 @@ def load_provider_key(provider: str) -> Optional[str]:
 # Ölçüm (2026-09-23, qwen3.8-flash): düşünme açıkken tur 2,5-3,7sn ve 6-9,6sn kuyruk;
 # `enable_thinking: False` ile 1,2-2,8sn. Bu yüzden varsayılan düşünmesiz çalışır, araç
 # hataları tekrarlarsa QUALITY_LADDER boyunca önce düşünen aynı modele, sonra Claude'a çıkılır.
-DEFAULT_BACKEND: str = "opencode"
+DEFAULT_BACKEND: str = "zen-free"
 # API/ağ hatası kalıcıysa son denemenin yapıldığı farklı sağlayıcı
-ESCALATION_BACKEND: str = "claude"
+ESCALATION_BACKEND: str = "openai"
 # Art arda başarısız araç turlarında sırayla çıkılan basamaklar
-QUALITY_LADDER: Tuple[str, ...] = ("opencode", "opencode-think", "claude")
+QUALITY_LADDER: Tuple[str, ...] = ("zen-free", "openai")
 
 _OPENCODE_BASE_URL: str = "https://opencode.ai/zen/go/v1"
 _OPENCODE_KEY: Optional[str] = load_provider_key("opencode-go")
 
 BACKENDS: Dict[str, BackendProfile] = {
+    "zen-free": {
+        "provider": "opencode-cli",
+        "base_url": "",
+        "api_key": None,
+        "model": "muse-spark-1.3-contributor-free",
+        "max_tokens": 8192,
+        "session_header": None,
+        "extra_headers": {},
+        "extra_body": {},
+    },
     "opencode": {
         "provider": "opencode",
         "base_url": _OPENCODE_BASE_URL,
@@ -107,11 +117,11 @@ BACKENDS: Dict[str, BackendProfile] = {
         "extra_body": {"thinking": {"type": "disabled"}, "reasoning_split": True},
     },
     "openai": {
-        "provider": "openai",
-        "base_url": "https://api.openai.com/v1",
-        "api_key": load_provider_key("openai"),
-        "model": "gpt-5-mini",
-        "max_tokens": 4096,
+        "provider": "codex-cli",
+        "base_url": "",
+        "api_key": None,
+        "model": "gpt-6-luna",
+        "max_tokens": 8192,
         "session_header": None,
         "extra_headers": {},
         "extra_body": {},
@@ -134,6 +144,20 @@ validation) back this up; never try to route around them.
 - Prefer one composite shell command over several trivial ones.
 - Do exactly what the goal says: no extra files, reports or steps.
 
+### WORKING STATE
+- For multi-step, multi-item or GUI research tasks, keep a compact `STATE:` block in your
+  assistant text on EVERY tool-calling turn. Record confirmed facts, rejected candidates with
+  reasons, and the remaining mandatory steps. Keep it terse; do not narrate your reasoning.
+- Treat STATE as the task ledger. Before opening/navigating to a URL, file, app or item again,
+  check whether the required fact is already recorded. Revisit only when a required field is
+  missing, the state may have changed, or the goal explicitly requires final revalidation.
+- If a screenshot reveals a needed name, number, date, code or status, copy that fact into STATE
+  in the SAME turn. Screenshots are temporary context; STATE is the durable textual record.
+- Stop optional discovery as soon as the goal's candidate/selection requirement is satisfied.
+  Preserve tool/time/token budget for required calculation, report, verification and cleanup.
+- Before returning a final answer, compare every mandatory clause in the goal against STATE.
+  If any required action or verification is still missing, continue using tools instead of finishing.
+
 ### GOAL FIDELITY (non-negotiable)
 - Paths, file names, dates, numbers and quoted text come ONLY from the goal. Copy them exactly,
   character by character. Never invent, "correct" or substitute them.
@@ -151,8 +175,8 @@ validation) back this up; never try to route around them.
 
 ### GUI
 - Prefer cua_get_ax_state + cua_click (accessibility, text only, fast) over take_screenshot.
-- Screenshots, the accessibility list and every click/move coordinate share ONE coordinate
-  space: use the numbers as they are.
+- Screenshots are 1000×1000 (not the screen's aspect ratio). The accessibility list and every
+  click/move point share that ONE 0-1000 space: pass points as [x, y] and use the numbers as they are.
 - Chain clicks, typing, keys and short waits in ONE run_action_sequence call. Keys accept
   combos such as cmd+c or cmd+shift+t; typing supports any Unicode text.
 
@@ -163,6 +187,16 @@ validation) back this up; never try to route around them.
 
 ### FINAL ANSWER
 - At most 5 short lines with the requested result. No method sections, no step summaries.
+### USER MEMORY
+- Use `user_memory` only for information the user explicitly asks you to remember, forget, or reuse:
+  a stable preference, frequently used path, or durable decision. Do not save transient task state.
+- The host runtime independently blocks `remember` and `forget` unless the user's current goal
+  explicitly requests a persistent-memory mutation; never try to route around that boundary.
+- When a task depends on a remembered preference/path/decision, call `user_memory` with `action=recall`
+  once before asking the user again. Use `remember` only after an explicit request or confirmation.
+- Store short, non-sensitive facts only. Never store passwords, tokens, API keys, private keys, or credentials.
+- The memory tool is opt-in: do not inject or reveal unrelated stored records.
+
 ### ENTEGRASYONLAR
 - Harici hesap/hizmet görevinde önce discover_capabilities kullan; yerel dosya/kabuk işinde kullanma.
 - Hazır API/MCP'yi tarayıcıya tercih et. allow_online yalnız yeni/toplu işte true olsun.

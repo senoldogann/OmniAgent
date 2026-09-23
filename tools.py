@@ -12,11 +12,13 @@ import tempfile
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from functools import lru_cache
+from functools import lru_cache, wraps
 from pathlib import Path
 from threading import Thread
-from typing import IO, Callable, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import IO, Callable, Concatenate, Dict, List, Optional, ParamSpec, Tuple, TypedDict, Union
+from urllib.parse import SplitResult, urlsplit
 
+import user_memory as memory
 import AppKit
 import ApplicationServices as AX
 import cv2
@@ -25,7 +27,7 @@ import pyautogui
 import Quartz
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from PIL import Image, ImageGrab
+from PIL import Image
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -44,9 +46,12 @@ STREAM_STDERR_MAX_BYTES: int = 16 * 1024
 STREAM_READ_CHARS: int = 4096
 TYPED_TEXT_ECHO_LIMIT: int = 80
 BACKUP_KEEP_PER_FILE: int = 5
-# Modelin gördüğü ekran görüntüsünün uzun kenarı. Tüm GUI koordinatları (görüntü, AX
-# listesi, tıklama/taşıma) bu ORTAK uzaydadır; Retina piksel/nokta dönüşümünü araçlar yapar.
-MODEL_SCREEN_MAX_EDGE: int = 1280
+# Modelin gördüğü ekran görüntüsü 1000×1000 karedir (ekran oranı korunmaz). Tüm GUI
+# koordinatları (görüntü, AX listesi, tıklama/taşıma) bu ORTAK uzaydadır; Retina piksel/nokta
+# dönüşümünü araçlar yapar. Qwen ailesi koordinatı görüntü boyutundan bağımsız 0-1000
+# normalize verir, Claude/GPT görüntü pikseli verir: kare 1000'lik görüntüde ikisi aynı sayıdır.
+# Ölçüm (qwen3.8-flash, 1280×832 görüntü): arama kutusu merkezi y=146 iken model y=156-173 verdi.
+MODEL_SCREEN_SIZE: int = 1000
 PAGE_TEXT_LIMIT: int = 5000
 PAGE_ELEMENT_LIMIT: int = 40
 PAGE_LOAD_TIMEOUT_MS: int = 20000
@@ -60,6 +65,24 @@ AX_LABEL_SEARCH_NODES: int = 12
 UNICODE_CHUNK_UNITS: int = 16
 UNICODE_CHUNK_DELAY_SECONDS: float = 0.005
 MAX_WAIT_SECONDS: float = 5.0
+# Eylem sonrası gözlem sabit uyku yerine ekranın durulmasını bekler. Karşılaştırma küçük gri
+# karelerle yapılır (~30 ms); imleç yanıp sönmesi, sekme simgesi dönmesi gibi küçük alan
+# değişimleri SETTLE_CHANGED_RATIO altında kalıp yok sayılır. Ölçümde durulmuş ekranda
+# 4 gri tonu aşan değişim yalnız menü çubuğundaki 2 pikseldi; yükleme iskeletinin parıltısı
+# kare başına ~2-3 ton değişir ve son değişim karesine göre birikerek eşiği aşar (%0,5-9 alan).
+SETTLE_FRAME_EDGE: int = 160
+SETTLE_PIXEL_DELTA: int = 4
+SETTLE_CHANGED_RATIO: float = 0.002
+SETTLE_POLL_SECONDS: float = 0.03
+# Eylemden sonra görünür tepki (ör. gecikmeli XHR sonucu) en çok bu kadar beklenir
+SETTLE_REACTION_SECONDS: float = 1.0
+# Tepkiden sonra bu kadar değişmeyen ekran durulmuş sayılır
+SETTLE_QUIET_SECONDS: float = 0.45
+# Sürekli animasyonda (video, yükleme göstergesi) gözlem eylemden en geç bu kadar sonra alınır
+SETTLE_MAX_SECONDS: float = 3.0
+# chrome_active_tab gezinmeden sonra sekmenin yüklenmesini 0,1 sn aralıkla en çok bu kadar yoklar
+CHROME_LOAD_CHECKS: int = 80
+CHROME_SCRIPT_TIMEOUT_SECONDS: float = 20.0
 
 
 SHELL_TIMEOUT_SECONDS: float = 60.0
@@ -309,13 +332,53 @@ def _shell_path(raw: str) -> Optional[Path]:
 
 
 def _command_words(segment: List[str]) -> List[str]:
-    """Öndeki sudo/env sarmalayıcılarını ve atamaları atlar."""
+    """Öndeki sudo/env sarmalayıcılarını, seçenek argümanlarını ve atamaları atlar."""
     words = list(segment)
+    sudo_value_options: frozenset[str] = frozenset({
+        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt",
+        "-C", "--close-from", "-T", "--command-timeout", "-R", "--chroot",
+        "-D", "--chdir", "--role", "--type",
+    })
+    env_value_options: frozenset[str] = frozenset({
+        "-u", "--unset", "-C", "--chdir", "-S", "--split-string",
+    })
     while words:
         first = Path(words[0]).name
-        if first in ("sudo", "env", "command", "builtin", "nohup"):
+        if first == "sudo":
             words.pop(0)
-            while words and (words[0].startswith("-") or "=" in words[0] and not words[0].startswith("/")):
+            while words:
+                option: str = words[0]
+                if option == "--":
+                    words.pop(0)
+                    break
+                if option in sudo_value_options:
+                    words.pop(0)
+                    if words:
+                        words.pop(0)
+                    continue
+                if option.startswith("-"):
+                    words.pop(0)
+                    continue
+                break
+        elif first == "env":
+            words.pop(0)
+            while words:
+                option = words[0]
+                if option == "--":
+                    words.pop(0)
+                    break
+                if option in env_value_options:
+                    words.pop(0)
+                    if words:
+                        words.pop(0)
+                    continue
+                if option.startswith("-") or ("=" in option and not option.startswith("/")):
+                    words.pop(0)
+                    continue
+                break
+        elif first in ("command", "builtin", "nohup"):
+            words.pop(0)
+            while words and words[0].startswith("-"):
                 words.pop(0)
         elif "=" in words[0] and not words[0].startswith("/"):
             words.pop(0)
@@ -324,8 +387,31 @@ def _command_words(segment: List[str]) -> List[str]:
     return words
 
 
+def _has_shell_expansion(raw: str) -> bool:
+    """Guard'ın çözemediği kabuk değişkeni/komut ikamesi bulunuyor mu?"""
+    return "$" in raw or "`" in raw
+
+
+def _nested_shell_commands(words: List[str]) -> List[str]:
+    """sh -c/--command gibi iç içe kabuk çağrılarının metnini döndürür."""
+    if not words or Path(words[0]).name not in {"sh", "bash", "zsh", "dash", "ksh"}:
+        return []
+    args: List[str] = words[1:]
+    for index, argument in enumerate(args):
+        is_command_option: bool = (
+            argument == "-c" or argument.startswith("--command=") or
+            argument.startswith("-") and not argument.startswith("--") and "c" in argument[1:]
+        )
+        if is_command_option and index + 1 < len(args):
+            return [args[index + 1]]
+    return []
+
+
 def _dangerous_rm_target(raw: str) -> bool:
-    """Kök, kullanıcı evleri ve korunan sistem yollarına recursive-force silmeyi engeller."""
+    """Kök, kullanıcı evleri, korunan sistem yolları ve çözülemeyen değişkenleri engeller."""
+    if _has_shell_expansion(raw):
+        # rm -rf $TARGET komutu çalışmadan önce hangi yola silindiği bilinemez.
+        return True
     target = _shell_path(raw)
     if target is None:
         return False
@@ -345,6 +431,8 @@ def _is_catastrophic_command(command: str) -> bool:
     tokens = _shell_tokens(command)
     for segment in _shell_segments(tokens):
         words = _command_words(segment)
+        if any(_is_catastrophic_command(nested) for nested in _nested_shell_commands(words)):
+            return True
         if not words or Path(words[0]).name != "rm":
             continue
         args = words[1:]
@@ -359,6 +447,8 @@ def _is_catastrophic_command(command: str) -> bool:
         if recursive and force and any(_dangerous_rm_target(arg) for arg in args if not arg.startswith("-")):
             return True
     normalized = " ".join(command.split())
+    if re.search(r"\benv\b[^\n;&|]*(?:-S|--split-string)", normalized, re.IGNORECASE):
+        return True
     return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in _CATASTROPHIC_SHELL_PATTERNS)
 
 
@@ -367,11 +457,16 @@ def _shell_writes_to_sensitive_path(command: str) -> bool:
     tokens = _shell_tokens(command)
     for index, token in enumerate(tokens[:-1]):
         if token in (">", ">>", ">|", "&>"):
-            target = _shell_path(tokens[index + 1])
+            raw_target = tokens[index + 1]
+            if _has_shell_expansion(raw_target):
+                return True
+            target = _shell_path(raw_target)
             if target is not None and _is_sensitive_path(target):
                 return True
     for segment in _shell_segments(tokens):
         words = _command_words(segment)
+        if any(_shell_writes_to_sensitive_path(nested) for nested in _nested_shell_commands(words)):
+            return True
         if not words:
             continue
         operation = Path(words[0]).name
@@ -390,8 +485,9 @@ def _shell_writes_to_sensitive_path(command: str) -> bool:
                                            arg == "--in-place" or arg.startswith("--in-place=")
                                            for arg in args):
             targets = [arg for arg in args if not arg.startswith("-")]
-        if any((path is not None and _is_sensitive_path(path))
-               for path in (_shell_path(raw) for raw in targets)):
+        if any(_has_shell_expansion(raw) or
+               (path is not None and _is_sensitive_path(path))
+               for raw, path in ((raw, _shell_path(raw)) for raw in targets)):
             return True
     return False
 
@@ -469,20 +565,30 @@ def points_to_model(x: float, y: float, geometry: ScreenGeometry) -> Tuple[int, 
 
 
 def current_geometry() -> ScreenGeometry:
-    """Ana ekranın güncel geometrisini okur (harici monitör takılıp çıkarılabilir)."""
+    """Ana ekranın güncel geometrisini okur (harici monitör takılıp çıkarılabilir); model uzayı karedir."""
     point_width, point_height = pyautogui.size()
-    model_width, model_height = model_space_size(point_width, point_height, MODEL_SCREEN_MAX_EDGE)
     return {
         "point_width": point_width, "point_height": point_height,
-        "model_width": model_width, "model_height": model_height,
+        "model_width": MODEL_SCREEN_SIZE, "model_height": MODEL_SCREEN_SIZE,
     }
 
 
-def grab_model_frame(geometry: ScreenGeometry) -> Image.Image:
+def parse_point(value: object) -> Tuple[int, int]:
     """
-    Ana ekranı yakalar (Retina'da fiziksel piksel, örn. 3420×2224) ve model uzayına
-    küçültür. Ekran kaydı izni yoksa macOS yalnızca duvar kâğıdını döndürür; bu
-    sessiz bozulma yerine açık hata verilir.
+    Modelin verdiği [x, y] noktasını doğrular. Ayrı x/y tamsayı alanlarında model yerel
+    biçimi olan [x, y]'yi x alanına yazıyordu (ölçümde 10 çağrının 7'si); tek point alanıyla
+    0/10. Saf fonksiyon.
+    """
+    if (isinstance(value, (list, tuple)) and len(value) == 2
+            and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)):
+        return round(value[0]), round(value[1])
+    raise ToolError(f"point [x, y] biçiminde iki sayı olmalı; alınan: {value!r}", "INVALID_POINT", False)
+
+
+def _require_screen_capture() -> None:
+    """
+    Ekran kaydı izni yoksa macOS yalnızca duvar kâğıdını döndürür; bu sessiz bozulma yerine
+    açık hata verilir. Denetim ~7 ms sürdüğü için yoklama döngülerinin dışında yapılır.
     """
     if not Quartz.CGPreflightScreenCaptureAccess():
         raise ToolError(
@@ -490,10 +596,93 @@ def grab_model_frame(geometry: ScreenGeometry) -> Image.Image:
             "Kaydı bölümünde bu uygulamaya (Terminal/Python) izin verin.",
             "SCREEN_CAPTURE_PERMISSION", False,
         )
-    frame: Image.Image = ImageGrab.grab().convert("RGB")
-    return frame.resize(
-        (geometry["model_width"], geometry["model_height"]), Image.Resampling.LANCZOS, reducing_gap=2.0,
+
+
+def _main_display_image(resolution: int) -> object:
+    """Ana ekranın anlık CGImage görüntüsü; resolution Quartz.kCGWindowImage* seçeneğidir."""
+    image: object = Quartz.CGWindowListCreateImage(
+        Quartz.CGDisplayBounds(Quartz.CGMainDisplayID()), Quartz.kCGWindowListOptionOnScreenOnly,
+        Quartz.kCGNullWindowID, resolution,
     )
+    if image is None:
+        raise ToolError("Ekran görüntüsü alınamadı: CGWindowListCreateImage boş döndü.", "SCREEN_CAPTURE_FAILED", True)
+    return image
+
+
+def _draw_scaled(image: object, width: int, height: int, color_space: object, channels: int, bitmap_info: int) -> bytes:
+    """CGImage'ı CoreGraphics ile width×height boyutuna ölçekleyip 8 bitlik piksel baytlarına çizer."""
+    buffer: bytearray = bytearray(width * height * channels)
+    context: object = Quartz.CGBitmapContextCreate(buffer, width, height, 8, width * channels, color_space, bitmap_info)
+    if context is None:
+        raise ToolError(f"Ekran karesi için çizim bağlamı kurulamadı ({width}×{height}, {channels} kanal).",
+                        "SCREEN_CAPTURE_FAILED", True)
+    Quartz.CGContextSetInterpolationQuality(context, Quartz.kCGInterpolationHigh)
+    Quartz.CGContextDrawImage(context, Quartz.CGRectMake(0, 0, width, height), image)
+    return bytes(buffer)
+
+
+def grab_model_frame(geometry: ScreenGeometry) -> Image.Image:
+    """
+    Ana ekranı yakalar (Retina'da fiziksel piksel, örn. 3420×2224) ve CoreGraphics ile kare
+    model uzayına sRGB olarak ölçekler. screencapture alt süreci ve geçici PNG yoluna göre
+    ~5 kat hızlıdır (≈55 ms).
+    """
+    _require_screen_capture()
+    width, height = geometry["model_width"], geometry["model_height"]
+    pixels: bytes = _draw_scaled(
+        _main_display_image(Quartz.kCGWindowImageDefault), width, height,
+        Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB), 4, Quartz.kCGImageAlphaNoneSkipLast,
+    )
+    return Image.frombuffer("RGBX", (width, height), pixels, "raw", "RGBX", 0, 1).convert("RGB")
+
+
+def settle_frame() -> np.ndarray:
+    """Durulma karşılaştırması için ekranın küçük gri tonlu karesi; izin denetimi çağırandadır."""
+    image: object = _main_display_image(Quartz.kCGWindowImageNominalResolution)
+    width, height = model_space_size(Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image), SETTLE_FRAME_EDGE)
+    pixels: bytes = _draw_scaled(image, width, height, Quartz.CGColorSpaceCreateDeviceGray(), 1, Quartz.kCGImageAlphaNone)
+    return np.frombuffer(pixels, dtype=np.uint8).reshape(height, width)
+
+
+def frame_change_ratio(previous: np.ndarray, current: np.ndarray, pixel_delta: int) -> float:
+    """İki gri karede farkı pixel_delta'yı aşan piksellerin oranı; boyut değiştiyse tamamı değişmiştir. Saf."""
+    if previous.shape != current.shape:
+        return 1.0
+    return float(np.mean(np.abs(current.astype(np.int16) - previous.astype(np.int16)) > pixel_delta))
+
+
+def _raise_if_stopped() -> None:
+    """Kullanıcı görevi durdurduysa bekleyen aracı hemen keser."""
+    runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
+    if runtime is not None and runtime["should_stop"]():
+        raise ToolError("Kullanıcı tarafından durduruldu.", "STOPPED", False)
+
+
+def wait_for_screen_settle(baseline: np.ndarray, input_at: float) -> float:
+    """
+    Ekran girdisinden sonra uygulamanın tepkisini ve ekranın durulmasını bekler; beklenen
+    süreyi döner. Önce girdi öncesi kareye (baseline) göre görünür bir tepki aranır
+    (gecikmeli sonuçlar için SETTLE_REACTION_SECONDS'a kadar), tepki görülünce ekran
+    SETTLE_QUIET_SECONDS boyunca değişmeyene kadar beklenir. Sürekli animasyonda
+    input_at + SETTLE_MAX_SECONDS'ta bırakılır. Sabit uyku yerine gerçek tepki beklenir.
+    """
+    started: float = time.monotonic()
+    # Karşılaştırma son değişimin görüldüğü kareye göredir (önceki kareye göre değil): yavaş
+    # animasyonlar birikerek eşiği aşar; ardışık kareler arası küçük fark onları gizlemez.
+    reference: np.ndarray = baseline
+    reacted: bool = False
+    last_change: float = started
+    while True:
+        _raise_if_stopped()
+        frame: np.ndarray = settle_frame()
+        now: float = time.monotonic()
+        if frame_change_ratio(reference, frame, SETTLE_PIXEL_DELTA) > SETTLE_CHANGED_RATIO:
+            reacted, last_change, reference = True, now, frame
+        quiet: bool = reacted and now - last_change >= SETTLE_QUIET_SECONDS
+        no_reaction: bool = not reacted and now >= input_at + SETTLE_REACTION_SECONDS
+        if quiet or no_reaction or now >= input_at + SETTLE_MAX_SECONDS:
+            return time.monotonic() - started
+        time.sleep(SETTLE_POLL_SECONDS)
 
 
 def _require_accessibility() -> None:
@@ -622,8 +811,7 @@ def press_key_spec(spec: str) -> str:
 class ActionStep(TypedDict, total=False):
     """run_action_sequence adımı; kullanılan alanlar eylem türüne göre değişir."""
     action: str
-    x: int
-    y: int
+    point: List[int]
     button: str
     text: str
     key: str
@@ -634,9 +822,11 @@ def _run_action_step(step: ActionStep, geometry: ScreenGeometry) -> str:
     """Tek bir fare/klavye adımını çalıştırır; eksik/yanlış alan KeyError/TypeError/ValueError verir."""
     action: object = step.get("action")
     if action == "click":
-        return click_model_point(int(step["x"]), int(step["y"]), str(step.get("button") or "left"), geometry)
+        x, y = parse_point(step["point"])
+        return click_model_point(x, y, str(step.get("button") or "left"), geometry)
     if action == "move":
-        return move_model_point(int(step["x"]), int(step["y"]), geometry)
+        x, y = parse_point(step["point"])
+        return move_model_point(x, y, geometry)
     if action == "type":
         text: str = str(step["text"])
         type_unicode_text(text)
@@ -649,9 +839,7 @@ def _run_action_step(step: ActionStep, geometry: ScreenGeometry) -> str:
             raise ToolError(f"Bekleme süresi 0-{MAX_WAIT_SECONDS}sn aralığında olmalı: {seconds}", "INVALID_WAIT", False)
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            runtime = TOOL_RUNTIME.get()
-            if runtime and runtime["should_stop"]():
-                raise ToolError("Kullanıcı tarafından durduruldu.", "STOPPED", False)
+            _raise_if_stopped()
             time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         return f"{seconds}sn beklendi."
     raise ToolError(f"Bilinmeyen eylem türü: {action} (click/move/type/press/wait).", "INVALID_ACTION", False)
@@ -987,19 +1175,88 @@ _PAGE_ELEMENTS_SCRIPT: str = """
 """
 
 
+class PendingInput(TypedDict):
+    """Henüz gözlenmemiş son ekran girdisi: bitiş anı ve girdiden hemen önceki karşılaştırma karesi."""
+    at: float
+    baseline: np.ndarray
+
+
+_P = ParamSpec("_P")
+
+
+def _screen_input(method: Callable[Concatenate["Toolbox", _P], str]) -> Callable[Concatenate["Toolbox", _P], str]:
+    """
+    Ekrana girdi gönderen araç yöntemini sarar: girdiden hemen önce küçük bir karşılaştırma
+    karesi alır, bitişte (hata olsa bile) bekleyen girdiyi kaydeder. Sonraki ekran görüntüsü
+    bu kareye göre uygulamanın tepki verip durulmasını bekler. Ekran kaydı izni yoksa kare
+    alınmaz; gözlem zaten izin hatasıyla durur.
+    """
+    @wraps(method)
+    def recorded(self: "Toolbox", *args: _P.args, **kwargs: _P.kwargs) -> str:
+        baseline: Optional[np.ndarray] = settle_frame() if Quartz.CGPreflightScreenCaptureAccess() else None
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            if baseline is not None:
+                self._pending_input = {"at": time.monotonic(), "baseline": baseline}
+    return recorded
+
+
 # Araç Kutusu (Toolbox) - Sistem ve Web araçları
 class Toolbox:
     """
     Sistem komutları, web tarayıcı ve GUI araçlarını içeren konnektör. Modelin
     çağırabileceği yöntemler main.build_tool_schemas içindeki adlarla sınırlıdır.
     """
-    def __init__(self) -> None:
+    def __init__(self, memory_file: Optional[str] = None, allow_memory_mutation: bool = False) -> None:
         self.playwright_instance: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
         self.browser_context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.cua: CUA = CUA()
         self._browser_lock: asyncio.Lock = asyncio.Lock()
+        self._pending_input: Optional[PendingInput] = None
+        self._memory_file: Optional[str] = memory_file
+        self._allow_memory_mutation: bool = allow_memory_mutation
+
+    def user_memory(
+        self, action: str, key: Optional[str] = None, value: Optional[str] = None,
+        query: Optional[str] = None, category: Optional[str] = None,
+    ) -> str:
+        """Kullanıcı tercihini yazar, arar veya siler; bellek kapsamı görev dışına çıkmaz."""
+        if not self._memory_file:
+            raise ToolError("Bu görev için kalıcı kullanıcı hafızası etkin değil.", "MEMORY_UNAVAILABLE", False)
+        normalized_action: str = action.strip().casefold()
+        if normalized_action in {"remember", "forget"} and not self._allow_memory_mutation:
+            raise ToolError(
+                "Bu görev kalıcı hafıza değiştirme yetkisiyle başlatılmadı.",
+                "MEMORY_MUTATION_NOT_ALLOWED", False,
+            )
+        try:
+            state: memory.MemoryState = memory.load_memory(self._memory_file)
+            if normalized_action == "remember":
+                if not key or value is None:
+                    raise ValueError("remember için key ve value zorunludur.")
+                updated: memory.MemoryState = memory.remember_preference(
+                    state, key, value, category or "preference", memory.utc_timestamp(),
+                )
+                memory.save_memory(self._memory_file, updated)
+                return json.dumps({"ok": True, "action": normalized_action,
+                                   "record": updated["preferences"][-1]}, ensure_ascii=False)
+            if normalized_action == "recall":
+                records: List[memory.PreferenceRecord] = memory.search_preferences(state, query or "")
+                return json.dumps({"ok": True, "preferences": records}, ensure_ascii=False)
+            if normalized_action == "forget":
+                if not key:
+                    raise ValueError("forget için key zorunludur.")
+                updated, removed = memory.forget_preference(state, key)
+                memory.save_memory(self._memory_file, updated)
+                return json.dumps({"ok": True, "action": normalized_action, "removed": removed}, ensure_ascii=False)
+            raise ValueError("action remember, recall veya forget olmalı.")
+        except ValueError as error:
+            raise ToolError(f"Kullanıcı hafızası işlemi reddedildi: {error}", "MEMORY_INVALID", False) from error
+        except OSError as error:
+            raise ToolError(f"Kullanıcı hafızasına erişilemedi: {error}", "MEMORY_IO", True) from error
 
     async def _get_page(self) -> Page:
         """
@@ -1091,9 +1348,11 @@ class Toolbox:
 
     def take_screenshot(self, filename: str) -> str:
         """
-        Ekran görüntüsünü ORTAK koordinat uzayında (uzun kenar MODEL_SCREEN_MAX_EDGE)
-        kaydeder: görüntüdeki bir noktanın koordinatı, tıklama araçlarına aynen verilir.
-        Retina piksel ↔ nokta dönüşümü burada yapılır, modele bırakılmaz.
+        Ekran görüntüsünü ORTAK koordinat uzayında (MODEL_SCREEN_SIZE karesi) kaydeder:
+        görüntüdeki bir noktanın koordinatı, tıklama araçlarına aynen verilir.
+        Gözlenmemiş bir ekran girdisi varsa önce uygulamanın tepki verip durulması beklenir;
+        modelin sabit bekleme eklemesi gerekmez. Retina piksel ↔ nokta dönüşümü burada
+        yapılır, modele bırakılmaz.
         """
         target: Path = Path(filename).expanduser()
         if _is_sensitive_path(target):
@@ -1101,6 +1360,12 @@ class Toolbox:
                 f"Korunan bir sistem/kimlik yoluna ekran görüntüsü yazılamaz: {filename}",
                 "SENSITIVE_PATH_BLOCKED", False,
             )
+        settle_note: str = ""
+        if self._pending_input is not None:
+            _require_screen_capture()
+            waited: float = wait_for_screen_settle(self._pending_input["baseline"], self._pending_input["at"])
+            self._pending_input = None
+            settle_note = f" Son eylemden sonra ekranın durulması {waited:.1f}sn beklendi."
         geometry: ScreenGeometry = current_geometry()
         frame: Image.Image = grab_model_frame(geometry)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1113,7 +1378,7 @@ class Toolbox:
             ) from error
         return (
             f"Ekran görüntüsü {target} dosyasına kaydedildi ({geometry['model_width']}×{geometry['model_height']}; "
-            "bu görüntüdeki koordinatlar tıklama araçlarıyla aynı uzayda)."
+            "bu görüntüdeki koordinatlar tıklama araçlarıyla aynı uzayda)." + settle_note
         )
 
     def capture_photo(self) -> str:
@@ -1194,6 +1459,7 @@ class Toolbox:
         center_y: int = y0 + location[1] + template.shape[0] // 2
         return click_model_point(center_x, center_y, "left", geometry) + f" (şablon güveni {best:.2f})"
 
+    @_screen_input
     def smart_click(self, app_name: str, element_id: Optional[int], template_path: Optional[str], confidence: float) -> str:
         """
         Hibrit Tıklama Protokolü: AX öğesi (AXPress / merkez) -> görsel şablon sırasıyla
@@ -1307,12 +1573,16 @@ class Toolbox:
 
     def fetch_raw(self, url: str) -> str:
         """
-        Curl kullanarak hızlı HTTP çekimi yapar ve içeriği temizler.
+        Curl kullanarak hızlı HTTP(S) çekimi yapar ve içeriği temizler.
         JSON gövdeler HTML temizleyiciden geçirilmez (karakter kaybı olur);
         kalıcı hatalar (--retry-all-errors) tekrar denenmez.
         """
+        parsed: SplitResult = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ToolError("fetch_raw yalnızca http(s) adreslerini kabul eder.", "INVALID_URL", False)
         result: subprocess.CompletedProcess[str] = subprocess.run(
             ["curl", "--fail", "--show-error", "--silent", "--location", "--compressed",
+             "--proto", "=http,https", "--proto-redir", "=http,https",
              "--retry", "2", "--retry-delay", "1", "--retry-max-time", "20",
              "--max-time", "15", "--", url],
             capture_output=True, text=True, timeout=25,
@@ -1327,24 +1597,57 @@ class Toolbox:
             return _clip(result.stdout, SHELL_STDOUT_LIMIT)
         return clean_html(result.stdout)
 
+    @_screen_input
     def chrome_active_tab(self, url: Optional[str]) -> str:
-        """Kullanıcının açık Chrome profilindeki etkin sekmeyi okur veya aynı sekmeye gider."""
-        if url is not None and not url.lower().startswith(("https://", "http://")):
+        """
+        Kullanıcının açık Chrome profilindeki sekmeyi kullanır: URL verilirse aynı kökene ait
+        açık sekmeyi (yoksa etkin sekmeyi) öne getirip oraya gider ve yüklenmesini bekler;
+        None ise etkin sekmeyi okur. Hiç pencere yoksa aynı profilde yeni pencere açar.
+        """
+        parsed: Optional[SplitResult] = urlsplit(url) if url is not None else None
+        if parsed is not None and (parsed.scheme not in ("https", "http") or not parsed.netloc):
             raise ToolError("Chrome sekmesi için http(s) adresi ver.", "INVALID_URL", False)
-        script = """on run argv
+        origin: str = f"{parsed.scheme}://{parsed.netloc}/" if parsed is not None else ""
+        # Sekme ve pencereler kimlikle tutulur: sıra numarası pencere öne alınınca başka
+        # pencereyi gösterir. Chrome sekmelerinde 'index' özelliği yoktur.
+        script: str = """on run argv
 set targetUrl to item 1 of argv
+set targetOrigin to item 2 of argv
+set loadChecks to (item 3 of argv) as integer
 tell application "Google Chrome"
-    if (count of windows) is 0 then error "Açık Chrome penceresi bulunamadı."
-    set selectedTab to active tab of front window
-    if targetUrl is not "" then set URL of selectedTab to targetUrl
+    if (count of windows) is 0 then make new window
+    set windowId to id of front window
+    set tabId to id of active tab of front window
+    if targetUrl is not "" then
+        repeat with windowItem in windows
+            set matchingIds to id of (every tab of windowItem whose URL starts with targetOrigin)
+            if matchingIds is not {} then
+                set windowId to id of windowItem
+                set tabId to item 1 of matchingIds
+                exit repeat
+            end if
+        end repeat
+    end if
+    set targetWindow to window id windowId
+    set tabIds to id of every tab of targetWindow
+    repeat with position from 1 to count of tabIds
+        if item position of tabIds is tabId then set active tab index of targetWindow to position
+    end repeat
+    set index of targetWindow to 1
+    set targetTab to tab id tabId of targetWindow
+    if targetUrl is not "" and (URL of targetTab) is not targetUrl then set URL of targetTab to targetUrl
     activate
-    return (URL of selectedTab) & linefeed & (title of selectedTab)
+    repeat loadChecks times
+        if not (loading of targetTab) then exit repeat
+        delay 0.1
+    end repeat
+    return (URL of targetTab) & linefeed & (title of targetTab) & linefeed & (loading of targetTab)
 end tell
 end run"""
         try:
-            result = subprocess.run(
-                ["osascript", "-e", script, url or ""],
-                capture_output=True, text=True, timeout=10, check=False,
+            result: subprocess.CompletedProcess[str] = subprocess.run(
+                ["osascript", "-e", script, url or "", origin, str(CHROME_LOAD_CHECKS)],
+                capture_output=True, text=True, timeout=CHROME_SCRIPT_TIMEOUT_SECONDS, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise ToolError(
@@ -1356,28 +1659,87 @@ end run"""
                 f"Açık Chrome sekmesine erişilemedi: {result.stderr.strip()}",
                 "CHROME_SESSION_FAILED", True,
             )
-        current_url, _, title = result.stdout.strip().partition("\n")
-        return f"Görünür Chrome etkin sekmesi: {current_url}\nBaşlık: {title}"
+        lines: List[str] = result.stdout.rstrip("\n").split("\n")
+        if len(lines) < 3:
+            raise ToolError(f"Chrome sekme yanıtı beklenmeyen biçimde: {result.stdout!r}", "CHROME_SESSION_FAILED", True)
+        loading_note: str = "\nSayfa hâlâ yükleniyor." if lines[-1] == "true" else ""
+        return f"Görünür Chrome sekmesi: {lines[0]}\nBaşlık: {' '.join(lines[1:-1])}{loading_note}"
 
+    @_screen_input
+    def cua_click_point(self, point: List[int]) -> str:
+        """Ortak ekran koordinatındaki [x, y] noktasına tıklar."""
+        _require_accessibility()
+        x, y = parse_point(point)
+        return click_model_point(x, y, "left", current_geometry())
+
+    @_screen_input
+    def cua_type_text(self, text: str) -> str:
+        """Odaklı alana klavye düzeninden bağımsız metin yazar."""
+        _require_accessibility()
+        type_unicode_text(text)
+        return f"Yazıldı ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
+
+    @_screen_input
+    def cua_press_key(self, key: str) -> str:
+        """Odaklı uygulamada tuş veya kısayol çalıştırır."""
+        _require_accessibility()
+        return press_key_spec(key)
+
+    @_screen_input
+    def cua_submit_text(self, point: List[int], text: str) -> str:
+        """
+        [x, y] noktasındaki alana tıklar, içeriğini seçip yerine metni yazar ve Enter'a basar:
+        arama/gönderme akışı tek çağrıda biter. Canlı ölçümde model tıkla → yaz → Enter'ı üç
+        ayrı model turuna bölüyordu.
+        """
+        _require_accessibility()
+        x, y = parse_point(point)
+        clicked: str = click_model_point(x, y, "left", current_geometry())
+        press_key_spec("cmd+a")
+        type_unicode_text(text)
+        press_key_spec("enter")
+        return f"{clicked} Alana yazıldı ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}; Enter'a basıldı."
+
+    @_screen_input
     def cua_get_app(self, app_name: str) -> str:
         return self.cua.get_app(app_name)
 
     def cua_get_ax_state(self, app_name: str) -> str:
         return self.cua.list_elements(app_name)
 
+    @_screen_input
     def cua_click(self, app_name: str, element_id: int) -> str:
         return self.cua.click_element(app_name, element_id)
 
+    @_screen_input
     def run_action_sequence(self, steps: List[ActionStep]) -> str:
         """
         Fare/klavye eylemlerini (click/move/type/press/wait) TEK araç çağrısında sırayla
         çalıştırır; her adım için ayrı model turu gerekmez. Bir adım başarısız olursa
         hata, o ana kadar tamamlanan adımları da bildirir (model durumu bilsin).
         """
+        if isinstance(steps, str):
+            try:
+                steps = json.loads(steps)
+            except json.JSONDecodeError as error:
+                raise ToolError(
+                    "steps bir JSON nesne listesi olmalı; örnek: "
+                    '[{"action":"click","point":[100,200]}]',
+                    "INVALID_ACTION_PARAMS", False,
+                ) from error
+        if not isinstance(steps, list):
+            raise ToolError("steps bir eylem nesnesi listesi olmalı.", "INVALID_ACTION_PARAMS", False)
         _require_accessibility()
         geometry: ScreenGeometry = current_geometry()
         executed: List[str] = []
         for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                raise ToolError(
+                    f"Eylem {index} nesne olmalı; alınan tür: {type(step).__name__}. "
+                    "Örnek: {\"action\":\"click\",\"point\":[100,200]}. "
+                    f"Tamamlanan adımlar: {executed}",
+                    "INVALID_ACTION_PARAMS", False,
+                )
             try:
                 executed.append(_run_action_step(step, geometry))
             except (KeyError, TypeError, ValueError) as error:
