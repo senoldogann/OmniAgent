@@ -25,6 +25,7 @@ from typing import Callable, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
 from openai import AsyncOpenAI
 
+from integration_runtime import IntegrationMetrics
 from main import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 
 SCENARIO_NAMES: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat", "takip", "takip_bos")
@@ -48,6 +49,7 @@ class RunResult(TypedDict):
     cached_tokens: int
     completion_tokens: int
     backend: str
+    integrations: IntegrationMetrics
 
 
 class JsonHandler(BaseHTTPRequestHandler):
@@ -180,6 +182,7 @@ async def run_one(
             "tool_calls": metrics["tool_calls"], "prompt_tokens": metrics["prompt_tokens"],
             "cached_tokens": metrics["cached_tokens"], "completion_tokens": metrics["completion_tokens"],
             "backend": metrics["backend"],
+            "integrations": metrics.get("integrations", {}),
         }
         print(f"{'✓' if ok else '✗'} {name:9s} {result['elapsed_seconds']:5.1f}s tur={result['turns']} "
               f"araç={result['tool_calls']} backend={result['backend']} | {report['outcome'][:70]!r} {detail[:80]}", flush=True)
@@ -204,6 +207,11 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
         f"ortalama={statistics.mean(all_times):.1f}s girdi={prompt} önbellek=%{100 * cached / prompt if prompt else 0:.0f} "
         f"çıktı={sum(r['completion_tokens'] for r in results)}"
     )
+    measurements = [row.get("integrations", {}) for row in results]
+    lines.append("Entegrasyon toplamları: " + " · ".join(
+        f"{key}={sum(item.get(key, 0) for item in measurements):.3f}"
+        for key in ("discovery_seconds", "install_seconds", "network_seconds", "wait_seconds",
+                    "user_wait_seconds", "network_requests", "operations_ok", "operations_failed")))
     return "\n".join(lines)
 
 

@@ -122,7 +122,6 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
     Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
     """
     return [
-        DISCOVERY_SCHEMA,
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
             "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
@@ -162,9 +161,9 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["click", "fill", "press"]},
+                            "action": {"type": "string", "enum": ["click", "fill", "press", "wait_for"]},
                             "selector": {"type": "string", "description": "Öğe seçicisi (dönen ÖĞELER listesinden)."},
-                            "value": {"type": ["string", "null"], "description": "fill için metin, press için tuş adı (örn. Enter); click için null."},
+                            "value": {"type": ["string", "null"], "description": "fill: metin; press: tuş; wait_for: visible/hidden/attached/detached; click: null."},
                         },
                         "required": ["action", "selector", "value"],
                     },
@@ -233,7 +232,7 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
                 },
             },
         ),
-    ]
+    ] + [DISCOVERY_SCHEMA]
 
 
 # Modelin çağırabileceği adlar: getattr ile Toolbox'ın özel yöntemlerine
@@ -305,7 +304,8 @@ async def execute_tool(
         if dynamic:
             validate_arguments(dynamic, arguments)
         if asyncio.iscoroutinefunction(method):
-            result: Any = await method(**arguments)
+            operation = method(**arguments)
+            result: Any = await runtime.wait(operation) if runtime is not None and not dynamic else await operation
         else:
             result = await asyncio.to_thread(method, **arguments)
         outcome: ToolResult = {"tool_call_id": call["id"], "ok": True,
@@ -678,7 +678,11 @@ async def _call_model_with_retries(
             timed_out: bool = isinstance(error, APITimeoutError)
             attempt = len(plan) - 1 if timed_out and attempt < len(plan) - 1 else attempt + 1
             if attempt < len(plan):
-                await asyncio.sleep(0.5 * attempt)
+                runtime = CURRENT_RUNTIME.get()
+                if runtime is not None:
+                    await runtime.delay(0.5 * attempt)
+                else:
+                    await asyncio.sleep(0.5 * attempt)
     assert last_error is not None
     raise last_error
 
@@ -837,14 +841,20 @@ async def run_agent_with_callback(
             "completion_tokens": usage["completion_tokens"],
             "integrations": dict(runtime.metrics),
         }
-        sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
         try:
-            await toolbox.close_browser()
-            if "integrations" not in options:
-                await service.close()
+            sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
         finally:
-            CURRENT_RUNTIME.reset(runtime_token)
-            CURRENT_SERVICE.reset(service_token)
+            try:
+                await toolbox.close_browser()
+            finally:
+                try:
+                    if service.outlook:
+                        service.outlook.release(runtime)
+                    if "integrations" not in options:
+                        await service.close()
+                finally:
+                    CURRENT_RUNTIME.reset(runtime_token)
+                    CURRENT_SERVICE.reset(service_token)
 
     emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "metrics": metrics, "exchange": exchange}

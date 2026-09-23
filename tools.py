@@ -492,7 +492,12 @@ def _run_action_step(step: ActionStep, geometry: ScreenGeometry) -> str:
         seconds: float = float(step["seconds"])
         if not 0 < seconds <= MAX_WAIT_SECONDS:
             raise ToolError(f"Bekleme süresi 0-{MAX_WAIT_SECONDS}sn aralığında olmalı: {seconds}", "INVALID_WAIT", False)
-        time.sleep(seconds)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            runtime = TOOL_RUNTIME.get()
+            if runtime and runtime["should_stop"]():
+                raise ToolError("Kullanıcı tarafından durduruldu.", "STOPPED", False)
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         return f"{seconds}sn beklendi."
     raise ToolError(f"Bilinmeyen eylem türü: {action} (click/move/type/press/wait).", "INVALID_ACTION", False)
 
@@ -1076,6 +1081,9 @@ class Toolbox:
                     await page.fill(selector, value)
                 elif kind == "press" and value is not None:
                     await page.press(selector, value)
+                elif kind == "wait_for":
+                    state = value if value in ("visible", "hidden", "attached", "detached") else "visible"
+                    await page.locator(selector).wait_for(state=state)
                 else:
                     raise ToolError(
                         f"Geçersiz tarayıcı eylemi {index}: {action} (click: selector; fill/press: selector + value).",

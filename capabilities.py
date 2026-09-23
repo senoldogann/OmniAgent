@@ -41,6 +41,7 @@ class Capability(TypedDict, total=False):
     skill_url: str
     token_key: str
     readonly_tools: List[str]
+    operation_tools: Dict[str, List[str]]
     observed: Dict[str, Any]
 
 
@@ -106,6 +107,9 @@ class CapabilityService:
     async def discover(self, runtime: IntegrationRuntime, query: str, operations: List[str],
                        allow_online: bool) -> Dict[str, Any]:
         runtime.check()
+        if matches(OUTLOOK, query):
+            aliases = {"delete": "clean", "trash": "clean", "cleanup": "clean", "read": "list"}
+            operations = [aliases.get(op.casefold(), op) for op in operations]
         start = time.monotonic()
         runtime.status("discovery", f"{query}: hazır bağlantılar aranıyor")
         try:
@@ -143,7 +147,7 @@ class CapabilityService:
         finally:
             runtime.metrics["discovery_seconds"] += time.monotonic() - start
 
-    async def remote_search(self, query: str, runtime: IntegrationRuntime) -> List[Capability]:
+    async def registry_search(self, query: str, runtime: IntegrationRuntime) -> List[Capability]:
         """Registry verisi keşif bilgisidir; kurulum yetkisi vermez."""
         started = time.monotonic()
         runtime.metrics["network_requests"] += 1
@@ -164,6 +168,54 @@ class CapabilityService:
             return result
         finally:
             runtime.metrics["network_seconds"] += time.monotonic() - started
+
+    async def remote_search(self, query: str, runtime: IntegrationRuntime) -> List[Capability]:
+        """Resmî doküman ve registry aramasını aynı sekiz saniyelik bütçede yürütür."""
+        sources = {"github": "https://docs.github.com", "slack": "https://api.slack.com",
+                   "notion": "https://developers.notion.com", "microsoft": "https://learn.microsoft.com"}
+        async def documentation() -> List[Capability]:
+            url = sources.get(query.casefold().strip())
+            if not url:
+                return []
+            started = time.monotonic()
+            runtime.metrics["network_requests"] += 1
+            try:
+                response = await self.http.get(url)
+                response.raise_for_status()
+                from urllib.parse import urljoin
+                links = re.findall(r'href=["\']([^"\']+)["\']', response.text[:250000])
+                relevant = [urljoin(url, link) for link in links
+                            if "SKILL.md" in link or "mcp" in link.casefold()]
+                return [{"id": link, "kind": "skill" if "SKILL.md" in link else "documentation",
+                         "title": query + " resmî kaynak bağlantısı", "source": url,
+                         "skill_url": link if "SKILL.md" in link else "",
+                         "trusted": False, "connection": "review_required", "version": ""}
+                        for link in dict.fromkeys(relevant) if link.startswith("https://")][:5]
+            finally:
+                runtime.metrics["network_seconds"] += time.monotonic() - started
+        results = await asyncio.gather(self.registry_search(query, runtime), documentation(), return_exceptions=True)
+        candidates = [item for group in results if isinstance(group, list) for item in group]
+        async def skill_at_repository(entry: Capability) -> Optional[Capability]:
+            parsed = urlparse(entry.get("source", ""))
+            parts = parsed.path.strip("/").removesuffix(".git").split("/")
+            if parsed.netloc != "github.com" or len(parts) != 2:
+                return None
+            url = f"https://raw.githubusercontent.com/{parts[0]}/{parts[1]}/main/SKILL.md"
+            started = time.monotonic()
+            runtime.metrics["network_requests"] += 1
+            try:
+                response = await self.http.get(url)
+                if response.status_code == 200:
+                    return {"id": entry["id"] + "/skill", "kind": "skill", "title": entry["id"] + " yöntemi",
+                            "source": entry["source"], "skill_url": url, "version": "",
+                            "trusted": False, "connection": "review_required"}
+            except httpx.HTTPError:
+                return None
+            finally:
+                runtime.metrics["network_seconds"] += time.monotonic() - started
+            return None
+        skills = await asyncio.gather(*(skill_at_repository(entry) for entry in candidates[:3]))
+        return candidates + [skill for skill in skills if skill is not None]
 
     async def activate(self, entry: Capability, runtime: IntegrationRuntime,
                        operations: List[str]) -> tuple[Dict[str, ToolEntry], str]:
