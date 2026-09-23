@@ -17,6 +17,7 @@ from config import BACKENDS, DEFAULT_BACKEND
 from events import AgentEvent, compact_count, tool_label
 from main import STATE_FILE, RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 from state_manager import EpisodeMetrics
+from markdown_render import render_markdown
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
@@ -147,6 +148,7 @@ class OmniUI(ctk.CTk):
         self._region_seq: int = 0
         # Akan bölgeler: bekleyen metin, metin etiketi, imleç var mı, model hâlâ yazıyor mu
         self._pending_text: Dict[str, str] = {}
+        self._raw_text: Dict[str, str] = {}
         self._region_text_tag: Dict[str, str] = {}
         self._streaming_regions: Dict[str, bool] = {}
         self._live_regions: Dict[str, bool] = {}
@@ -259,6 +261,20 @@ class OmniUI(ctk.CTk):
             "notice_warning": {"foreground": WARNING, "font": small, "lmargin1": indent, "lmargin2": indent},
             "notice_error": {"foreground": ERROR, "font": small, "lmargin1": indent, "lmargin2": indent},
         }
+        tags.update({
+            "md_h1": {"font": (MONO_FAMILY, 18, "bold"), "spacing1": 10},
+            "md_h2": {"font": (MONO_FAMILY, 15, "bold"), "spacing1": 8},
+            "md_h3": {"font": (MONO_FAMILY, 13, "bold"), "spacing1": 6},
+            "md_bold": {"font": mono_bold},
+            "md_italic": {"font": (MONO_FAMILY, 12, "italic")},
+            "md_code": {"background": COMMAND_BG, "foreground": TEXT},
+            "md_codeblock": {"background": COMMAND_BG, "spacing1": 4, "spacing3": 4},
+            "md_bullet": {"lmargin2": indent + 16},
+            "md_quote": {"foreground": TEXT_DIM, "lmargin1": indent + 8, "lmargin2": indent + 8},
+            "md_rule": {"foreground": BORDER},
+            "md_table_head": {"font": mono_bold},
+            "md_link": {"foreground": INFO, "underline": True},
+        })
         for name, options in tags.items():
             self._text.tag_configure(name, **options)
 
@@ -350,6 +366,7 @@ class OmniUI(ctk.CTk):
         bounds: Optional[Tuple[str, str]] = self._region_bounds(region)
         if bounds is not None:
             self._text.delete(bounds[0], bounds[1])
+        self._raw_text.pop(region, None)
         self._pending_text.pop(region, None)
         self._region_text_tag.pop(region, None)
         self._streaming_regions.pop(region, None)
@@ -367,6 +384,9 @@ class OmniUI(ctk.CTk):
         bounds: Optional[Tuple[str, str]] = self._region_bounds(region)
         if bounds is not None and self._streaming_regions.get(region):
             self._text.delete(f"{bounds[1]} - 2 chars", f"{bounds[1]} - 1 chars")
+        if self._streaming_regions.get(region) and region in self._raw_text:
+            self._replace_region(region, [("⏺ ", ("bullet_text",))] + render_markdown(self._raw_text[region]))
+            self._text.see("end")
         self._streaming_regions[region] = False
 
     # --- Olay → durum ---
@@ -426,6 +446,7 @@ class OmniUI(ctk.CTk):
             self.model_label.configure(text=self._model_text(event["backend"]))
         elif event["kind"] == "text_delta" and self._turn is not None:
             region: str = self._text_region()
+            self._raw_text[region] = self._raw_text.get(region, "") + event["text"]
             self._pending_text[region] = self._pending_text.get(region, "") + event["text"]
             self._turn_streamed_chars += len(event["text"])
             self._activity_verb = "Yazıyor"
@@ -707,6 +728,7 @@ class OmniUI(ctk.CTk):
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._pending_text = {}
+        self._raw_text = {}
         self._region_text_tag = {}
         self._streaming_regions = {}
         self._live_regions = {}
