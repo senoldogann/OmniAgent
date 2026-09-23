@@ -3,7 +3,7 @@ import os
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, TypedDict
+from typing import List, Optional, TypedDict, NotRequired, Dict, Union
 
 # Epizodik bellekte tutulacak en fazla görev sayısı (bellek dosyasının sınırsız
 # büyüyüp her yüklemede yavaşlamasını önler).
@@ -32,6 +32,7 @@ class EpisodeMetrics(TypedDict):
     prompt_tokens: int
     cached_tokens: int
     completion_tokens: int
+    integrations: NotRequired[Dict[str, Union[int, float]]]
 
 
 class Episode(TypedDict):

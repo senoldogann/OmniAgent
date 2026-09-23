@@ -113,15 +113,31 @@ class RunFinished(TypedDict):
     metrics: EpisodeMetrics
 
 
+class IntegrationStatus(TypedDict):
+    kind: Literal["integration_status"]
+    stage: str
+    text: str
+    completed: int
+    total: int
+
+
+class UserInputRequired(TypedDict):
+    kind: Literal["user_input_required"]
+    request_id: str
+    title: str
+    fields: Dict[str, object]
+
+
 AgentEvent = Union[
     RunStarted, TurnStarted, TextDelta, ReasoningDelta, ToolCallPreview, StreamReset,
-    ModelFinished, ToolStarted, ToolOutput, ToolFinished, BackendChanged, Notice, RunFinished,
+    ModelFinished, ToolStarted, ToolOutput, ToolFinished, BackendChanged, Notice, RunFinished, IntegrationStatus, UserInputRequired,
 ]
 # Olayları tüketen hedef; araç çıktısı işçi thread'lerinden de çağrılır (thread-safe olmalı).
 EventSink = Callable[[AgentEvent], None]
 
 # Araçların arayüzde görünen kısa adları
 TOOL_LABELS: Dict[str, str] = {
+    "discover_capabilities": "Bağlantı keşfi", "outlook_clean": "Posta temizliği",
     "execute_shell": "Kabuk", "process_list": "Süreçler", "read_file": "Oku", "write_file": "Yaz",
     "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "execute_js": "Node",
     "take_screenshot": "Ekran", "cua_get_app": "Uygulama", "cua_get_ax_state": "Arayüz ağacı",

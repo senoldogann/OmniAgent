@@ -9,7 +9,7 @@ import uuid
 from datetime import date
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, NotRequired
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, Timeout
 from openai.types import CompletionUsage
@@ -20,6 +20,11 @@ from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arg
 from tools import MODEL_SCREEN_MAX_EDGE, TOOL_RUNTIME, Toolbox, ToolError
 import state_manager as sm
 from conversation import Exchange, make_exchange, to_messages
+from capabilities import CapabilityService, DISCOVERY_SCHEMA, discovery_entry, validate_arguments
+from integration_runtime import (
+    AnswerSink, CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime,
+    IntegrationStopped, InteractionRequired,
+)
 
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
 MAX_ITERATIONS: int = 25
@@ -76,6 +81,8 @@ class RunOptions(TypedDict):
     # Epizot kaydının yazılacağı bellek dosyası (benchmark ayrı dosya kullanır)
     state_file: str
     history: List[Exchange]
+    integrations: NotRequired[CapabilityService]
+    answer: NotRequired[AnswerSink]
 
 
 class RunReport(TypedDict):
@@ -115,6 +122,7 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
     Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
     """
     return [
+        DISCOVERY_SCHEMA,
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
             "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
@@ -267,7 +275,13 @@ async def execute_tool(
             "tool_call_id": call["id"], "ok": False,
             "error_type": "JSONDecodeError", "error": f"Araç argümanları çözümlenemedi: {error}",
         }
-    if name not in TOOL_NAMES:
+    runtime = CURRENT_RUNTIME.get()
+    service = CURRENT_SERVICE.get()
+    dynamic = runtime.published.get(name) if runtime is not None else None
+    if name == "discover_capabilities" and dynamic is None:
+        return {"tool_call_id": call["id"], "ok": False, "error_type": "IntegrationUnavailable",
+                "error": "Keşif yalnızca görev bağlamında kullanılabilir."}
+    if name not in TOOL_NAMES and dynamic is None:
         return {
             "tool_call_id": call["id"], "ok": False,
             "error_type": "UnknownTool", "error": f"Bilinmeyen araç: {name}. Geçerli araçlar: {', '.join(sorted(TOOL_NAMES))}",
@@ -279,17 +293,27 @@ async def execute_tool(
         if cache_key in cache:
             return {**cache[cache_key], "tool_call_id": call["id"]}
 
-    method: Callable[..., Any] = getattr(toolbox, name)
+    method: Callable[..., Any] = dynamic["execute"] if dynamic else getattr(toolbox, name)
+    integration_started = time.monotonic()
     token = TOOL_RUNTIME.set({
         "emit_output": lambda text: emit({"kind": "tool_output", "call_id": call["id"], "text": text}),
         "should_stop": should_stop,
     })
     try:
+        if runtime is not None:
+            runtime.check()
+        if dynamic:
+            validate_arguments(dynamic, arguments)
         if asyncio.iscoroutinefunction(method):
             result: Any = await method(**arguments)
         else:
             result = await asyncio.to_thread(method, **arguments)
-        outcome: ToolResult = {"tool_call_id": call["id"], "ok": True, "result": str(result)}
+        outcome: ToolResult = {"tool_call_id": call["id"], "ok": True,
+                               "result": json.dumps(result, ensure_ascii=False) if dynamic else str(result)}
+    except (IntegrationStopped, InteractionRequired) as error:
+        outcome = {"tool_call_id": call["id"], "ok": False, "error_type": type(error).__name__,
+                   "error": str(error), "code": "STOPPED" if isinstance(error, IntegrationStopped) else "INPUT_REQUIRED",
+                   "recoverable": False}
     except ToolError as error:
         outcome = {
             "tool_call_id": call["id"], "ok": False,
@@ -310,7 +334,9 @@ async def execute_tool(
     finally:
         TOOL_RUNTIME.reset(token)
 
-    if outcome.get("ok") and name in _SIDE_EFFECT_TOOLS:
+    if dynamic and service:
+        service.record(dynamic["capability"], time.monotonic() - integration_started, bool(outcome.get("ok")))
+    if outcome.get("ok") and _is_side_effect(name):
         cache.clear()
     if cache_key is not None and outcome.get("ok"):
         cache[cache_key] = outcome
@@ -338,6 +364,12 @@ async def _run_tool_with_events(
     return result
 
 
+def _is_side_effect(name: str) -> bool:
+    runtime = CURRENT_RUNTIME.get()
+    entry = runtime.published.get(name) if runtime else None
+    return (not entry["readonly"]) if entry else name in _SIDE_EFFECT_TOOLS
+
+
 async def _execute_tool_calls(
     calls: List[ToolCallDraft], toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
     should_stop: Callable[[], bool],
@@ -351,12 +383,12 @@ async def _execute_tool_calls(
     results: List[Optional[ToolResult]] = [None] * len(calls)
     index: int = 0
     while index < len(calls):
-        if calls[index]["name"] in _SIDE_EFFECT_TOOLS:
+        if _is_side_effect(calls[index]["name"]):
             results[index] = await _run_tool_with_events(index, calls[index], toolbox, cache, emit, should_stop)
             index += 1
             continue
         stop: int = index
-        while stop < len(calls) and calls[stop]["name"] not in _SIDE_EFFECT_TOOLS:
+        while stop < len(calls) and not _is_side_effect(calls[stop]["name"]):
             stop += 1
         group: List[ToolResult] = list(await asyncio.gather(
             *(_run_tool_with_events(k, calls[k], toolbox, cache, emit, should_stop) for k in range(index, stop))
@@ -695,6 +727,11 @@ async def run_agent_with_callback(
         + to_messages(options["history"])
         + [{"role": "user", "content": goal}]
     )
+    service = options.get("integrations") or CapabilityService()
+    runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
+    runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
+    runtime_token = CURRENT_RUNTIME.set(runtime)
+    service_token = CURRENT_SERVICE.set(service)
     tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
     steps: List[sm.StepRecord] = []
     outcome: str = ""
@@ -713,10 +750,13 @@ async def run_agent_with_callback(
             if options["should_stop"]():
                 outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
-            if time.monotonic() - start_time > MAX_WALL_CLOCK_SECONDS:
+            if time.monotonic() - start_time - runtime.metrics["user_wait_seconds"] > MAX_WALL_CLOCK_SECONDS:
                 outcome, reason = "", f"zaman bütçesi ({MAX_WALL_CLOCK_SECONDS:.0f}sn) aşıldı"
                 break
 
+            runtime.published = dict(runtime.selected)
+            tool_schemas = build_tool_schemas() + [
+                entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             messages = _trim_old_turns(messages)
             emit({"kind": "turn_started", "turn": iteration, "max_turns": MAX_ITERATIONS,
                   "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
@@ -795,9 +835,16 @@ async def run_agent_with_callback(
             "elapsed_seconds": round(time.monotonic() - start_time, 2), "backend": current_backend,
             "prompt_tokens": usage["prompt_tokens"], "cached_tokens": usage["cached_tokens"],
             "completion_tokens": usage["completion_tokens"],
+            "integrations": dict(runtime.metrics),
         }
         sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
-        await toolbox.close_browser()
+        try:
+            await toolbox.close_browser()
+            if "integrations" not in options:
+                await service.close()
+        finally:
+            CURRENT_RUNTIME.reset(runtime_token)
+            CURRENT_SERVICE.reset(service_token)
 
     emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "metrics": metrics, "exchange": exchange}
@@ -828,6 +875,8 @@ def print_event(event: AgentEvent) -> None:
         print(f"\n  ↻ akış sıfırlandı: {event['reason']}")
     elif event["kind"] == "notice":
         print(f"  [{event['level']}] {event['text']}")
+    elif event["kind"] == "integration_status":
+        print(f"  · {event['text']}")
     elif event["kind"] == "run_finished":
         metrics: sm.EpisodeMetrics = event["metrics"]
         status: str = "✓ Tamamlandı" if event["success"] else f"✗ Tamamlanamadı: {event['reason']}"
