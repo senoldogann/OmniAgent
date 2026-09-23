@@ -1,5 +1,7 @@
 import asyncio
 import sys
+import uuid
+import webbrowser
 import json
 import math
 import threading
@@ -20,6 +22,8 @@ from main import STATE_FILE, RunOptions, RunReport, close_model_clients, create_
 from state_manager import EpisodeMetrics
 from markdown_render import render_markdown
 from conversation import Exchange, make_exchange, trim_history
+from capabilities import CapabilityService
+from integration_runtime import IntegrationRuntime, IntegrationStopped
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
@@ -151,6 +155,9 @@ class OmniUI(ctk.CTk):
         self._agent_future: Optional["Future[RunReport]"] = None
         self._history: List[Exchange] = []
         self._active_goal: str = ""
+        self._input_futures: Dict[str, asyncio.Future] = {}
+        self._input_windows: Dict[str, ctk.CTkToplevel] = {}
+        self._waiting_user: bool = False
         self._region_seq: int = 0
         # Akan bölgeler: bekleyen metin, metin etiketi, imleç var mı, model hâlâ yazıyor mu
         self._pending_text: Dict[str, str] = {}
@@ -178,6 +185,7 @@ class OmniUI(ctk.CTk):
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, daemon=True).start()
         self._clients: Dict[str, AsyncOpenAI] = create_model_clients()
+        self._integrations = CapabilityService()
 
         self.bind("<Escape>", lambda event: self._request_stop())
         self.bind("<Command-k>", lambda event: self._clear_transcript())
@@ -460,7 +468,13 @@ class OmniUI(ctk.CTk):
         self._dirty_tools[view["region"]] = view
 
     def _handle_event(self, event: AgentEvent) -> None:
-        if event["kind"] == "run_started":
+        if event["kind"] == "integration_status":
+            self._waiting_user = event["stage"] == "waiting_user"
+            self._activity_verb = event["text"]
+            self._new_region([(event["text"] + "\n", ("notice_info",))])
+        elif event["kind"] == "user_input_required":
+            self._show_input(event["request_id"], event["title"], event["fields"])
+        elif event["kind"] == "run_started":
             self.model_label.configure(text=self._model_text(event["backend"]))
         elif event["kind"] == "turn_started":
             self._turn = {"number": event["turn"], "text_region": None, "reasoning_region": None, "tools": {}}
@@ -700,6 +714,9 @@ class OmniUI(ctk.CTk):
         if self._agent_future is not None and not self._agent_future.done():
             self._stop_event.set()
             self._activity_verb = "Durduruluyor"
+            for window in list(self._input_windows.values()):
+                window.destroy()
+            self._input_windows.clear()
 
     def _send_goal(self) -> None:
         """Giriş alanındaki hedefi transkripte ekler ve ajanı kalıcı event loop'ta başlatır."""
@@ -729,11 +746,72 @@ class OmniUI(ctk.CTk):
             "should_stop": self._stop_event.is_set,
             "state_file": STATE_FILE,
             "history": trim_history(self._history),
+            "integrations": self._integrations,
+            "answer": self._request_input,
         }
         self._agent_future = asyncio.run_coroutine_threadsafe(
             run_agent_with_callback(goal, self._post, options, self._clients), self._loop,
         )
         self._agent_future.add_done_callback(self._on_agent_future_done)
+
+    async def _request_input(self, title: str, fields: Dict[str, object]) -> Dict[str, object]:
+        """Model çağırmadan Tk arayüzünden cevap bekler."""
+        request_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self._input_futures[request_id] = future
+        self._post({"kind": "user_input_required", "request_id": request_id, "title": title, "fields": fields})
+        try:
+            return await future
+        finally:
+            self._input_futures.pop(request_id, None)
+
+    def _show_input(self, request_id: str, title: str, fields: Dict[str, object]) -> None:
+        """Alanları Tk thread'inde gösterir; cevap yalnız ilgili Future'a teslim edilir."""
+        if self._stop_event.is_set():
+            return
+        window = ctk.CTkToplevel(self)
+        self._input_windows[request_id] = window
+        window.title("OmniAgent — Bağlantı ve tercihler")
+        window.geometry("660x640")
+        window.transient(self)
+        panel = ctk.CTkScrollableFrame(window, fg_color=BG)
+        panel.pack(fill="both", expand=True, padx=12, pady=12)
+        ctk.CTkLabel(panel, text=title, wraplength=590, justify="left").pack(anchor="w", pady=8)
+        if fields.get("_help"):
+            ctk.CTkLabel(panel, text=str(fields["_help"]), wraplength=590, justify="left").pack(anchor="w", pady=8)
+        if fields.get("_url"):
+            url = str(fields["_url"])
+            ctk.CTkButton(panel, text="Microsoft uygulama kaydını aç",
+                          command=lambda: webbrowser.open(url)).pack(anchor="w", pady=6)
+        widgets = {}
+        for name, spec in fields.items():
+            if name.startswith("_") or not isinstance(spec, dict):
+                continue
+            if spec.get("type") == "boolean":
+                variable = tk.BooleanVar(value=bool(spec.get("default", False)))
+                widget = ctk.CTkCheckBox(panel, text=spec.get("label", name), variable=variable)
+                widget.pack(anchor="w", pady=8)
+                widgets[name] = variable
+            else:
+                ctk.CTkLabel(panel, text=spec.get("label", name)).pack(anchor="w")
+                widget = ctk.CTkEntry(panel, width=590)
+                widget.insert(0, str(spec.get("default", "")))
+                widget.pack(anchor="w", pady=(0, 6))
+                widgets[name] = widget
+
+        def submit() -> None:
+            values = {name: widget.get() for name, widget in widgets.items()}
+            def deliver() -> None:
+                future = self._input_futures.get(request_id)
+                if future is not None and not future.done():
+                    future.set_result(values)
+            self._loop.call_soon_threadsafe(deliver)
+            self._input_windows.pop(request_id, None)
+            window.destroy()
+
+        ctk.CTkButton(panel, text="Kaydet ve devam et", command=submit).pack(pady=12)
+        window.protocol("WM_DELETE_WINDOW", self._request_stop)
+        window.lift()
 
     def _on_agent_future_done(self, future: "Future[RunReport]") -> None:
         """Görev bitince (event loop thread'inde) sonucu kuyruğa bırakır."""
@@ -751,6 +829,10 @@ class OmniUI(ctk.CTk):
         self._history = trim_history(self._history + [exchange])
         self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
         self._agent_future = None
+        self._waiting_user = False
+        for window in list(self._input_windows.values()):
+            window.destroy()
+        self._input_windows.clear()
         if error:
             self._new_region([(f"⚠ Kritik hata: {error}\n", ("notice_error",))])
         self._end_live_regions()
@@ -781,7 +863,15 @@ class OmniUI(ctk.CTk):
     def _on_close(self) -> None:
         """Pencere kapanırken istemci bağlantılarını kapatıp event loop'u durdurur."""
         self._stop_event.set()
-        asyncio.run_coroutine_threadsafe(close_model_clients(self._clients), self._loop).result(timeout=5)
+        async def close_connections() -> None:
+            if self._agent_future is not None and not self._agent_future.done():
+                try:
+                    await asyncio.wait_for(asyncio.wrap_future(self._agent_future), timeout=3)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            await self._integrations.close()
+            await close_model_clients(self._clients)
+        asyncio.run_coroutine_threadsafe(close_connections(), self._loop).result(timeout=8)
         self._loop.call_soon_threadsafe(self._loop.stop)
         self.destroy()
 
