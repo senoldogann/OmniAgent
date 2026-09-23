@@ -19,6 +19,7 @@ from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER
 from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
 from tools import MODEL_SCREEN_MAX_EDGE, TOOL_RUNTIME, Toolbox, ToolError
 import state_manager as sm
+from conversation import Exchange, make_exchange, to_messages
 
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
 MAX_ITERATIONS: int = 25
@@ -74,6 +75,7 @@ class RunOptions(TypedDict):
     should_stop: Callable[[], bool]
     # Epizot kaydının yazılacağı bellek dosyası (benchmark ayrı dosya kullanır)
     state_file: str
+    history: List[Exchange]
 
 
 class RunReport(TypedDict):
@@ -81,6 +83,7 @@ class RunReport(TypedDict):
     outcome: str
     success: bool
     metrics: sm.EpisodeMetrics
+    exchange: Exchange
 
 
 def encode_image(path: str) -> str:
@@ -687,10 +690,11 @@ async def run_agent_with_callback(
     toolbox: Toolbox = Toolbox()
     session_id: str = str(uuid.uuid4())
     state: sm.StateDict = sm.load_state(options["state_file"])
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": build_system_prompt(date.today())},
-        {"role": "user", "content": goal},
-    ]
+    messages: List[Dict[str, Any]] = (
+        [{"role": "system", "content": build_system_prompt(date.today())}]
+        + to_messages(options["history"])
+        + [{"role": "user", "content": goal}]
+    )
     tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
     steps: List[sm.StepRecord] = []
     outcome: str = ""
@@ -781,8 +785,11 @@ async def run_agent_with_callback(
     except Exception as error:
         outcome, reason = f"Kritik hata: {error}", f"kritik hata: {error}"
         emit({"kind": "notice", "level": "error", "text": outcome})
-        raise
     finally:
+        history_answer: str = outcome or reason
+        if not success and reason and reason not in history_answer:
+            history_answer = f"[Görev tamamlanamadı: {reason}]\n{history_answer}"
+        exchange: Exchange = make_exchange(goal, history_answer, steps)
         metrics = {
             "turns": turns, "tool_calls": tool_call_count,
             "elapsed_seconds": round(time.monotonic() - start_time, 2), "backend": current_backend,
@@ -793,7 +800,7 @@ async def run_agent_with_callback(
         await toolbox.close_browser()
 
     emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
-    return {"outcome": outcome, "success": success, "metrics": metrics}
+    return {"outcome": outcome, "success": success, "metrics": metrics, "exchange": exchange}
 
 
 def print_event(event: AgentEvent) -> None:
@@ -831,7 +838,7 @@ async def run_agent(goal: str) -> RunReport:
     """Hedefi terminale akış olarak basarak çalıştırır (CLI)."""
     clients: Dict[str, AsyncOpenAI] = create_model_clients()
     try:
-        options: RunOptions = {"requested_backend": None, "should_stop": lambda: False, "state_file": STATE_FILE}
+        options: RunOptions = {"requested_backend": None, "should_stop": lambda: False, "state_file": STATE_FILE, "history": []}
         return await run_agent_with_callback(goal, print_event, options, clients)
     finally:
         await close_model_clients(clients)

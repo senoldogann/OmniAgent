@@ -1,0 +1,80 @@
+[
+ {
+  "name": "takip",
+  "ok": true,
+  "detail": "beklenen=137",
+  "outcome": "SATIR: 137",
+  "elapsed_seconds": 4.2,
+  "turns": 2,
+  "tool_calls": 1,
+  "prompt_tokens": 6117,
+  "cached_tokens": 4096,
+  "completion_tokens": 85,
+  "backend": "opencode"
+ },
+ {
+  "name": "takip",
+  "ok": true,
+  "detail": "beklenen=137",
+  "outcome": "SATIR: 137",
+  "elapsed_seconds": 6.76,
+  "turns": 3,
+  "tool_calls": 2,
+  "prompt_tokens": 9384,
+  "cached_tokens": 7168,
+  "completion_tokens": 181,
+  "backend": "opencode"
+ },
+ {
+  "name": "takip",
+  "ok": true,
+  "detail": "beklenen=137",
+  "outcome": "SATIR: 137",
+  "elapsed_seconds": 6.71,
+  "turns": 3,
+  "tool_calls": 2,
+  "prompt_tokens": 9379,
+  "cached_tokens": 7168,
+  "completion_tokens": 176,
+  "backend": "opencode"
+ },
+ {
+  "name": "takip_bos",
+  "ok": false,
+  "detail": "beklenen=137",
+  "outcome": "SATIR: 646",
+  "elapsed_seconds": 5.96,
+  "turns": 3,
+  "tool_calls": 2,
+  "prompt_tokens": 9912,
+  "cached_tokens": 7168,
+  "completion_tokens": 67,
+  "backend": "opencode"
+ },
+ {
+  "name": "takip_bos",
+  "ok": false,
+  "detail": "beklenen=137",
+  "outcome": "",
+  "elapsed_seconds": 57.34,
+  "turns": 25,
+  "tool_calls": 25,
+  "prompt_tokens": 136298,
+  "cached_tokens": 101120,
+  "completion_tokens": 778,
+  "backend": "opencode"
+ },
+ {
+  "name": "takip_bos",
+  "ok": false,
+  "detail": "beklenen=137",
+  "outcome": "",
+  "elapsed_seconds": 79.2,
+  "turns": 25,
+  "tool_calls": 25,
+  "prompt_tokens": 127596,
+  "cached_tokens": 104192,
+  "completion_tokens": 1810,
+  "backend": "opencode"
+ }
+]

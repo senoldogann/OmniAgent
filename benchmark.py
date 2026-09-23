@@ -21,18 +21,19 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import Callable, Dict, List, Optional, Tuple, TypedDict
+from typing import Callable, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
 from openai import AsyncOpenAI
 
 from main import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 
-SCENARIO_NAMES: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat")
+SCENARIO_NAMES: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat", "takip", "takip_bos")
 
 
 class Scenario(TypedDict):
     goal: str
     check: Callable[[str], Tuple[bool, str]]
+    first_goal: NotRequired[str]
 
 
 class RunResult(TypedDict):
@@ -132,6 +133,18 @@ def build_scenario(name: str, run_dir: Path, run_id: str, port: int) -> Scenario
             return content == f"OMNI-{run_id}" and files == ["not.txt"], f"icerik={content} dosyalar={files}"
         return {"goal": f"{directory}/not.txt dosyasına tam olarak 'OMNI-{run_id}' yaz. Başka dosya oluşturma. Tek satır 'TAMAM' yaz.",
                 "check": check_sadakat}
+    if name in ("takip", "takip_bos"):
+        directory = run_dir / "belgeler"
+        directory.mkdir()
+        largest = directory / f"veri-{run_id}.txt"
+        largest.write_text(("uzun kayıt " + "x" * 80 + "\n") * 137, encoding="utf-8")
+        (directory / "kisa.txt").write_text("kısa\n" * 7, encoding="utf-8")
+        followup: Scenario = {
+            "first_goal": f"{directory} dizinindeki boyutu en büyük dosyayı bul. Tam yolunu belirt.",
+            "goal": "Onun satır sayısını söyle. Tek satır 'SATIR: <n>' yaz.",
+            "check": lambda o: (bool(re.search(r"SATIR:\s*137\b", o)), "beklenen=137"),
+        }
+        return followup
     raise ValueError(f"Bilinmeyen senaryo: {name}")
 
 
@@ -147,12 +160,19 @@ async def run_one(
         scenario: Scenario = build_scenario(name, run_dir, run_id, port)
         options: RunOptions = {
             "requested_backend": backend, "should_stop": lambda: False,
-            "state_file": str(root / "memory.json"),
+            "state_file": str(run_dir / "memory.json"), "history": [],
         }
+        first_ok = True
+        if name in ("takip", "takip_bos"):
+            first = await run_agent_with_callback(scenario["first_goal"], lambda event: None, options, clients)
+            first_ok = first["success"] and f"veri-{run_id}.txt" in first["outcome"]
+            if name == "takip":
+                options["history"] = [first["exchange"]]
+        # Takipte yalnızca ikinci mesajın maliyeti ölçülür; ilk mesaj her iki kolda aynıdır.
         started: float = time.monotonic()
         report: RunReport = await run_agent_with_callback(scenario["goal"], lambda event: None, options, clients)
         ok, detail = scenario["check"](report["outcome"])
-        ok = ok and report["success"]
+        ok = ok and report["success"] and first_ok
         metrics = report["metrics"]
         result: RunResult = {
             "name": name, "ok": ok, "detail": detail, "outcome": report["outcome"][:300],

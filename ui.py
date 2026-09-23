@@ -18,6 +18,7 @@ from events import AgentEvent, compact_count, tool_label
 from main import STATE_FILE, RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 from state_manager import EpisodeMetrics
 from markdown_render import render_markdown
+from conversation import Exchange, make_exchange, trim_history
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
@@ -85,6 +86,7 @@ class UiItem(TypedDict):
     event: Optional[AgentEvent]
     done: bool
     error: str
+    report: Optional[RunReport]
 
 
 def _clip_line(line: str) -> str:
@@ -145,6 +147,8 @@ class OmniUI(ctk.CTk):
         self._inbox: "Queue[UiItem]" = Queue()
         self._stop_event: threading.Event = threading.Event()
         self._agent_future: Optional["Future[RunReport]"] = None
+        self._history: List[Exchange] = []
+        self._active_goal: str = ""
         self._region_seq: int = 0
         # Akan bölgeler: bekleyen metin, metin etiketi, imleç var mı, model hâlâ yazıyor mu
         self._pending_text: Dict[str, str] = {}
@@ -195,6 +199,11 @@ class OmniUI(ctk.CTk):
         ctk.CTkLabel(header, text="✻", text_color=ACCENT, font=ctk.CTkFont(family=MONO_FAMILY, size=20, weight="bold")).grid(
             row=0, column=0, padx=(0, 8))
         ctk.CTkLabel(header, text="OmniAgent", text_color=TEXT, font=self._ui_font(16, "bold")).grid(row=0, column=1)
+        self.context_label: ctk.CTkLabel = ctk.CTkLabel(
+            header, text="bağlam: 0 mesaj", text_color=TEXT_FAINT,
+            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        )
+        self.context_label.grid(row=1, column=1, columnspan=3, sticky="w")
         self.model_label: ctk.CTkLabel = ctk.CTkLabel(
             header, text=self._model_text(DEFAULT_BACKEND), text_color=TEXT_FAINT,
             font=ctk.CTkFont(family=MONO_FAMILY, size=11),
@@ -393,7 +402,7 @@ class OmniUI(ctk.CTk):
 
     def _post(self, event: AgentEvent) -> None:
         """Ajan thread'lerinden çağrılır (thread-safe kuyruk)."""
-        self._inbox.put({"event": event, "done": False, "error": ""})
+        self._inbox.put({"event": event, "done": False, "error": "", "report": None})
 
     def _new_streaming_region(self, head: Tuple[str, Tuple[str, ...]], text_tag: str) -> str:
         """Sonunda yanıp sönen '▌' imleci olan, daktilo ile dolacak bir bölge açar."""
@@ -645,7 +654,7 @@ class OmniUI(ctk.CTk):
             if item["event"] is not None:
                 self._handle_event(item["event"])
             if item["done"]:
-                self._on_run_done(item["error"])
+                self._on_run_done(item["error"], item["report"])
         changed: bool = self._typewriter_step() or processed > 0
         if now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL:
             self._last_running_refresh = now
@@ -680,9 +689,12 @@ class OmniUI(ctk.CTk):
 
     def _send_goal(self) -> None:
         """Giriş alanındaki hedefi transkripte ekler ve ajanı kalıcı event loop'ta başlatır."""
+        if self._agent_future is not None:
+            return
         goal: str = self.entry.get().strip()
         if not goal:
             return
+        self._active_goal = goal
         self.entry.delete(0, "end")
         self._text.configure(state="normal")
         self._render_goal(goal)
@@ -702,6 +714,7 @@ class OmniUI(ctk.CTk):
             "requested_backend": None if selected == "Otomatik" else selected,
             "should_stop": self._stop_event.is_set,
             "state_file": STATE_FILE,
+            "history": trim_history(self._history),
         }
         self._agent_future = asyncio.run_coroutine_threadsafe(
             run_agent_with_callback(goal, self._post, options, self._clients), self._loop,
@@ -710,10 +723,20 @@ class OmniUI(ctk.CTk):
 
     def _on_agent_future_done(self, future: "Future[RunReport]") -> None:
         """Görev bitince (event loop thread'inde) sonucu kuyruğa bırakır."""
-        error: Optional[BaseException] = future.exception()
-        self._inbox.put({"event": None, "done": True, "error": "" if error is None else f"{type(error).__name__}: {error}"})
+        try:
+            report = future.result()
+        except Exception as error:
+            self._inbox.put({"event": None, "done": True,
+                             "error": f"{type(error).__name__}: {error}", "report": None})
+        else:
+            self._inbox.put({"event": None, "done": True, "error": "", "report": report})
 
-    def _on_run_done(self, error: str) -> None:
+    def _on_run_done(self, error: str, report: Optional[RunReport]) -> None:
+        exchange = report["exchange"] if report is not None else make_exchange(
+            self._active_goal, f"Kritik hata: {error}", [])
+        self._history = trim_history(self._history + [exchange])
+        self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
+        self._agent_future = None
         if error:
             self._new_region([(f"⚠ Kritik hata: {error}\n", ("notice_error",))])
         self._end_live_regions()
@@ -723,12 +746,17 @@ class OmniUI(ctk.CTk):
         self.entry.focus_set()
 
     def _clear_transcript(self) -> None:
-        if self._agent_future is not None and not self._agent_future.done():
+        if self._agent_future is not None:
             return
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
         self._pending_text = {}
         self._raw_text = {}
+        self._history = []
+        self._turn = None
+        self._tools_by_call = {}
+        self._dirty_tools = {}
+        self.context_label.configure(text="bağlam: 0 mesaj")
         self._region_text_tag = {}
         self._streaming_regions = {}
         self._live_regions = {}
