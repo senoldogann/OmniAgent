@@ -139,7 +139,8 @@ class OmniUI(ctk.CTk):
         self.geometry("780x880")
         self.minsize(560, 620)
         self.configure(fg_color=BG)
-        self.bind("<Map>", self._style_native_titlebar, add="+")
+        self.bind("<Map>", lambda event: self.after_idle(self._style_native_titlebar)
+                  if event.widget is self else None, add="+")
         self._ui_family: str = tkfont.nametofont("TkDefaultFont").actual("family")
 
         self.grid_columnconfigure(0, weight=1)
@@ -196,10 +197,11 @@ class OmniUI(ctk.CTk):
         self._set_activity_idle()
         self.after(FRAME_MS, self._tick)
         self.after(120, self.entry.focus_set)
+        self.after(120, self._style_native_titlebar)
 
-    def _style_native_titlebar(self, event: tk.Event) -> None:
+    def _style_native_titlebar(self) -> None:
         """macOS başlık çubuğunu içerikle aynı arka plan rengine getirir."""
-        if sys.platform != "darwin" or event.widget is not self:
+        if sys.platform != "darwin":
             return
         import AppKit
         color = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
