@@ -249,9 +249,9 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
         ),
         _function_schema(
             "browse_url",
-            "Kalıcı tarayıcı sekmesi: url verilirse gider (null: mevcut sayfada kalır), actions'ı sırayla "
-            "uygular, sonunda URL, başlık, sayfa metni ve seçicileriyle etkileşimli öğeleri döner. "
-            "'Alanı doldur → gönder → sonucu oku' akışını TEK çağrıda yap.",
+            "Arka planda, kullanıcıya görünmeyen ayrı Chromium sekmesi; açık Google Chrome oturumunu "
+            "kullanmaz. url verilirse gider (null: mevcut sayfa), actions'ı sırayla uygular; sonunda "
+            "URL, başlık, sayfa metni ve seçicileri döner. Doldur → gönder → oku tek çağrıdır.",
             {
                 "url": {"type": ["string", "null"], "description": "Gidilecek URL; mevcut sayfada kalmak için null."},
                 "actions": {
@@ -722,15 +722,17 @@ def next_quality_backend(current: str, available: frozenset[str]) -> Optional[st
 
 def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, str, str]:
     """
-    Model çağrısı deneme planı: ilk iki deneme aynı backend'de (geçici bağlantı/5xx/429),
-    son deneme farklı sağlayıcıda (ESCALATION_BACKEND kullanılabiliyorsa). Saf fonksiyon.
+    Model çağrısı deneme planı: geçici hatalarda bir aynı sağlayıcı denemesi,
+    ardından hazır alternatif. Paralı profillerde önce yerel Ollama tercih edilir. Saf fonksiyon.
     """
-    if backend == "openai" and "zen-free" in available:
-        fallback: str = "zen-free"
-    elif backend == "zen-free" and "openai" in available:
-        fallback = "openai"
-    else:
-        fallback = ESCALATION_BACKEND if ESCALATION_BACKEND in available else backend
+    candidates: Tuple[str, ...] = {
+        "ollama-cloud": ("openai", "zen-free"),
+        "openai": ("ollama-cloud", "zen-free"),
+        "zen-free": ("ollama-cloud", "openai"),
+    }.get(backend, ("ollama-cloud", "openai", "zen-free"))
+    fallback: str = next(
+        (name for name in candidates if name != backend and name in available), backend,
+    )
     return (backend, backend, fallback)
 
 
@@ -990,8 +992,9 @@ async def _call_model_with_retries(
 ) -> Tuple[ModelTurn, str]:
     """
     Model çağrısını attempt_plan'a göre yapar ve yanıt veren backend'i de döner. Kalıcı
-    istemci hataları (400/401/402/403…) yeniden denenmez. Zaman aşımında aynı backend'i bir
-    kez daha beklemek boşa gider: doğrudan son (farklı sağlayıcı) denemeye atlanır. Yarıda
+    istemci hataları (400/404 vb.) yeniden denenmez. Kimlik/bakiye hatası 401/402/403
+    aynı backend'de beklemeden farklı sağlayıcıya geçer. Zaman aşımında da doğrudan son
+    denemeye atlanır. Yarıda
     kesilen bir akış yeniden denenirse önce stream_reset yayınlanır (arayüz o turun akmış
     içeriğini siler, metin iki kez görünmez).
     """
@@ -1015,7 +1018,9 @@ async def _call_model_with_retries(
         # yükselebiliyor; geçici bağlantı hatası gibi yeniden denenir (canlı ölçümde görevi bitirdi).
         except (APIStatusError, APIConnectionError, ssl.SSLError, CliModelError) as error:
             status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
-            if status is not None and status < 500 and status not in (402, 429):
+            if status is not None and status < 500 and status not in (401, 402, 403, 429):
+                raise
+            if status in (401, 402, 403) and plan[-1] == active:
                 raise
             last_error = error
             logging.warning(
@@ -1028,7 +1033,7 @@ async def _call_model_with_retries(
                 emitted[0] = False
             timed_out: bool = isinstance(error, APITimeoutError)
             cli_failed: bool = isinstance(error, CliModelError)
-            quota_failed: bool = status == 402
+            quota_failed: bool = status in (401, 402, 403)
             attempt = len(plan) - 1 if (timed_out or cli_failed or quota_failed) and attempt < len(plan) - 1 else attempt + 1
             if attempt < len(plan):
                 if cli_failed or quota_failed:
@@ -1148,15 +1153,16 @@ async def run_agent_with_callback(
         return startup_failure(error, DEFAULT_BACKEND)
     if not clients:
         return startup_failure(RuntimeError(
-            "Kullanılabilir model yok: OpenCode veya Codex CLI kurulumu ve oturumu gerekli."
+            "Kullanılabilir model yok: Ollama Cloud modeli, Codex/OpenCode CLI veya API bağlantısı gerekli."
         ), DEFAULT_BACKEND)
     available: frozenset[str] = frozenset(clients)
     backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
-    current_backend: str = backend_override if backend_override else (
-        DEFAULT_BACKEND if DEFAULT_BACKEND in available else next(iter(clients))
+    preferred: str = next(
+        (name for name in QUALITY_LADDER if name in available), next(iter(clients)),
     )
+    current_backend: str = backend_override if backend_override else preferred
     if current_backend not in available:
-        replacement: str = DEFAULT_BACKEND if DEFAULT_BACKEND in available else next(iter(clients))
+        replacement: str = preferred
         emit({"kind": "notice", "level": "warning",
               "text": f"'{current_backend}' backend'i kullanılamıyor; '{replacement}' kullanılacak."})
         current_backend = replacement

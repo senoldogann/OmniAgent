@@ -1,7 +1,11 @@
 """Oturumlu Codex ve ücretsiz OpenCode bağlayıcısının regresyon testleri."""
+import asyncio
 import base64
 import io
 import json
+import os
+import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -37,8 +41,8 @@ async def test_cli_model_uses_isolated_client_and_keeps_images(
         if provider == "opencode":
             config = json.loads(Path(env["OPENCODE_CONFIG"]).read_text())
             assert config["agent"]["build"]["permission"]["*"] == "deny"
-            prompt_index = next(index for index, arg in enumerate(command) if "KONUŞMA:" in arg)
-            assert command.index("-f") > prompt_index
+            assert input_text is not None and "KONUŞMA:" in input_text
+            assert all("KONUŞMA:" not in arg for arg in command)
             assert command[-1].endswith(".png")
             output = [
                 {"type": "text", "part": {"text": '{"content":"Kırmızı","tool_calls":[]}' }},
@@ -107,21 +111,24 @@ def test_cli_model_fallback_prefers_available_unbilled_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quota_error_skips_same_paid_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    """402 durumunda aynı paralı modele tekrar gitmeden ücretsiz modele geçilir."""
+@pytest.mark.parametrize("status", [401, 402, 403])
+async def test_access_error_skips_same_paid_backend(
+    monkeypatch: pytest.MonkeyPatch, status: int,
+) -> None:
+    """Kimlik/izin/bakiye hatasında aynı sağlayıcıyı beklemeden yedeğe geçilir."""
     attempts: List[str] = []
 
-    class QuotaError(Exception):
-        status_code = 402
+    class AccessError(Exception):
+        status_code = status
 
     async def fake_stream(client, profile, messages, schemas, session_id, emit, should_stop):
         attempts.append(profile["model"])
         if profile["model"] == "qwen3.8-flash":
-            raise QuotaError("bakiye yok")
+            raise AccessError("erişim yok")
         return {"content": "tamam", "tool_calls": [], "finish_reason": "stop",
                 "usage": main.ZERO_USAGE}
 
-    monkeypatch.setattr(main, "APIStatusError", QuotaError)
+    monkeypatch.setattr(main, "APIStatusError", AccessError)
     monkeypatch.setattr(main, "_stream_completion", fake_stream)
     turn, backend = await main._call_model_with_retries(
         {"opencode": object(), "zen-free": None}, [], [], "oturum",
@@ -129,3 +136,55 @@ async def test_quota_error_skips_same_paid_backend(monkeypatch: pytest.MonkeyPat
     )
     assert turn["content"] == "tamam" and backend == "zen-free"
     assert attempts == ["qwen3.8-flash", "muse-spark-1.3-contributor-free"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_stop", [False, True])
+async def test_cli_process_timeout_and_stop_reap_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, request_stop: bool,
+) -> None:
+    """Süre sınırı ve Esc, alt süreci açık bırakmadan hızlıca sonlandırır."""
+    pid_file = tmp_path / "child.pid"
+    script = (
+        "import os,sys,time; "
+        "from pathlib import Path; "
+        "Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    monkeypatch.setattr(cli_backends, "TIMEOUT_SECONDS", 5.0 if request_stop else 0.2)
+    started = time.monotonic()
+    should_stop = lambda: request_stop and time.monotonic() - started >= 0.2
+    _, _, _, stopped = await cli_backends._process(
+        [sys.executable, "-c", script, str(pid_file)], dict(os.environ), None, should_stop,
+    )
+    assert stopped == request_stop
+    assert time.monotonic() - started < 3.0
+    child_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
+@pytest.mark.asyncio
+async def test_cli_task_cancellation_reaps_child(tmp_path: Path) -> None:
+    """Event loop iptali de alt süreci bırakmaz."""
+    pid_file = tmp_path / "cancelled.pid"
+    script = (
+        "import os,sys,time; "
+        "from pathlib import Path; "
+        "Path(sys.argv[1]).write_text(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    task = asyncio.create_task(cli_backends._process(
+        [sys.executable, "-c", script, str(pid_file)], dict(os.environ), None, lambda: False,
+    ))
+    for _ in range(30):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.05)
+    assert pid_file.exists()
+    child_pid = int(pid_file.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)

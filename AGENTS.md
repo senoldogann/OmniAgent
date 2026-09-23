@@ -125,24 +125,28 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   SVG kopyala düğmesi görünen transcript'in tamamını panoya alır.
 
 ## 🔀 Çoklu Model Backend'i (config.py: BACKENDS)
-- Dört profil: `opencode` (varsayılan, qwen3.8-flash, düşünme kapalı), `opencode-think` (aynı
-  model, düşünme açık), `claude` (openrouter üzerinden claude-sonnet-5, ESCALATION_BACKEND),
-  `openai` (gpt-5-mini). Hepsi opencode'un auth.json'ındaki anahtarları kullanır.
+- Yedi profil: varsayılan `ollama-cloud` (yerel Ollama API'si üzerinden `gemma4:cloud`),
+  `openai` (yerel ChatGPT oturumlu Codex CLI üzerinden GPT-6-Luna), `zen-free` (OpenCode CLI
+  üzerinden Muse Spark Contributor Free), ayrıca paralı API profilleri `opencode`,
+  `opencode-think`, `claude` ve `minimax`. Yalnız paralı API profilleri opencode'un
+  `auth.json` dosyasındaki anahtarları kullanır. Ollama modeli `OMNI_OLLAMA_CLOUD_MODEL`
+  ile değiştirilebilir; seçilen modelin `ollama list` içinde bulunması gerekir.
 - **Kalite merdiveni:** art arda `CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD` (2) tamamen başarısız
-  araç turunda `QUALITY_LADDER` boyunca çıkılır: `opencode` → `opencode-think` → `claude`.
-- **API hataları:** ilk iki deneme aynı backend'de (5xx/429/bağlantı; akıştan sarılmadan yükselen
-  `ssl.SSLError` dahil), son deneme `claude`'da; zaman aşımında doğrudan `claude`'a atlanır;
-  kalıcı 4xx hataları yeniden denenmez. API hatası nedeniyle kullanılan farklı backend yalnız
-  o model turunun fallback'idir; sonraki tur tercih edilen/mevcut backend yeniden denenir.
-  Kalıcı backend değişimi yalnız art arda başarısız araç turlarındaki kalite merdiveniyle olur.
-  Böylece geçici ağ hatası uzun görevi Claude'un 2048 `max_tokens` sınırına kilitlemez.
+  araç turunda `QUALITY_LADDER` boyunca çıkılır: `ollama-cloud` → `openai` → `zen-free`.
+- **API hataları:** geçici 5xx/429/bağlantı hatalarında aynı backend en fazla bir kez yeniden
+  denenir, ardından uygun farklı sağlayıcıya geçilir. 402 bakiye hatasında aynı paralı API
+  beklenmeden atlanır; kalıcı diğer 4xx hataları yeniden denenmez. Fallback yalnız o model
+  turundadır; kalıcı backend değişimi kalite merdiveniyle olur.
 - **Önbellek:** `claude` profili `cache_control` gönderir (OpenRouter'da Anthropic önek önbelleği
   yalnızca bununla açılır); opencode öneki kendiliğinden önbellekler.
-- **Manuel seçim:** `OMNI_BACKEND=<profil>` ya da arayüzdeki seçim (anahtar yoksa varsayılana
-  düşer, uyarı verir).
-- **Bilinen kısıt (2026-09-22 itibarıyla):** `openai` hesabında kredi yok (429). `claude`
-  (openrouter) bakiyesi düşük; `max_tokens` 2048 ile sınırlıdır (yüksek rezervasyon 402
-  veriyordu). opencode profilleri 8192 token üretebilir.
+- **Manuel seçim:** `OMNI_BACKEND=<profil>` ya da arayüzdeki seçim. Yerel CLI veya Ollama modeli
+  hazır değilse kullanılabilir kalite basamağına düşer ve uyarı verir.
+- **Ölçüm (2026-09-24):** `ollama-cloud` 9 senaryo × 3 koşuda 27/27 başarı ve 4,2 sn medyan;
+  `openai` (Codex CLI) aynı 9 senaryonun tek koşusunda 9/9 ve 11,3 sn medyan verdi.
+  CLI bağlayıcıları her model turunda ayrı süreç başlatır; Ollama Cloud yerel HTTP API'si
+  sıcak bağlantı kullanır. CLI istemleri stdin üzerinden gider (süreç argümanlarına yazılmaz),
+  45 saniye sınırına ve iptal/süreç grubu temizliğine tabidir. Ollama Cloud kullanım sınırı
+  dolarsa CLI yedekleri denenir.
 
 ## 🎯 Hedefler
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (bkz. Plugin Entegrasyonu)

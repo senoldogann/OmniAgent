@@ -1567,6 +1567,7 @@ class Toolbox:
         text: str = await asyncio.to_thread(clean_html, await page.content())
         elements = await page.evaluate(_PAGE_ELEMENTS_SCRIPT, PAGE_ELEMENT_LIMIT)
         return (
+            "Tarayıcı: arka planda çalışan ayrı Chromium; açık Google Chrome oturumunda görünmez.\n"
             f"URL: {page.url}\nBaşlık: {await page.title()}\n\n{text}\n\n"
             f"ÖĞELER (seçici — tür \"etiket\"):\n" + "\n".join(elements)
         )

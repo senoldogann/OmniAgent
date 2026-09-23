@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict, Union
 
@@ -47,15 +48,15 @@ def load_provider_key(provider: str) -> Optional[str]:
 
 
 # --- Çoklu model backend'i (hız + doğruluk yönlendirmesi) ---
-# Hepsi opencode'un auth.json'ında kayıtlı anahtarları kullanır.
-# Ölçüm (2026-09-23, qwen3.8-flash): düşünme açıkken tur 2,5-3,7sn ve 6-9,6sn kuyruk;
-# `enable_thinking: False` ile 1,2-2,8sn. Bu yüzden varsayılan düşünmesiz çalışır, araç
-# hataları tekrarlarsa QUALITY_LADDER boyunca önce düşünen aynı modele, sonra Claude'a çıkılır.
-DEFAULT_BACKEND: str = "openai"
+# Varsayılan yerel Ollama API'si üzerinden bulut modelini kullanır.
+# Codex CLI, yerel ChatGPT oturumuyla GPT-6-Luna; OpenCode CLI ise Muse Spark
+# Contributor Free yedeğidir. Paralı API profilleri opencode auth.json anahtarlarını kullanır.
+DEFAULT_BACKEND: str = "ollama-cloud"
 # API/ağ hatası kalıcıysa son denemenin yapıldığı farklı sağlayıcı
-ESCALATION_BACKEND: str = "zen-free"
+ESCALATION_BACKEND: str = "ollama-cloud"
 # Art arda başarısız araç turlarında sırayla çıkılan basamaklar
-QUALITY_LADDER: Tuple[str, ...] = ("openai", "zen-free")
+QUALITY_LADDER: Tuple[str, ...] = ("ollama-cloud", "openai", "zen-free")
+_OLLAMA_CLOUD_MODEL: str = os.environ.get("OMNI_OLLAMA_CLOUD_MODEL", "gemma4:cloud").strip() or "gemma4:cloud"
 
 _OPENCODE_BASE_URL: str = "https://opencode.ai/zen/go/v1"
 _OPENCODE_KEY: Optional[str] = load_provider_key("opencode-go")
@@ -66,6 +67,16 @@ BACKENDS: Dict[str, BackendProfile] = {
         "base_url": "",
         "api_key": None,
         "model": "muse-spark-1.3-contributor-free",
+        "max_tokens": 8192,
+        "session_header": None,
+        "extra_headers": {},
+        "extra_body": {},
+    },
+    "ollama-cloud": {
+        "provider": "ollama-cloud",
+        "base_url": "http://127.0.0.1:11434/v1/",
+        "api_key": "ollama",
+        "model": _OLLAMA_CLOUD_MODEL,
         "max_tokens": 8192,
         "session_header": None,
         "extra_headers": {},

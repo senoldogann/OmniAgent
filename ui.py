@@ -50,7 +50,7 @@ WARNING: str = "#FFC107"
 INFO: str = "#B1B9F9"
 
 MONO_FAMILY: str = "Menlo"
-BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "zen-free", "openai", "opencode", "minimax", "opencode-think", "claude")
+BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "ollama-cloud", "openai", "zen-free", "opencode", "minimax", "opencode-think", "claude")
 RUN_MODE_CHOICES: Tuple[str, ...] = tuple(
     profile["label"] for profile in RUN_MODE_PROFILES.values()
 )
@@ -279,7 +279,7 @@ class OmniUI(ctk.CTk):
         # her görev sıcak HTTP bağlantılarıyla başlar (TLS el sıkışması tekrarlanmaz).
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, daemon=True).start()
-        self._clients: Dict[str, AsyncOpenAI] = create_model_clients()
+        self._clients: Dict[str, Optional[AsyncOpenAI]] = create_model_clients()
         self._integrations = CapabilityService()
 
         self.bind("<Escape>", lambda event: self._request_stop())

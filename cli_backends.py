@@ -31,7 +31,7 @@ SCHEMA: Dict[str, Any] = {
     "required": ["content", "tool_calls"],
     "additionalProperties": False,
 }
-TIMEOUT_SECONDS: float = 90.0
+TIMEOUT_SECONDS: float = 45.0
 
 
 def _prompt(messages: List[Dict[str, Any]], schemas: List[Dict[str, Any]], directory: Path) -> tuple[str, List[Path]]:
@@ -135,7 +135,7 @@ async def _process(
     command: List[str], env: Dict[str, str], input_text: Optional[str],
     should_stop: Callable[[], bool],
 ) -> tuple[bytes, bytes, int, bool]:
-    """Süreç grubunu Esc veya zaman aşımında durdurur."""
+    """Süreç grubunu Esc, iptal veya zaman aşımında temizleyip sonlandırır."""
     process = await asyncio.create_subprocess_exec(
         *command, stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -144,27 +144,41 @@ async def _process(
     operation = asyncio.create_task(process.communicate(
         input_text.encode("utf-8") if input_text is not None else None
     ))
-    loop = asyncio.get_running_loop()
-    deadline: float = loop.time() + TIMEOUT_SECONDS
-    while not operation.done():
-        if should_stop() or loop.time() >= deadline:
-            stopped: bool = should_stop()
+
+    async def terminate() -> None:
+        """wait_for'ın communicate görevini iptal etmeden süreç ağacını kapatır."""
+        if process.returncode is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+        done, _ = await asyncio.wait({operation}, timeout=2)
+        if not done:
             try:
-                await asyncio.wait_for(operation, timeout=2)
-            except asyncio.TimeoutError:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await operation
-            return b"", b"", int(process.returncode or 0), stopped
-        await asyncio.wait({operation}, timeout=0.1)
-    stdout, stderr = await operation
-    return stdout, stderr, int(process.returncode or 0), False
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            done, _ = await asyncio.wait({operation}, timeout=2)
+        if not done:
+            operation.cancel()
+            await asyncio.gather(operation, return_exceptions=True)
+        if process.returncode is None:
+            await process.wait()
+
+    loop = asyncio.get_running_loop()
+    deadline: float = loop.time() + TIMEOUT_SECONDS
+    try:
+        while not operation.done():
+            if should_stop() or loop.time() >= deadline:
+                stopped: bool = should_stop()
+                await terminate()
+                return b"", b"", int(process.returncode or 0), stopped
+            await asyncio.wait({operation}, timeout=0.1)
+        stdout, stderr = await operation
+        return stdout, stderr, int(process.returncode or 0), False
+    except BaseException:
+        await terminate()
+        raise
 
 
 async def run_cli_model(
@@ -200,10 +214,9 @@ async def run_cli_model(
                 "opencode", "run", "--pure", "--agent", "build", "--model",
                 f"opencode/{model}", "--format", "json", "--dir", temporary,
             ]
-            command.append(prompt)
             for path in images:
                 command.extend(["-f", str(path)])
-            input_text = None
+            input_text = prompt
         stdout, stderr, code, stopped = await _process(command, env, input_text, should_stop)
         if stopped:
             return {"content": "", "tool_calls": [], "finish_reason": "stopped",

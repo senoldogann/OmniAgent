@@ -1,10 +1,10 @@
 # OmniAgent yetenek envanteri
 
-Bu belge, 23 Eylül 2026 itibarıyla kodda bulunan yetenekleri ve bu makinedeki bağlantı durumunu ayırır. Bir aracın kodda bulunması, harici hesaba giriş yapıldığı veya her uygulamada çalışacağı anlamına gelmez.
+Bu belge, 24 Eylül 2026 itibarıyla kodda bulunan yetenekleri ve bu makinedeki bağlantı durumunu ayırır. Bir aracın kodda bulunması, harici hesaba giriş yapıldığı veya her uygulamada çalışacağı anlamına gelmez.
 
 ## Görev akışı
 
-Kullanıcı hedefi arayüzden veya CLI'den alınır. Ajan, varsayılan `opencode` modeliyle kısa bir araç çağırma döngüsü çalıştırır; araç sonucunu görüp gerektiğinde sonraki tura geçer. Bir turda bağımsız okumalar paralel, yan etkili işlemler sırayla çalışır. Composer'daki Normal profil 25 tur/10 dakika, Uzun profil 50 tur/20 dakika, Otonom profil 100 tur/45 dakika bütçe sunar; kullanıcı cevabı bekleme süresi bu bütçeden düşülür. Model akışı ve kabuk çıktısı arayüze canlı gelir; `Esc` çalışan görevi durdurur.
+Kullanıcı hedefi arayüzden veya CLI'den alınır. Ajan, varsayılan `ollama-cloud` modeliyle kısa bir araç çağırma döngüsü çalıştırır; araç sonucunu görüp gerektiğinde sonraki tura geçer. Bir turda bağımsız okumalar paralel, yan etkili işlemler sırayla çalışır. Composer'daki Normal profil 25 tur/10 dakika, Uzun profil 50 tur/20 dakika, Otonom profil 100 tur/45 dakika bütçe sunar; kullanıcı cevabı bekleme süresi bu bütçeden düşülür. API model akışı ve kabuk çıktısı arayüze canlı gelir; CLI modelleri tamamlanmış turu yayınlar. `Esc` çalışan görevi durdurur.
 
 Arayüzde model seçimi, sohbet geçmişi, komut/araç önizlemeleri, canlı çıktı, hata ve bağlantı durumları bulunur. Görev bitince alt bölümde toplam süre, model/araç süresi, tur ve araç sayısı, kesin giriş/önbellek/yeni giriş/çıkış/toplam token sayısı görünür. Entegrasyon kullanıldıysa ağ isteği, keşif, kurulum ve bekleme ölçüleri de gösterilir. `⌘K` transkripti ve sohbet bağlamını temizler.
 
@@ -27,7 +27,7 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 | Entegrasyon | `discover_capabilities` | Yerel kataloğu ve gerektiğinde kısa çevrimiçi keşfi kullanıp görev için uygun API/MCP/skill yolunu bulma |
 | Kullanıcı hafızası | `user_memory` | Açıkça istenen tercih, sık yol ve kararı atomik JSON dosyasında saklama, arama ve silme |
 
-Kabuk koruması bilinen yıkıcı komutları, çözülemeyen kabuk değişkeni hedeflerini ve hassas yollara yazmayı engeller; `fetch_raw` yalnızca http(s) adres kabul eder. Hassas dosya okuması varsayılan olarak kapalıdır. Bu kod seviyesi raylar tam güvenlik yalıtımı değildir. GUI eylemleri macOS erişilebilirlik/ekran kaydı izinlerine bağlıdır. `browse_url` ayrı bir Chromium oturumu kullanır. Kullanıcı açık Chrome oturumunu açıkça istediğinde bu araç, entegrasyon keşfi ve CDP araştırmasına yol açan kabuk/Node araçları o görevde kapatılır; `chrome_active_tab` aynı siteye ait açık sekmeyi bulup kullanır. Chrome görevlerinde hataya açık iç içe eylem dizisi yerine düz parametreli tıklama/yazma/tuş araçları kullanılır; bir turda birden çok çağrı model sırasıyla işlenir. Chrome AX ağacı web içeriğini vermediği için bu yolda AX araçları kapalıdır; ekran 1000×1000 görüntü olarak görülür ve noktalar `point: [x, y]` biçiminde verilir. Ekran görüntüsü, son eylemden sonra sabit bekleme yerine ekranın durulmasını bekler.
+Kabuk koruması bilinen yıkıcı komutları, çözülemeyen kabuk değişkeni hedeflerini ve hassas yollara yazmayı engeller; `fetch_raw` yalnızca http(s) adres kabul eder. Hassas dosya okuması varsayılan olarak kapalıdır. Bu kod seviyesi raylar tam güvenlik yalıtımı değildir. GUI eylemleri macOS erişilebilirlik/ekran kaydı izinlerine bağlıdır. `browse_url` görünmeyen, ayrı bir Chromium oturumu kullanır ve araç sonucu bunu açıkça belirtir. Kullanıcı açık Chrome oturumunu açıkça istediğinde bu araç, entegrasyon keşfi ve CDP araştırmasına yol açan kabuk/Node araçları o görevde kapatılır; `chrome_active_tab` aynı siteye ait açık sekmeyi bulup kullanır. Chrome görevlerinde hataya açık iç içe eylem dizisi yerine düz parametreli tıklama/yazma/tuş araçları kullanılır; bir turda birden çok çağrı model sırasıyla işlenir. Chrome AX ağacı web içeriğini vermediği için bu yolda AX araçları kapalıdır; ekran 1000×1000 görüntü olarak görülür ve noktalar `point: [x, y]` biçiminde verilir. Ekran görüntüsü, son eylemden sonra sabit bekleme yerine ekranın durulmasını bekler.
 
 ## Entegrasyonlar
 
@@ -39,11 +39,27 @@ Hazır katalog çözümü ağ beklemesi gerektirmez. Yeni hizmette çevrimiçi k
 
 ## Model ve hız davranışı
 
-Varsayılan profil `opencode` (`qwen3.8-flash`, düşünme kapalıdır). Araç başarısızlıkları sürerse `opencode-think`, ardından anahtarı kullanılabiliyorsa `claude` profiline yükselir. `minimax` (MiniMax M3, düşünme kapalı) ve `openai` elle seçilebilir. Bağlantılar görevler arasında sıcak tutulur; eski büyük araç sonuçları bağlamdan budanır, son tur tam korunur. Sabit GUI beklemesi yerine uygun olduğunda öğe/durum beklenir. Uygulama belirtilmeyen tek fotoğraf hedefinde doğrudan kamera yakalama yolu tercih edilir; Photo Booth gerektiğinde yedektir.
+Varsayılan profil `ollama-cloud` (`gemma4:cloud`, yerel Ollama API'si); bu makinede Ollama oturumu ve model doğrulandı. `OMNI_OLLAMA_CLOUD_MODEL` ile `ollama list` içinde bulunan başka bir bulut modeli seçilebilir. Araç başarısızlıkları sürerse ChatGPT oturumuyla çalışan `openai` (Codex CLI, GPT-6-Luna), ardından `zen-free` (OpenCode CLI, Muse Spark Contributor Free) kullanılır. Paralı API profilleri `opencode`, `opencode-think`, `claude` ve `minimax` elle seçilebilir. API bağlantıları görevler arasında sıcak tutulur; CLI yedekleri her turda süreç başlatır. Eski büyük araç sonuçları bağlamdan budanır, son tur tam korunur. Sabit GUI beklemesi yerine uygun olduğunda öğe/durum beklenir. Uygulama belirtilmeyen tek fotoğraf hedefinde doğrudan kamera yakalama yolu tercih edilir; Photo Booth gerektiğinde yedektir.
+
+`gpt-oss:20b-cloud` da bu makinede kurulu ve metin/araçlı görevde canlı doğrulandı;
+`OMNI_OLLAMA_CLOUD_MODEL=gpt-oss:20b-cloud` ile seçilebilir. Görsel görevler için doğrulanan
+varsayılan `gemma4:cloud` korunur. `qwen3.5:cloud` denendi fakat bu hesapta 402 ile
+"ücretsiz kullanıma dahil değil" yanıtı verdi; bu yüzden hazır profil yapılmadı.
+
+Yeni uzun görev denemelerinde `ollama-cloud`, sekiz adayı kontrol edip raporlayan
+`long_research` görevini 8,3 saniyede doğru tamamladı (6 tur, 13 araç). Hiçbir zaman hazır
+olmayacak uç noktayı izleyen `stagnation` görevini 12,1 saniyede sınırlandırılmış başarısızlık
+olarak durdurdu (10 tur); iki denemede de ev dizininde istenmeyen dosya oluşmadı.
 
 Son sekiz sohbet alışverişi sınırlı uzunlukta bağlam olarak taşınır. Son 30 görevin ölçüm ve araç adımları yerel epizodik kayıtta tutulur, modele otomatik ders olarak enjekte edilmez. `user_memory.json` ise yalnızca kullanıcının açıkça istediği tercih/yol/karar kayıtlarını tutar; her görevde otomatik olarak okunmaz, gizli bilgileri reddeder ve atomik olarak yazılır. Council, StateTree/time-travel, kendi kendine Python araç üretimi ve AST öngörülü worker bu sürümde bulunmaz.
 
-23 Eylül'deki son genel benchmark 9 senaryoda üçer koşuyla 27/27 başarı ve 4,95 saniye
+24 Eylül'de `ollama-cloud` 9 deterministik senaryoda üçer koşuyla 27/27 başarı ve 4,2 saniye
+medyan verdi. Aynı senaryolarda `openai` (Codex CLI) tek koşuda 9/9 ve 11,3 saniye medyan
+verdi; örnek sayıları farklı olduğu için bu tek başına kesin hız oranı değildir. İki koşuda da
+benchmark ev dizininde istenmeyen dosya bulmadı. Bulut kullanım sınırı ve oturum durumu
+görevler arasında değişebilir.
+
+23 Eylül'deki önceki genel benchmark 9 senaryoda üçer koşuyla 27/27 başarı ve 4,95 saniye
 medyan süre verdi. Aynı koşularda sürenin toplam %99,4'ü model çağrılarında geçti; yerel
 araç süresi 27 görevde toplam 0,84 saniyeydi. Fotoğraf görevindeki özel aracın ilk model
 kararı üç denemede de doğru aracı seçti (1,63–1,80 saniye); canlı kamera çekiminin uçtan uca
