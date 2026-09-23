@@ -3,13 +3,16 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
+import stat
 import signal
 import subprocess
 import tempfile
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from threading import Thread
 from typing import IO, Callable, Dict, List, Optional, Tuple, TypedDict, Union
@@ -35,6 +38,10 @@ pyautogui.PAUSE = 0.02
 SHELL_STDOUT_LIMIT: int = 4000
 SHELL_STDERR_LIMIT: int = 1000
 FILE_READ_LIMIT: int = 8000
+FILE_READ_MAX_BYTES: int = 8 * 1024 * 1024
+STREAM_STDOUT_MAX_BYTES: int = 64 * 1024
+STREAM_STDERR_MAX_BYTES: int = 16 * 1024
+STREAM_READ_CHARS: int = 4096
 TYPED_TEXT_ECHO_LIMIT: int = 80
 BACKUP_KEEP_PER_FILE: int = 5
 # Modelin gördüğü ekran görüntüsünün uzun kenarı. Tüm GUI koordinatları (görüntü, AX
@@ -79,22 +86,61 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit] + f"\n…[kısaltıldı, toplam {len(text)} karakter]"
 
 
-def _pump_lines(stream: IO[str], lines: List[str], sink: Optional[Callable[[str], None]]) -> None:
-    """Borudan satırları okuyup biriktirir; hedef varsa her satırı anında yayınlar."""
-    for line in stream:
-        lines.append(line)
+def _pump_lines(stream: IO[str], lines: List[str], sink: Optional[Callable[[str], None]],
+                limit: int, label: str) -> None:
+    """Boruyu sınırlı parçalarla tüketir; fazla baytları tutmadan akışı boşaltır."""
+    used = 0
+    truncated = False
+    event_parts: List[str] = []
+    event_size = 0
+    last_emit = 0.0
+
+    def publish(value: str) -> None:
         if sink is not None:
-            sink(line)
-    stream.close()
+            try:
+                sink(value)
+            except Exception:
+                # Arayüz kapanmış olsa bile boru boşaltılmalı; aksi hâlde süreç takılabilir.
+                logging.warning("Canlı komut çıktısı yayınlanamadı", extra={"stream": label})
+
+    try:
+        while True:
+            chunk = stream.readline(STREAM_READ_CHARS)
+            if not chunk:
+                break
+            raw = chunk.encode("utf-8")
+            remaining = max(0, limit - used)
+            if remaining:
+                kept = raw[:remaining].decode("utf-8", errors="ignore")
+                if kept:
+                    lines.append(kept)
+                    event_parts.append(kept)
+                    event_size += len(kept)
+                used += min(len(raw), remaining)
+                if event_size >= 2048 or (event_parts and time.monotonic() - last_emit >= 0.1):
+                    publish("".join(event_parts))
+                    event_parts.clear()
+                    event_size = 0
+                    last_emit = time.monotonic()
+            if len(raw) > remaining and not truncated:
+                if event_parts:
+                    publish("".join(event_parts))
+                    event_parts.clear()
+                marker = f"\n…[{label} çıktısı {limit} bayt sınırında kırpıldı]\n"
+                lines.insert(0, marker)
+                publish(marker)
+                truncated = True
+        if event_parts:
+            publish("".join(event_parts))
+    finally:
+        stream.close()
 
 
 def run_streaming_process(command: Union[str, List[str]], shell: bool, timeout: float) -> Tuple[int, str, str]:
     """
-    Süreci çalıştırır ve (çıkış kodu, stdout, stderr) döner. TOOL_RUNTIME ayarlıysa satırlar
-    geldikçe yayınlanır (arayüz komut çıktısını akış olarak gösterir) ve kullanıcı durdurunca
-    süreç hemen sonlandırılır. Zaman aşımında/durdurmada süreç GRUBU öldürülür: kabuğun alt
-    süreçleri boruyu açık tutup okuyucuları sonsuza dek bekletmesin. Çözülemeyen baytlar
-    U+FFFD ile değiştirilir.
+    Süreci çalıştırır ve (çıkış kodu, stdout, stderr) döner. Borular sınır dolsa da
+    boşaltılır; bellek, model sonucu ve arayüz akışı sınırlı kalır. İptalde/zaman
+    aşımında süreç grubu sonlandırılır.
     """
     runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
     sink: Optional[Callable[[str], None]] = runtime["emit_output"] if runtime is not None else None
@@ -105,8 +151,8 @@ def run_streaming_process(command: Union[str, List[str]], shell: bool, timeout: 
     stdout_lines: List[str] = []
     stderr_lines: List[str] = []
     readers: List[Thread] = [
-        Thread(target=_pump_lines, args=(process.stdout, stdout_lines, sink), daemon=True),
-        Thread(target=_pump_lines, args=(process.stderr, stderr_lines, sink), daemon=True),
+        Thread(target=_pump_lines, args=(process.stdout, stdout_lines, sink, STREAM_STDOUT_MAX_BYTES, "stdout"), daemon=True),
+        Thread(target=_pump_lines, args=(process.stderr, stderr_lines, sink, STREAM_STDERR_MAX_BYTES, "stderr"), daemon=True),
     ]
     for reader in readers:
         reader.start()
@@ -119,15 +165,28 @@ def run_streaming_process(command: Union[str, List[str]], shell: bool, timeout: 
             stopped: bool = runtime is not None and runtime["should_stop"]()
             if not stopped and time.monotonic() < deadline:
                 continue
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait()
             for reader in readers:
                 reader.join(timeout=1)
             if stopped:
-                raise ToolError("Komut kullanıcı tarafından durduruldu.", "STOPPED", False)
+                raise ToolError("Komut kullanıcı tarafından durduruldu.", "STOPPED", False) from None
             raise
     for reader in readers:
-        reader.join()
+        reader.join(timeout=0.5)
+    if any(reader.is_alive() for reader in readers):
+        # Kabuk bittiği hâlde arka plan çocuğu boruyu açık tuttuysa grup sonlandırılır.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for reader in readers:
+            reader.join(timeout=0.5)
+        raise ToolError("Arka plan süreci çıktı borusunu açık tuttu; süreç grubu sonlandırıldı.",
+                        "SHELL_OUTPUT_STALLED", True)
     return process.returncode, "".join(stdout_lines), "".join(stderr_lines)
 
 
@@ -150,6 +209,9 @@ _SENSITIVE_PATH_PREFIXES: Tuple[Path, ...] = (
     Path.home() / ".ssh",
     Path.home() / ".aws",
     Path.home() / ".gnupg",
+    Path.home() / ".netrc",
+    Path.home() / ".git-credentials",
+    Path.home() / ".local/share/opencode/auth.json",
     Path.home() / ".zshrc",
     Path.home() / ".zprofile",
     Path.home() / ".zshenv",
@@ -167,8 +229,6 @@ _SENSITIVE_PATH_PREFIXES: Tuple[Path, ...] = (
 )
 
 _CATASTROPHIC_SHELL_PATTERNS: Tuple[str, ...] = (
-    r"rm\s+-\w*[rR]\w*[fF]\w*\s+(/|~|\$HOME|/\*)\s*$",
-    r"rm\s+-\w*[fF]\w*[rR]\w*\s+(/|~|\$HOME|/\*)\s*$",
     r"\bmkfs\b",
     r"\bdd\b[^\n]*of=/dev/",
     r":\(\)\s*{\s*:\|:&\s*};\s*:",
@@ -180,13 +240,7 @@ _CATASTROPHIC_SHELL_PATTERNS: Tuple[str, ...] = (
 
 
 def _logical_path(path: Path) -> Path:
-    """
-    macOS firmlink tuzağını çözer: kullanıcı yolları çözümlenince
-    `/System/Volumes/Data/...` altına düşer; bu bir SİSTEM yolu değil, veri
-    biriminin arka plan yoludur. Karşılaştırmayı mantıksal yol üzerinden yapmak,
-    `/System` korumasının yanlışlıkla `/home`, `/Users`, `/tmp` gibi yolları
-    engellemesini (false positive) önler.
-    """
+    """macOS firmlink yollarını mantıksal kullanıcı yoluna indirger."""
     resolved: Path = path.expanduser().resolve()
     posix: str = resolved.as_posix()
     marker: str = "/System/Volumes/Data"
@@ -197,46 +251,147 @@ def _logical_path(path: Path) -> Path:
     return resolved
 
 
+@lru_cache(maxsize=4)
+def _sensitive_prefixes(prefixes: Tuple[Path, ...]) -> Tuple[Path, ...]:
+    """Sabit koruma yollarını her araç çağrısında yeniden çözümleme."""
+    return tuple(_logical_path(raw.expanduser()) for raw in prefixes)
+
+
 def _is_sensitive_path(path: Path) -> bool:
-    """Hedef yolun korunan sistem/kimlik dosyalarından biri olup olmadığını denetler."""
+    """Hedef yol korunan sistem/kimlik yolunun kendisi ya da altı mı?"""
     resolved: Path = _logical_path(path)
-    for raw_prefix in _SENSITIVE_PATH_PREFIXES:
-        prefix: Path = _logical_path(raw_prefix.expanduser())
-        if resolved == prefix or prefix in resolved.parents:
-            return True
-    return False
+    return any(resolved == prefix or prefix in resolved.parents
+               for prefix in _sensitive_prefixes(_SENSITIVE_PATH_PREFIXES))
 
 
 def _sensitive_write_allowed() -> bool:
-    """
-    Hassas yol koruması varsayılan olarak kapalı bırakılır. Kullanıcı, betiği
-    ÇALIŞTIRMADAN ÖNCE kendi ortamında OMNI_ALLOW_SENSITIVE_WRITE=1 ayarladıysa
-    bu çalıştırma boyunca gevşetilir. Ajan bunu kendi kendine açamaz:
-    execute_shell alt-süreçlerinin `export` gibi ortam değişiklikleri bu Python
-    sürecine geri sızmaz, ve hiçbir araç os.environ'ı programatik olarak
-    değiştirmez — karar her zaman kullanıcıda kalır.
-    """
+    """Yalnız kullanıcı tarafından başlangıçta verilen yazma gevşetme bayrağı."""
     return os.environ.get("OMNI_ALLOW_SENSITIVE_WRITE") == "1"
 
 
+def _sensitive_read_allowed() -> bool:
+    """Yalnız kullanıcı tarafından başlangıçta verilen okuma gevşetme bayrağı."""
+    return os.environ.get("OMNI_ALLOW_SENSITIVE_READ") == "1"
+
+
+def _shell_tokens(command: str) -> List[str]:
+    """Kabuk metnini alıntı ve bitişik yönlendirmeleri gözeterek parçalar."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>()\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError as error:
+        raise ToolError(f"Kabuk komutu ayrıştırılamadı: {error}", "SHELL_PARSE", False) from error
+
+
+def _shell_segments(tokens: List[str]) -> List[List[str]]:
+    """Sıralı/pipeline komutlarını ayırır; yönlendirmeler ilgili komutta kalır."""
+    segments: List[List[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= set(";&|()\n"):
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [segment for segment in segments if segment]
+
+
+def _shell_path(raw: str) -> Optional[Path]:
+    """Yalnız bilinen ev dizini gösterimlerini açar; değişken komut çalıştırmaz."""
+    if not raw or raw == "-":
+        return None
+    for prefix in ("${HOME}", "$HOME"):
+        if raw.startswith(prefix):
+            raw = str(Path.home()) + raw[len(prefix):]
+            break
+    return Path(raw).expanduser()
+
+
+def _command_words(segment: List[str]) -> List[str]:
+    """Öndeki sudo/env sarmalayıcılarını ve atamaları atlar."""
+    words = list(segment)
+    while words:
+        first = Path(words[0]).name
+        if first in ("sudo", "env", "command", "builtin", "nohup"):
+            words.pop(0)
+            while words and (words[0].startswith("-") or "=" in words[0] and not words[0].startswith("/")):
+                words.pop(0)
+        elif "=" in words[0] and not words[0].startswith("/"):
+            words.pop(0)
+        else:
+            break
+    return words
+
+
+def _dangerous_rm_target(raw: str) -> bool:
+    """Kök, kullanıcı evleri ve korunan sistem yollarına recursive-force silmeyi engeller."""
+    target = _shell_path(raw)
+    if target is None:
+        return False
+    resolved = _logical_path(target)
+    home = _logical_path(Path.home())
+    if resolved in (Path("/"), Path("/Users"), home) or _is_sensitive_path(target):
+        return True
+    if resolved.parts[:2] == ("/", "Users") and len(resolved.parts) == 3:
+        return True
+    if "*" in raw and resolved.parent in (Path("/"), Path("/Users"), home):
+        return True
+    return False
+
+
 def _is_catastrophic_command(command: str) -> bool:
-    """Bilinen yıkıcı kabuk komutu kalıplarını tespit eder (en iyi çaba kontrolü)."""
-    normalized: str = " ".join(command.split())
+    """shlex hedef analiziyle yıkıcı silmeleri, diğer bilinen kalıpları yakalar."""
+    tokens = _shell_tokens(command)
+    for segment in _shell_segments(tokens):
+        words = _command_words(segment)
+        if not words or Path(words[0]).name != "rm":
+            continue
+        args = words[1:]
+        if any(arg == "--no-preserve-root" for arg in args):
+            return True
+        recursive = any(arg == "--recursive" or
+                        arg.startswith("-") and not arg.startswith("--") and "r" in arg.lower()
+                        for arg in args)
+        force = any(arg == "--force" or
+                    arg.startswith("-") and not arg.startswith("--") and "f" in arg.lower()
+                    for arg in args)
+        if recursive and force and any(_dangerous_rm_target(arg) for arg in args if not arg.startswith("-")):
+            return True
+    normalized = " ".join(command.split())
     return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in _CATASTROPHIC_SHELL_PATTERNS)
 
 
-# write_file hassas yolları reddediyor; execute_shell'in de aynı korumaya ihtiyacı var,
-# yoksa `echo x > ~/.ssh/...` gibi bir yönlendirme aynı korumayı atlatır.
-_SHELL_REDIRECT_TARGET_PATTERN = re.compile(r"(?:>{1,2}|\btee\b(?:\s+-a)?)\s+(~?/?[^\s;|&<>]+)")
-
-
 def _shell_writes_to_sensitive_path(command: str) -> bool:
-    """Komut metnindeki `>`, `>>` veya `tee` hedeflerinden herhangi biri korunan bir yola mı yazıyor."""
-    for match in _SHELL_REDIRECT_TARGET_PATTERN.finditer(command):
-        target: str = match.group(1).strip("'\"")
-        if not target:
+    """Yönlendirme ve tee/sed -i/cp/mv hedeflerini korunan yol listesiyle eşler."""
+    tokens = _shell_tokens(command)
+    for index, token in enumerate(tokens[:-1]):
+        if token in (">", ">>", ">|", "&>"):
+            target = _shell_path(tokens[index + 1])
+            if target is not None and _is_sensitive_path(target):
+                return True
+    for segment in _shell_segments(tokens):
+        words = _command_words(segment)
+        if not words:
             continue
-        if _is_sensitive_path(Path(target)):
+        operation = Path(words[0]).name
+        args = words[1:]
+        targets: List[str] = []
+        if operation == "tee":
+            targets = [arg for arg in args if not arg.startswith("-")]
+        elif operation in ("cp", "mv"):
+            targets = [args[-1]] if args else []
+            for index, arg in enumerate(args[:-1]):
+                if arg in ("-t", "--target-directory"):
+                    targets.append(args[index + 1])
+                elif arg.startswith("--target-directory="):
+                    targets.append(arg.split("=", 1)[1])
+        elif operation == "sed" and any(arg == "-i" or arg.startswith("-i.") or
+                                           arg == "--in-place" or arg.startswith("--in-place=")
+                                           for arg in args):
+            targets = [arg for arg in args if not arg.startswith("-")]
+        if any((path is not None and _is_sensitive_path(path))
+               for path in (_shell_path(raw) for raw in targets)):
             return True
     return False
 
@@ -609,7 +764,7 @@ def scan_ax_elements(root: object) -> Tuple[List[AXElement], List[object], bool]
             raise ToolError("Uygulama erişilebilirlik sorgusuna yanıt vermiyor (meşgul olabilir).", "AX_TIMEOUT", True)
         if error != AX.kAXErrorSuccess:
             raise ToolError(f"AX öznitelikleri okunamadı: hata kodu={error}", "AX_READ_FAILED", True)
-        attrs: Dict[str, object] = {name: _ax_present(value) for name, value in zip(_AX_SCAN_ATTRIBUTES, values)}
+        attrs: Dict[str, object] = {name: _ax_present(value) for name, value in zip(_AX_SCAN_ATTRIBUTES, values, strict=True)}
         children: object = attrs["AXChildren"]
         if children:
             stack.extend(reversed(list(children)))
@@ -690,7 +845,7 @@ def _app_pid(app_name: str) -> int:
     for name, pid in owners:
         if name.casefold() == wanted:
             return pid
-    for name, pid in owners:
+    for _name, pid in owners:
         if _bundle_name(pid).casefold() == wanted:
             return pid
     available: str = ", ".join(sorted({name for name, _ in owners if name})[:20])
@@ -1021,8 +1176,9 @@ class Toolbox:
         DuckDuckGo üzerinden web araması yapar (`ddgs` paketi).
         Boş sonuç kararlı bir durumdur, yeniden denenmez (3x gidiş-dönüş israfı).
         """
-        last_error: Optional[Exception] = None
-        for attempt in range(1, 4):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 with DDGS() as ddgs:
                     results: List[Dict[str, str]] = list(ddgs.text(query, max_results=5))
@@ -1044,7 +1200,6 @@ class Toolbox:
             except ToolError:
                 raise
             except Exception as error:
-                last_error = error
                 logging.warning(
                     "Web araması başarısız",
                     extra={"query": query, "attempt": attempt, "error_type": type(error).__name__},
@@ -1054,7 +1209,6 @@ class Toolbox:
                         f"Web araması başarısız: sorgu={query}, ayrıntı={error}",
                         "WEB_SEARCH_FAILED", True,
                     ) from error
-        raise AssertionError(f"Arama denemeleri sonuç vermedi: {last_error}")
 
     async def browse_url(self, url: Optional[str], actions: List[BrowserAction]) -> str:
         """
@@ -1192,6 +1346,8 @@ class Toolbox:
                 f"Korunan bir sistem/kimlik dosyasına yazma engellendi: {destination}",
                 "SENSITIVE_PATH_BLOCKED", False,
             )
+        if len(content.encode("utf-8")) > FILE_READ_MAX_BYTES:
+            raise ToolError(f"Dosya {FILE_READ_MAX_BYTES} bayt yazma sınırını aşıyor.", "FILE_TOO_LARGE", False)
         if destination.suffix == ".py":
             try:
                 compile(content, str(destination), "exec")
@@ -1235,17 +1391,34 @@ class Toolbox:
         return _clip(self._read_full(path), FILE_READ_LIMIT)
 
     def _read_full(self, path: str) -> str:
-        """Doğrulama için kırpılmamış, satır sonları çevrilmemiş tam dosya içeriği okur."""
+        """Düzenli UTF-8 dosyasını boyut sınırıyla ve satır sonlarını koruyarak okur."""
         source_path: Path = Path(path).expanduser()
+        if _is_sensitive_path(source_path) and not _sensitive_read_allowed():
+            raise ToolError(
+                f"Korunan sistem/kimlik dosyasını okuma engellendi: {source_path}. "
+                "Kullanıcı bilerek izin verirse OMNI_ALLOW_SENSITIVE_READ=1 ile başlatmalı.",
+                "SENSITIVE_PATH_BLOCKED", False,
+            )
         try:
-            with open(source_path, 'r', encoding='utf-8', newline='') as source:
-                return source.read()
+            metadata = source_path.stat()
+            if not stat.S_ISREG(metadata.st_mode):
+                code = "IS_DIRECTORY" if stat.S_ISDIR(metadata.st_mode) else "NOT_REGULAR_FILE"
+                raise ToolError(f"Yol düzenli bir dosya değil: {source_path}", code, False)
+            if metadata.st_size > FILE_READ_MAX_BYTES:
+                raise ToolError(f"Dosya {FILE_READ_MAX_BYTES} bayt okuma sınırını aşıyor: {source_path}",
+                                "FILE_TOO_LARGE", False)
+            with source_path.open("rb") as source:
+                raw = source.read(FILE_READ_MAX_BYTES + 1)
+            if len(raw) > FILE_READ_MAX_BYTES:
+                raise ToolError(f"Dosya okuma sırasında boyut sınırını aştı: {source_path}",
+                                "FILE_TOO_LARGE", False)
+            return raw.decode("utf-8")
         except FileNotFoundError as error:
-            raise ToolError(f"Dosya bulunamadı: {source_path}.{missing_path_hint(source_path)}", "FILE_NOT_FOUND", True) from error
-        except IsADirectoryError as error:
-            raise ToolError(f"Yol bir dizin, dosya değil: {source_path}", "IS_DIRECTORY", True) from error
+            raise ToolError(f"Dosya bulunamadı: {source_path}.{missing_path_hint(source_path)}",
+                            "FILE_NOT_FOUND", True) from error
         except UnicodeDecodeError as error:
-            raise ToolError(f"Dosya UTF-8 metin değil (ikili dosya olabilir): {source_path}", "NOT_TEXT", False) from error
+            raise ToolError(f"Dosya UTF-8 metin değil (ikili dosya olabilir): {source_path}",
+                            "NOT_TEXT", False) from error
 
     async def close_browser(self) -> None:
         """

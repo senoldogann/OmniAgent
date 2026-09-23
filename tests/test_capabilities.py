@@ -1,13 +1,12 @@
 """Katalog bütçeleri, çağrı yetkisi ve iptal davranışı."""
 import asyncio
-import statistics
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from capabilities import CapabilityService, DISCOVERY_SCHEMA, discovery_entry, function_schema
+from capabilities import CapabilityService, function_schema
 from integration_runtime import CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime, IntegrationStopped
 from main import execute_tool, _execute_tool_calls
 from tools import Toolbox

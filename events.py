@@ -138,6 +138,8 @@ EventSink = Callable[[AgentEvent], None]
 # Araçların arayüzde görünen kısa adları
 TOOL_LABELS: Dict[str, str] = {
     "discover_capabilities": "Bağlantı keşfi", "outlook_clean": "Posta temizliği",
+    "outlook_search": "Posta arama", "outlook_apply_selection": "Posta seçimi",
+    "outlook_restore": "Posta geri yükleme",
     "execute_shell": "Kabuk", "process_list": "Süreçler", "read_file": "Oku", "write_file": "Yaz",
     "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "execute_js": "Node",
     "take_screenshot": "Ekran", "cua_get_app": "Uygulama", "cua_get_ax_state": "Arayüz ağacı",
@@ -146,6 +148,7 @@ TOOL_LABELS: Dict[str, str] = {
 
 # Önizlemede gösterilen asıl argüman
 _PREVIEW_KEYS: Dict[str, str] = {
+    "discover_capabilities": "query", "outlook_restore": "operation_id",
     "execute_shell": "command", "read_file": "path", "write_file": "path", "web_search": "query",
     "fetch_raw": "url", "browse_url": "url", "execute_js": "code", "take_screenshot": "filename",
     "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name", "smart_click": "app_name",
@@ -154,7 +157,9 @@ _PREVIEW_KEYS: Dict[str, str] = {
 
 def tool_label(name: str) -> str:
     """Aracın arayüz adı; tanımsız adlar (model uydurduysa) olduğu gibi gösterilir. Saf."""
-    return TOOL_LABELS[name] if name in TOOL_LABELS else name
+    if name.startswith("mcp_"):
+        return "MCP aracı"
+    return TOOL_LABELS.get(name, name)
 
 
 def _partial_json_string(arguments: str, key: str) -> Optional[str]:

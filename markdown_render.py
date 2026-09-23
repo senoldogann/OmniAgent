@@ -177,7 +177,7 @@ def format_table(rows: List[List[str]]) -> List[str]:
     result: List[str] = []
     for number, row in enumerate(plain):
         cells = row + [""] * (count - len(row))
-        result.append(" │ ".join(cell + " " * (width - _width(cell)) for cell, width in zip(cells, widths)))
+        result.append(" │ ".join(cell + " " * (width - _width(cell)) for cell, width in zip(cells, widths, strict=True)))
         if number == 0:
             result.append("─┼─".join("─" * width for width in widths))
     return result

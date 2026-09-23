@@ -1,6 +1,5 @@
 """Microsoft kişisel hesap bağlantısı; tokenlar yalnız macOS Keychain'de."""
 import asyncio
-import json
 import os
 import sys
 import time

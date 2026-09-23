@@ -28,7 +28,9 @@ from openai import AsyncOpenAI
 from integration_runtime import IntegrationMetrics
 from main import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 
-SCENARIO_NAMES: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat", "takip", "takip_bos")
+CORE_SCENARIOS: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat")
+# Takip ve geçmişsiz negatif kontrol ayrı ölçülür; varsayılan başarı/hız paydasını bozmaz.
+SCENARIO_NAMES: Tuple[str, ...] = CORE_SCENARIOS + ("takip", "takip_bos")
 
 
 class Scenario(TypedDict):
@@ -248,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument("--runs", type=int, required=True, help="Senaryo başına koşu sayısı")
     parser.add_argument("--concurrency", type=int, required=True, help="Aynı anda koşan görev sayısı")
     parser.add_argument("--backend", default=None, help="Başlangıç backend'i (varsayılan: config.DEFAULT_BACKEND)")
-    parser.add_argument("--only", default=",".join(SCENARIO_NAMES), help="Virgülle ayrılmış senaryo adları")
+    parser.add_argument("--only", default=",".join(CORE_SCENARIOS), help="Virgülle ayrılmış senaryo adları")
     parser.add_argument("--json", default=None, help="Ham sonuçların yazılacağı JSON dosyası")
     arguments: argparse.Namespace = parser.parse_args()
     selected: List[str] = [name for name in arguments.only.split(",") if name]

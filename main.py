@@ -336,7 +336,7 @@ async def execute_tool(
 
     if dynamic and service:
         service.record(dynamic["capability"], time.monotonic() - integration_started, bool(outcome.get("ok")))
-    if outcome.get("ok") and _is_side_effect(name):
+    if _is_side_effect(name):
         cache.clear()
     if cache_key is not None and outcome.get("ok"):
         cache[cache_key] = outcome
@@ -709,11 +709,24 @@ async def run_agent_with_callback(
     İstemciler çağırana aittir (kapatılmaz), böylece arayüz görevler arasında sıcak
     bağlantıları yeniden kullanır.
     """
+    def startup_failure(error: Exception, backend: str) -> RunReport:
+        """Başlangıç hatasında bile arayüze terminal olayını teslim eder."""
+        failure = f"Kritik hata: {error}"
+        initial_metrics: sm.EpisodeMetrics = {
+            "turns": 0, "tool_calls": 0, "elapsed_seconds": 0.0, "backend": backend,
+            "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
+        }
+        emit({"kind": "notice", "level": "error", "text": failure})
+        emit({"kind": "run_finished", "success": False, "outcome": failure,
+              "reason": failure, "metrics": initial_metrics})
+        return {"outcome": failure, "success": False, "metrics": initial_metrics,
+                "exchange": make_exchange(goal, failure, [])}
+
     if DEFAULT_BACKEND not in clients:
-        raise RuntimeError(
+        return startup_failure(RuntimeError(
             f"Varsayılan backend '{DEFAULT_BACKEND}' için API anahtarı bulunamadı: "
             "~/.local/share/opencode/auth.json içinde 'opencode-go' girdisi yok."
-        )
+        ), DEFAULT_BACKEND)
     available: frozenset[str] = frozenset(clients)
     backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
     current_backend: str = backend_override if backend_override else DEFAULT_BACKEND
@@ -723,20 +736,29 @@ async def run_agent_with_callback(
         current_backend = DEFAULT_BACKEND
     emit({"kind": "run_started", "goal": goal, "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
 
-    toolbox: Toolbox = Toolbox()
-    session_id: str = str(uuid.uuid4())
-    state: sm.StateDict = sm.load_state(options["state_file"])
-    messages: List[Dict[str, Any]] = (
-        [{"role": "system", "content": build_system_prompt(date.today())}]
-        + to_messages(options["history"])
-        + [{"role": "user", "content": goal}]
-    )
-    service = options.get("integrations") or CapabilityService()
-    runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
-    runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
+    service: Optional[CapabilityService] = None
+    try:
+        toolbox: Toolbox = Toolbox()
+        session_id: str = str(uuid.uuid4())
+        state: sm.StateDict = sm.load_state(options["state_file"])
+        messages: List[Dict[str, Any]] = (
+            [{"role": "system", "content": build_system_prompt(date.today())}]
+            + to_messages(options["history"])
+            + [{"role": "user", "content": goal}]
+        )
+        service = options.get("integrations") or CapabilityService()
+        runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
+        runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
+        tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
+    except Exception as error:
+        if service is not None and "integrations" not in options:
+            try:
+                await service.close()
+            except Exception:
+                logging.exception("Başlangıç hatasından sonra entegrasyon kapanışı başarısız")
+        return startup_failure(error, current_backend)
     runtime_token = CURRENT_RUNTIME.set(runtime)
     service_token = CURRENT_SERVICE.set(service)
-    tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
     steps: List[sm.StepRecord] = []
     outcome: str = ""
     reason: str = ""
@@ -796,7 +818,7 @@ async def run_agent_with_callback(
 
             failures_in_turn: int = 0
             pending_shots: List[ToolCallDraft] = []
-            for call, result in zip(turn["tool_calls"], results):
+            for call, result in zip(turn["tool_calls"], results, strict=True):
                 ok: bool = bool(result.get("ok"))
                 steps.append(sm.make_step_record(call["name"], call["arguments"], ok, result_text(result)))
                 if ok and call["name"] == "take_screenshot":
@@ -841,22 +863,34 @@ async def run_agent_with_callback(
             "completion_tokens": usage["completion_tokens"],
             "integrations": dict(runtime.metrics),
         }
+        cleanup_errors: List[str] = []
         try:
             sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
-        finally:
+        except Exception as error:
+            cleanup_errors.append(f"Bellek kaydı: {type(error).__name__}: {error}")
+        try:
+            await toolbox.close_browser()
+        except Exception as error:
+            cleanup_errors.append(f"Tarayıcı kapanışı: {type(error).__name__}: {error}")
+        try:
+            if service.outlook:
+                service.outlook.release(runtime)
+        except Exception as error:
+            cleanup_errors.append(f"Outlook görev temizliği: {type(error).__name__}: {error}")
+        try:
+            if "integrations" not in options:
+                await service.close()
+        except Exception as error:
+            cleanup_errors.append(f"Entegrasyon kapanışı: {type(error).__name__}: {error}")
+        CURRENT_RUNTIME.reset(runtime_token)
+        CURRENT_SERVICE.reset(service_token)
+        for detail in cleanup_errors:
+            logging.warning("Görev temizliği başarısız: %s", detail)
             try:
-                await toolbox.close_browser()
-            finally:
-                try:
-                    if service.outlook:
-                        service.outlook.release(runtime)
-                    if "integrations" not in options:
-                        await service.close()
-                finally:
-                    CURRENT_RUNTIME.reset(runtime_token)
-                    CURRENT_SERVICE.reset(service_token)
-
-    emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
+                emit({"kind": "notice", "level": "warning", "text": detail})
+            except Exception:
+                logging.exception("Temizlik uyarısı yayınlanamadı")
+        emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "metrics": metrics, "exchange": exchange}
 
 

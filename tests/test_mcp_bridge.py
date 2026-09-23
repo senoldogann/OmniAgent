@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 import mcp_bridge
-from integration_runtime import IntegrationRuntime, save_json
+from integration_runtime import IntegrationRuntime
 from mcp_bridge import MCPBridge, install_package, load_skill, run_install
 
 FIXTURE = Path(__file__).parent / "fixtures/mcp_server.py"

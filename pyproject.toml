@@ -21,6 +21,7 @@ dependencies = [
     "keyring>=25,<26",
     "httpx>=0.28,<1",
     "jsonschema>=4.23,<5",
+    "requests>=2.32,<3",
 ]
 
 [dependency-groups]

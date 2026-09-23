@@ -23,7 +23,6 @@ from state_manager import EpisodeMetrics
 from markdown_render import render_markdown
 from conversation import Exchange, make_exchange, trim_history
 from capabilities import CapabilityService
-from integration_runtime import IntegrationRuntime, IntegrationStopped
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
@@ -158,7 +157,6 @@ class OmniUI(ctk.CTk):
         self._active_goal: str = ""
         self._input_futures: Dict[str, asyncio.Future] = {}
         self._input_windows: Dict[str, ctk.CTkToplevel] = {}
-        self._waiting_user: bool = False
         self._region_seq: int = 0
         # Akan bölgeler: bekleyen metin, metin etiketi, imleç var mı, model hâlâ yazıyor mu
         self._pending_text: Dict[str, str] = {}
@@ -471,7 +469,6 @@ class OmniUI(ctk.CTk):
 
     def _handle_event(self, event: AgentEvent) -> None:
         if event["kind"] == "integration_status":
-            self._waiting_user = event["stage"] == "waiting_user"
             self._activity_verb = event["text"]
             self._new_region([(event["text"] + "\n", ("notice_info",))])
         elif event["kind"] == "user_input_required":
@@ -532,11 +529,11 @@ class OmniUI(ctk.CTk):
             self._mark_dirty(view)
         elif event["kind"] == "tool_output" and event["call_id"] in self._tools_by_call:
             view = self._tools_by_call[event["call_id"]]
-            line: str = event["text"]
-            if len(view["head"]) < SUMMARY_LINES:
-                view["head"].append(line)
-            view["tail"] = (view["tail"] + [line])[-LIVE_TAIL_LINES:]
-            view["line_count"] += 1
+            for line in event["text"].splitlines(keepends=True):
+                if len(view["head"]) < SUMMARY_LINES:
+                    view["head"].append(line)
+                view["tail"] = (view["tail"] + [line])[-LIVE_TAIL_LINES:]
+                view["line_count"] += 1
             self._mark_dirty(view)
         elif event["kind"] == "tool_finished" and event["call_id"] in self._tools_by_call:
             view = self._tools_by_call[event["call_id"]]
@@ -831,7 +828,6 @@ class OmniUI(ctk.CTk):
         self._history = trim_history(self._history + [exchange])
         self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
         self._agent_future = None
-        self._waiting_user = False
         for window in list(self._input_windows.values()):
             window.destroy()
         self._input_windows.clear()

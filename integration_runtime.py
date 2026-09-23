@@ -4,7 +4,6 @@ import json
 import os
 import tempfile
 import time
-import uuid
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar, TypedDict
@@ -50,6 +49,8 @@ def save_json(path: Path, value: Any) -> None:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as target:
             name = target.name
             json.dump(value, target, ensure_ascii=False, indent=2)
+            target.flush()
+            os.fsync(target.fileno())
         os.chmod(name, 0o600)
         os.replace(name, path)
     finally:

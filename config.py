@@ -30,6 +30,12 @@ def load_provider_key(provider: str) -> Optional[str]:
             data: object = json.load(source)
     except FileNotFoundError:
         return None
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"Kimlik doğrulama dosyası bozuk JSON içeriyor: {auth_path} "
+                           f"(satır {error.lineno}, sütun {error.colno}).") from error
+    except OSError as error:
+        raise RuntimeError(f"Kimlik doğrulama dosyası okunamadı: {auth_path} "
+                           f"({type(error).__name__}).") from error
     if not isinstance(data, dict):
         raise ValueError(f"Kimlik doğrulama dosyası nesne içermiyor: {auth_path}")
     entry: object = data.get(provider)

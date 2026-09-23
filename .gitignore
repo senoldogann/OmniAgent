@@ -5,3 +5,5 @@ __pycache__/
 .omni_backups/
 cognitive_memory.json
 *.png
+lessons.json
+python_versions.txt

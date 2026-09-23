@@ -1,7 +1,6 @@
 """Graph üzerinden filtreli okuma, hesap kuralları ve toplu posta taşıma."""
 import asyncio
 import hashlib
-import json
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -383,7 +382,7 @@ class OutlookAdapter:
                 if selected:
                     result = await self.move(runtime, selected, source)
                     restored = read_json(self.account_root() / "operations" / (result["operation_id"] + ".json"), {})
-                    for before, after in zip(original, restored["rows"]):
+                    for before, after in zip(original, restored["rows"], strict=True):
                         if after["status"] == "moved":
                             before["status"] = "restored"
                             total += 1

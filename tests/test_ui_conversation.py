@@ -84,3 +84,14 @@ def test_history_delivery_clear_and_pending_completion(app: ui.OmniUI) -> None:
     assert not app._history
     assert not app._raw_text
     assert app.context_label.cget("text") == "bağlam: 0 mesaj"
+
+
+def test_batched_tool_output_keeps_line_summary(app: ui.OmniUI) -> None:
+    _start(app)
+    app._handle_event({"kind": "tool_started", "call_id": "batch", "index": 0,
+                       "name": "execute_shell", "preview": "seq 1 5"})
+    app._handle_event({"kind": "tool_output", "call_id": "batch", "text": "1\n2\n3\n4\n5\n"})
+    view = app._tools_by_call["batch"]
+    assert view["line_count"] == 5
+    assert view["head"][:2] == ["1\n", "2\n"]
+    assert view["tail"][-1] == "5\n"

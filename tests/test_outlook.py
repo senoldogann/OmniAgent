@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from integration_runtime import IntegrationRuntime, IntegrationStopped, InteractionRequired, save_json
+from integration_runtime import IntegrationRuntime, IntegrationStopped, save_json
 from outlook import OutlookAdapter, GraphError, parse_rule, mail_filter
 
 
