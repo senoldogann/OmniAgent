@@ -256,3 +256,58 @@ def test_capture_photo_rejects_failed_or_invalid_capture(tmp_path: Path, monkeyp
         Toolbox().capture_photo()
     assert error.value.code == "CAMERA_EMPTY"
     assert not list(desktop.glob("fotograf-*.jpg"))
+
+def test_explicit_chrome_session_excludes_hidden_browser_and_discovery() -> None:
+    """Açık Chrome isteği yalnız görünür oturum yolunu açar."""
+    goal = "Açık Google Chrome oturumunu kullanarak Outlook çöp kutusuna git."
+    names = {entry["function"]["name"] for entry in main.build_tool_schemas(goal)}
+    assert main.active_chrome_session_goal(goal)
+    assert "chrome_active_tab" in names
+    assert "take_screenshot" in names
+    assert "run_action_sequence" in names
+    assert not names.intersection({
+        "browse_url", "discover_capabilities", "fetch_raw", "execute_shell", "execute_js",
+    })
+    assert "USER'S OPEN CHROME SESSION" in main.build_system_prompt(date.today(), goal)
+    ordinary = {entry["function"]["name"] for entry in main.build_tool_schemas("Outlook hesabımı incele")}
+    assert "browse_url" in ordinary and "discover_capabilities" in ordinary
+    assert not main.active_chrome_session_goal("Chrome kullanma")
+
+
+@pytest.mark.asyncio
+async def test_chrome_route_rejects_hidden_browser_at_execution() -> None:
+    """Şemadan gizlenen araç, model adını uydursa bile çalışmaz."""
+    from integration_runtime import CURRENT_RUNTIME, IntegrationRuntime
+
+    runtime = IntegrationRuntime(lambda event: None, lambda: False)
+    runtime.allowed_tools = frozenset({"chrome_active_tab", "take_screenshot"})
+    token = CURRENT_RUNTIME.set(runtime)
+    try:
+        call: ToolCallDraft = {
+            "id": "hidden", "name": "browse_url",
+            "arguments": '{"url":"https://outlook.live.com","actions":[]}',
+        }
+        result = await execute_tool(call, Toolbox(), {}, lambda event: None, lambda: False)
+        assert result["error_type"] == "ToolUnavailable"
+    finally:
+        CURRENT_RUNTIME.reset(token)
+
+
+def test_chrome_active_tab_reuses_front_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Chrome denetimi yeni profil açmaz; URL'yi ayrı argüman olarak iletir."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return tools.subprocess.CompletedProcess(args, 0, "https://outlook.live.com/mail/0/deleteditems\\nPoistetut\\n", "")
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    toolbox = Toolbox()
+    result = toolbox.chrome_active_tab("https://outlook.live.com/mail/0/deleteditems")
+    assert "Görünür Chrome" in result and "Poistetut" in result
+    assert calls[0][0] == "osascript"
+    assert calls[0][-1] == "https://outlook.live.com/mail/0/deleteditems"
+    assert toolbox.browser is None
+    with pytest.raises(ToolError) as error:
+        toolbox.chrome_active_tab("javascript:alert(1)")
+    assert error.value.code == "INVALID_URL"

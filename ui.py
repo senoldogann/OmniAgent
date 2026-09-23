@@ -44,7 +44,7 @@ WARNING: str = "#FFC107"
 INFO: str = "#B1B9F9"
 
 MONO_FAMILY: str = "Menlo"
-BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "opencode", "opencode-think", "claude", "openai")
+BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "opencode", "minimax", "opencode-think", "claude", "openai")
 SPINNER_FRAMES: Tuple[str, ...] = ("·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢")
 
 FRAME_MS: int = 16

@@ -127,6 +127,19 @@ def camera_photo_goal(goal: str) -> bool:
     )
 
 
+def active_chrome_session_goal(goal: Optional[str]) -> bool:
+    """Hedefte kullanıcının mevcut Chrome oturumu açıkça istendi mi? Saf."""
+    if not goal:
+        return False
+    lowered = goal.casefold()
+    return "chrome" in lowered and any(
+        term in lowered for term in (
+            "açık", "acik", "oturum", "session", "existing", "already open",
+            "sekme", "tab", "kullan", "use", "chrome'da", "chrome’da",
+        )
+    ) and not any(term in lowered for term in ("chrome kullanma", "do not use chrome"))
+
+
 def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
@@ -245,6 +258,21 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
             },
         ),
     ] + [DISCOVERY_SCHEMA]
+    if active_chrome_session_goal(goal):
+        # Kullanıcının açık oturumu istendiğinde gizli Playwright/API yolu ve CDP
+        # araştırmasına yol açan kabuk/Node araçları bu görevden çıkarılır.
+        excluded = {
+            "browse_url", "discover_capabilities", "fetch_raw", "web_search",
+            "execute_shell", "execute_js", "process_list",
+        }
+        schemas = [entry for entry in schemas if entry["function"]["name"] not in excluded]
+        schemas.append(_function_schema(
+            "chrome_active_tab",
+            "Kullanıcının zaten açık Google Chrome penceresindeki etkin sekmeyi kullanır. "
+            "url verilirse AYNI görünür sekmeye gider; null ise yalnız adresi/başlığı okur. "
+            "Giriş yapılmış Chrome profilini korur, ayrı tarayıcı açmaz.",
+            {"url": {"type": ["string", "null"], "description": "Gidilecek http(s) adresi; mevcut sekmeyi okumak için null."}},
+        ))
     if goal is not None and camera_photo_goal(goal):
         schemas.append(_function_schema(
             "capture_photo",
@@ -258,7 +286,11 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
 
 # Modelin çağırabileceği adlar: getattr ile Toolbox'ın özel yöntemlerine
 # (_read_full, close_browser…) ulaşılmasın.
-TOOL_NAMES: frozenset[str] = frozenset(schema["function"]["name"] for schema in build_tool_schemas("fotoğraf çek masaüstüne"))
+TOOL_NAMES: frozenset[str] = frozenset(
+    schema["function"]["name"]
+    for sample in ("fotoğraf çek masaüstüne", "açık Chrome oturumunu kullan")
+    for schema in build_tool_schemas(sample)
+)
 
 # Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
 # önbelleklenmez; her başarılı yan etkili çağrıdan sonra önbellek tamamen temizlenir.
@@ -270,6 +302,7 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({"process_list", "read_file", "web_
 _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "execute_shell", "write_file", "execute_js", "take_screenshot", "browse_url",
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
+    "chrome_active_tab",
 })
 
 
@@ -301,6 +334,12 @@ async def execute_tool(
     if name == "discover_capabilities" and dynamic is None:
         return {"tool_call_id": call["id"], "ok": False, "error_type": "IntegrationUnavailable",
                 "error": "Keşif yalnızca görev bağlamında kullanılabilir."}
+    if runtime is not None and runtime.allowed_tools is not None and name not in runtime.allowed_tools:
+        return {
+            "tool_call_id": call["id"], "ok": False,
+            "error_type": "ToolUnavailable",
+            "error": f"Bu görevde {name} aracı kullanılamaz; seçilen oturum yolunu koru.",
+        }
     if name not in TOOL_NAMES and dynamic is None:
         return {
             "tool_call_id": call["id"], "ok": False,
@@ -498,10 +537,20 @@ def build_system_prompt(today: date, goal: Optional[str] = None) -> str:
         "Photo Booth probes; use Photo Booth only if the tool fails.\n"
         if goal is not None and camera_photo_goal(goal) else ""
     )
+    chrome_guidance: str = (
+        "\n### USER'S OPEN CHROME SESSION\n"
+        "- Use chrome_active_tab and the visible Chrome GUI. Never use browse_url, "
+        "API/MCP discovery, shell, Node or CDP for this goal.\n"
+        "- Open the requested URL in the current Chrome tab with chrome_active_tab. "
+        "If Chrome AX omits page content, use take_screenshot immediately; do not keep probing.\n"
+        "- Batch chrome_active_tab + take_screenshot in one tool turn. After an action, "
+        "observe the changed page without fixed sleeps. A click alone is not proof of completion.\n"
+        if active_chrome_session_goal(goal) else ""
+    )
     return (
         SYSTEM_PROMPT
         + f"\n### TODAY\n- Date: {today.isoformat()} ({TURKISH_WEEKDAYS[weekday]} / {ENGLISH_WEEKDAYS[weekday]}).\n"
-        + camera_guidance
+        + camera_guidance + chrome_guidance
     )
 
 
@@ -776,7 +825,8 @@ async def run_agent_with_callback(
         )
         service = options.get("integrations") or CapabilityService()
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
-        runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
+        if not active_chrome_session_goal(goal):
+            runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
         tool_schemas: List[Dict[str, Any]] = build_tool_schemas(goal)
     except Exception as error:
         if service is not None and "integrations" not in options:
@@ -813,6 +863,7 @@ async def run_agent_with_callback(
             runtime.published = dict(runtime.selected)
             tool_schemas = build_tool_schemas(goal) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
+            runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)
             emit({"kind": "turn_started", "turn": iteration, "max_turns": MAX_ITERATIONS,
                   "backend": current_backend, "model": BACKENDS[current_backend]["model"]})

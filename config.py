@@ -95,6 +95,17 @@ BACKENDS: Dict[str, BackendProfile] = {
         # (önbellekten okuma normal fiyatın 0,1 katı, ilk tur sonrası TTFT düşer).
         "extra_body": {"cache_control": {"type": "ephemeral"}},
     },
+    "minimax": {
+        "provider": "minimax",
+        "base_url": "https://api.minimax.io/v1",
+        "api_key": load_provider_key("minimax"),
+        "model": "MiniMax-M3",
+        "max_tokens": 8192,
+        "session_header": None,
+        "extra_headers": {},
+        # Ayrı düşünme metni geçmişe eklenmez; hızlı görevlerde düşünme kapalıdır.
+        "extra_body": {"thinking": {"type": "disabled"}, "reasoning_split": True},
+    },
     "openai": {
         "provider": "openai",
         "base_url": "https://api.openai.com/v1",

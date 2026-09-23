@@ -1327,6 +1327,38 @@ class Toolbox:
             return _clip(result.stdout, SHELL_STDOUT_LIMIT)
         return clean_html(result.stdout)
 
+    def chrome_active_tab(self, url: Optional[str]) -> str:
+        """Kullanıcının açık Chrome profilindeki etkin sekmeyi okur veya aynı sekmeye gider."""
+        if url is not None and not url.lower().startswith(("https://", "http://")):
+            raise ToolError("Chrome sekmesi için http(s) adresi ver.", "INVALID_URL", False)
+        script = """on run argv
+set targetUrl to item 1 of argv
+tell application "Google Chrome"
+    if (count of windows) is 0 then error "Açık Chrome penceresi bulunamadı."
+    set selectedTab to active tab of front window
+    if targetUrl is not "" then set URL of selectedTab to targetUrl
+    activate
+    return (URL of selectedTab) & linefeed & (title of selectedTab)
+end tell
+end run"""
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script, url or ""],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise ToolError(
+                f"Açık Chrome sekmesine erişilemedi: {type(error).__name__}",
+                "CHROME_SESSION_FAILED", True,
+            ) from error
+        if result.returncode != 0:
+            raise ToolError(
+                f"Açık Chrome sekmesine erişilemedi: {result.stderr.strip()}",
+                "CHROME_SESSION_FAILED", True,
+            )
+        current_url, _, title = result.stdout.strip().partition("\n")
+        return f"Görünür Chrome etkin sekmesi: {current_url}\nBaşlık: {title}"
+
     def cua_get_app(self, app_name: str) -> str:
         return self.cua.get_app(app_name)
 

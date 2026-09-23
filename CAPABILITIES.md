@@ -22,10 +22,11 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 | Sistem | `execute_shell`, `process_list`, `execute_js` | macOS kabuğu ve Node.js çalıştırma; süreçleri özetleme |
 | Dosya | `read_file`, `write_file` | Dosya okuma/yazma; Python sözdizimi denetimi, önceki sürüm yedeği ve yazma doğrulaması |
 | Web | `web_search`, `fetch_raw`, `browse_url` | Arama; hızlı HTTP/HTML/JSON okuma; kalıcı Playwright sekmesinde DOM eylem dizisi |
+| Açık Chrome oturumu | `chrome_active_tab` | Kullanıcının görünür Chrome penceresindeki etkin sekmenin adresini/başlığını okuma veya aynı sekmede URL açma |
 | macOS arayüzü | `cua_get_app`, `cua_get_ax_state`, `cua_click`, `smart_click`, `run_action_sequence`, `take_screenshot` | Uygulama açma/öne getirme; erişilebilirlik ağacı; AX veya görsel şablonla tıklama; fare/klavye dizisi; ekran görüntüsünü modele verme |
 | Entegrasyon | `discover_capabilities` | Yerel kataloğu ve gerektiğinde kısa çevrimiçi keşfi kullanıp görev için uygun API/MCP/skill yolunu bulma |
 
-Kabuk koruması bilinen yıkıcı komutları ve hassas yollara yazmayı engeller; hassas dosya okuması varsayılan olarak kapalıdır. Bu kod seviyesi raylar tam güvenlik yalıtımı değildir. GUI eylemleri macOS erişilebilirlik/ekran kaydı izinlerine bağlıdır. Tarayıcı Playwright'ın ayrı Chromium oturumudur; kullanıcının Chrome oturumunu otomatik olarak devralmaz.
+Kabuk koruması bilinen yıkıcı komutları ve hassas yollara yazmayı engeller; hassas dosya okuması varsayılan olarak kapalıdır. Bu kod seviyesi raylar tam güvenlik yalıtımı değildir. GUI eylemleri macOS erişilebilirlik/ekran kaydı izinlerine bağlıdır. `browse_url` ayrı bir Chromium oturumu kullanır. Kullanıcı açık Chrome oturumunu açıkça istediğinde bu araç, entegrasyon keşfi ve CDP araştırmasına yol açan kabuk/Node araçları o görevde kapatılır; `chrome_active_tab` ile mevcut görünür sekme kullanılır. Chrome AX ağacı sayfa içeriğini göstermiyorsa ekran görüntüsü gerekir.
 
 ## Entegrasyonlar
 
@@ -37,7 +38,7 @@ Hazır katalog çözümü ağ beklemesi gerektirmez. Yeni hizmette çevrimiçi k
 
 ## Model ve hız davranışı
 
-Varsayılan profil `opencode` (`qwen3.8-flash`, düşünme kapalıdır). Araç başarısızlıkları sürerse `opencode-think`, ardından anahtarı kullanılabiliyorsa `claude` profiline yükselir. `openai` elle seçilebilir. Bağlantılar görevler arasında sıcak tutulur; eski büyük araç sonuçları bağlamdan budanır, son tur tam korunur. Sabit GUI beklemesi yerine uygun olduğunda öğe/durum beklenir. Uygulama belirtilmeyen tek fotoğraf hedefinde doğrudan kamera yakalama yolu tercih edilir; Photo Booth gerektiğinde yedektir.
+Varsayılan profil `opencode` (`qwen3.8-flash`, düşünme kapalıdır). Araç başarısızlıkları sürerse `opencode-think`, ardından anahtarı kullanılabiliyorsa `claude` profiline yükselir. `minimax` (MiniMax M3, düşünme kapalı) ve `openai` elle seçilebilir. Bağlantılar görevler arasında sıcak tutulur; eski büyük araç sonuçları bağlamdan budanır, son tur tam korunur. Sabit GUI beklemesi yerine uygun olduğunda öğe/durum beklenir. Uygulama belirtilmeyen tek fotoğraf hedefinde doğrudan kamera yakalama yolu tercih edilir; Photo Booth gerektiğinde yedektir.
 
 Son sekiz sohbet alışverişi sınırlı uzunlukta bağlam olarak taşınır. Son 30 görevin ölçüm ve araç adımları yerel epizodik kayıtta tutulur, modele otomatik ders olarak enjekte edilmez. Council, StateTree/time-travel, kendi kendine Python araç üretimi ve AST öngörülü worker bu sürümde bulunmaz.
 
@@ -48,3 +49,8 @@ kararı üç denemede de doğru aracı seçti (1,63–1,80 saniye); canlı kamer
 süresi henüz ölçülmedi. Photo Booth'un varsayılan üç saniyelik geri sayımı ve FFmpeg'in
 AVFoundation varsayılan kamera erişimi için [Apple kılavuzu](https://support.apple.com/guide/photo-booth/pbhlp3714a9d/mac)
 ve [FFmpeg aygıt belgeleri](https://ffmpeg.org/ffmpeg-devices.html) esas alındı.
+
+Açık Chrome yönlendirmesi sonrasında son genel Qwen benchmark'ı 27/27 başarı ve
+4,0 saniye medyan verdi. MiniMax M3 aynı dokuz senaryoda 25/27 ve 26/27 başarı,
+1,8 ve 3,3 saniye medyan verdi. Özellikle araç kullanma ve kod öneki kopyalama hataları
+görüldüğü için M3 varsayılan yapılmadı; sağlayıcı gecikmesi koşular arasında da değişti.

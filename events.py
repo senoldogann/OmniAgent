@@ -141,7 +141,7 @@ TOOL_LABELS: Dict[str, str] = {
     "outlook_search": "Posta arama", "outlook_apply_selection": "Posta seçimi",
     "outlook_restore": "Posta geri yükleme",
     "execute_shell": "Kabuk", "process_list": "Süreçler", "read_file": "Oku", "write_file": "Yaz",
-    "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "execute_js": "Node",
+    "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "chrome_active_tab": "Chrome sekmesi", "execute_js": "Node",
     "take_screenshot": "Ekran", "cua_get_app": "Uygulama", "cua_get_ax_state": "Arayüz ağacı",
     "cua_click": "Tıkla", "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
     "capture_photo": "Fotoğraf çek",
@@ -151,7 +151,7 @@ TOOL_LABELS: Dict[str, str] = {
 _PREVIEW_KEYS: Dict[str, str] = {
     "discover_capabilities": "query", "outlook_restore": "operation_id",
     "execute_shell": "command", "read_file": "path", "write_file": "path", "web_search": "query",
-    "fetch_raw": "url", "browse_url": "url", "execute_js": "code", "take_screenshot": "filename",
+    "fetch_raw": "url", "browse_url": "url", "chrome_active_tab": "url", "execute_js": "code", "take_screenshot": "filename",
     "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name", "smart_click": "app_name",
 }
 

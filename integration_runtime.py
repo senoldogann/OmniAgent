@@ -74,6 +74,7 @@ class IntegrationRuntime:
         self.install_attempts: set[str] = set()
         self.published: Dict[str, Any] = {}
         self.selected: Dict[str, Any] = {}
+        self.allowed_tools: Optional[frozenset[str]] = None
 
     def check(self) -> None:
         if self.should_stop():
