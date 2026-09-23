@@ -200,9 +200,9 @@ async def run_cli_model(
                 "opencode", "run", "--pure", "--agent", "build", "--model",
                 f"opencode/{model}", "--format", "json", "--dir", temporary,
             ]
+            command.append(prompt)
             for path in images:
                 command.extend(["-f", str(path)])
-            command.append(prompt)
             input_text = None
         stdout, stderr, code, stopped = await _process(command, env, input_text, should_stop)
         if stopped:

@@ -22,6 +22,9 @@ from PIL import Image
 from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER, SYSTEM_PROMPT, BackendProfile
 from cli_backends import CliModelError, run_cli_model
 from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
+from fast_loop import (
+    FastLoopPolicy, FastLoopState, TurnSignal, advance_fast_loop, normalize_progress_signature,
+)
 from tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, Toolbox, ToolError
 import state_manager as sm
 from conversation import Exchange, make_exchange, to_messages
@@ -65,6 +68,7 @@ CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
 SOFT_UNCACHED_PROMPT_TOKEN_BUDGET: int = 60_000
 SOFT_TOOL_CALL_BUDGET: int = 24
 MAX_FINAL_LENGTH_RECOVERIES: int = 1
+TASK_LEDGER_LIMIT: int = 4000
 
 # SDK varsayılanı 600sn zaman aşımı + 2 gizli yeniden denemeydi: takılan tek bir çağrı tüm
 # görev bütçesini yiyebiliyor, yükseltme mantığı da SDK aynı backend'i tekrar denedikten
@@ -720,6 +724,8 @@ def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, str, str
     """
     if backend == "openai" and "zen-free" in available:
         fallback: str = "zen-free"
+    elif backend == "zen-free" and "openai" in available:
+        fallback = "openai"
     else:
         fallback = ESCALATION_BACKEND if ESCALATION_BACKEND in available else backend
     return (backend, backend, fallback)
@@ -789,6 +795,46 @@ def budget_pressure_message(usage: TokenUsage, tool_call_count: int) -> Optional
         "STATE içindeki doğrulanmış bilgileri yeniden kullan ve kalan zorunlu hesaplama, yazma, "
         "final doğrulama ve cleanup adımlarını en kısa yoldan tamamla."
     )
+
+
+def extract_task_ledger(current: str, content: str) -> str:
+    """Assistant metnindeki STATE bloğunu dayanıklı, sınırlı çalışma kaydına dönüştürür."""
+    match = re.search(r"(?im)^\s*STATE\s*:", content)
+    if match is None:
+        return current
+    return content[match.start():].strip()[:TASK_LEDGER_LIMIT]
+
+
+def _ledger_delivery_ready(ledger: str) -> bool:
+    """Model açıkça kalan zorunlu iş olmadığını kaydetti mi? Saf ve muhafazakâr."""
+    return bool(re.search(
+        r"(?im)^\s*(?:REMAINING|KALAN)\s*:\s*(?:0|none|nothing|yok|tamamlandı|complete)\s*$",
+        ledger,
+    ))
+
+
+def _call_signature_arguments(call: ToolCallDraft) -> Dict[str, Any]:
+    try:
+        value: object = json.loads(call["arguments"] or "{}")
+    except json.JSONDecodeError:
+        return {"raw": call["arguments"][:TRIMMED_ARGS_LIMIT]}
+    return value if isinstance(value, dict) else {"value": value}
+
+
+def _fast_loop_prompt(kind: str, ledger: str) -> str:
+    ledger_text: str = ledger or "STATE: henüz kalıcı görev kaydı yok"
+    if kind == "replan":
+        instruction = (
+            "HOST FAST LOOP — YENİDEN PLAN: Anlamlı ilerleme durdu. Yeni keşif açma; aşağıdaki "
+            "STATE'i kullanarak eksik zorunlu işi en az model turu ve araç çağrısıyla tamamlayacak "
+            "tek kısa yol seç."
+        )
+    else:
+        instruction = (
+            "HOST FAST LOOP — TESLİM MODU: Opsiyonel keşfi bırak. Yalnız kalan zorunlu hesaplama, "
+            "dosya/rapor yazma, açıkça istenen final doğrulama ve cleanup adımlarını tamamla."
+        )
+    return f"{instruction}\n\n{ledger_text}"
 
 
 def merge_tool_call_delta(
@@ -1098,8 +1144,15 @@ async def run_agent_with_callback(
     no_progress_turns: int = 0
     tool_cache: Dict[str, ToolResult] = {}
     chrome_visits: Dict[str, int] = {}
-    budget_warning_sent: bool = False
     final_length_recoveries: int = 0
+    task_ledger: str = ""
+    fast_loop_policy = FastLoopPolicy(
+        soft_uncached_prompt_tokens=SOFT_UNCACHED_PROMPT_TOKEN_BUDGET,
+        soft_tool_calls=SOFT_TOOL_CALL_BUDGET,
+    )
+    fast_loop_state = FastLoopState()
+    fast_loop_delivery_entries: int = 0
+    fast_loop_stagnation_events: int = 0
     turns: int = 0
     tool_call_count: int = 0
     usage: TokenUsage = ZERO_USAGE
@@ -1115,13 +1168,6 @@ async def run_agent_with_callback(
             if time.monotonic() - start_time - runtime.metrics["user_wait_seconds"] > max_wall_clock:
                 outcome, reason = "", f"zaman bütçesi ({max_wall_clock:.0f}sn) aşıldı"
                 break
-
-            if not budget_warning_sent:
-                budget_note: Optional[str] = budget_pressure_message(usage, tool_call_count)
-                if budget_note is not None:
-                    messages.append({"role": "user", "content": budget_note})
-                    emit({"kind": "notice", "level": "warning", "text": budget_note})
-                    budget_warning_sent = True
 
             runtime.published = dict(runtime.selected)
             tool_schemas = build_tool_schemas(goal) + [
@@ -1234,8 +1280,61 @@ async def run_agent_with_callback(
                     ),
                 })
 
-            # Yükseltme sayacı TUR bazlıdır: turda herhangi bir başarı varsa sıfırlanır.
             all_failed: bool = bool(results) and failures_in_turn == len(results)
+            previous_ledger: str = task_ledger
+            task_ledger = extract_task_ledger(task_ledger, turn["content"])
+            ledger_changed: bool = task_ledger != previous_ledger
+            signature: str = normalize_progress_signature(
+                tool_facts=[
+                    (call["name"], _call_signature_arguments(call))
+                    for call in turn["tool_calls"]
+                ],
+                result_facts=[result_text(result)[:TRIMMED_CONTENT_LIMIT] for result in results],
+                observation_digest=None,
+                ledger_digest=task_ledger,
+                unresolved_deliverables=0 if _ledger_delivery_ready(task_ledger) else 1,
+            )
+            semantic_progress: bool = ledger_changed or (
+                not task_ledger and signature != fast_loop_state.last_signature
+            )
+            if all_failed and not ledger_changed:
+                semantic_progress = False
+            if not semantic_progress:
+                fast_loop_stagnation_events += 1
+            previous_phase = fast_loop_state.phase
+            decision = advance_fast_loop(
+                fast_loop_state,
+                TurnSignal(
+                    signature=signature,
+                    semantic_progress=semantic_progress,
+                    unresolved_deliverables=0 if _ledger_delivery_ready(task_ledger) else 1,
+                    uncached_prompt_tokens=max(0, usage["prompt_tokens"] - usage["cached_tokens"]),
+                    tool_calls=tool_call_count,
+                    delivery_ready=_ledger_delivery_ready(task_ledger),
+                ),
+                fast_loop_policy,
+            )
+            fast_loop_state = decision.state
+            if decision.notice:
+                emit({"kind": "notice", "level": "warning", "text": decision.notice})
+            if decision.request_replan:
+                messages.append({"role": "user", "content": _fast_loop_prompt("replan", task_ledger)})
+            elif decision.entered_delivery:
+                fast_loop_delivery_entries += 1
+                messages.append({"role": "user", "content": _fast_loop_prompt("delivery", task_ledger)})
+            elif previous_phase != fast_loop_state.phase and fast_loop_state.phase == "conserve":
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "HOST FAST LOOP — CONSERVE: Opsiyonel keşfi ve tekrar kontrollerini azalt; "
+                        "mevcut STATE ile zorunlu işi en kısa yoldan sürdür."
+                    ),
+                })
+            if decision.stop_reason is not None:
+                reason = decision.stop_reason
+                break
+
+            # Yükseltme sayacı TUR bazlıdır: turda herhangi bir başarı varsa sıfırlanır.
             consecutive_failed_turns = consecutive_failed_turns + 1 if all_failed else 0
             no_progress_turns = no_progress_turns + 1 if all_failed else 0
             if consecutive_failed_turns >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD:
@@ -1265,6 +1364,11 @@ async def run_agent_with_callback(
             "prompt_tokens": usage["prompt_tokens"], "cached_tokens": usage["cached_tokens"],
             "completion_tokens": usage["completion_tokens"],
             "model_seconds": round(model_seconds, 2), "tool_seconds": round(tool_seconds, 2),
+            "fast_loop_transitions": fast_loop_state.transitions,
+            "fast_loop_replans": fast_loop_state.replans,
+            "fast_loop_delivery_entries": fast_loop_delivery_entries,
+            "semantic_progress_events": fast_loop_state.semantic_progress_events,
+            "fast_loop_stagnation_events": fast_loop_stagnation_events,
             "integrations": dict(runtime.metrics),
         }
         cleanup_errors: List[str] = []

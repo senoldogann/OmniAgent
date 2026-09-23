@@ -51,11 +51,11 @@ def load_provider_key(provider: str) -> Optional[str]:
 # Ölçüm (2026-09-23, qwen3.8-flash): düşünme açıkken tur 2,5-3,7sn ve 6-9,6sn kuyruk;
 # `enable_thinking: False` ile 1,2-2,8sn. Bu yüzden varsayılan düşünmesiz çalışır, araç
 # hataları tekrarlarsa QUALITY_LADDER boyunca önce düşünen aynı modele, sonra Claude'a çıkılır.
-DEFAULT_BACKEND: str = "zen-free"
+DEFAULT_BACKEND: str = "openai"
 # API/ağ hatası kalıcıysa son denemenin yapıldığı farklı sağlayıcı
-ESCALATION_BACKEND: str = "openai"
+ESCALATION_BACKEND: str = "zen-free"
 # Art arda başarısız araç turlarında sırayla çıkılan basamaklar
-QUALITY_LADDER: Tuple[str, ...] = ("zen-free", "openai")
+QUALITY_LADDER: Tuple[str, ...] = ("openai", "zen-free")
 
 _OPENCODE_BASE_URL: str = "https://opencode.ai/zen/go/v1"
 _OPENCODE_KEY: Optional[str] = load_provider_key("opencode-go")
