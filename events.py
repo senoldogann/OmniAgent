@@ -144,6 +144,7 @@ TOOL_LABELS: Dict[str, str] = {
     "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "execute_js": "Node",
     "take_screenshot": "Ekran", "cua_get_app": "Uygulama", "cua_get_ax_state": "Arayüz ağacı",
     "cua_click": "Tıkla", "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
+    "capture_photo": "Fotoğraf çek",
 }
 
 # Önizlemede gösterilen asıl argüman

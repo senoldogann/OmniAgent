@@ -1116,6 +1116,52 @@ class Toolbox:
             "bu görüntüdeki koordinatlar tıklama araçlarıyla aynı uzayda)."
         )
 
+    def capture_photo(self) -> str:
+        """Varsayılan kameradan tek kareyi masaüstüne benzersiz adla kaydeder."""
+        desktop: Path = Path.home() / "Desktop"
+        if not desktop.is_dir():
+            raise ToolError(f"Masaüstü dizini bulunamadı: {desktop}", "MISSING_DIRECTORY", False)
+        target: Path = desktop / f"fotograf-{datetime.now().strftime('%Y-%m-%d-%H%M%S-%f')}.jpg"
+        if _is_sensitive_path(target):
+            raise ToolError(f"Korunan yola fotoğraf yazılamaz: {target}", "SENSITIVE_PATH_BLOCKED", False)
+        ffmpeg: Optional[str] = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise ToolError("Doğrudan kamera çekimi için ffmpeg bulunamadı; Photo Booth kullanılabilir.",
+                            "FFMPEG_MISSING", True)
+        temporary: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=".omni_camera_", suffix=target.suffix, dir=target.parent, delete=False,
+            ) as pending:
+                temporary = Path(pending.name)
+            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
+                       "-i", "default:none", "-frames:v", "1", "-update", "1",
+                       "-y", str(temporary)]
+            try:
+                returncode, stdout, stderr = run_streaming_process(command, False, 30.0)
+            except subprocess.TimeoutExpired as error:
+                raise ToolError("Kamera 30 saniyede kare üretmedi.", "CAMERA_TIMEOUT", True) from error
+            if returncode != 0:
+                raise ToolError(
+                    f"Kamera çekimi başarısız (çıkış {returncode}): {_clip(stderr or stdout, 600)}",
+                    "CAMERA_CAPTURE_FAILED", True,
+                )
+            if temporary.stat().st_size == 0:
+                raise ToolError("Kamera boş dosya üretti.", "CAMERA_EMPTY", True)
+            try:
+                with Image.open(temporary) as frame:
+                    frame.verify()
+            except (OSError, ValueError) as error:
+                raise ToolError("Kamera geçerli bir görüntü üretmedi.", "CAMERA_INVALID_IMAGE", True) from error
+            try:
+                os.link(temporary, target)
+            except FileExistsError as error:
+                raise ToolError(f"Fotoğraf hedefi işlem sırasında oluştu: {target}", "FILE_EXISTS", False) from error
+            return f"Fotoğraf kaydedildi ve doğrulandı: {target} ({target.stat().st_size} bayt)."
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
     def _click_template(self, app_name: str, template_path: str, confidence: float) -> str:
         """
         Şablonu uygulama penceresi içinde, ortak uzaydaki ekran karesinde arar ve

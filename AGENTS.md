@@ -50,9 +50,10 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 - **Ölçüm önce gelir:** `benchmark.py` 9 deterministik senaryoyu gerçek modelle koşturur; başarı
   oranı, medyan/maks süre, tur ve token (önbellek dahil) raporlar, ev dizininde istenmeyen dosya
   oluşursa bildirir. Her değişiklik hız VE doğrulukla birlikte ölçülmelidir.
-- **Araç diyeti:** model 14 araç görür (önce 26). 26 araçlı şemada model hedefteki tarihi 10
-  denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu. Fare/klavye adımları
-  `run_action_sequence`, şablon tıklama `smart_click` içindedir.
+- **Araç diyeti:** model 14 temel araç ve bir `discover_capabilities` şeması görür (önce 26
+  temel araç vardı). Masaüstüne fotoğraf çekme hedefinde `capture_photo` eklenir. 26 araçlı
+  şemada model hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10
+  doğruydu. Fare/klavye adımları `run_action_sequence`, şablon tıklama `smart_click` içindedir.
 - **Paralellik:** bağımsız araç çağrıları `asyncio.gather` ile gerçek paralellikte çalışır; yan
   etkili araçlar (`_SIDE_EFFECT_TOOLS`) model sırasıyla seri çalışır (iki tıklama/yazma
   çakışmaz, eylem→gözlem sırası korunur). Her araç sonucunun başında çağrı etiketi vardır;

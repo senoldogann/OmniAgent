@@ -95,3 +95,31 @@ def test_batched_tool_output_keeps_line_summary(app: ui.OmniUI) -> None:
     assert view["line_count"] == 5
     assert view["head"][:2] == ["1\n", "2\n"]
     assert view["tail"][-1] == "5\n"
+
+
+def test_format_run_stats_shows_exact_totals_and_waits() -> None:
+    metrics = {
+        "turns": 8, "tool_calls": 7, "elapsed_seconds": 30.25, "backend": "opencode",
+        "prompt_tokens": 29593, "cached_tokens": 23040, "completion_tokens": 561,
+        "model_seconds": 22.8, "tool_seconds": 7.4,
+        "integrations": {"network_requests": 2, "wait_seconds": 1.5},
+    }
+    lines = ui.format_run_stats(metrics)
+    assert "30.2 sn" in lines[0]
+    assert "model 22.8 sn" in lines[0]
+    assert "Giriş 29.593 (önbellek 23.040, yeni 6.553)" in lines[1]
+    assert "toplam 30.154 token" in lines[1]
+    assert "ağ isteği 2" in lines[2]
+
+
+def test_finished_run_keeps_stats_in_footer(app: ui.OmniUI) -> None:
+    metrics = {
+        "turns": 2, "tool_calls": 1, "elapsed_seconds": 5.1, "backend": "opencode",
+        "prompt_tokens": 100, "cached_tokens": 80, "completion_tokens": 20,
+        "model_seconds": 4.0, "tool_seconds": 1.0,
+    }
+    app._handle_event({"kind": "run_finished", "success": True, "outcome": "tamam",
+                       "reason": "", "metrics": metrics})
+    assert "5.1 sn" in app.stats_label.cget("text")
+    assert "toplam 120 token" in app.stats_label.cget("text")
+    assert "✓ Tamamlandı" in app._text.get("1.0", "end")

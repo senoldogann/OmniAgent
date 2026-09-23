@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
@@ -10,6 +11,9 @@ import pytest
 from openai import AsyncOpenAI
 
 from config import BACKENDS, DEFAULT_BACKEND
+import main
+import tools
+from PIL import Image
 from events import AgentEvent, preview_arguments
 from main import ToolCallDraft, _trim_old_turns, encode_image, execute_tool, merge_tool_call_delta
 from state_manager import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
@@ -191,3 +195,64 @@ def test_sensitive_path_macos_firmlink_false_positive() -> None:
     assert _is_sensitive_path(Path("/System/Library/CoreServices/test.txt"))
     assert _is_sensitive_path(Path("/etc/hosts"))
     assert _is_sensitive_path(Path.home() / ".ssh" / "id_rsa")
+
+
+def test_camera_tool_only_appears_for_photo_capture_goal() -> None:
+    ordinary = {entry["function"]["name"] for entry in main.build_tool_schemas()}
+    camera = {entry["function"]["name"] for entry in main.build_tool_schemas(
+        "Kamerayı açıp fotoğrafımı çek ve masaüstüne kaydet")}
+    assert "capture_photo" not in ordinary
+    assert "capture_photo" in camera
+    assert len(camera) == len(ordinary) + 1
+    assert not main.camera_photo_goal("Photo Booth fotoğraflarını listele")
+    assert not main.camera_photo_goal("Fotoğrafımı çek ve /tmp/ozel.jpg dosyasına kaydet")
+    assert not main.camera_photo_goal("Photo Booth ile fotoğraf çek ve masaüstüne kaydet")
+    assert main.build_system_prompt(date.today(), "Bir dosya oku") == main.build_system_prompt(date.today())
+    assert "### CAMERA PHOTO" in main.build_system_prompt(date.today(), "Fotoğrafımı çek ve desktop’a kaydet")
+
+
+def test_capture_photo_validates_image_and_never_overwrites(tmp_path: Path, monkeypatch) -> None:
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(tools.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+    commands = []
+
+    def fake_process(command, shell, timeout):
+        commands.append(command)
+        Image.new("RGB", (3, 2), "red").save(command[-1])
+        return 0, "", ""
+
+    monkeypatch.setattr(tools, "run_streaming_process", fake_process)
+    first = Toolbox().capture_photo()
+    second = Toolbox().capture_photo()
+    files = list(desktop.glob("fotograf-*.jpg"))
+    assert len(files) == 2 and files[0] != files[1]
+    assert all(path.stat().st_size > 0 for path in files)
+    assert all("doğrulandı" in result for result in (first, second))
+    assert all(command[command.index("-i") + 1] == "default:none" for command in commands)
+    assert not list(desktop.glob(".omni_camera_*"))
+
+
+def test_capture_photo_rejects_failed_or_invalid_capture(tmp_path: Path, monkeypatch) -> None:
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(tools.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(tools.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+
+    def failed_process(command, shell, timeout):
+        Path(command[-1]).write_bytes(b"broken")
+        return 1, "", "kamera meşgul"
+
+    monkeypatch.setattr(tools, "run_streaming_process", failed_process)
+    with pytest.raises(ToolError) as error:
+        Toolbox().capture_photo()
+    assert error.value.code == "CAMERA_CAPTURE_FAILED"
+    assert not list(desktop.glob("fotograf-*.jpg"))
+    assert not list(desktop.glob(".omni_camera_*"))
+    monkeypatch.setattr(tools, "run_streaming_process",
+                        lambda command, shell, timeout: (0, "", ""))
+    with pytest.raises(ToolError) as error:
+        Toolbox().capture_photo()
+    assert error.value.code == "CAMERA_EMPTY"
+    assert not list(desktop.glob("fotograf-*.jpg"))

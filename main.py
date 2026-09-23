@@ -115,13 +115,25 @@ def _function_schema(name: str, description: str, properties: Dict[str, Dict[str
     }}
 
 
-def build_tool_schemas() -> List[Dict[str, Any]]:
+def camera_photo_goal(goal: str) -> bool:
+    """Tek kare kamera çekimi hedeflerinde özel aracı açar; diğer görevleri sade tutar."""
+    lowered: str = goal.casefold()
+    return (
+        any(term in lowered for term in ("fotoğraf", "fotograf", "photo", "selfie", "picture"))
+        and any(term in lowered for term in ("çek", "take", "capture", "shoot"))
+        and any(term in lowered for term in ("desktop", "masaüst", "masaust"))
+        and not any(extension in lowered for extension in (".jpg", ".jpeg", ".png"))
+        and not any(app in lowered for app in ("photo booth", "photobooth"))
+    )
+
+
+def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
     hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu.
     Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
     """
-    return [
+    schemas: List[Dict[str, Any]] = [
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
             "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
@@ -233,11 +245,20 @@ def build_tool_schemas() -> List[Dict[str, Any]]:
             },
         ),
     ] + [DISCOVERY_SCHEMA]
+    if goal is not None and camera_photo_goal(goal):
+        schemas.append(_function_schema(
+            "capture_photo",
+            "Varsayılan Mac kamerasından TEK fotoğrafı otomatik benzersiz adla ~/Desktop'a kaydeder; "
+            "görüntüyü doğrular, mevcut dosyayı ezmez ve tam yolu sonuçta verir. "
+            "Ayrı kamera/ffmpeg/Photo Booth yoklaması yapmadan doğrudan kullan. Başarısız olursa Photo Booth'a geç.",
+            {},
+        ))
+    return schemas
 
 
 # Modelin çağırabileceği adlar: getattr ile Toolbox'ın özel yöntemlerine
 # (_read_full, close_browser…) ulaşılmasın.
-TOOL_NAMES: frozenset[str] = frozenset(schema["function"]["name"] for schema in build_tool_schemas())
+TOOL_NAMES: frozenset[str] = frozenset(schema["function"]["name"] for schema in build_tool_schemas("fotoğraf çek masaüstüne"))
 
 # Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
 # önbelleklenmez; her başarılı yan etkili çağrıdan sonra önbellek tamamen temizlenir.
@@ -248,7 +269,7 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({"process_list", "read_file", "web_
 # korunsun); aralarındaki bağımsız salt okunur bloklar gerçek paralellikle çalışır.
 _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "execute_shell", "write_file", "execute_js", "take_screenshot", "browse_url",
-    "cua_get_app", "cua_click", "smart_click", "run_action_sequence",
+    "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
 })
 
 
@@ -465,15 +486,22 @@ def _trim_old_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [_trim_entry(entry) if index < cutoff else entry for index, entry in enumerate(messages)]
 
 
-def build_system_prompt(today: date) -> str:
+def build_system_prompt(today: date, goal: Optional[str] = None) -> str:
     """
-    Sabit sistem talimatının SONUNA günün tarihini ekler (önek önbelleği korunur). Ev dizini
-    bilerek eklenmez: ölçümde modeli istenmeyen ~/output.txt dosyaları yazmaya itti. Saf.
+    Sabit istemin sonuna tarih ve yalnız ilgili görevde kısa yöntem bilgisi ekler.
+    Genel görevlerde önek aynı kalır; ev dizini modele verilmez. Saf.
     """
     weekday: int = today.weekday()
+    camera_guidance: str = (
+        "\n### CAMERA PHOTO\n- Call capture_photo with {} directly. It chooses the real "
+        "~/Desktop path, validates the image and returns its filename. Skip camera/ffmpeg/"
+        "Photo Booth probes; use Photo Booth only if the tool fails.\n"
+        if goal is not None and camera_photo_goal(goal) else ""
+    )
     return (
         SYSTEM_PROMPT
         + f"\n### TODAY\n- Date: {today.isoformat()} ({TURKISH_WEEKDAYS[weekday]} / {ENGLISH_WEEKDAYS[weekday]}).\n"
+        + camera_guidance
     )
 
 
@@ -742,14 +770,14 @@ async def run_agent_with_callback(
         session_id: str = str(uuid.uuid4())
         state: sm.StateDict = sm.load_state(options["state_file"])
         messages: List[Dict[str, Any]] = (
-            [{"role": "system", "content": build_system_prompt(date.today())}]
+            [{"role": "system", "content": build_system_prompt(date.today(), goal)}]
             + to_messages(options["history"])
             + [{"role": "user", "content": goal}]
         )
         service = options.get("integrations") or CapabilityService()
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
         runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
-        tool_schemas: List[Dict[str, Any]] = build_tool_schemas()
+        tool_schemas: List[Dict[str, Any]] = build_tool_schemas(goal)
     except Exception as error:
         if service is not None and "integrations" not in options:
             try:
@@ -769,6 +797,8 @@ async def run_agent_with_callback(
     turns: int = 0
     tool_call_count: int = 0
     usage: TokenUsage = ZERO_USAGE
+    model_seconds: float = 0.0
+    tool_seconds: float = 0.0
     metrics: sm.EpisodeMetrics
 
     try:
@@ -781,19 +811,23 @@ async def run_agent_with_callback(
                 break
 
             runtime.published = dict(runtime.selected)
-            tool_schemas = build_tool_schemas() + [
+            tool_schemas = build_tool_schemas(goal) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             messages = _trim_old_turns(messages)
             emit({"kind": "turn_started", "turn": iteration, "max_turns": MAX_ITERATIONS,
                   "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
             model_started: float = time.monotonic()
-            turn, used_backend = await _call_model_with_retries(
-                clients, messages, tool_schemas, session_id, current_backend, emit, options["should_stop"],
-            )
+            try:
+                turn, used_backend = await _call_model_with_retries(
+                    clients, messages, tool_schemas, session_id, current_backend, emit, options["should_stop"],
+                )
+            finally:
+                model_elapsed: float = time.monotonic() - model_started
+                model_seconds += model_elapsed
             turns += 1
             usage = add_usage(usage, turn["usage"])
             emit({"kind": "model_finished", "turn": iteration,
-                  "seconds": round(time.monotonic() - model_started, 2), "usage": turn["usage"]})
+                  "seconds": round(model_elapsed, 2), "usage": turn["usage"]})
             if used_backend != current_backend:
                 emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
                       "reason": "API hatası"})
@@ -812,9 +846,13 @@ async def run_agent_with_callback(
                 emit({"kind": "notice", "level": "warning",
                       "text": "Yanıt max_tokens sınırında kesildi; araç argümanları eksik olabilir."})
             tool_call_count += len(turn["tool_calls"])
-            results: List[ToolResult] = await _execute_tool_calls(
-                turn["tool_calls"], toolbox, tool_cache, emit, options["should_stop"],
-            )
+            tools_started: float = time.monotonic()
+            try:
+                results: List[ToolResult] = await _execute_tool_calls(
+                    turn["tool_calls"], toolbox, tool_cache, emit, options["should_stop"],
+                )
+            finally:
+                tool_seconds += time.monotonic() - tools_started
 
             failures_in_turn: int = 0
             pending_shots: List[ToolCallDraft] = []
@@ -861,6 +899,7 @@ async def run_agent_with_callback(
             "elapsed_seconds": round(time.monotonic() - start_time, 2), "backend": current_backend,
             "prompt_tokens": usage["prompt_tokens"], "cached_tokens": usage["cached_tokens"],
             "completion_tokens": usage["completion_tokens"],
+            "model_seconds": round(model_seconds, 2), "tool_seconds": round(tool_seconds, 2),
             "integrations": dict(runtime.metrics),
         }
         cleanup_errors: List[str] = []

@@ -124,6 +124,45 @@ def summarize_result(name: str, text: str, head: List[str], line_count: int, ok:
     return [_clip_line(line) for line in lines[:3]] + tail_note
 
 
+def format_run_stats(metrics: EpisodeMetrics) -> List[str]:
+    """Görev bitişinde tam token sayılarını ve süre dağılımını okunur satırlara çevirir."""
+    prompt: int = metrics["prompt_tokens"]
+    cached: int = min(prompt, metrics["cached_tokens"])
+    completion: int = metrics["completion_tokens"]
+    def fmt(value: int) -> str:
+        return f"{value:,}".replace(",", ".")
+    first: str = (
+        f"{metrics['elapsed_seconds']:.1f} sn · {metrics['turns']} tur · "
+        f"{metrics['tool_calls']} araç · {metrics['backend']}"
+    )
+    if "model_seconds" in metrics and "tool_seconds" in metrics:
+        first += f" · model {metrics['model_seconds']:.1f} sn · araç {metrics['tool_seconds']:.1f} sn"
+    second: str = (
+        f"Giriş {fmt(prompt)} (önbellek {fmt(cached)}, yeni {fmt(prompt - cached)})"
+        f" · çıkış {fmt(completion)} · toplam {fmt(prompt + completion)} token"
+    )
+    lines: List[str] = [first, second]
+    integration = metrics.get("integrations", {})
+    if integration:
+        pieces: List[str] = []
+        for key, label, unit in (
+            ("discovery_seconds", "keşif", " sn"),
+            ("install_seconds", "kurulum", " sn"),
+            ("network_seconds", "ağ", " sn"),
+            ("wait_seconds", "bekleme", " sn"),
+            ("user_wait_seconds", "kullanıcı", " sn"),
+            ("network_requests", "ağ isteği", ""),
+            ("operations_ok", "işlem başarılı", ""),
+            ("operations_failed", "işlem hatalı", ""),
+        ):
+            value = integration.get(key, 0)
+            if value:
+                pieces.append(f"{label} {value}{unit}")
+        if pieces:
+            lines.append("Entegrasyon: " + " · ".join(pieces))
+    return lines
+
+
 class OmniUI(ctk.CTk):
     """
     OmniAgent arayüzü: ajanın model yanıtını, araç çağrılarını, çalıştırdığı komutları ve
@@ -363,9 +402,10 @@ class OmniUI(ctk.CTk):
             font=ctk.CTkFont(family=MONO_FAMILY, size=10), anchor="w",
         ).grid(row=0, column=0, sticky="w")
         self.stats_label: ctk.CTkLabel = ctk.CTkLabel(
-            footer, text="", text_color=TEXT_FAINT, font=ctk.CTkFont(family=MONO_FAMILY, size=10), anchor="e",
+            footer, text="", text_color=TEXT_FAINT, font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+            anchor="w", justify="left",
         )
-        self.stats_label.grid(row=0, column=1, sticky="e")
+        self.stats_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
     # --- Transkript bölgeleri (etiket tabanlı; her bölge '\n' ile biter, asla boş kalmaz) ---
 
@@ -548,6 +588,8 @@ class OmniUI(ctk.CTk):
             self._new_region([(f"{'⚠' if event['level'] != 'info' else 'ℹ'} {event['text']}\n", (f"notice_{event['level']}",))])
         elif event["kind"] == "run_finished":
             self._render_summary(event["success"], event["reason"], event["metrics"])
+            status: str = "✓" if event["success"] else "■" if event["reason"] == "durduruldu" else "✗"
+            self.stats_label.configure(text=status + " " + "\n".join(format_run_stats(event["metrics"])))
 
     # --- Çizim ---
 
@@ -609,13 +651,9 @@ class OmniUI(ctk.CTk):
             head = ("■ Durduruldu", ("summary_error",))
         else:
             head = (f"✗ Tamamlanamadı: {reason}", ("summary_error",))
-        meta: str = (
-            f"  {metrics['turns']} tur · {metrics['tool_calls']} araç · {metrics['elapsed_seconds']:.1f}sn · "
-            f"↑{compact_count(metrics['prompt_tokens'])} (önbellek {compact_count(metrics['cached_tokens'])}) "
-            f"· ↓{metrics['completion_tokens']}\n"
-        )
-        self._new_region([("\n", ("gap",))])
-        self._new_region([head, (meta, ("summary_meta",))])
+        parts: List[Tuple[str, Tuple[str, ...]]] = [("\n", ("gap",)), (head[0] + "\n", head[1])]
+        parts.extend((f"  {line}\n", ("summary_meta",)) for line in format_run_stats(metrics))
+        self._new_region(parts)
 
     def _typewriter_step(self) -> bool:
         """Bekleyen akış metnini kare başına birkaç karakter ekleyerek gösterir (daktilo efekti)."""

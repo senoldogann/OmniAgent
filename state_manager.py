@@ -32,6 +32,8 @@ class EpisodeMetrics(TypedDict):
     prompt_tokens: int
     cached_tokens: int
     completion_tokens: int
+    model_seconds: NotRequired[float]
+    tool_seconds: NotRequired[float]
     integrations: NotRequired[Dict[str, Union[int, float]]]
 
 
