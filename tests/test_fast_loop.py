@@ -4,6 +4,7 @@ from fast_loop import (
     FastLoopState,
     TurnSignal,
     advance_fast_loop,
+    classify_semantic_progress,
     normalize_progress_signature,
 )
 
@@ -150,3 +151,28 @@ def test_signature_normalization_ignores_dict_key_order() -> None:
         unresolved_deliverables=1,
     )
     assert a == b
+
+
+def test_changing_tool_signatures_without_ledger_do_not_fake_progress() -> None:
+    """Farklı URL/araç gezmek, STATE ilerlemiyorsa runaway döngüyü sıfırlamamalı."""
+    assert classify_semantic_progress(
+        ledger_changed=False,
+        has_ledger=False,
+        previous_signature=None,
+        signature="first",
+        all_failed=False,
+    ) is True
+    assert classify_semantic_progress(
+        ledger_changed=False,
+        has_ledger=False,
+        previous_signature="first",
+        signature="different-url",
+        all_failed=False,
+    ) is False
+    assert classify_semantic_progress(
+        ledger_changed=True,
+        has_ledger=True,
+        previous_signature="first",
+        signature="same-tool",
+        all_failed=False,
+    ) is True

@@ -34,6 +34,15 @@ class EpisodeMetrics(TypedDict):
     completion_tokens: int
     model_seconds: NotRequired[float]
     tool_seconds: NotRequired[float]
+    fast_loop_transitions: NotRequired[int]
+    fast_loop_replans: NotRequired[int]
+    fast_loop_delivery_entries: NotRequired[int]
+    semantic_progress_events: NotRequired[int]
+    fast_loop_stagnation_events: NotRequired[int]
+    observations: NotRequired[int]
+    observations_reused: NotRequired[int]
+    duplicate_navigation: NotRequired[int]
+    uncached_prompt_tokens: NotRequired[int]
     integrations: NotRequired[Dict[str, Union[int, float]]]
 
 

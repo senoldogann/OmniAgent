@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import time
 import uuid
+from urllib.request import urlopen
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -23,7 +25,8 @@ from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER
 from cli_backends import CliModelError, run_cli_model
 from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
 from fast_loop import (
-    FastLoopPolicy, FastLoopState, TurnSignal, advance_fast_loop, normalize_progress_signature,
+    FastLoopPolicy, FastLoopState, TurnSignal, advance_fast_loop, classify_semantic_progress,
+    normalize_progress_signature,
 )
 from tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, Toolbox, ToolError
 import state_manager as sm
@@ -856,14 +859,33 @@ def merge_tool_call_delta(
     return padded[:index] + [updated] + padded[index + 1:]
 
 
+def ollama_cloud_ready() -> bool:
+    """Yerel Ollama sunucusunda seçilen bulut modelinin kurulu olduğunu hızlıca doğrular."""
+    try:
+        with urlopen("http://127.0.0.1:11434/api/tags", timeout=0.3) as response:
+            payload: Any = json.load(response)
+    except (OSError, ValueError):
+        return False
+    models: Any = payload.get("models", []) if isinstance(payload, dict) else []
+    return isinstance(models, list) and any(
+        isinstance(model, dict) and model.get("name") == BACKENDS["ollama-cloud"]["model"]
+        for model in models
+    )
+
+
 def create_model_clients() -> Dict[str, Optional[AsyncOpenAI]]:
     """API istemcilerini ve oturumlu CLI modellerinin kullanılabilirliğini kurar."""
     timeout: Timeout = Timeout(MODEL_REQUEST_TIMEOUT_SECONDS, connect=MODEL_CONNECT_TIMEOUT_SECONDS)
     clients: Dict[str, Optional[AsyncOpenAI]] = {
         name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"], timeout=timeout, max_retries=0)
         for name, profile in BACKENDS.items()
-        if profile["api_key"]
+        if profile["api_key"] and name != "ollama-cloud"
     }
+    if ollama_cloud_ready():
+        profile: BackendProfile = BACKENDS["ollama-cloud"]
+        clients["ollama-cloud"] = AsyncOpenAI(
+            api_key="ollama", base_url=profile["base_url"], timeout=timeout, max_retries=0,
+        )
     if shutil.which("opencode"):
         clients["zen-free"] = None
     if shutil.which("codex"):
@@ -874,6 +896,19 @@ def create_model_clients() -> Dict[str, Optional[AsyncOpenAI]]:
 async def close_model_clients(clients: Dict[str, Optional[AsyncOpenAI]]) -> None:
     """API bağlantı havuzlarını kapatır; oturumlu CLI modellerinde havuz yoktur."""
     await asyncio.gather(*(client.close() for client in clients.values() if client is not None))
+
+
+def model_request_overrides(
+    profile: BackendProfile, session_id: str,
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    """Provider'a özgü request metadata'sını shared profile'ı değiştirmeden kurar."""
+    headers: Dict[str, str] = dict(profile["extra_headers"])
+    body: Dict[str, Any] = dict(profile["extra_body"])
+    if profile["session_header"] is not None:
+        headers[profile["session_header"]] = session_id
+    if "openrouter.ai" in profile["base_url"].casefold():
+        body["session_id"] = session_id
+    return headers, body
 
 
 async def _stream_completion(
@@ -890,9 +925,7 @@ async def _stream_completion(
         return await run_cli_model(provider, profile["model"], messages, tool_schemas, emit, should_stop)
     if client is None:
         raise CliModelError("API istemcisi bulunamadı.")
-    headers: Dict[str, str] = dict(profile["extra_headers"])
-    if profile["session_header"] is not None:
-        headers[profile["session_header"]] = session_id
+    headers, extra_body = model_request_overrides(profile, session_id)
     stream: Any = await client.chat.completions.create(
         model=profile["model"],
         messages=messages,
@@ -900,7 +933,7 @@ async def _stream_completion(
         tool_choice="auto",
         max_tokens=profile["max_tokens"],
         extra_headers=headers,
-        extra_body=profile["extra_body"],
+        extra_body=extra_body,
         stream=True,
         stream_options={"include_usage": True},
     )
@@ -982,7 +1015,7 @@ async def _call_model_with_retries(
         # yükselebiliyor; geçici bağlantı hatası gibi yeniden denenir (canlı ölçümde görevi bitirdi).
         except (APIStatusError, APIConnectionError, ssl.SSLError, CliModelError) as error:
             status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
-            if status is not None and status < 500 and status != 429:
+            if status is not None and status < 500 and status not in (402, 429):
                 raise
             last_error = error
             logging.warning(
@@ -995,8 +1028,11 @@ async def _call_model_with_retries(
                 emitted[0] = False
             timed_out: bool = isinstance(error, APITimeoutError)
             cli_failed: bool = isinstance(error, CliModelError)
-            attempt = len(plan) - 1 if (timed_out or cli_failed) and attempt < len(plan) - 1 else attempt + 1
+            quota_failed: bool = status == 402
+            attempt = len(plan) - 1 if (timed_out or cli_failed or quota_failed) and attempt < len(plan) - 1 else attempt + 1
             if attempt < len(plan):
+                if cli_failed or quota_failed:
+                    continue
                 runtime = CURRENT_RUNTIME.get()
                 if runtime is not None:
                     await runtime.delay(0.5 * attempt)
@@ -1006,11 +1042,14 @@ async def _call_model_with_retries(
     raise last_error
 
 
-async def _screenshot_observation(call: ToolCallDraft) -> Dict[str, Any]:
-    """Başarılı bir ekran görüntüsünü modele gidecek görsel gözlem mesajına çevirir."""
+async def _screenshot_observation_with_digest(
+    call: ToolCallDraft,
+) -> Tuple[Dict[str, Any], str]:
+    """Görsel gözlem mesajını ve tekrar tespiti için ucuz içerik digest'ini döner."""
     arguments: Dict[str, Any] = json.loads(call["arguments"] or "{}")
     image_b64: str = await asyncio.to_thread(encode_image, str(Path(arguments["filename"]).expanduser()))
-    return {
+    digest: str = hashlib.sha256(image_b64.encode("ascii")).hexdigest()
+    message: Dict[str, Any] = {
         "role": "user",
         "content": [
             {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü (koordinatlar tıklama araçlarıyla aynı uzayda). "
@@ -1019,6 +1058,24 @@ async def _screenshot_observation(call: ToolCallDraft) -> Dict[str, Any]:
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
         ],
     }
+    return message, digest
+
+
+async def _screenshot_observation(call: ToolCallDraft) -> Dict[str, Any]:
+    """Geriye uyumlu görsel gözlem helper'ı."""
+    message, _ = await _screenshot_observation_with_digest(call)
+    return message
+
+
+def should_reuse_observation(
+    digest: Optional[str], last_digest: Optional[str], *, current_turn: int,
+    last_injected_turn: Optional[int],
+) -> bool:
+    """Aynı görsel hâlâ full-detail context penceresindeyse image payload'ını yeniden gönderme."""
+    if not digest or digest != last_digest or last_injected_turn is None:
+        return False
+    age: int = current_turn - last_injected_turn
+    return 0 < age < FULL_DETAIL_TURNS
 
 
 def needs_action_observation(calls: List[ToolCallDraft], results: List[ToolResult]) -> bool:
@@ -1039,7 +1096,7 @@ def needs_action_observation(calls: List[ToolCallDraft], results: List[ToolResul
 async def _observe_after_actions(
     call_id: str, index: int, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
     should_stop: Callable[[], bool],
-) -> Tuple[Dict[str, Any], sm.StepRecord]:
+) -> Tuple[Dict[str, Any], sm.StepRecord, Optional[str]]:
     """
     Eylem turunun sonunda take_screenshot'ı model yerine çalıştırır (ekran durulunca) ve
     görüntüyü gözlem mesajı olarak döner; geçici dosya modele eklendikten sonra silinir.
@@ -1051,12 +1108,13 @@ async def _observe_after_actions(
         index, call, AUTO_OBSERVATION_PREVIEW, toolbox, cache, emit, should_stop)
     step: sm.StepRecord = sm.make_step_record(call["name"], call["arguments"], bool(result.get("ok")), result_text(result))
     if not result.get("ok"):
-        return {"role": "user", "content": f"Otomatik gözlem alınamadı: {result_text(result)}"}, step
+        return {"role": "user", "content": f"Otomatik gözlem alınamadı: {result_text(result)}"}, step, None
     try:
-        return await _screenshot_observation(call), step
+        observation, digest = await _screenshot_observation_with_digest(call)
+        return observation, step, digest
     except (OSError, ValueError) as error:
         logging.warning("Otomatik gözlem modele eklenemedi", extra={"error_type": type(error).__name__})
-        return {"role": "user", "content": f"Otomatik gözlem modele eklenemedi: {type(error).__name__}: {error}"}, step
+        return {"role": "user", "content": f"Otomatik gözlem modele eklenemedi: {type(error).__name__}: {error}"}, step, None
     finally:
         path.unlink(missing_ok=True)
 
@@ -1098,9 +1156,10 @@ async def run_agent_with_callback(
         DEFAULT_BACKEND if DEFAULT_BACKEND in available else next(iter(clients))
     )
     if current_backend not in available:
+        replacement: str = DEFAULT_BACKEND if DEFAULT_BACKEND in available else next(iter(clients))
         emit({"kind": "notice", "level": "warning",
-              "text": f"'{current_backend}' backend'i kullanılamıyor (anahtar yok), '{DEFAULT_BACKEND}' kullanılacak."})
-        current_backend = DEFAULT_BACKEND
+              "text": f"'{current_backend}' backend'i kullanılamıyor; '{replacement}' kullanılacak."})
+        current_backend = replacement
     emit({"kind": "run_started", "goal": goal, "backend": current_backend, "model": BACKENDS[current_backend]["model"],
           "run_mode": run_mode, "max_turns": max_iterations, "max_wall_clock_seconds": max_wall_clock})
 
@@ -1153,6 +1212,11 @@ async def run_agent_with_callback(
     fast_loop_state = FastLoopState()
     fast_loop_delivery_entries: int = 0
     fast_loop_stagnation_events: int = 0
+    observations: int = 0
+    observations_reused: int = 0
+    duplicate_navigation_count: int = 0
+    last_observation_digest: Optional[str] = None
+    last_observation_injected_turn: Optional[int] = None
     turns: int = 0
     tool_call_count: int = 0
     usage: TokenUsage = ZERO_USAGE
@@ -1231,6 +1295,7 @@ async def run_agent_with_callback(
 
             failures_in_turn: int = 0
             pending_shots: List[ToolCallDraft] = []
+            turn_observation_digests: List[str] = []
             duplicate_navigation_notes: List[str] = []
             for call, result in zip(turn["tool_calls"], results, strict=True):
                 ok: bool = bool(result.get("ok"))
@@ -1243,12 +1308,18 @@ async def run_agent_with_callback(
                 chrome_visits, duplicate_note = update_chrome_visits(chrome_visits, call, result)
                 if duplicate_note is not None:
                     duplicate_navigation_notes.append(duplicate_note)
+                    duplicate_navigation_count += 1
 
             # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: tool sonuçları assistant
             # tool_calls'ı kesintisiz izlemeli; araya user mesajı 400'e yol açar.
             for shot_call in pending_shots:
                 try:
-                    messages.append(await _screenshot_observation(shot_call))
+                    observation, digest = await _screenshot_observation_with_digest(shot_call)
+                    observations += 1
+                    turn_observation_digests.append(digest)
+                    messages.append(observation)
+                    last_observation_digest = digest
+                    last_observation_injected_turn = iteration
                 except (OSError, KeyError, ValueError) as error:
                     logging.warning("Ekran görüntüsü modele eklenemedi", extra={"error_type": type(error).__name__})
                     emit({"kind": "notice", "level": "warning",
@@ -1259,14 +1330,33 @@ async def run_agent_with_callback(
             if chrome_session and needs_action_observation(turn["tool_calls"], results):
                 observation_started: float = time.monotonic()
                 try:
-                    observation, observation_step = await _observe_after_actions(
+                    observation, observation_step, observation_digest = await _observe_after_actions(
                         f"otomatik-gozlem-{session_id[:8]}-{iteration}", len(turn["tool_calls"]),
                         toolbox, tool_cache, emit, options["should_stop"],
                     )
                 finally:
                     tool_seconds += time.monotonic() - observation_started
                 steps.append(observation_step)
-                messages.append(observation)
+                observations += 1
+                if observation_digest is not None:
+                    turn_observation_digests.append(observation_digest)
+                if should_reuse_observation(
+                    observation_digest, last_observation_digest,
+                    current_turn=iteration, last_injected_turn=last_observation_injected_turn,
+                ):
+                    observations_reused += 1
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Otomatik gözlem önceki yakın görselle aynı; image payload yeniden "
+                            "gönderilmedi. Önceki görsel hâlâ full-detail context içinde."
+                        ),
+                    })
+                else:
+                    messages.append(observation)
+                    if observation_digest is not None:
+                        last_observation_digest = observation_digest
+                        last_observation_injected_turn = iteration
 
             if duplicate_navigation_notes:
                 messages.append({"role": "user", "content": "\n".join(duplicate_navigation_notes)})
@@ -1290,15 +1380,17 @@ async def run_agent_with_callback(
                     for call in turn["tool_calls"]
                 ],
                 result_facts=[result_text(result)[:TRIMMED_CONTENT_LIMIT] for result in results],
-                observation_digest=None,
+                observation_digest=":".join(turn_observation_digests)[:512] or None,
                 ledger_digest=task_ledger,
                 unresolved_deliverables=0 if _ledger_delivery_ready(task_ledger) else 1,
             )
-            semantic_progress: bool = ledger_changed or (
-                not task_ledger and signature != fast_loop_state.last_signature
+            semantic_progress: bool = classify_semantic_progress(
+                ledger_changed=ledger_changed,
+                has_ledger=bool(task_ledger),
+                previous_signature=fast_loop_state.last_signature,
+                signature=signature,
+                all_failed=all_failed,
             )
-            if all_failed and not ledger_changed:
-                semantic_progress = False
             if not semantic_progress:
                 fast_loop_stagnation_events += 1
             previous_phase = fast_loop_state.phase
@@ -1369,6 +1461,10 @@ async def run_agent_with_callback(
             "fast_loop_delivery_entries": fast_loop_delivery_entries,
             "semantic_progress_events": fast_loop_state.semantic_progress_events,
             "fast_loop_stagnation_events": fast_loop_stagnation_events,
+            "observations": observations,
+            "observations_reused": observations_reused,
+            "duplicate_navigation": duplicate_navigation_count,
+            "uncached_prompt_tokens": max(0, usage["prompt_tokens"] - usage["cached_tokens"]),
             "integrations": dict(runtime.metrics),
         }
         cleanup_errors: List[str] = []

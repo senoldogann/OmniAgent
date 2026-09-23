@@ -738,3 +738,101 @@ async def test_semantic_state_change_resets_stagnation(
     assert report["metrics"]["fast_loop_replans"] == 0
     assert report["metrics"]["fast_loop_delivery_entries"] == 0
     assert report["metrics"]["semantic_progress_events"] >= 2
+
+
+def test_openrouter_session_overrides_are_request_local() -> None:
+    profile = {
+        **BACKENDS["claude"],
+        "extra_headers": dict(BACKENDS["claude"]["extra_headers"]),
+        "extra_body": dict(BACKENDS["claude"]["extra_body"]),
+    }
+    original_body = dict(profile["extra_body"])
+    headers_one, body_one = main.model_request_overrides(profile, "session-one")
+    headers_two, body_two = main.model_request_overrides(profile, "session-two")
+
+    assert headers_one == profile["extra_headers"]
+    assert body_one["session_id"] == "session-one"
+    assert body_two["session_id"] == "session-two"
+    assert body_one["cache_control"] == {"type": "ephemeral"}
+    assert profile["extra_body"] == original_body
+    assert "session_id" not in profile["extra_body"]
+
+
+def test_opencode_session_header_behavior_is_preserved() -> None:
+    profile = {
+        **BACKENDS["opencode"],
+        "extra_headers": dict(BACKENDS["opencode"]["extra_headers"]),
+        "extra_body": dict(BACKENDS["opencode"]["extra_body"]),
+    }
+    headers, body = main.model_request_overrides(profile, "abc-123")
+    assert headers["x-opencode-session"] == "abc-123"
+    assert "session_id" not in body
+    assert profile["extra_headers"] == {}
+
+
+def test_recent_duplicate_observation_reuses_only_inside_visual_context_window() -> None:
+    assert main.should_reuse_observation("abc", "abc", current_turn=2, last_injected_turn=1) is True
+    assert main.should_reuse_observation(
+        "abc", "abc", current_turn=1 + main.FULL_DETAIL_TURNS, last_injected_turn=1,
+    ) is False
+    assert main.should_reuse_observation("abc", "def", current_turn=2, last_injected_turn=1) is False
+    assert main.should_reuse_observation(None, "abc", current_turn=2, last_injected_turn=1) is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_auto_observation_is_not_reinjected_while_recent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_screenshot(self: Toolbox, filename: str) -> str:
+        Image.new("RGB", (8, 8), "white").save(filename)
+        return "kaydedildi"
+
+    monkeypatch.setattr(Toolbox, "chrome_active_tab", lambda self, url: f"Görünür Chrome sekmesi: {url}")
+    monkeypatch.setattr(Toolbox, "cua_click_point", lambda self, point: f"{point} tıklandı")
+    monkeypatch.setattr(Toolbox, "take_screenshot", fake_screenshot)
+
+    call_index = 0
+    image_counts: List[int] = []
+
+    async def fake_model(clients, messages, schemas, session_id, backend, emit, should_stop):
+        nonlocal call_index
+        image_counts.append(sum(
+            1
+            for message in messages
+            if isinstance(message.get("content"), list)
+            for part in message["content"]
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ))
+        call_index += 1
+        if call_index == 1:
+            calls = [{"id": "nav", "name": "chrome_active_tab",
+                      "arguments": json.dumps({"url": "https://example.com"})}]
+        elif call_index in (2, 3):
+            calls = [{"id": f"click-{call_index}", "name": "cua_click_point",
+                      "arguments": json.dumps({"point": [500, 500]})}]
+        else:
+            return {
+                "content": "tamam", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE,
+            }, backend
+        return {
+            "content": "STATE:\nFACTS: ekran=same\nREMAINING: final",
+            "tool_calls": calls, "finish_reason": "tool_calls", "usage": main.ZERO_USAGE,
+        }, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    service = CapabilityService(tmp_path)
+    try:
+        report = await main.run_agent_with_callback(
+            "Açık Chrome oturumunu kullan ve örnek sayfayı kontrol et", lambda event: None,
+            {"requested_backend": None, "should_stop": lambda: False,
+             "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
+            {"opencode": object()},
+        )
+    finally:
+        await service.close()
+
+    assert report["success"]
+    assert report["metrics"]["observations"] >= 3
+    assert report["metrics"]["observations_reused"] >= 1
+    assert image_counts[2] == image_counts[1]
+    assert report["metrics"]["uncached_prompt_tokens"] >= 0

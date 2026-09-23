@@ -86,6 +86,27 @@ def normalize_progress_signature(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def classify_semantic_progress(
+    *,
+    ledger_changed: bool,
+    has_ledger: bool,
+    previous_signature: Optional[str],
+    signature: str,
+    all_failed: bool,
+) -> bool:
+    """Tool başarısını gerçek görev ilerlemesinden ayırır; ilk tur yalnız bootstrap istisnasıdır."""
+    if ledger_changed:
+        return True
+    if all_failed:
+        return False
+    # Modelin STATE yazmadığı ilk araç turunun başlamasına izin ver; bundan sonra farklı URL,
+    # tıklama veya sonuç imzaları tek başına ilerleme sayılmaz. Böylece model STATE'i atlayarak
+    # farklı sayfalarda gezinip stagnation penceresini sürekli sıfırlayamaz.
+    if not has_ledger and previous_signature is None:
+        return bool(signature)
+    return False
+
+
 def advance_fast_loop(
     state: FastLoopState,
     signal: TurnSignal,
