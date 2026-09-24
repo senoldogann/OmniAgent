@@ -12,7 +12,8 @@ import tempfile
 import time
 import uuid
 from urllib.request import urlopen
-from datetime import date
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, NotRequired
@@ -736,6 +737,21 @@ def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, str, str
     return (backend, backend, fallback)
 
 
+def retry_after_seconds(error: APIStatusError) -> float:
+    """429 başlığındaki saniye veya HTTP tarihini güvenli bir bekleme süresine çevirir."""
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", {}) if response is not None else {}
+    raw = headers.get("retry-after", "") if headers is not None else ""
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        try:
+            moment = parsedate_to_datetime(str(raw))
+            return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return 1.0
+
+
 def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str]:
     """
     Araç çağrısız son yanıtın gerçekten tamamlanmış bir cevap olup olmadığına karar verir:
@@ -998,7 +1014,9 @@ async def _call_model_with_retries(
     kesilen bir akış yeniden denenirse önce stream_reset yayınlanır (arayüz o turun akmış
     içeriğini siler, metin iki kez görünmez).
     """
-    plan: Tuple[str, str, str] = attempt_plan(backend, frozenset(clients))
+    runtime = CURRENT_RUNTIME.get()
+    available = frozenset(clients) - (runtime.blocked_backends if runtime is not None else set())
+    plan: Tuple[str, str, str] = attempt_plan(backend, available)
     emitted: List[bool] = [False]
 
     def tracking_emit(event: AgentEvent) -> None:
@@ -1020,7 +1038,10 @@ async def _call_model_with_retries(
             status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
             if status is not None and status < 500 and status not in (401, 402, 403, 429):
                 raise
-            if status in (401, 402, 403) and plan[-1] == active:
+            has_alternative = plan[-1] != active
+            if status in (401, 402, 403, 429) and has_alternative and runtime is not None:
+                runtime.blocked_backends.add(active)
+            if status in (401, 402, 403) and not has_alternative:
                 raise
             last_error = error
             logging.warning(
@@ -1033,12 +1054,27 @@ async def _call_model_with_retries(
                 emitted[0] = False
             timed_out: bool = isinstance(error, APITimeoutError)
             cli_failed: bool = isinstance(error, CliModelError)
-            quota_failed: bool = status in (401, 402, 403)
-            attempt = len(plan) - 1 if (timed_out or cli_failed or quota_failed) and attempt < len(plan) - 1 else attempt + 1
+            access_failed: bool = status in (401, 402, 403)
+            throttled: bool = status == 429
+            if throttled and not has_alternative:
+                if attempt >= len(plan) - 1:
+                    raise
+                delay = retry_after_seconds(error)
+                if delay > 30:
+                    raise
+                if runtime is not None:
+                    await runtime.delay(delay)
+                else:
+                    await asyncio.sleep(delay)
+            attempt = (
+                len(plan) - 1
+                if (timed_out or cli_failed or access_failed or (throttled and has_alternative))
+                and attempt < len(plan) - 1
+                else attempt + 1
+            )
             if attempt < len(plan):
-                if cli_failed or quota_failed:
+                if cli_failed or access_failed or throttled:
                     continue
-                runtime = CURRENT_RUNTIME.get()
                 if runtime is not None:
                     await runtime.delay(0.5 * attempt)
                 else:
@@ -1259,8 +1295,15 @@ async def run_agent_with_callback(
             emit({"kind": "model_finished", "turn": iteration,
                   "seconds": round(model_elapsed, 2), "usage": turn["usage"]})
             if used_backend != current_backend:
+                permanent_failure = current_backend in runtime.blocked_backends
                 emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
-                      "reason": f"API hatası; yalnız bu tur için geçici fallback, sonraki tur {current_backend} yeniden denenecek"})
+                      "reason": (
+                          f"erişim/bakiye/hız sınırı; {current_backend} bu görevde yeniden denenmeyecek"
+                          if permanent_failure else
+                          f"geçici hata; yalnız bu tur için fallback, sonraki tur {current_backend} yeniden denenecek"
+                      )})
+                if permanent_failure:
+                    current_backend = used_backend
             if turn["finish_reason"] == "stopped":
                 outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
@@ -1436,7 +1479,9 @@ async def run_agent_with_callback(
             consecutive_failed_turns = consecutive_failed_turns + 1 if all_failed else 0
             no_progress_turns = no_progress_turns + 1 if all_failed else 0
             if consecutive_failed_turns >= CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD:
-                upgraded: Optional[str] = next_quality_backend(current_backend, available)
+                upgraded: Optional[str] = next_quality_backend(
+                    current_backend, available - runtime.blocked_backends,
+                )
                 if upgraded is not None:
                     emit({"kind": "backend_changed", "backend": upgraded, "model": BACKENDS[upgraded]["model"],
                           "reason": f"art arda {consecutive_failed_turns} başarısız tur"})

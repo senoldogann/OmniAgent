@@ -72,6 +72,7 @@ class IntegrationRuntime:
         }
         self.discovery_remaining = 8.0
         self.install_attempts: set[str] = set()
+        self.blocked_backends: set[str] = set()
         self.published: Dict[str, Any] = {}
         self.selected: Dict[str, Any] = {}
         self.allowed_tools: Optional[frozenset[str]] = None

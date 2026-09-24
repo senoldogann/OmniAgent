@@ -56,7 +56,7 @@ PAGE_TEXT_LIMIT: int = 5000
 PAGE_ELEMENT_LIMIT: int = 40
 PAGE_LOAD_TIMEOUT_MS: int = 20000
 # Playwright varsayılanı 30sn: yanlış bir seçici bütün turu kilitlemesin.
-PAGE_ACTION_TIMEOUT_MS: int = 5000
+PAGE_ACTION_TIMEOUT_MS: int = 3000
 AX_ELEMENT_LIMIT: int = 80
 AX_NODE_LIMIT: int = 3000
 AX_SCAN_BUDGET_SECONDS: float = 2.0
@@ -1139,6 +1139,20 @@ class CUA:
         return (position[0], position[1], size[0], size[1])
 
 
+def normalize_browser_key(value: str) -> str:
+    """Modelin yaygın küçük harf/kısayol yazımlarını Playwright tuş adlarına çevirir."""
+    aliases = {
+        "enter": "Enter", "return": "Enter", "esc": "Escape", "escape": "Escape",
+        "tab": "Tab", "space": "Space", "backspace": "Backspace", "delete": "Delete",
+        "arrowup": "ArrowUp", "arrowdown": "ArrowDown",
+        "arrowleft": "ArrowLeft", "arrowright": "ArrowRight",
+        "cmd": "Meta", "command": "Meta", "meta": "Meta",
+        "ctrl": "Control", "control": "Control",
+        "alt": "Alt", "option": "Alt", "shift": "Shift",
+    }
+    return "+".join(aliases.get(part.strip().casefold(), part.strip()) for part in value.split("+"))
+
+
 class BrowserAction(TypedDict, total=False):
     """browse_url eylemi: click (selector), fill (selector + value), press (selector + tuş adı value)."""
     action: str
@@ -1546,7 +1560,7 @@ class Toolbox:
                 elif kind == "fill" and value is not None:
                     await page.fill(selector, value)
                 elif kind == "press" and value is not None:
-                    await page.press(selector, value)
+                    await page.press(selector, normalize_browser_key(value))
                 elif kind == "wait_for":
                     state = value if value in ("visible", "hidden", "attached", "detached") else "visible"
                     await page.locator(selector).wait_for(state=state)
