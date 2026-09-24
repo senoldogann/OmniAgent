@@ -16,6 +16,11 @@ class FakeAPI:
     def __init__(self) -> None:
         self.sent: list[str] = []
         self.edited: list[str] = []
+        self.drafts: list[tuple[int, dict[str, str]]] = []
+        self.rich: list[str] = []
+        self.draft_error: int | None = None
+        self.rich_error: int | None = None
+        self.reject_partial_markdown = False
         self.photos: list[Path] = []
         self.closed = False
 
@@ -27,6 +32,23 @@ class FakeAPI:
     async def edit(self, chat_id: int, message_id: int, text: str) -> None:
         assert chat_id == 123 and message_id > 0
         self.edited.append(text)
+
+    async def send_draft(
+        self, chat_id: int, draft_id: int, rich_message: dict[str, str],
+    ) -> None:
+        assert chat_id == 123 and draft_id > 0
+        if self.draft_error is not None:
+            raise telegram.TelegramError("draft unsupported", self.draft_error)
+        if self.reject_partial_markdown and rich_message.get("markdown") == "**Yarım":
+            raise telegram.TelegramError("unclosed markdown", 400)
+        self.drafts.append((draft_id, rich_message))
+
+    async def send_rich(self, chat_id: int, markdown: str) -> int:
+        assert chat_id == 123
+        if self.rich_error is not None:
+            raise telegram.TelegramError("rich unsupported", self.rich_error)
+        self.rich.append(markdown)
+        return len(self.rich)
 
     async def send_photo(self, chat_id: int, path: Path) -> None:
         assert chat_id == 123
@@ -199,10 +221,11 @@ async def test_compact_reply_uses_one_message_without_debug_details(
     task = bridge.active
     assert task is not None
     await task
-    assert len(api.sent) == 1
-    assert api.sent[0] == "Bugün "
-    assert api.edited[-1] == "Bugün Perşembe."
-    transcript = "\n".join(api.sent + api.edited)
+    assert api.sent == []
+    assert api.rich == ["Bugün Perşembe."]
+    assert api.drafts
+    assert len({draft_id for draft_id, _ in api.drafts}) == 1
+    transcript = "\n".join(api.sent + api.edited + api.rich)
     assert "Model:" not in transcript
     assert "Token:" not in transcript
     assert "Tur 1" not in transcript
@@ -245,10 +268,104 @@ async def test_compact_tool_turn_hides_state_and_keeps_one_status(
     task = bridge.active
     assert task is not None
     await task
-    assert len(api.sent) == 1
-    assert api.sent[0] == "⏳ Çalışıyor…"
-    assert api.edited[-1] == "Sonuç: 4"
-    assert "STATE:" not in "\n".join(api.sent + api.edited)
+    assert api.sent == []
+    assert api.rich == ["Sonuç: 4"]
+    assert any("Kod çalıştırıyor" in draft.get("html", "") for _, draft in api.drafts)
+    assert "STATE:" not in "\n".join(api.sent + api.edited + api.rich)
+
+
+@pytest.mark.asyncio
+async def test_native_draft_animates_tools_and_preserves_markdown() -> None:
+    api = FakeAPI()
+    fallback = telegram.TelegramStream(api, 123)
+    live = telegram.TelegramDraftStream(api, 123, fallback)
+    presenter = telegram.CompactPresenter(live)
+    await presenter.event({"kind": "turn_started", "turn": 1, "max_turns": 25,
+                           "backend": "test", "model": "test"})
+    assert api.drafts[-1][1] == {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"}
+    await presenter.event({"kind": "tool_started", "call_id": "1", "index": 0,
+                           "name": "execute_shell", "preview": "printf '<secret>'"})
+    live.last_draft = time.monotonic() - 2
+    await live.tick()
+    status = api.drafts[-1][1]["html"]
+    assert "Komut çalıştırıyor" in status
+    assert "&lt;secret&gt;" in status
+    await presenter.event({"kind": "tool_output", "call_id": "1", "text": "çalışıyor\\n"})
+    live.last_draft = time.monotonic() - 2
+    await live.tick()
+    assert "çalışıyor" in api.drafts[-1][1]["html"]
+    await presenter.event({"kind": "run_finished", "success": True,
+                           "outcome": "**Kalın** [kaynak](https://example.com)",
+                           "reason": "", "metrics": {}})
+    assert api.rich == ["**Kalın** [kaynak](https://example.com)"]
+    assert api.sent == []
+    assert len({draft_id for draft_id, _ in api.drafts}) == 1
+
+
+@pytest.mark.asyncio
+async def test_old_bot_api_falls_back_to_existing_message_stream() -> None:
+    api = FakeAPI()
+    api.draft_error = 404
+    api.rich_error = 404
+    fallback = telegram.TelegramStream(api, 123)
+    live = telegram.TelegramDraftStream(api, 123, fallback)
+    await live.show("⏳ Düşünüyor…")
+    assert not live.native
+    assert api.sent == ["⏳ Düşünüyor…"]
+    await live.finish("**Yanıt**")
+    assert api.edited == ["**Yanıt**"]
+
+
+@pytest.mark.asyncio
+async def test_partial_markdown_uses_plain_draft_then_rich_final() -> None:
+    api = FakeAPI()
+    api.reject_partial_markdown = True
+    live = telegram.TelegramDraftStream(api, 123, telegram.TelegramStream(api, 123))
+    await live.show("**Yarım")
+    assert live.native
+    assert api.drafts[-1][1] == {"html": "**Yarım"}
+    await live.finish("**Yarım**")
+    assert api.rich == ["**Yarım**"]
+    assert api.sent == []
+
+
+@pytest.mark.asyncio
+async def test_bot_api_rich_payload_contract() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.url.path.rsplit("/", 1)[-1], __import__("json").loads(request.content)))
+        result: Any = {"message_id": 9} if calls[-1][0] == "sendRichMessage" else True
+        return httpx.Response(200, json={"ok": True, "result": result})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = telegram.TelegramAPI("secret-token", client)
+    try:
+        await api.send_draft(123, 7, {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"})
+        assert await api.send_rich(123, "**Kalın**") == 9
+    finally:
+        await client.aclose()
+    assert calls == [
+        ("sendRichMessageDraft", {"chat_id": 123, "draft_id": 7,
+                                  "rich_message": {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"}}),
+        ("sendRichMessage", {"chat_id": 123, "rich_message": {"markdown": "**Kalın**"}}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_draft_heartbeat_and_rate_limit() -> None:
+    api = FakeAPI()
+    live = telegram.TelegramDraftStream(api, 123, telegram.TelegramStream(api, 123))
+    await live.show("ilk")
+    assert len(api.drafts) == 1
+    await live.show("ikinci")
+    assert len(api.drafts) == 1
+    live.last_draft = time.monotonic() - 2
+    await live.tick()
+    assert api.drafts[-1][1] == {"markdown": "ikinci"}
+    live.last_draft = time.monotonic() - 5
+    await live.tick()
+    assert len(api.drafts) == 3
 
 
 @pytest.mark.asyncio

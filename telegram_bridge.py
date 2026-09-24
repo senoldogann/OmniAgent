@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import html
 import json
 import os
 import plistlib
@@ -178,6 +179,21 @@ class TelegramAPI:
             "chat_id": chat_id, "message_id": message_id, "text": text[:PAGE_LIMIT],
         })
 
+    async def send_rich(self, chat_id: int, markdown: str) -> int:
+        """Markdown içeriğini Telegram'ın zengin ileti biçimiyle gönderir."""
+        result = await self.call("sendRichMessage", {
+            "chat_id": chat_id, "rich_message": {"markdown": markdown},
+        })
+        if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
+            raise TelegramError("sendRichMessage: ileti kimliği eksik.")
+        return result["message_id"]
+
+    async def send_draft(self, chat_id: int, draft_id: int, rich_message: Dict[str, str]) -> None:
+        """Aynı taslak kimliğini güncelleyerek yerel akış animasyonunu sürdürür."""
+        await self.call("sendRichMessageDraft", {
+            "chat_id": chat_id, "draft_id": draft_id, "rich_message": rich_message,
+        })
+
     async def send_photo(self, chat_id: int, path: Path) -> None:
         """Gerçek ekran görüntüsünü eşleştirilmiş sohbete dosya olarak iletir."""
         mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
@@ -247,20 +263,150 @@ class TelegramStream:
         self.last_edit = time.monotonic()
 
 
-class CompactPresenter:
-    """Kısa sohbet için ara olayları tek balonda tutar, son yanıtı yinelenmeden gösterir."""
+def _markdown_pages(text: str) -> list[str]:
+    """Yanıtı Telegram ileti sınırını aşmadan satır başlarından böler."""
+    pages: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= PAGE_LIMIT:
+            pages.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, PAGE_LIMIT + 1)
+        if cut < PAGE_LIMIT // 2:
+            cut = PAGE_LIMIT
+        pages.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    return pages or ["Yanıt yok."]
 
-    def __init__(self, stream: TelegramStream) -> None:
+
+class TelegramDraftStream:
+    """Geçici zengin taslağı akıtır; finali kalıcı Markdown ile gönderir."""
+
+    def __init__(self, api: TelegramAPI, chat_id: int, fallback: TelegramStream) -> None:
+        self.api = api
+        self.chat_id = chat_id
+        self.fallback = fallback
+        self.draft_id = secrets.randbelow(2**31 - 1) + 1
+        self.native = True
+        self.finished = False
+        self.visible = ""
+        self.rich_message: Dict[str, str] = {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"}
+        self.sent = ""
+        self.last_draft = 0.0
+
+    async def show(
+        self, text: str, *, rich_message: Optional[Dict[str, str]] = None,
+        force: bool = False, immediate: bool = False,
+    ) -> None:
+        if force:
+            await self.finish(text)
+            return
+        if self.finished:
+            return
+        self.visible = text[:PAGE_LIMIT]
+        self.rich_message = rich_message or {"markdown": self.visible}
+        await self.tick(immediate=immediate)
+
+    async def tick(self, immediate: bool = False) -> None:
+        if self.finished:
+            return
+        if not self.native:
+            await self.fallback.flush()
+            return
+        now = time.monotonic()
+        if self.sent == self.visible and now - self.last_draft < 4.0:
+            return
+        if not immediate and self.sent != self.visible and now - self.last_draft < EDIT_INTERVAL:
+            return
+        try:
+            await self.api.send_draft(self.chat_id, self.draft_id, self.rich_message)
+        except TelegramError as error:
+            # Yarım Markdown (örn. kapanmamış ** veya bağlantı) taslağı reddedilebilir.
+            if error.status == 400 and "markdown" in self.rich_message:
+                plain = {"html": html.escape(self.visible)}
+                try:
+                    await self.api.send_draft(self.chat_id, self.draft_id, plain)
+                except TelegramError as plain_error:
+                    error = plain_error
+                else:
+                    self.sent = self.visible
+                    self.last_draft = time.monotonic()
+                    return
+            if error.status not in (400, 404):
+                raise error
+            self.native = False
+            await self.fallback.show(self.visible or "⏳ Düşünüyor…")
+            return
+        self.sent = self.visible
+        self.last_draft = time.monotonic()
+
+    async def finish(self, answer: str) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        for page in _markdown_pages(answer):
+            if self.native:
+                try:
+                    await self.api.send_rich(self.chat_id, page)
+                    continue
+                except TelegramError as error:
+                    if error.status not in (400, 404):
+                        raise
+                    self.native = False
+            await self.fallback.show(page, force=True)
+            self.fallback.page = ""
+            self.fallback.message_id = None
+            self.fallback.sent = ""
+
+
+def _compact_tool_status(name: str, preview: str, output: str = "") -> tuple[str, Dict[str, str]]:
+    """Araç olayunu kısa canlı durum ve güvenli zengin içeriğe çevirir."""
+    labels = {
+        "web_search": "Web’de arıyor…",
+        "browse_url": "Sayfayı açıyor…",
+        "fetch_raw": "Web içeriğini okuyor…",
+        "execute_shell": "Komut çalıştırıyor…",
+        "execute_js": "Kod çalıştırıyor…",
+        "read_file": "Dosya okuyor…",
+        "write_file": "Dosyayı yazıyor…",
+    }
+    label = labels.get(name, f"{tool_label(name)} çalışıyor…")
+    detail = preview.strip()[:240]
+    tail = output.strip()[-300:]
+    visible = "⏳ " + label
+    if detail:
+        visible += "\n" + detail
+    if tail:
+        visible += "\n" + tail
+    rich = "<tg-thinking>" + html.escape(label) + "</tg-thinking>"
+    if detail:
+        rich += "\n<pre>" + html.escape(detail) + "</pre>"
+    if tail:
+        rich += "\n<pre>" + html.escape(tail) + "</pre>"
+    return visible, {"html": rich}
+
+
+class CompactPresenter:
+    """Kısa görünümde taslak durumunu ve biçimli son yanıtı yönetir."""
+
+    def __init__(self, stream: TelegramDraftStream) -> None:
         self.stream = stream
         self.turn_text = ""
         self.hide_turn = False
         self.finished = False
+        self.active_tool: Optional[tuple[str, str, str, str]] = None
 
     async def event(self, event: AgentEvent) -> None:
         kind = event["kind"]
-        if kind == "turn_started":
+        if kind in ("run_started", "turn_started", "stream_reset"):
             self.turn_text = ""
             self.hide_turn = False
+            self.active_tool = None
+            await self.stream.show(
+                "⏳ Düşünüyor…",
+                rich_message={"html": "<tg-thinking>Düşünüyor…</tg-thinking>"},
+                immediate=True,
+            )
         elif kind == "text_delta" and not self.hide_turn:
             self.turn_text += event["text"]
             visible = self.turn_text.lstrip()
@@ -270,18 +416,48 @@ class CompactPresenter:
                 self.hide_turn = True
                 return
             await self.stream.show(self.turn_text)
-        elif kind == "tool_started":
+        elif kind in ("tool_call_preview", "tool_started"):
             self.hide_turn = True
-            await self.stream.show("⏳ Çalışıyor…")
+            name = event["name"]
+            preview = event["preview"]
+            call_id = event.get("call_id", "") if kind == "tool_started" else ""
+            self.active_tool = (call_id, name, preview, "")
+            visible, rich = _compact_tool_status(name, preview)
+            await self.stream.show(
+                visible, rich_message=rich, immediate=kind == "tool_started",
+            )
+        elif kind == "tool_output" and self.active_tool is not None:
+            call_id, name, preview, output = self.active_tool
+            if event["call_id"] != call_id:
+                return
+            output = (output + event["text"])[-300:]
+            self.active_tool = (call_id, name, preview, output)
+            visible, rich = _compact_tool_status(name, preview, output)
+            await self.stream.show(visible, rich_message=rich)
+        elif kind == "tool_finished":
+            if self.active_tool is not None and event["call_id"] == self.active_tool[0]:
+                self.active_tool = None
+                label = "Tamamlandı" if event["ok"] else "Araç başarısız"
+                await self.stream.show(
+                    ("✓ " if event["ok"] else "⚠️ ") + label + " · düşünüyor…",
+                    rich_message={"html": "<tg-thinking>" + label + "</tg-thinking>"},
+                )
+        elif kind == "integration_status":
+            progress = f" {event['completed']}/{event['total']}" if event["total"] else ""
+            label = event["stage"] + progress
+            await self.stream.show(
+                "⏳ " + label,
+                rich_message={"html": "<tg-thinking>" + html.escape(label) + "</tg-thinking>"},
+            )
         elif kind == "run_finished":
             self.finished = True
             answer = str(event["outcome"]).strip() or str(event["reason"]).strip() or "Yanıt yok."
-            await self.stream.show(answer if event["success"] else f"⚠️ {answer}", force=True)
+            await self.stream.finish(answer if event["success"] else f"⚠️ {answer}")
 
     async def finish(self, report: RunReport) -> None:
         if not self.finished:
             answer = str(report["outcome"]).strip() or str(report.get("reason", "")).strip() or "Yanıt yok."
-            await self.stream.show(answer if report["success"] else f"⚠️ {answer}", force=True)
+            await self.stream.finish(answer if report["success"] else f"⚠️ {answer}")
 
 
 class TelegramBridge:
@@ -350,7 +526,8 @@ class TelegramBridge:
 
         worker = asyncio.create_task(work())
         stream = TelegramStream(self.api, self.settings["chat_id"])
-        compact = CompactPresenter(stream)
+        live = TelegramDraftStream(self.api, self.settings["chat_id"], stream)
+        compact = CompactPresenter(live)
         verbose = self.verbose
         screenshot_paths: Dict[str, Path] = {}
         saw_finished = False
@@ -359,7 +536,10 @@ class TelegramBridge:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=0.25)
                 except TimeoutError:
-                    await stream.flush()
+                    if verbose:
+                        await stream.flush()
+                    else:
+                        await live.tick()
                     continue
                 saw_finished = saw_finished or event["kind"] == "run_finished"
                 if event["kind"] == "tool_started" and event["name"] == "take_screenshot":
@@ -403,7 +583,7 @@ class TelegramBridge:
                 if verbose:
                     await stream.append(f"\n✗ {error}\n")
                 else:
-                    await stream.show(f"⚠️ {error}", force=True)
+                    await live.finish(f"⚠️ {error}")
             except TelegramError:
                 pass
         except Exception as error:
@@ -412,7 +592,7 @@ class TelegramBridge:
                 if verbose:
                     await stream.append(f"\n✗ {message}\n")
                 else:
-                    await stream.show(f"⚠️ {message}", force=True)
+                    await live.finish(f"⚠️ {message}")
             except TelegramError:
                 pass
         finally:

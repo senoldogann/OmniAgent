@@ -1,6 +1,6 @@
 # Telegram uzaktan görev köprüsü
 
-OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır. Varsayılan kısa görünümde yanıt tek balonda akışla güncellenir; araç kullanılırken yalnız kısa bir çalışma durumu görünür. Hedef, tur, model ve token dökümü tekrarlanmaz. `/verbose on` sonraki görevlerde model metni, araç/komut olayları, model değişimi ve istatistikleri gösteren ayrıntılı akışı açar; `/verbose off` kısa görünüme döner. Ekran görüntüsü aracı başarılı olursa görüntü ayrıca gönderilir. Uzun metinler sayfalanır.
+OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır. Varsayılan kısa görünüm Telegram'ın yerel zengin taslağında **Düşünüyor…** durumunu, araç çalışırken kısa adını ve komut önizlemesini animasyonlu gösterir. Model metni aynı taslakta akar; görev bitince Markdown biçimli kalıcı bir yanıt gönderilir. Taslaklar geçicidir; sohbet geçmişinde ayrı ara mesajlar bırakmaz. Bot API zengin taslağı desteklemiyorsa mevcut tek mesajı güncelleyen yol kullanılır. Hedef, tur, model ve token dökümü tekrarlanmaz. `/verbose on` sonraki görevlerde model metni, araç/komut olayları, model değişimi ve istatistikleri gösteren ayrıntılı akışı açar; `/verbose off` kısa görünüme döner. Ekran görüntüsü aracı başarılı olursa görüntü ayrıca gönderilir. Uzun metinler sayfalanır.
 
 ## İlk kurulum
 
