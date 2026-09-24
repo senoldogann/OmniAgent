@@ -44,8 +44,8 @@ async def test_catalog_inventory_has_no_network_or_activation(tmp_path, monkeypa
     runtime = IntegrationRuntime(lambda event: None, lambda: False)
     try:
         result = await service.discover(runtime, "catalog", [], True)
-        assert result["total"] == 2
-        assert {entry["id"] for entry in result["installed"]} == {"outlook", "skill:mail-method"}
+        assert result["total"] == 3
+        assert {entry["id"] for entry in result["installed"]} == {"outlook", "context7", "skill:mail-method"}
         assert runtime.metrics["network_requests"] == 0
         assert runtime.selected == {}
     finally:

@@ -76,6 +76,24 @@ OUTLOOK: Capability = {
 }
 
 
+CONTEXT7: Capability = {
+    "id": "context7", "kind": "mcp", "title": "Context7 (kütüphane belgeleri)",
+    "aliases": ["context7", "context 7", "library documentation", "kütüphane dokümantasyonu"],
+    "source": "https://github.com/upstash/context7", "version": "remote-mcp-v1",
+    "operations": ["docs", "documentation", "search", "resolve", "query"],
+    "batch": False, "trusted": True, "connection": "ready",
+    "transport": "streamable_http", "url": "https://mcp.context7.com/mcp",
+    "readonly_tools": ["resolve-library-id", "query-docs"],
+    "operation_tools": {
+        "docs": ["resolve-library-id", "query-docs"],
+        "documentation": ["resolve-library-id", "query-docs"],
+        "search": ["resolve-library-id"],
+        "resolve": ["resolve-library-id"],
+        "query": ["query-docs"],
+    },
+}
+
+
 def local_skill_entries() -> List[Capability]:
     """Kurulu yerel skill dizinlerini bir kez dizinler; içerik ancak seçilince okunur."""
     configured = os.environ.get("OMNI_SKILLS_DIRS")
@@ -147,7 +165,7 @@ class CapabilityService:
         catalog = read_json(self.root / "catalog.json", [])
         if not isinstance(catalog, list):
             raise ValueError("Entegrasyon kataloğu liste biçiminde olmalı.")
-        self.entries = [dict(OUTLOOK)] + catalog + local_skill_entries()
+        self.entries = [dict(OUTLOOK), dict(CONTEXT7)] + catalog + local_skill_entries()
 
     def local(self, query: str, operations: List[str]) -> List[Capability]:
         return sorted([dict(entry, observed=self.stats.get(entry["id"], {})) for entry in self.entries

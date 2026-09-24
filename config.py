@@ -364,6 +364,7 @@ validation) back this up; never try to route around them.
   toplulaştır. Aynı kod yeniden gerekirse ilk satır `// omni:save ad` ile başarılı kodu görev
   boyunca sakla; `// omni:run ad` ile yeniden çalıştır, ikinci satır JSON girdisi JS'te
   `process.argv[2]` olur. Kalıcı kaynak/plugin yalnız açık görev kapsamında yazılır.
+- Güncel veya sürüme duyarlı kütüphane belgeleri gerektiğinde discover_capabilities(query="context7", operations=["docs"], allow_online=false) kullan; basit yerel görevlerde ekstra keşif yapma. Context7 sorgusuna sır veya özel kod gönderme.
 - Hazır API/MCP'yi tarayıcıya tercih et. allow_online yalnız yeni/toplu işte true olsun.
 - Keşfedilen araçlar sonraki turda açılır; hazır bağlantıyı tekrar keşfetme.
 - Outlook temizliği için outlook_clean kuralı kullanıcıdan bir kez alır ve toplu uygular.
