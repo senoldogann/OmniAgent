@@ -108,7 +108,7 @@ async def list_provider_models(
     provider: str, base_url: str, key: Optional[str], *, refresh: bool = False,
 ) -> tuple[str, ...]:
     """Model ID'lerini kısa zaman aşımıyla getirir; anahtarı asla hata metnine koymaz."""
-    if provider != "ollama-cloud" and not key:
+    if provider in ("openai", "openrouter") and not key:
         raise ModelCatalogError("Önce API anahtarını girin.")
     cached = cached_models(provider, key)
     if cached and not refresh:

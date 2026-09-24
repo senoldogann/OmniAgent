@@ -77,3 +77,18 @@ async def test_missing_key_and_auth_failure_are_clear(
 def test_ollama_endpoint_rejects_remote_host() -> None:
     with pytest.raises(catalog.ModelCatalogError):
         catalog._endpoint("ollama-cloud", "https://remote.example/v1")
+
+
+@pytest.mark.asyncio
+async def test_opencode_public_model_list_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"data": [{"id": "qwen3.8-flash"}]})
+    )
+    monkeypatch.setattr(catalog.httpx, "AsyncClient", lambda **kw: real_client(transport=transport, **kw))
+    catalog._CACHE.clear()
+    assert await catalog.list_provider_models(
+        "opencode", "https://opencode.ai/zen/go/v1", None,
+    ) == ("qwen3.8-flash",)
