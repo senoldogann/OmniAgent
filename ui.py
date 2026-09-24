@@ -92,6 +92,8 @@ def _svg_ctk_image(svg: str, color: str, size: int = 20) -> ctk.CTkImage:
 SPINNER_FRAMES: Tuple[str, ...] = ("·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢")
 
 FRAME_MS: int = 16
+IDLE_FRAME_MS: int = 100
+RUNNING_IDLE_FRAME_MS: int = 50
 SPINNER_INTERVAL: float = 0.11
 SHIMMER_INTERVAL: float = 0.07
 BLINK_INTERVAL: float = 0.45
@@ -775,7 +777,7 @@ class OmniUI(ctk.CTk):
             tokens: int = self._completed_tokens + self._turn_streamed_chars // 4
             meta: str = f"({now - self._run_started_at:.0f}sn · ↓ {compact_count(tokens)} token · esc ile durdur)"
             self._set_activity(SPINNER_FRAMES[self._spinner_index], self._activity_verb, meta, self._shine_index)
-        if now - self._last_blink >= BLINK_INTERVAL:
+        if (running or any(self._pending_text.values())) and now - self._last_blink >= BLINK_INTERVAL:
             self._last_blink = now
             self._blink_on = not self._blink_on
             self._text.tag_configure("bullet_running", foreground=ACCENT if self._blink_on else ACCENT_DIM)
@@ -785,6 +787,19 @@ class OmniUI(ctk.CTk):
     def _tick(self) -> None:
         """~60 fps kare döngüsü: olayları işle, daktiloyu ilerlet, kirli blokları çiz, animasyonları oynat."""
         now: float = time.monotonic()
+        running: bool = self._agent_future is not None and not self._agent_future.done()
+        refresh_due: bool = (
+            running and now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL
+            and any(view["status"] == "running" and not view["tail"] for view in self._tools_by_call.values())
+        )
+        if (
+            self._inbox.empty() and self._voice_queue.empty()
+            and not any(self._pending_text.values()) and not self._dirty_tools
+            and not refresh_due
+        ):
+            self._animate(now)
+            self.after(RUNNING_IDLE_FRAME_MS if running else IDLE_FRAME_MS, self._tick)
+            return
         at_bottom: bool = self._text.yview()[1] >= 0.995
         self._text.configure(state="normal")
         processed: int = 0
@@ -813,7 +828,7 @@ class OmniUI(ctk.CTk):
                 self._set_voice_state(voice_kind, voice_value)
             processed += 1
         changed: bool = self._typewriter_step() or processed > 0
-        if now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL:
+        if running and now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL:
             self._last_running_refresh = now
             for view in self._tools_by_call.values():
                 if view["status"] == "running" and not view["tail"]:
@@ -826,7 +841,10 @@ class OmniUI(ctk.CTk):
         if changed and at_bottom:
             self._text.see("end")
         self._animate(now)
-        self.after(FRAME_MS, self._tick)
+        delay: int = FRAME_MS if any(self._pending_text.values()) else (
+            RUNNING_IDLE_FRAME_MS if running else IDLE_FRAME_MS
+        )
+        self.after(delay, self._tick)
 
     # --- Ajan tetikleme ---
 

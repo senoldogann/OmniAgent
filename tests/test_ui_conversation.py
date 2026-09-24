@@ -123,3 +123,16 @@ def test_finished_run_keeps_stats_in_footer(app: ui.OmniUI) -> None:
     assert "5.1 sn" in app.stats_label.cget("text")
     assert "toplam 120 token" in app.stats_label.cget("text")
     assert "✓ Tamamlandı" in app._text.get("1.0", "end")
+
+
+def test_idle_tick_skips_transcript_redraw(app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boş arayüzde zamanlayıcı çalışır, büyük transkript yeniden çizilmez."""
+    redraws = []
+    timers = []
+    app._tools_by_call["eski"] = {"status": "running", "tail": []}
+    app._last_running_refresh = 0.0
+    monkeypatch.setattr(app._text, "configure", lambda **kwargs: redraws.append(kwargs))
+    monkeypatch.setattr(app, "after", lambda delay, callback: timers.append((delay, callback)))
+    app._tick()
+    assert redraws == []
+    assert timers and timers[-1][0] == ui.IDLE_FRAME_MS
