@@ -8,6 +8,7 @@ import html
 import json
 import os
 import plistlib
+import re
 import secrets
 import subprocess
 import sys
@@ -179,14 +180,20 @@ class TelegramAPI:
             "chat_id": chat_id, "message_id": message_id, "text": text[:PAGE_LIMIT],
         })
 
-    async def send_rich(self, chat_id: int, markdown: str) -> int:
-        """Markdown içeriğini Telegram'ın zengin ileti biçimiyle gönderir."""
-        result = await self.call("sendRichMessage", {
-            "chat_id": chat_id, "rich_message": {"markdown": markdown},
+    async def send_html(self, chat_id: int, content: str) -> int:
+        """Eski Bot API için güvenli HTML biçimli ileti gönderir."""
+        result = await self.call("sendMessage", {
+            "chat_id": chat_id, "text": content, "parse_mode": "HTML",
         })
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
-            raise TelegramError("sendRichMessage: ileti kimliği eksik.")
+            raise TelegramError("sendMessage: ileti kimliği eksik.")
         return result["message_id"]
+
+    async def edit_html(self, chat_id: int, message_id: int, content: str) -> None:
+        await self.call("editMessageText", {
+            "chat_id": chat_id, "message_id": message_id,
+            "text": content, "parse_mode": "HTML",
+        })
 
     async def send_draft(self, chat_id: int, draft_id: int, rich_message: Dict[str, str]) -> None:
         """Aynı taslak kimliğini güncelleyerek yerel akış animasyonunu sürdürür."""
@@ -263,6 +270,71 @@ class TelegramStream:
         self.last_edit = time.monotonic()
 
 
+def _legacy_markdown_html(markdown: str) -> str:
+    """Yaygın Markdown'ı eski Telegram HTML biçimine güvenli biçimde çevirir."""
+    tokens: list[str] = []
+
+    def inline(raw: str) -> str:
+        raw = raw.replace("\x00", "�")
+
+        def reserve(value: str) -> str:
+            key = f"OMNITOKEN{len(tokens)}END"
+            tokens.append(value)
+            return key
+
+        raw = re.sub(
+            r"`([^`\n]+)`",
+            lambda match: reserve("<code>" + html.escape(match.group(1)) + "</code>"),
+            raw,
+        )
+        raw = re.sub(
+            r"\[([^\]\n]+)\]\((https?://[^\s)]+)\)",
+            lambda match: reserve(
+                '<a href="' + html.escape(match.group(2), quote=True) + '">'
+                + html.escape(match.group(1)) + "</a>"
+            ),
+            raw,
+        )
+        escaped = html.escape(raw)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        escaped = re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped)
+        escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+        for index, value in enumerate(tokens):
+            escaped = escaped.replace(f"OMNITOKEN{index}END", value)
+        tokens.clear()
+        return escaped
+
+    result: list[str] = []
+    code_lines: list[str] = []
+    fenced = False
+    for line in markdown.split("\n"):
+        if line.lstrip().startswith("```"):
+            if fenced:
+                result.append("<pre>" + html.escape("\n".join(code_lines)) + "</pre>")
+                code_lines = []
+                fenced = False
+            else:
+                fenced = True
+            continue
+        if fenced:
+            code_lines.append(line)
+            continue
+        if not line.strip():
+            continue
+        stripped = line.lstrip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            line = re.sub(r"^#{1,6}\s+", "", stripped)
+            result.append("<b>" + inline(line) + "</b>")
+        elif re.match(r"^[-*+]\s+", stripped):
+            line = re.sub(r"^[-*+]\s+", "", stripped)
+            result.append("• " + inline(line))
+        else:
+            result.append(inline(line))
+    if fenced:
+        result.append("<pre>" + html.escape("\n".join(code_lines)) + "</pre>")
+    return "\n".join(result)
+
+
 def _markdown_pages(text: str) -> list[str]:
     """Yanıtı Telegram ileti sınırını aşmadan satır başlarından böler."""
     pages: list[str] = []
@@ -280,7 +352,7 @@ def _markdown_pages(text: str) -> list[str]:
 
 
 class TelegramDraftStream:
-    """Geçici zengin taslağı akıtır; finali kalıcı Markdown ile gönderir."""
+    """Geçici zengin taslağı akıtır; finali sıkı aralıklı biçimli mesaj yapar."""
 
     def __init__(self, api: TelegramAPI, chat_id: int, fallback: TelegramStream) -> None:
         self.api = api
@@ -344,19 +416,20 @@ class TelegramDraftStream:
         if self.finished:
             return
         self.finished = True
-        for page in _markdown_pages(answer):
-            if self.native:
-                try:
-                    await self.api.send_rich(self.chat_id, page)
-                    continue
-                except TelegramError as error:
-                    if error.status not in (400, 404):
-                        raise
-                    self.native = False
-            await self.fallback.show(page, force=True)
-            self.fallback.page = ""
+        for page in _markdown_pages(answer.strip()):
+            formatted = _legacy_markdown_html(page)
+            try:
+                if self.fallback.message_id is None:
+                    self.fallback.message_id = await self.api.send_html(self.chat_id, formatted)
+                else:
+                    await self.api.edit_html(self.chat_id, self.fallback.message_id, formatted)
+            except TelegramError as error:
+                if error.status not in (400, 404):
+                    raise
+                await self.fallback.show(page, force=True)
+            self.fallback.page = page
+            self.fallback.sent = page
             self.fallback.message_id = None
-            self.fallback.sent = ""
 
 
 def _compact_tool_status(name: str, preview: str, output: str = "") -> tuple[str, Dict[str, str]]:

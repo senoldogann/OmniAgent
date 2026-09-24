@@ -17,9 +17,9 @@ class FakeAPI:
         self.sent: list[str] = []
         self.edited: list[str] = []
         self.drafts: list[tuple[int, dict[str, str]]] = []
-        self.rich: list[str] = []
+        self.html_sent: list[str] = []
+        self.html_edited: list[str] = []
         self.draft_error: int | None = None
-        self.rich_error: int | None = None
         self.reject_partial_markdown = False
         self.photos: list[Path] = []
         self.closed = False
@@ -33,6 +33,15 @@ class FakeAPI:
         assert chat_id == 123 and message_id > 0
         self.edited.append(text)
 
+    async def send_html(self, chat_id: int, content: str) -> int:
+        assert chat_id == 123
+        self.html_sent.append(content)
+        return 1
+
+    async def edit_html(self, chat_id: int, message_id: int, content: str) -> None:
+        assert chat_id == 123 and message_id > 0
+        self.html_edited.append(content)
+
     async def send_draft(
         self, chat_id: int, draft_id: int, rich_message: dict[str, str],
     ) -> None:
@@ -42,13 +51,6 @@ class FakeAPI:
         if self.reject_partial_markdown and rich_message.get("markdown") == "**Yarım":
             raise telegram.TelegramError("unclosed markdown", 400)
         self.drafts.append((draft_id, rich_message))
-
-    async def send_rich(self, chat_id: int, markdown: str) -> int:
-        assert chat_id == 123
-        if self.rich_error is not None:
-            raise telegram.TelegramError("rich unsupported", self.rich_error)
-        self.rich.append(markdown)
-        return len(self.rich)
 
     async def send_photo(self, chat_id: int, path: Path) -> None:
         assert chat_id == 123
@@ -222,10 +224,10 @@ async def test_compact_reply_uses_one_message_without_debug_details(
     assert task is not None
     await task
     assert api.sent == []
-    assert api.rich == ["Bugün Perşembe."]
+    assert api.html_sent == ["Bugün Perşembe."]
     assert api.drafts
     assert len({draft_id for draft_id, _ in api.drafts}) == 1
-    transcript = "\n".join(api.sent + api.edited + api.rich)
+    transcript = "\n".join(api.sent + api.edited + api.html_sent)
     assert "Model:" not in transcript
     assert "Token:" not in transcript
     assert "Tur 1" not in transcript
@@ -269,9 +271,9 @@ async def test_compact_tool_turn_hides_state_and_keeps_one_status(
     assert task is not None
     await task
     assert api.sent == []
-    assert api.rich == ["Sonuç: 4"]
+    assert api.html_sent == ["Sonuç: 4"]
     assert any("Kod çalıştırıyor" in draft.get("html", "") for _, draft in api.drafts)
-    assert "STATE:" not in "\n".join(api.sent + api.edited + api.rich)
+    assert "STATE:" not in "\n".join(api.sent + api.edited + api.html_sent)
 
 
 @pytest.mark.asyncio
@@ -297,7 +299,7 @@ async def test_native_draft_animates_tools_and_preserves_markdown() -> None:
     await presenter.event({"kind": "run_finished", "success": True,
                            "outcome": "**Kalın** [kaynak](https://example.com)",
                            "reason": "", "metrics": {}})
-    assert api.rich == ["**Kalın** [kaynak](https://example.com)"]
+    assert api.html_sent == ['<b>Kalın</b> <a href="https://example.com">kaynak</a>']
     assert api.sent == []
     assert len({draft_id for draft_id, _ in api.drafts}) == 1
 
@@ -306,14 +308,24 @@ async def test_native_draft_animates_tools_and_preserves_markdown() -> None:
 async def test_old_bot_api_falls_back_to_existing_message_stream() -> None:
     api = FakeAPI()
     api.draft_error = 404
-    api.rich_error = 404
     fallback = telegram.TelegramStream(api, 123)
     live = telegram.TelegramDraftStream(api, 123, fallback)
     await live.show("⏳ Düşünüyor…")
     assert not live.native
     assert api.sent == ["⏳ Düşünüyor…"]
     await live.finish("**Yanıt**")
-    assert api.edited == ["**Yanıt**"]
+    assert api.html_edited == ["<b>Yanıt</b>"]
+
+
+def test_legacy_markdown_formatter_escapes_input_and_formats_common_syntax() -> None:
+    source = "# Başlık\n*   **OpenAI:** [haber](https://example.com?a=1&b=2)\n`kod <x>`"
+    actual = telegram._legacy_markdown_html(source)
+    assert "<b>Başlık</b>" in actual
+    assert "• <b>OpenAI:</b>" in actual
+    assert '<a href="https://example.com?a=1&amp;b=2">haber</a>' in actual
+    assert "<code>kod &lt;x&gt;</code>" in actual
+    assert "<x>" not in actual
+    assert "\n\n" not in telegram._legacy_markdown_html("Özet\n\n\n**Başlık**")
 
 
 @pytest.mark.asyncio
@@ -325,7 +337,7 @@ async def test_partial_markdown_uses_plain_draft_then_rich_final() -> None:
     assert live.native
     assert api.drafts[-1][1] == {"html": "**Yarım"}
     await live.finish("**Yarım**")
-    assert api.rich == ["**Yarım**"]
+    assert api.html_sent == ["<b>Yarım</b>"]
     assert api.sent == []
 
 
@@ -335,20 +347,23 @@ async def test_bot_api_rich_payload_contract() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.url.path.rsplit("/", 1)[-1], __import__("json").loads(request.content)))
-        result: Any = {"message_id": 9} if calls[-1][0] == "sendRichMessage" else True
+        result: Any = {"message_id": 9} if calls[-1][0] in ("sendRichMessage", "sendMessage") else True
         return httpx.Response(200, json={"ok": True, "result": result})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     api = telegram.TelegramAPI("secret-token", client)
     try:
         await api.send_draft(123, 7, {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"})
-        assert await api.send_rich(123, "**Kalın**") == 9
+        assert await api.send_html(123, "<b>Kalın</b>") == 9
+        await api.edit_html(123, 9, "<b>Düzenle</b>")
     finally:
         await client.aclose()
     assert calls == [
         ("sendRichMessageDraft", {"chat_id": 123, "draft_id": 7,
                                   "rich_message": {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"}}),
-        ("sendRichMessage", {"chat_id": 123, "rich_message": {"markdown": "**Kalın**"}}),
+        ("sendMessage", {"chat_id": 123, "text": "<b>Kalın</b>", "parse_mode": "HTML"}),
+        ("editMessageText", {"chat_id": 123, "message_id": 9,
+                             "text": "<b>Düzenle</b>", "parse_mode": "HTML"}),
     ]
 
 
