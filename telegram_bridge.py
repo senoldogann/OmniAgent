@@ -400,12 +400,19 @@ class TelegramBridge:
             save_json(history_path(), self.history)
         except (HostBusyError, TelegramError) as error:
             try:
-                await stream.append(f"\n✗ {error}\n")
+                if verbose:
+                    await stream.append(f"\n✗ {error}\n")
+                else:
+                    await stream.show(f"⚠️ {error}", force=True)
             except TelegramError:
                 pass
         except Exception as error:
             try:
-                await stream.append(f"\n✗ Görev hatası: {type(error).__name__}: {str(error)[:300]}\n")
+                message = f"Görev hatası: {type(error).__name__}: {str(error)[:300]}"
+                if verbose:
+                    await stream.append(f"\n✗ {message}\n")
+                else:
+                    await stream.show(f"⚠️ {message}", force=True)
             except TelegramError:
                 pass
         finally:
