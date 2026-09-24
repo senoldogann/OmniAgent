@@ -765,6 +765,30 @@ def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str
     return True, ""
 
 
+def unmet_wait_status(goal: str, steps: List[sm.StepRecord]) -> Optional[str]:
+    """'status X olana kadar bekle' hedefini son başarılı JSON gözlemiyle karşılaştırır."""
+    match = re.search(
+        r"""(?i)\bstatus\s*['"]([\w-]+)['"]\s*olana\s+kadar\b""", goal,
+    )
+    if match is None:
+        return None
+    expected = match.group(1).casefold()
+    for step in reversed(steps):
+        if step["tool"] != "fetch_raw" or not step["ok"]:
+            continue
+        try:
+            payload = json.loads(step["detail"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
+            continue
+        observed = payload["status"].casefold()
+        if observed != expected:
+            return f"beklenen status {expected}; son doğrulanan status {observed}"
+        return None
+    return "beklenen status doğrulanmadı"
+
+
 def resolve_run_limits(options: RunOptions) -> Tuple[str, int, float]:
     """Görev profilini ve geçersiz override'ları güvenli biçimde çözer. Saf fonksiyon."""
     mode: str = options.get("run_mode", "normal")
@@ -1312,6 +1336,9 @@ async def run_agent_with_callback(
             if not turn["tool_calls"]:
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
+                status_gap = unmet_wait_status(goal, steps)
+                if success and status_gap is not None:
+                    success, reason = False, status_gap
                 if (
                     not success
                     and turn["finish_reason"] == "length"

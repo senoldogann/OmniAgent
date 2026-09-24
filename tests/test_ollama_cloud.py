@@ -44,7 +44,13 @@ async def test_cloud_client_only_when_local_model_is_ready(monkeypatch: pytest.M
 def test_backend_fallback_keeps_free_routes() -> None:
     """Ollama yoksa Luna, Luna yoksa ücretsiz OpenCode seçilir."""
     all_available = frozenset({"ollama-cloud", "openai", "zen-free"})
-    assert main.attempt_plan("ollama-cloud", all_available)[-1] == "openai"
-    assert main.attempt_plan("openai", all_available)[-1] == "ollama-cloud"
-    assert main.attempt_plan("zen-free", all_available)[-1] == "ollama-cloud"
+    assert main.attempt_plan("ollama-cloud", all_available) == (
+        "ollama-cloud", "ollama-cloud", "openai", "zen-free",
+    )
+    assert main.attempt_plan("openai", all_available) == (
+        "openai", "openai", "ollama-cloud", "zen-free",
+    )
+    assert main.attempt_plan("zen-free", all_available) == (
+        "zen-free", "zen-free", "ollama-cloud", "openai",
+    )
     assert main.attempt_plan("ollama-cloud", frozenset({"ollama-cloud", "zen-free"}))[-1] == "zen-free"
