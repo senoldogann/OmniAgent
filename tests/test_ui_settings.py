@@ -183,3 +183,16 @@ def test_settings_page_reveals_keys_on_request(app: ui.OmniUI, keychain: FakeKey
     checks[0].toggle()
     assert all(entry.cget("show") == "" for entry in entries)
     window.destroy()
+
+def test_composer_tools_commands_show_local_inventory_without_agent(app: ui.OmniUI) -> None:
+    """Yerel katalog komutları model görevi başlatmadan sonuç verir."""
+    app.entry.insert(0, "/tools")
+    app._send_goal()
+    transcript = app._text.get("1.0", "end-1c")
+    assert "context7" in transcript
+    assert "/skills" in transcript
+    assert app._agent_future is None
+    app.entry.insert(0, "/skills")
+    app._send_goal()
+    assert "Kurulu skill sayısı" in app._text.get("1.0", "end-1c")
+    assert app._agent_future is None
