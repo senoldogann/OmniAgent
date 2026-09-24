@@ -4,9 +4,11 @@ OmniAgent harici hizmet görevinde `discover_capabilities` ile önce yerel katal
 
 ## Outlook kurulumu
 
-1. [Microsoft Entra uygulama kayıtları](https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) içinde kişisel Microsoft hesaplarını destekleyen bir public client uygulaması kaydedin. Platform olarak **Mobile and desktop applications**, yönlendirme URI'sı olarak `http://localhost` kullanın.
-2. Uygulamanın **Application (client) ID** değerini ilk Outlook görevinde açılan OmniAgent formuna girin. Alternatif olarak `OMNI_OUTLOOK_CLIENT_ID` ortam değişkenini ayarlayın.
-3. Microsoft giriş ekranında kişisel hesabınızı seçip **delegated Mail.ReadWrite** iznini verin. İstemci sırrı ve posta gönderme izni kullanılmaz.
+1. [Microsoft Entra uygulama kayıtları](https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade) içinde **New registration** açın; **Supported account types** olarak **Personal Microsoft accounts only** seçin. Bu adaptör `consumers` otoritesini kullanır; iş/okul hesabıyla giriş yapmaz.
+2. **Authentication → Add a platform → Mobile and desktop applications** altında sistem tarayıcısı yönlendirmesi `http://localhost` değerini seçin. **Advanced settings → Allow public client flows** seçeneğini **Yes** yapıp kaydedin. [Microsoft masaüstü uygulaması kurulumu](https://learn.microsoft.com/en-us/entra/identity-platform/scenario-desktop-app-configuration)
+3. **API permissions → Add a permission → Microsoft Graph → Delegated permissions** altında `Mail.ReadWrite` ekleyin. **Application permissions** seçmeyin; kişisel Microsoft hesabı bu delegated izne giriş sırasında onay verebilir. [Microsoft Graph izinleri](https://learn.microsoft.com/en-us/graph/permissions-reference#mailreadwrite)
+4. **Overview → Application (client) ID** değerini ilk Outlook görevinde açılan OmniAgent formuna girin. Alternatif olarak `OMNI_OUTLOOK_CLIENT_ID` ortam değişkenini ayarlayın.
+5. Microsoft giriş ekranında kişisel Outlook/Hotmail hesabınızı seçip `Mail.ReadWrite` onayını verin. İstemci sırrı ve posta gönderme izni kullanılmaz.
 
 MSAL token önbelleği macOS Keychain'de, temizlik kuralı ve işlem günlüğü `~/Library/Application Support/OmniAgent/mail/<hesap-kimliği-özeti>/` altında saklanır. Hesap kimliği dosya adında düz metin olarak tutulmaz. Kurallar hesap başına bir kez sorulur; `outlook_clean(reset_rule=true)` ile yeniden tanımlanabilir. Varsayılan işlem Çöp Kutusu'na taşımadır. `outlook_restore(operation_id=...)` günlükteki taşınan iletileri kaynak klasörlerine geri taşır.
 
