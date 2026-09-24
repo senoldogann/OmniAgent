@@ -1,13 +1,23 @@
 import json
 import os
+import re
 import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, TypedDict, NotRequired, Dict, Union
 
 # Epizodik bellekte tutulacak en fazla görev sayısı (bellek dosyasının sınırsız
-# büyüyüp her yüklemede yavaşlamasını önler).
-MAX_EPISODES: int = 30
+# büyüyüp her yüklemede yavaşlamasını önler). Kayıt, kullanıcının "geçen gün ne yapmıştık"
+# sorusuna user_memory(action=history) ile yanıt verebilmek için yüz görev tutar.
+MAX_EPISODES: int = 100
+# Uzun otonom görevlerin kaydı dosyayı şişirmesin: epizot başına son adımlar tutulur.
+MAX_STEPS_PER_EPISODE: int = 60
+# Geçmiş aramasında gösterilen hedef/sonuç özetinin uzunluğu
+HISTORY_GOAL_LIMIT: int = 240
+HISTORY_OUTCOME_LIMIT: int = 400
+# Türkçe ekler aramayı bozmasın: sözcüklerin ilk bu kadar harfi karşılaştırılır (rapor/raporları)
+SEARCH_STEM_LENGTH: int = 5
 
 # Epizot kaydında adım ayrıntısının ve argümanlarının saklanacak azami uzunluğu.
 STEP_DETAIL_LIMIT: int = 500
@@ -44,6 +54,9 @@ class EpisodeMetrics(TypedDict):
     duplicate_navigation: NotRequired[int]
     uncached_prompt_tokens: NotRequired[int]
     integrations: NotRequired[Dict[str, Union[int, float]]]
+    # Deneyim belleği: hatırlatılan ders sayısı ve görevde doğrulanan yeni ders adayı sayısı
+    experience_hints: NotRequired[int]
+    experience_candidates: NotRequired[int]
 
 
 class Episode(TypedDict):
@@ -131,9 +144,53 @@ def record_episode(
     episode: Episode = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "goal": goal,
-        "steps": steps,
+        "steps": steps[-MAX_STEPS_PER_EPISODE:],
         "outcome": outcome,
         "success": success,
         "metrics": metrics,
     }
     return {"episodic_memory": (state["episodic_memory"] + [episode])[-MAX_EPISODES:]}
+
+
+class EpisodeSummary(TypedDict):
+    """Geçmiş görev aramasında modele dönen kısa özet."""
+    timestamp: str
+    goal: str
+    success: bool
+    outcome: str
+
+
+def ascii_fold(text: str) -> str:
+    """Türkçe harfleri ASCII karşılığına indirir ve küçük harfe çevirir (ı→i, ş→s…). Saf."""
+    replaced: str = text.replace("ı", "i").replace("İ", "i")
+    decomposed: str = unicodedata.normalize("NFKD", replaced)
+    return "".join(character for character in decomposed if not unicodedata.combining(character)).casefold()
+
+
+def search_stems(text: str) -> frozenset[str]:
+    """Arama için sözcük kökleri: ASCII'ye indirgenmiş, en az 3 harfli sözcüklerin ilk harfleri. Saf."""
+    return frozenset(
+        word[:SEARCH_STEM_LENGTH] for word in re.split(r"[^a-z0-9]+", ascii_fold(text)) if len(word) >= 3
+    )
+
+
+def search_episodes(state: StateDict, query: str, limit: int) -> List[EpisodeSummary]:
+    """
+    Önceki görevleri sorgu köklerinin hedef + sonuç metninde geçme sayısına göre sıralar; eşit
+    skorda yeni görev önce gelir. Boş sorgu en yeni görevleri döner. Saf fonksiyon.
+    """
+    wanted: frozenset[str] = search_stems(query)
+    scored: List[tuple[int, str, EpisodeSummary]] = []
+    for episode in state["episodic_memory"]:
+        score: int = len(wanted & search_stems(f"{episode['goal']} {episode['outcome']}")) if wanted else 0
+        if wanted and score == 0:
+            continue
+        summary: EpisodeSummary = {
+            "timestamp": episode["timestamp"],
+            "goal": _clip(episode["goal"], HISTORY_GOAL_LIMIT),
+            "success": episode["success"],
+            "outcome": _clip(episode["outcome"], HISTORY_OUTCOME_LIMIT),
+        }
+        scored.append((score, episode["timestamp"], summary))
+    ordered: List[tuple[int, str, EpisodeSummary]] = sorted(scored, key=lambda item: (item[0], item[1]), reverse=True)
+    return [summary for _, _, summary in ordered[:limit]]

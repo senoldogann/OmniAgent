@@ -14,8 +14,9 @@ ExecutionPhase = Literal["fast", "conserve", "delivery"]
 class FastLoopPolicy:
     """Thresholds are host policy, not prompt-only suggestions."""
 
-    stagnation_window: int = 3
-    delivery_stagnation_limit: int = 3
+    stagnation_window: int = 2
+    visual_stagnation_window: int = 3
+    delivery_stagnation_limit: int = 2
     soft_uncached_prompt_tokens: int = 60_000
     soft_tool_calls: int = 24
 
@@ -42,6 +43,7 @@ class TurnSignal:
     uncached_prompt_tokens: int
     tool_calls: int
     delivery_ready: bool = False
+    visual_turn: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,16 +91,17 @@ def normalize_progress_signature(
 def classify_semantic_progress(
     *,
     ledger_changed: bool,
+    deterministic_progress: bool = False,
     has_ledger: bool,
     previous_signature: Optional[str],
     signature: str,
     all_failed: bool,
 ) -> bool:
     """Tool başarısını gerçek görev ilerlemesinden ayırır; ilk tur yalnız bootstrap istisnasıdır."""
-    if ledger_changed:
-        return True
     if all_failed:
         return False
+    if ledger_changed or deterministic_progress:
+        return True
     # Modelin STATE yazmadığı ilk araç turunun başlamasına izin ver; bundan sonra farklı URL,
     # tıklama veya sonuç imzaları tek başına ilerleme sayılmaz. Böylece model STATE'i atlayarak
     # farklı sayfalarda gezinip stagnation penceresini sürekli sıfırlayamaz.
@@ -117,6 +120,9 @@ def advance_fast_loop(
     pressure = (
         signal.uncached_prompt_tokens >= policy.soft_uncached_prompt_tokens
         or signal.tool_calls >= policy.soft_tool_calls
+    )
+    stagnation_window: int = (
+        policy.visual_stagnation_window if signal.visual_turn else policy.stagnation_window
     )
 
     stagnant = 0 if progressed else state.stagnant_turns + 1
@@ -176,7 +182,7 @@ def advance_fast_loop(
             notice="Çalışma bütçesi baskısı: opsiyonel keşif azaltılıyor, zorunlu iş korunuyor.",
         )
 
-    if state.phase == "fast" and stagnant >= policy.stagnation_window:
+    if state.phase == "fast" and stagnant >= stagnation_window:
         conserve = replace(
             updated,
             phase="conserve",
@@ -190,7 +196,7 @@ def advance_fast_loop(
             notice="Anlamlı ilerleme durdu; en kısa kalan yol için bir kez yeniden planlanıyor.",
         )
 
-    if state.phase == "conserve" and stagnant >= policy.stagnation_window:
+    if state.phase == "conserve" and stagnant >= stagnation_window:
         delivery = replace(
             updated,
             phase="delivery",

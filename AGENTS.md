@@ -28,7 +28,16 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 - Model yalnızca `main.build_tool_schemas` içindeki araç adlarını çağırabilir; `Toolbox`'ın
   özel yöntemlerine (`_read_full`, `close_browser`…) erişemez.
 - GUI araçları erişilebilirlik veya ekran kaydı izni yoksa açık hata verir (macOS izinsiz
-  sentetik olayları sessizce düşürür; araç "başarılı" deyip hiçbir şey yapmamalı).
+  sentetik olayları sessizce düşürür; araç "başarılı" deyip hiçbir şey yapmamalı). Ekran
+  kaydı izni ilk eksik denemede `CGRequestScreenCaptureAccess` ile BİR KEZ sorulur; uygulama
+  sisteme ancak bu çağrıyla kaydolduğu için izin listesinde görünmesi buna bağlıdır. Hata
+  metni "Terminal/Python" gibi belirsiz ifade yerine izni alacak uygulamayı adı + bundle
+  kimliğiyle, yoksa eklenecek tam python yolunu ve sayfayı açan komutu yazar; `permissions.py`
+  aynı tanıyı komut satırında verir.
+- Sırlar süreç ağacına yayılmaz: API anahtarları `os.environ` yerine süreç-içi depoda tutulur,
+  alt süreçlere `child_environment()` anahtar değişkenleri çıkarılmış ortam verir ve araç
+  çıktısı modele/transcripte gitmeden önce `redact()` ile maskelenir. Böylece model
+  `printenv` ile anahtarı okuyamaz.
 - Bu raylar iyi niyetli hatalara karşı geri dönüş sağlar, kötü niyetli kullanıma karşı bir
   güvenlik sınırı değildir.
 
@@ -103,7 +112,13 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   eklenmez. 60 bin önbelleksiz giriş tokenı veya 24 araç çağrısından sonra tek seferlik yumuşak
   bütçe uyarısı yeni/opsiyonel keşfi kesip hesaplama, yazma, doğrulama ve cleanup gibi zorunlu
   teslim adımlarına öncelik verir; görevi kendiliğinden abort etmez.
-- **Zaman sınırları:** model isteği 60sn (bağlantı 5sn) ve SDK içi yeniden deneme kapalıdır
+- **Fast Loop:** tool başarısı tek başına ilerleme sayılmaz; host `STATE`/ledger değişimi,
+  deterministik teslim araçları ve görsel gözlem imzasını ayrı izler. Görsel olmayan turlarda
+  2 anlamsız turdan sonra tek replan, görsel turlarda animasyon/yükleme toleransı için 3 tur
+  beklenir; delivery aşamasında 2 anlamsız tur bounded-stop üretir. 24 Eylül 3 koşuluk stress
+  ölçümünde `long_research` 3/3 başarı, 6 tur/13 araç ve 8,5 sn medyan; `stagnation` 3/3
+  beklenen bounded-failure, 7 tur ve 5,4 sn medyan verdi (önceki politika 10 turdu).
+- **Zaman sınırları:** model isteği 30sn (bağlantı 5sn) ve SDK içi yeniden deneme kapalıdır
   (SDK varsayılanı 600sn + 2 gizli deneme idi); composer'da Normal 25 tur/10dk,
   Uzun 50 tur/20dk, Otonom 100 tur/45dk bütçeleri sunar. Dört ardışık tamamen başarısız
   araç turu ilerleme yok sayılır.
@@ -114,8 +129,8 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   grubuyla) anında keser.
 - **Bellek:** `cognitive_memory.json` son 30 görevi ölçümleriyle kaydeder ve modele geri
   enjekte EDİLMEZ. `user_memory.json` ise yalnızca kullanıcının açıkça istediği tercih, sık yol
-  ve karar kayıtlarını atomik olarak tutar; `user_memory` aracı olmadan okunmaz, her görevde
-  otomatik olarak enjekte edilmez ve parola/token/API anahtarı gibi gizli bilgileri reddeder.
+  ve karar kayıtlarını atomik olarak tutar; kısa kayıtlar her görev başında sistem bağlamına
+  eklenir, parola/token/API anahtarı gibi gizli bilgileri reddeder.
   Otomatik ders/rota enjeksiyonu ölçümde zararlı bulundu (alakasız "çözümler", başka görevlerin
   yolları, "görev belirtilmedi" yanıtları) ve kaldırıldı; macOS'a özgü bilinen tuzaklar
   `SYSTEM_PROMPT` içindeki sabit ENVIRONMENT bloğundadır.
@@ -129,6 +144,20 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   altında (çalışırken canlı son 6 satır, bitince ilk 4 satır + "… +N satır").
 - Animasyonlar: daktilo akışı, yanıp sönen imleç ve çalışan araç işareti, yıldız spinner'lı ve
   parıltılı durum satırı (süre, token, "esc ile durdur").
+- Görev başlarken üst sağda süreli durum etiketi, arka planda geçici macOS menü çubuğu
+  spinner'ı ve Dock rozeti görünür. Arka planda biten görev özel içerik taşımayan macOS
+  bildirimi verir; pencere öne gelince rozet/menü öğesi temizlenir.
+- Header'daki ⚙ Ayarlar sayfası API anahtarlarını düzenler: alanlar maskelidir, her kartta
+  ilgili profil/model/endpoint ve kaynağı söyleyen rozet ("ayarlardan", "ortam değişkeni",
+  "yok") bulunur, "Anahtarları göster" kutusu maskeyi kaldırır. Kaydet, değişen alanı
+  Keychain'e yazar, süreç-içi depoya alır ve profil anahtarını günceller, model istemcilerini
+  yeniden kurar; kısmi başarıda da başarılı anahtar bekletilmez. Görev sürüyorsa değişiklik
+  görev bitince uygulanır (eski bağlantı havuzu o an kapatılır). Silme işlemi doğrulama
+  okumasıyla kanıtlanır: Keychain silmeyi reddederse kayıt "silindi" sayılmaz ve kullanıcı
+  açık hata görür (aksi hâlde sır sonraki açılışta geri geliyordu). Sonuç hem sayfada hem
+  transkriptte "hazır profiller" olarak görünür.
+- İzin tanısı: `uv run python permissions.py` ekran kaydı durumunu, izni alacak uygulamayı
+  (bundle kimliğiyle) ve eklenecek python ikilisini yazar; `--request` sistem istemini gösterir.
 - Görevler kalıcı bir event loop'ta paylaşımlı model istemcileriyle çalışır; `Esc` durdurur,
   `⌘K` temizler. Composer'da Normal/Uzun/Otonom bütçe profili ve macOS yerel mikrofon
   düğmesi bulunur; mikrofon SVG ikonludur, `AVAudioEngine` buffer'ları konuşma sırasında
@@ -136,30 +165,45 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   SVG kopyala düğmesi görünen transcript'in tamamını panoya alır.
 
 ## 🔀 Çoklu Model Backend'i (config.py: BACKENDS)
-- Yedi profil: varsayılan `ollama-cloud` (yerel Ollama API'si üzerinden `gemma4:cloud`),
-  `openai` (yerel ChatGPT oturumlu Codex CLI üzerinden GPT-6-Luna), `zen-free` (OpenCode CLI
-  üzerinden Muse Spark Contributor Free), ayrıca paralı API profilleri `opencode`,
-  `opencode-think`, `claude` ve `minimax`. Yalnız paralı API profilleri opencode'un
-  `auth.json` dosyasındaki anahtarları kullanır. Ollama modeli `OMNI_OLLAMA_CLOUD_MODEL`
-  ile değiştirilebilir; seçilen modelin `ollama list` içinde bulunması gerekir.
+- Beş profil, hepsi API anahtarıyla çağrılır: varsayılan `ollama-cloud` (yerel Ollama API'si
+  üzerinden `gemma4:cloud`), `openai` (OpenAI API, GPT-6-Luna), `opencode` ve `opencode-think`
+  (Opencode Go, `qwen3.8-flash`) ve `openrouter` (`anthropic/claude-sonnet-5`). Bilgisayardaki
+  oturum kimliğine dayanan CLI bağlayıcıları (Codex, OpenCode) kaldırıldı: her model turunda
+  ayrı süreç başlattıkları için yavaş kalıyorlardı; yerlerini sıcak HTTP bağlantısı aldı.
+- **Anahtarlar:** anahtar süreç-içi depoda tutulur (`config._RUNTIME_KEYS`, `set_api_key`),
+  ortam değişkeni yalnız kayıt yoksa kullanılan yedektir (`load_api_key`); kabuk değişkeni
+  (`OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`; eşleme `config.API_KEY_VARIABLES`)
+  böylece ajanın başlattığı alt süreçlere miras kalmaz. Arayüzdeki Ayarlar sayfası (⚙)
+  anahtarı macOS Keychain'e (`api_keys.py`, hizmet `OmniAgent.APIKeys`) yazar ve süreç-içi
+  depoya alır; `config.apply_stored_api_keys()` giriş noktalarında (ui/main/telegram/benchmark)
+  kayıtlı anahtarları depoya alır, ortama YAZMAZ. Kayıtlı anahtar bilinçli olarak kabuk
+  değişkenini geçersiz kılar (arayüzden girilen anahtar sessizce yok sayılmasın); rozet iki
+  kaynağı ayrı gösterir. Hiçbir anahtar dosyası veya opencode `auth.json` okunmaz; anahtar
+  log'a, olay akışına, araç çıktısına veya dokümana yazılmaz, arayüzde maskeli gösterilir ve
+  `redact()` ile araç çıktısından temizlenir. Anahtarı tanımlı olmayan profil istemci kurmaz,
+  hangi değişkenin gerektiğini BİR KEZ uyarı olarak bildirir ve o görevde kullanılamaz sayılır. Model adları `OMNI_OPENAI_MODEL`, `OMNI_OPENCODE_MODEL`,
+  `OMNI_OPENROUTER_MODEL` ve `OMNI_OLLAMA_CLOUD_MODEL` ile değiştirilebilir; seçilen Ollama
+  modelinin `ollama list` içinde bulunması gerekir.
 - **Kalite merdiveni:** art arda `CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD` (2) tamamen başarısız
-  araç turunda `QUALITY_LADDER` boyunca çıkılır: `ollama-cloud` → `openai` → `zen-free`.
+  araç turunda `QUALITY_LADDER` boyunca çıkılır: `ollama-cloud` → `openai` → `openrouter`.
 - **API hataları:** geçici 5xx/bağlantı hatasında aynı backend bir kez yeniden denenir.
   429'da hazır başka profil varsa sağlayıcıya erken yeniden istek atılmadan ona geçilir;
   tek profil varsa Retry-After en çok 30 sn ise beklenir. 401/402/403 ve alternatifli 429
-  ve alternatifli CLI hatası görev boyunca karantinaya alınır; sonraki turda aynı başarısız profil çağrılmaz.
+  görev boyunca karantinaya alınır; sonraki turda aynı başarısız profil çağrılmaz.
   Geçici fallback yalnız o turdadır; kalıcı erişim hatası veya kalite merdiveni geçişi
   mevcut profili görev boyunca değiştirir.
-- **Önbellek:** `claude` profili `cache_control` gönderir (OpenRouter'da Anthropic önek önbelleği
-  yalnızca bununla açılır); opencode öneki kendiliğinden önbellekler.
-- **Manuel seçim:** `OMNI_BACKEND=<profil>` ya da arayüzdeki seçim. Yerel CLI veya Ollama modeli
-  hazır değilse kullanılabilir kalite basamağına düşer ve uyarı verir.
-- **Ölçüm (2026-09-24):** `ollama-cloud` 9 senaryo × 3 koşuda 27/27 başarı ve 4,2 sn medyan;
-  `openai` (Codex CLI) aynı 9 senaryonun tek koşusunda 9/9 ve 11,3 sn medyan verdi.
-  CLI bağlayıcıları her model turunda ayrı süreç başlatır; Ollama Cloud yerel HTTP API'si
-  sıcak bağlantı kullanır. CLI istemleri stdin üzerinden gider (süreç argümanlarına yazılmaz),
-  45 saniye sınırına ve iptal/süreç grubu temizliğine tabidir. Ollama Cloud kullanım sınırı
-  dolarsa CLI yedekleri denenir.
+- **Önbellek:** `openrouter` profili `cache_control` gönderir (OpenRouter'da Anthropic önek
+  önbelleği yalnızca bununla açılır); opencode öneki kendiliğinden önbellekler.
+- **Manuel seçim:** `OMNI_BACKEND=<profil>` ya da arayüzdeki seçim. Ollama modeli kurulu değilse
+  veya ilgili anahtar tanımlı değilse kullanılabilir kalite basamağına düşer ve uyarı verir.
+- **Ollama request uyumu:** OpenAI sözleşmesinde `tools` varsa `tool_choice` varsayılanı zaten
+  `auto`dur; Ollama'nın güncel tool-calling örnekleri de yalnız `tools` gönderir. Bu yüzden
+  Ollama hot path'inde redundant `tool_choice="auto"` alanı taşınmaz; canlı A/B'de aynı doğru
+  tool call korunurken istek 0,727→0,628 sn ölçüldü.
+- **Ölçüm (2026-09-24):** `ollama-cloud` 9 senaryo × 3 koşuda 27/27 başarı ve 4,0 sn medyan
+  verdi. Oturum tabanlı CLI yedekleriyle alınan eski ölçüm (Codex CLI 9/9, 11,3 sn medyan)
+  geçersizdir: CLI bağlayıcıları kaldırıldı. Artık her tur tek bir sıcak HTTP çağrısıdır;
+  yedekler yalnız API anahtarı tanımlıysa ve merdiven sırası geldiğinde denenir.
 
 ## 📱 Telegram ve yetenek farkındalığı
 - `telegram_bridge.py`, eşleştirilmiş özel Telegram sohbetinde varsayılan olarak tek
@@ -167,11 +211,15 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   model, süre ve token ayrıntılarını açar; `/verbose off` kısa görünüme döner. Ekran
   görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
   Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
-  Kurulum: [TELEGRAM.md](TELEGRAM.md).
+  Kurulum: [TELEGRAM.md](docs/TELEGRAM.md).
 - Modelin gerçek yürütme yetkisi her turdaki araç şemalarıdır. `discover_capabilities` hazır
   API/MCP'yi ve gerekirse kısa kaynak keşfini açar; skill dosyası yöntem bilgisidir, hesap
-  erişimi değildir. Kalıcı plugin yalnız güvenilir, sabit sürümlü kayıtla kurulur.
-- Tekrarlı yerel iş için `execute_js` veya temizlenen geçici script kullanılabilir. Görevin
+  erişimi değildir. Kurulu yerel skill'ler `~/.agents/skills` ve `~/.codex/skills` altında
+  dizinlenir; `query=catalog` yerel envanteri ağ olmadan döner. Skill, çalıştırılabilir API/MCP
+  kaydını sıralamada geçemez. Kalıcı plugin yalnız güvenilir, sabit sürümlü kayıtla kurulur.
+- Tekrarlı yerel iş için `execute_js` veya temizlenen geçici script kullanılabilir.
+  `// omni:save ad` başarılı JS kodunu en çok beş adla yalnız görevde saklar;
+  `// omni:run ad` JSON girdisiyle yeniden çalıştırır. Başarısız kod kaydedilmez. Görevin
   istemediği kalıcı aracı ya da kendi kaynak değişikliğini ajan kendiliğinden eklemez.
 - Epizodik kayıtlar otomatik ders olarak modele verilmez: önceki ölçümde hedef sapmasına yol
   açtı. Kalıcı kullanıcı tercihleri yalnız açık istekle `user_memory` aracına yazılır.
@@ -181,10 +229,14 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 ## 🎯 Hedefler
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (bkz. Plugin Entegrasyonu)
 - [x] Ajanın kendi yetki seviyesini yönetebildiği bir güvenlik katmanı eklemek. (bkz. 🛡️ Güvenlik Rayları)
-- [x] Açıkça istenen tercih, yol ve kararları atomik `user_memory.json` deposunda tutup otomatik
-  enjeksiyon yapmadan hatırlama/arama/silme akışı eklemek.
-- [x] Vizyon ve koordinat sistemini hibrit hale getirmek. (`smart_click`: AX → görsel şablon; tek ortak koordinat uzayı)
+- [x] Açıkça istenen tercih, yol ve kararları atomik `user_memory.json` deposunda tutup
+  kısa kayıtları görev başında yükleyen hatırlama/arama/silme akışı eklemek.
+- [x] Vizyon ve koordinat sistemini hibrit hale getirmek. (`smart_click`: AX → görsel şablon;
+  tek ortak koordinat uzayı.) Açık Chrome görevinde görüntü + settle yalnız öndeki Chrome
+  penceresinden alınır; model koordinatları pencerenin ekran origin'ine çevrilir.
 - [x] Ajan döngüsünü canlı hedeflerle ölçüp hız/doğruluk sınırlarını ayarlamak.
   (2026-09-23, `benchmark.py`, 9 senaryo × 3 koşu: başarı 19/27 → 27/27, medyan 17,3sn → 4,5sn.)
-- [ ] Hatalardan kalıcı öğrenme: yeniden eklenecekse argüman farkına dayanan, yalnızca aynı
-  hatalı argümanla eşleşen dersler olarak ve `benchmark.py` ile ölçülerek eklenmeli.
+- [x] Hatalardan doğrulanmış kalıcı öğrenme: `experience.py` aynı araç/hata imzasına koşullu,
+  yalnız başarılı görevde doğrulanmış düzeltmeyi saklar; `self_repair` canlı ölçümü 3/3,
+  öğrenme sonrası 4 araçtan 2 araca düştü.
+- [x] Finansal para hareketi ve istenmemiş kalıcı hafıza mutasyonu için host onayı + maskeli audit.

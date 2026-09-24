@@ -110,13 +110,18 @@ class IntegrationRuntime:
         finally:
             self.metrics["wait_seconds"] += time.monotonic() - start
 
-    async def ask(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    async def ask(self, title: str, fields: Dict[str, Any], timeout: Optional[float]) -> Dict[str, Any]:
+        """
+        Kullanıcıdan arayüz/Telegram üzerinden yanıt bekler; bekleme süresi görev bütçesinden
+        düşülür. timeout verilirse süre dolunca TimeoutError yükselir (onay/soru görevi
+        sonsuza dek kilitlemesin); None kurulum akışlarında sınırsız bekler.
+        """
         if self.answer is None:
             raise InteractionRequired(title)
         start = time.monotonic()
         self.status("waiting_user", title)
         try:
-            return await self.wait(self.answer(title, fields))
+            return await self.wait(self.answer(title, fields), timeout=timeout)
         finally:
             self.metrics["user_wait_seconds"] += time.monotonic() - start
             self.status("resumed", "Göreve devam ediliyor")

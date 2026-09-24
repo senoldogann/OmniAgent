@@ -170,7 +170,8 @@ class OutlookAdapter:
             "exclude_senders": {"type": "string", "label": "Korunacak gönderenler (virgülle)", "default": ""},
             "keep_flagged": {"type": "boolean", "label": "Bayraklı mesajları koru", "default": True},
             "semantic": {"type": "string", "label": "Anlamsal ölçüt (isteğe bağlı; ör. yalnız reklamlar)", "default": ""},
-            "_help": "Girilen ölçütler birlikte uygulanır. Eşleşenler Çöp Kutusu'na taşınır; kalıcı silme yapılmaz."})
+            "_help": "Girilen ölçütler birlikte uygulanır. Eşleşenler Çöp Kutusu'na taşınır; kalıcı silme yapılmaz."},
+            None)
         result = parse_rule(values)
         save_json(path, result)
         return result

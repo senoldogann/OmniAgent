@@ -105,5 +105,47 @@ async def test_wait_cancels_and_questions_pause_clock() -> None:
         await asyncio.sleep(0.01)
         return {"ok": True}
     task.answer = answer
-    assert await task.ask("deneme", {}) == {"ok": True}
+    assert await task.ask("deneme", {}, None) == {"ok": True}
     assert task.metrics["user_wait_seconds"] >= 0.01
+
+
+@pytest.mark.asyncio
+async def test_explicit_skills_sh_outlook_search_keeps_graph_separate_and_caches(tmp_path: Path) -> None:
+    calls = []
+
+    def network(request):
+        calls.append(request)
+        assert request.url.host == "skills.sh"
+        assert request.url.path == "/api/search"
+        assert request.url.params["q"] == "outlook"
+        return httpx.Response(200, json={"skills": [
+            {"id": "pietz/skills/m365", "name": "m365", "source": "pietz/skills"},
+            {"id": "bad/../../escape", "name": "bad", "source": "bad/repo"},
+        ]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(network)) as http:
+        service = CapabilityService(tmp_path, http)
+        task = runtime()
+        first = await service.discover(task, "skills.sh:outlook", ["mail"], True)
+        assert first["selected"] is None
+        assert first["candidates"][0]["kind"] == "skill"
+        assert first["candidates"][0]["trusted"] is False
+        assert first["candidates"][0]["source"] == "https://skills.sh/pietz/skills/m365"
+        assert len(first["candidates"]) == 1
+        assert task.selected == {}
+        second = await service.discover(runtime(), "skills.sh:outlook", ["mail"], True)
+        assert second["cached"] is True
+        assert len(calls) == 1
+
+
+def test_explicit_skill_search_remains_available_in_visible_chrome_mode() -> None:
+    from main import build_tool_schemas, skills_sh_goal
+
+    goal = "Açık Chrome oturumumu kullan ve skills.sh'de Outlook skillini bul"
+    assert skills_sh_goal(goal)
+    names = {schema["function"]["name"] for schema in build_tool_schemas(goal)}
+    assert {"discover_capabilities", "fetch_raw", "chrome_active_tab"} <= names
+    assert "browse_url" not in names
+    ordinary = {schema["function"]["name"] for schema in build_tool_schemas(
+        "Açık Chrome oturumumu kullanarak Outlook'a git")}
+    assert "discover_capabilities" not in ordinary

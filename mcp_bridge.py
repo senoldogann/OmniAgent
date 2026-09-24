@@ -19,7 +19,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from approval import financial_tool_name
 from capabilities import Capability, ToolEntry
+from config import API_KEY_VARIABLES
 from integration_runtime import IntegrationRuntime, InteractionRequired, read_json, save_json
 
 
@@ -28,6 +30,7 @@ async def run_install(command: List[str], runtime: IntegrationRuntime, timeout: 
     runtime.check()
     process = await asyncio.create_subprocess_exec(
         *command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        env={key: value for key, value in os.environ.items() if key not in API_KEY_VARIABLES.values()},
         start_new_session=True)
     try:
         await runtime.wait(process.wait(), timeout=timeout)
@@ -250,7 +253,8 @@ class MCPBridge:
                            "description": (remote_name + ": " + (tool.description or ""))[:1200],
                            "parameters": tool.inputSchema}},
                 "execute": bind(remote_name), "readonly": remote_name in entry.get("readonly_tools", []),
-                "capability": entry["id"],
+                "capability": entry["id"], "label": remote_name,
+                "financial": bool(entry.get("financial")) or financial_tool_name(remote_name),
             }
         if not tools:
             raise ValueError("İstenen işlemler bu MCP'de yok: " + ", ".join(t.name for t in advertised)[:1500])

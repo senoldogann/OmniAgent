@@ -456,3 +456,33 @@ async def test_question_waits_for_authorized_reply(monkeypatch: pytest.MonkeyPat
         "text": "newsletter@example.com",
     }})
     assert await waiting == {"sender": "newsletter@example.com"}
+
+
+@pytest.mark.asyncio
+async def test_bridge_reuses_integration_connections_between_tasks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    bridge = telegram.TelegramBridge(FakeAPI(), {"chat_id": 123, "user_id": 456})
+    services: list[Any] = []
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        services.append(options["integrations"])
+        metrics = {"turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1,
+                   "backend": "ollama-cloud", "prompt_tokens": 1,
+                   "cached_tokens": 0, "completion_tokens": 1}
+        emit({"kind": "run_finished", "success": True, "outcome": goal,
+              "reason": "", "metrics": metrics})
+        return {"outcome": goal, "success": True, "reason": "",
+                "metrics": metrics, "exchange": make_exchange(goal, goal, [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    try:
+        await bridge._execute("Birinci görev")
+        await bridge._execute("İkinci görev")
+        assert len(services) == 2
+        assert services[0] is services[1] is bridge.integrations
+        assert not bridge.integrations.closed
+    finally:
+        if bridge.integrations is not None:
+            await bridge.integrations.close()

@@ -41,16 +41,21 @@ async def test_cloud_client_only_when_local_model_is_ready(monkeypatch: pytest.M
         await main.close_model_clients(present)
 
 
-def test_backend_fallback_keeps_free_routes() -> None:
-    """Ollama yoksa Luna, Luna yoksa ücretsiz OpenCode seçilir."""
-    all_available = frozenset({"ollama-cloud", "openai", "zen-free"})
+def test_backend_fallback_follows_api_key_ladder() -> None:
+    """Merdiven sırası korunur: ollama-cloud → openai → openrouter."""
+    all_available = frozenset({"ollama-cloud", "openai", "openrouter"})
     assert main.attempt_plan("ollama-cloud", all_available) == (
-        "ollama-cloud", "ollama-cloud", "openai", "zen-free",
+        "ollama-cloud", "ollama-cloud", "openai", "openrouter",
     )
     assert main.attempt_plan("openai", all_available) == (
-        "openai", "openai", "ollama-cloud", "zen-free",
+        "openai", "openai", "ollama-cloud", "openrouter",
     )
-    assert main.attempt_plan("zen-free", all_available) == (
-        "zen-free", "zen-free", "ollama-cloud", "openai",
+    assert main.attempt_plan("openrouter", all_available) == (
+        "openrouter", "openrouter", "ollama-cloud", "openai",
     )
-    assert main.attempt_plan("ollama-cloud", frozenset({"ollama-cloud", "zen-free"}))[-1] == "zen-free"
+    # Merdiven dışındaki elle seçilmiş profil tüm merdiveni sırayla izler.
+    assert main.attempt_plan("opencode", all_available) == (
+        "opencode", "opencode", "ollama-cloud", "openai", "openrouter",
+    )
+    # Yalnız iki profil hazırsa plan hazır olmayan basamağı atlar.
+    assert main.attempt_plan("ollama-cloud", frozenset({"ollama-cloud", "openrouter"}))[-1] == "openrouter"

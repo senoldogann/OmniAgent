@@ -58,7 +58,8 @@ class OutlookAuth:
                  "_help": "Entra App registrations: kişisel Microsoft hesapları destekli uygulama oluşturun. "
                           "Mobile and desktop applications yönlendirmesi: http://localhost. "
                           "İstemci sırrı gerekmez. Microsoft Graph delegated Mail.ReadWrite kullanılır.",
-                 "_url": "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"})
+                 "_url": "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade"},
+                None)
             client_id = result.get("client_id", "").strip()
         try:
             client_id = str(uuid.UUID(str(client_id)))

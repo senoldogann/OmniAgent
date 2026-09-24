@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import ssl
 import sys
 import tempfile
@@ -22,20 +21,25 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpe
 from openai.types import CompletionUsage
 from PIL import Image
 
-from config import BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER, SYSTEM_PROMPT, BackendProfile
-from cli_backends import CliModelError, run_cli_model
+from config import (
+    API_KEY_VARIABLES, BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER,
+    SYSTEM_PROMPT, BackendProfile, apply_stored_api_keys, redact,
+)
 from events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
 from fast_loop import (
     FastLoopPolicy, FastLoopState, TurnSignal, advance_fast_loop, classify_semantic_progress,
     normalize_progress_signature,
 )
-from tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, Toolbox, ToolError
+from tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, ToolRuntime, Toolbox, ToolError, shell_command_words
+import approval
+import experience
 import state_manager as sm
+import user_memory
 from conversation import Exchange, make_exchange, to_messages
-from capabilities import CapabilityService, DISCOVERY_SCHEMA, discovery_entry, validate_arguments
+from capabilities import CapabilityService, DISCOVERY_SCHEMA, ToolEntry, discovery_entry, validate_arguments
 from integration_runtime import (
     AnswerSink, CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime,
-    IntegrationStopped, InteractionRequired,
+    IntegrationStopped, InteractionRequired, data_root,
 )
 
 STATE_FILE: str = str(Path(__file__).resolve().parent / "cognitive_memory.json")
@@ -72,13 +76,17 @@ CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: int = 2
 SOFT_UNCACHED_PROMPT_TOKEN_BUDGET: int = 60_000
 SOFT_TOOL_CALL_BUDGET: int = 24
 MAX_FINAL_LENGTH_RECOVERIES: int = 1
+MAX_UNEXECUTED_TOOL_RECOVERIES: int = 1
+MAX_SOURCE_ACTION_RECOVERIES: int = 1
+MAX_ACTION_EVIDENCE_RECOVERIES: int = 1
+MAX_NOVEL_SHELL_OUTPUTS: int = 8
 TASK_LEDGER_LIMIT: int = 4000
 
 # SDK varsayılanı 600sn zaman aşımı + 2 gizli yeniden denemeydi: takılan tek bir çağrı tüm
 # görev bütçesini yiyebiliyor, yükseltme mantığı da SDK aynı backend'i tekrar denedikten
 # sonra devreye giriyordu. Yeniden denemeyi yalnızca bu döngü yönetir. Akışta zaman aşımı
 # iki parça arasındaki beklemeye uygulanır.
-MODEL_REQUEST_TIMEOUT_SECONDS: float = 60.0
+MODEL_REQUEST_TIMEOUT_SECONDS: float = 30.0
 MODEL_CONNECT_TIMEOUT_SECONDS: float = 5.0
 TURKISH_WEEKDAYS: Tuple[str, ...] = ("Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar")
 ENGLISH_WEEKDAYS: Tuple[str, ...] = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -117,6 +125,8 @@ class RunOptions(TypedDict):
     state_file: str
     # Kullanıcı tercihleri için ayrı, atomik JSON deposu; verilmezse state_file ile aynı klasörde olur.
     memory_file: NotRequired[str]
+    # Hatalardan öğrenilen dersler (experience.py); verilmezse state_file ile aynı klasörde olur.
+    experience_file: NotRequired[str]
     history: List[Exchange]
     integrations: NotRequired[CapabilityService]
     answer: NotRequired[AnswerSink]
@@ -129,6 +139,7 @@ class RunReport(TypedDict):
     """Bir görevin sonucu ve ölçümleri."""
     outcome: str
     success: bool
+    reason: str
     metrics: sm.EpisodeMetrics
     exchange: Exchange
 
@@ -154,12 +165,18 @@ POINT_SCHEMA: Dict[str, Any] = {
 }
 
 
-def _function_schema(name: str, description: str, properties: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """Tüm parametreleri zorunlu bir function-calling şeması kurar (isteğe bağlılar null alır). Saf."""
+def _function_schema(
+    name: str, description: str, properties: Dict[str, Dict[str, Any]],
+    required: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Function-calling şemasını kurar; belirtilmeyen zorunlu alanlar eskisi gibi tüm alanlardır."""
     return {"type": "function", "function": {
         "name": name,
         "description": description,
-        "parameters": {"type": "object", "properties": properties, "required": list(properties)},
+        "parameters": {
+            "type": "object", "properties": properties,
+            "required": list(properties) if required is None else required,
+        },
     }}
 
 
@@ -173,6 +190,11 @@ def camera_photo_goal(goal: str) -> bool:
         and not any(extension in lowered for extension in (".jpg", ".jpeg", ".png"))
         and not any(app in lowered for app in ("photo booth", "photobooth"))
     )
+
+
+def skills_sh_goal(goal: Optional[str]) -> bool:
+    """Kullanıcı skills.sh kaynağını açıkça istedi mi? Saf."""
+    return bool(goal and re.search(r"\bskills\.sh\b", goal, re.IGNORECASE))
 
 
 def active_chrome_session_goal(goal: Optional[str]) -> bool:
@@ -203,7 +225,7 @@ def memory_mutation_requested(goal: str) -> bool:
     return any(pattern.search(goal) is not None for pattern in _MEMORY_MUTATION_PATTERNS)
 
 
-def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
+def build_tool_schemas(goal: Optional[str] = None, allow_edit: bool = False) -> List[Dict[str, Any]]:
     """
     Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
     hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu.
@@ -213,18 +235,32 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
             "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
+            "timeout_seconds": {
+                "type": ["integer", "null"],
+                "description": "null: 60 sn. Uzun kurulum/derleme/indirme için en çok 900.",
+            },
         }),
         _function_schema("process_list", "Süreç sayısını ve CPU'ya göre en ağır 15 süreci döner.", {}),
         _function_schema(
             "user_memory",
-            "Kullanıcının açıkça belirttiği kalıcı tercih, sık kullanılan yol veya kararı saklar; "
-            "gerektiğinde arar veya siler. Parola, token ve API anahtarı saklamaz.",
+            "Kullanıcının kalıcı tercih, sık kullanılan yol veya kararını saklar, arar veya siler; "
+            "history önceki görevlerin hedef ve sonuçlarında arar. Parola, token ve API anahtarı saklamaz.",
             {
-                "action": {"type": "string", "enum": ["remember", "recall", "forget"]},
+                "action": {"type": "string", "enum": ["remember", "recall", "forget", "history"]},
                 "key": {"type": ["string", "null"], "description": "Tercih/yol/karar anahtarı."},
                 "value": {"type": ["string", "null"], "description": "remember işleminde saklanacak kısa değer."},
-                "query": {"type": ["string", "null"], "description": "recall işleminde arama metni; boşsa tüm kayıtlar."},
+                "query": {"type": ["string", "null"], "description": "recall/history arama metni; boşsa en yeniler."},
                 "category": {"type": ["string", "null"], "enum": ["preference", "path", "decision", None]},
+            },
+        ),
+        _function_schema(
+            "ask_user",
+            "Görev sırasında kullanıcıya soru sorar ve yanıtı bekler. Yalnız para hareketi/geri "
+            "alınamaz dış eylem onayı (confirm), yalnız kullanıcının bildiği bilgi veya pahalı bir "
+            "belirsizlik (text) için kullan.",
+            {
+                "question": {"type": "string", "description": "Kısa, eksiksiz soru (tutar, alıcı, hesap dahil)."},
+                "kind": {"type": "string", "enum": ["confirm", "text"]},
             },
         ),
         _function_schema("read_file", "Bir dosyanın içeriğini okur (uzun dosyalar kısaltılır).", {
@@ -270,15 +306,26 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
                 },
             },
         ),
-        _function_schema("execute_js", "Node.js ile JavaScript kodu çalıştırır.", {
-            "code": {"type": "string", "description": "Çalıştırılacak JavaScript kodu."},
-        }),
+        _function_schema(
+            "execute_js",
+            "Node.js ile JavaScript çalıştırır. Tekrarlı görevde ilk satır '// omni:save ad' "
+            "ile başarılı kodu görev boyunca sakla; '// omni:run ad' ve isteğe bağlı ikinci "
+            "satır JSON ile yeniden çalıştır (JS process.argv[2] okur).",
+            {"code": {"type": "string", "description": "Kod veya görev içi yardımcı çağrısı."}},
+        ),
         _function_schema(
             "take_screenshot",
-            "Ekranın 1000×1000 görüntüsünü alır, kaydeder ve sana görsel olarak gösterir; görüntüdeki "
-            "noktalar tıklama araçlarına aynen verilir. Son fare/klavye eyleminden sonra ekran durulana kadar "
-            "kendisi bekler: öncesine bekleme ekleme. Pahalıdır: önce cua_get_ax_state dene.",
-            {"filename": {"type": "string", "description": "Kaydedilecek .png veya .jpg dosya yolu."}},
+            "Seçilen ekranın 1000×1000 görüntüsünü alır. display_index=2 ikinci monitörü seçer; "
+            "sonraki görüntü ve tıklamalar aynı ekranda kalır. Noktalar tıklama araçlarıyla aynı uzaydadır. "
+            "Son eylemden sonra ekranın durulmasını kendisi bekler.",
+            {
+                "filename": {"type": "string", "description": "Kaydedilecek .png veya .jpg dosya yolu."},
+                "display_index": {
+                    "type": ["integer", "null"],
+                    "description": "1 ana ekran, 2 ikinci ekran; null/eksik son seçilen ekran (başlangıçta ana).",
+                },
+            },
+            required=["filename"],
         ),
         _function_schema("cua_get_app", "Uygulamayı başlatır veya öne getirir.", {
             "app_name": {"type": "string", "description": "Uygulama adı (örn. Safari, Notes)."},
@@ -333,6 +380,18 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
             },
         ),
     ] + [DISCOVERY_SCHEMA]
+    if allow_edit:
+        schemas.append(_function_schema(
+            "edit_file",
+            "Var olan büyük metin dosyasında benzersiz eski metni yenisiyle değiştirir. "
+            "Tam dosya içeriği içeride write_file ile doğrulanarak yazılır. "
+            "Eski metin tam ve tek eşleşmeli olmalı; ilgisiz içerik korunur.",
+            {
+                "path": {"type": "string", "description": "Düzenlenecek dosyanın yolu."},
+                "old_text": {"type": "string", "description": "Birebir ve benzersiz eski metin."},
+                "new_text": {"type": "string", "description": "Yerine geçecek tam metin."},
+            },
+        ))
     if active_chrome_session_goal(goal):
         # Kullanıcının açık oturumu istendiğinde gizli Playwright/API yolu ve CDP
         # araştırmasına yol açan kabuk/Node araçları bu görevden çıkarılır.
@@ -343,6 +402,9 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
             "execute_shell", "execute_js", "process_list",
             "run_action_sequence", "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
         }
+        if skills_sh_goal(goal):
+            # Açık Chrome eylemleri görünür kalır; açıkça istenen skill kaynağı okunabilir.
+            excluded.difference_update({"discover_capabilities", "fetch_raw"})
         schemas = [entry for entry in schemas if entry["function"]["name"] not in excluded]
         schemas.append(_function_schema(
             "chrome_active_tab",
@@ -384,7 +446,7 @@ def build_tool_schemas(goal: Optional[str] = None) -> List[Dict[str, Any]]:
 TOOL_NAMES: frozenset[str] = frozenset(
     schema["function"]["name"]
     for sample in ("fotoğraf çek masaüstüne", "açık Chrome oturumunu kullan")
-    for schema in build_tool_schemas(sample)
+    for schema in build_tool_schemas(sample, allow_edit=True)
 )
 
 # Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
@@ -395,10 +457,10 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({"process_list", "read_file", "web_
 # paralel bir okuma yazmadan önce bayat sonuç önbelleğe girmesin, eylem→gözlem sırası
 # korunsun); aralarındaki bağımsız salt okunur bloklar gerçek paralellikle çalışır.
 _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
-    "execute_shell", "write_file", "execute_js", "take_screenshot", "browse_url",
+    "execute_shell", "write_file", "edit_file", "execute_js", "take_screenshot", "browse_url",
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
-    "user_memory",
+    "user_memory", "ask_user",
 })
 
 # Açık Chrome yolunda ekranı değiştiren araçlar. Bunlardan sonra görüntü alınmadıysa tur
@@ -407,12 +469,84 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
 _SCREEN_ACTION_TOOLS: frozenset[str] = frozenset({
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
 })
+_DETERMINISTIC_PROGRESS_TOOLS: frozenset[str] = frozenset({
+    "write_file", "edit_file", "execute_js", "capture_photo", "user_memory",
+})
 AUTO_OBSERVATION_PREVIEW: str = "otomatik gözlem"
 
 
 def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
     """Önbellek anahtarı: araç adı + kararlı (sıralı) argüman JSON'u."""
     return name + ":" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+
+
+def approval_request_for_call(
+    name: str, arguments: Dict[str, Any], dynamic: Optional[ToolEntry], memory_mutation_allowed: bool,
+) -> Optional[approval.ApprovalRequest]:
+    """
+    Çağrının çalışmadan önce kullanıcı onayı gerektirip gerektirmediğine karar verir: hedefin
+    açıkça istemediği kalıcı hafıza değişikliği, finansal işaretli entegrasyon araçları ve para
+    hareketi yapan kabuk/JS çağrıları. Ayrıştırılamayan kabuk komutu için onay istenmez; araç
+    kendisi reddeder. Saf fonksiyon.
+    """
+    if name == "user_memory":
+        action: str = str(arguments.get("action", "")).strip().casefold()
+        if action in ("remember", "forget") and not memory_mutation_allowed:
+            return approval.memory_request(arguments)
+        return None
+    if dynamic is not None:
+        if dynamic.get("financial", False) and not dynamic["readonly"]:
+            return approval.financial_request(dynamic.get("label", name), arguments, "finansal entegrasyon işlemi")
+        return None
+    reason: Optional[str] = None
+    if name == "execute_shell":
+        command: str = str(arguments.get("command", ""))
+        try:
+            reason = approval.shell_financial_reason(shell_command_words(command), command)
+        except ToolError:
+            return None
+    elif name == "execute_js":
+        reason = approval.script_financial_reason(str(arguments.get("code", "")))
+    return approval.financial_request(name, arguments, reason) if reason is not None else None
+
+
+_APPROVAL_REFUSALS: Dict[str, Tuple[str, str]] = {
+    "unavailable": (
+        "Bu işlem kullanıcı onayı gerektiriyor ama etkileşimli kanal (arayüz/Telegram) yok; yapılmadı. "
+        "Onay gerektiğini final yanıtında açıkça bildir.", "APPROVAL_UNAVAILABLE",
+    ),
+    "timeout": (
+        f"Kullanıcı onayı {approval.APPROVAL_TIMEOUT_SECONDS / 60:.0f} dakika içinde gelmedi; işlem yapılmadı.",
+        "APPROVAL_TIMEOUT",
+    ),
+    "denied": ("Kullanıcı bu işlemi onaylamadı; yapılmadı. Aynı işlemi yeniden deneme.", "APPROVAL_DENIED"),
+}
+
+
+async def require_approval(tool: str, request: approval.ApprovalRequest) -> None:
+    """
+    Onayı arayüz/Telegram üzerinden sorar ve kararı (onay/ret/zaman aşımı/kanal yok) denetim
+    kaydına yazar; kayıt yazılamazsa işlem yürütülmez. Onaylanmayan çağrı ToolError ile
+    reddedilir; kullanıcı görevi durdurursa IntegrationStopped yükselir.
+    """
+    runtime: Optional[IntegrationRuntime] = CURRENT_RUNTIME.get()
+    decision: str = "unavailable"
+    if runtime is not None and runtime.answer is not None:
+        try:
+            answer: Dict[str, Any] = await runtime.ask(
+                request["title"], approval.approval_fields(request), approval.APPROVAL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            decision = "timeout"
+        else:
+            decision = "approved" if approval.approval_granted(answer.get(approval.APPROVAL_FIELD)) else "denied"
+    approval.append_audit(
+        data_root() / "audit.jsonl",
+        approval.audit_record(tool, request, decision, datetime.now(timezone.utc).isoformat()),
+    )
+    if decision != "approved":
+        message, code = _APPROVAL_REFUSALS[decision]
+        raise ToolError(message, code, False)
 
 
 async def execute_tool(
@@ -458,15 +592,24 @@ async def execute_tool(
 
     method: Callable[..., Any] = dynamic["execute"] if dynamic else getattr(toolbox, name)
     integration_started = time.monotonic()
-    token = TOOL_RUNTIME.set({
+    call_context: ToolRuntime = {
         "emit_output": lambda text: emit({"kind": "tool_output", "call_id": call["id"], "text": text}),
         "should_stop": should_stop,
-    })
+        "approved": False,
+    }
+    token = TOOL_RUNTIME.set(call_context)
     try:
         if runtime is not None:
             runtime.check()
         if dynamic:
             validate_arguments(dynamic, arguments)
+        request: Optional[approval.ApprovalRequest] = approval_request_for_call(
+            name, arguments, dynamic, toolbox.memory_mutation_allowed,
+        )
+        if request is not None:
+            await require_approval(name, request)
+            # Onay yalnız bu çağrının bağlamına işlenir; araç (ör. user_memory) bunu doğrular.
+            TOOL_RUNTIME.set({**call_context, "approved": True})
         if asyncio.iscoroutinefunction(method):
             operation = method(**arguments)
             result: Any = await runtime.wait(operation) if runtime is not None and not dynamic else await operation
@@ -508,10 +651,15 @@ async def execute_tool(
 
 
 def result_text(result: ToolResult) -> str:
-    """Araç sonucunun gösterim/kayıt metni (başarıda çıktı, hatada 'tip: mesaj'). Saf."""
-    if result.get("ok"):
-        return str(result.get("result", ""))
-    return f"{result.get('error_type')}: {result.get('error')}"
+    """
+    Araç sonucunun gösterim/kayıt metni (başarıda çıktı, hatada 'tip: mesaj'). Metin modele,
+    transkripte ve Telegram'a gitmeden önce bilinen sır değerleri maskelenir (redact):
+    execute_shell ile okunan bir API anahtarı süreç ağacına ve sohbet geçmişine yayılmaz.
+    Anahtarın kendisi hiçbir durumda log'a yazılmaz. Saf fonksiyon değildir (sır deposunu okur).
+    """
+    text: str = str(result.get("result", "")) if result.get("ok") else \
+        f"{result.get('error_type')}: {result.get('error')}"
+    return redact(text)
 
 
 async def _run_tool_with_events(
@@ -672,10 +820,11 @@ def _trim_old_turns(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [_trim_entry(entry) if index < cutoff else entry for index, entry in enumerate(messages)]
 
 
-def build_system_prompt(today: date, goal: Optional[str] = None) -> str:
+def build_system_prompt(today: date, goal: Optional[str], memory_block: str) -> str:
     """
-    Sabit istemin sonuna tarih ve yalnız ilgili görevde kısa yöntem bilgisi ekler.
-    Genel görevlerde önek aynı kalır; ev dizini modele verilmez. Saf.
+    Sabit istemin sonuna tarih, kullanıcının kayıtlı hafıza bloğu ve yalnız ilgili görevde kısa
+    yöntem bilgisi ekler. Hafıza bloğu görevden bağımsız aynı sırada olduğundan genel görevlerde
+    önek aynı kalır; ev dizini modele verilmez. Saf.
     """
     weekday: int = today.weekday()
     camera_guidance: str = (
@@ -692,6 +841,10 @@ def build_system_prompt(today: date, goal: Optional[str] = None) -> str:
         "- Search or submit a single field with ONE cua_submit_text call (click + replace text + "
         "enter). Otherwise use cua_click_point (coordinates from the latest screenshot), "
         "cua_type_text and cua_press_key; put every step you can already locate in ONE turn.\n"
+        "- Click the CENTER of a visible label, card, button or row, not empty whitespace. In a "
+        "list/detail split layout, choose the item in the list pane; do not click the empty detail pane.\n"
+        "- If the automatic screenshot is unchanged after a click, treat that click as ineffective. "
+        "Do not repeat the same point/region; choose a different visible target or record the obstacle in STATE.\n"
         "- After a turn with actions you automatically receive a screenshot taken once the screen "
         "settles. Do not call take_screenshot after actions and never wait.\n"
         "- To inspect several items already visible, return cua_click_point + take_screenshot "
@@ -704,7 +857,7 @@ def build_system_prompt(today: date, goal: Optional[str] = None) -> str:
     return (
         SYSTEM_PROMPT
         + f"\n### TODAY\n- Date: {today.isoformat()} ({TURKISH_WEEKDAYS[weekday]} / {ENGLISH_WEEKDAYS[weekday]}).\n"
-        + camera_guidance + chrome_guidance
+        + memory_block + camera_guidance + chrome_guidance
     )
 
 
@@ -724,15 +877,16 @@ def next_quality_backend(current: str, available: frozenset[str]) -> Optional[st
 def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, ...]:
     """
     Geçici hatada aynı profili bir kez dener, sonra hazır ve farklı profillerin hepsine
-    sırayla geçer. Görev kapsamındaki karantinaya alınmış profiller available dışındadır.
+    sırayla geçer. Merdiven içindeki profil önce merdivenin kendi sırasını, merdiven
+    dışındaki profil tüm merdiveni izler. Görev kapsamındaki karantinaya alınmış profiller
+    available dışındadır. Saf fonksiyon.
     """
-    candidates: Tuple[str, ...] = {
-        "ollama-cloud": ("openai", "zen-free"),
-        "openai": ("ollama-cloud", "zen-free"),
-        "zen-free": ("ollama-cloud", "openai"),
-    }.get(backend, ("ollama-cloud", "openai", "zen-free"))
+    candidates: Tuple[str, ...] = (
+        tuple(name for name in QUALITY_LADDER if name != backend)
+        if backend in QUALITY_LADDER else QUALITY_LADDER
+    )
     return (backend, backend) + tuple(
-        name for name in candidates if name != backend and name in available
+        name for name in candidates if name in available
     )
 
 
@@ -762,7 +916,137 @@ def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str
         return False, "yanıt içerik filtresine takıldı"
     if not content.strip():
         return False, "model boş yanıt döndü"
+    if re.search(
+        r"^\s*[✗❌⚠️-]*\s*(?:(?:maalesef|üzgünüm)[,;:\s]*)?"
+        r"(?:(?:bunu|işlemi|görevi|işlem|görev)\s*)?"
+        r"(?:yapamadım|tamamlayamadım|tamamlanamadı|gerçekleştiremedim|"
+        r"başarısız|could not complete|unable to complete)\b",
+        content, re.IGNORECASE,
+    ):
+        return False, "model işlemin başarısız olduğunu bildirdi"
     return True, ""
+
+
+def contains_unexecuted_tool_call(content: str) -> bool:
+    """Metne yazılmış fakat API'nin tool_calls alanına ulaşmamış araç çağrısını saptar."""
+    return bool(re.search(
+        r"<\|?tool_call\|?>|(?m:^\s*(?:⏺\s*)?call:[A-Za-z_][A-Za-z0-9_]*\s*\{)",
+        content,
+    ))
+
+
+def source_change_expected(goal: str, history: List[Exchange]) -> bool:
+    """Kod değişikliği isteğini doğrudan hedeften veya onaylanmış kısa devam mesajından çıkarır."""
+    lowered = goal.casefold().strip()
+    action = re.search(r"\b(?:uygula|implement|geliştir|düzelt|onar|ekle|değiştir|yaz|oluştur|tamamla|iyileştir|hızlandır|gider|düzenle|optimize)\b", lowered)
+    source = re.search(r"(?:\.py\b|\bkod|\bproje|\brepo\b|\bkaynak|\bözellik|\bdestek|\bdesteğ|\bentegrasyon)", lowered)
+    if action is not None and source is not None:
+        return True
+    followup = re.fullmatch(
+        r"(?:(?:evet|tamam|okey)[,\s]+)?(?:başla|basla|dene|devam et|uygula)[.!\s]*",
+        lowered,
+    )
+    if not history:
+        return False
+    recent = " ".join(
+        part for exchange in history[-2:] for part in (exchange["goal"], exchange["answer"])
+    ).casefold()
+    if not re.search(r"(?:\.py\b|\bkaynak kod\b|\bkod değişikli)", recent):
+        return False
+    if followup is not None:
+        return True
+    return len(lowered) <= 80 and bool(re.search(
+        r"\b(?:başla|basla|dene|devam et|uygula|implement et|ekle|yap|hallet)\b",
+        lowered,
+    ))
+
+
+_ACTION_VERBS: re.Pattern[str] = re.compile(
+    r"\b(?:sil|silebilir|siler|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
+    r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|"
+    r"kapat|aç|açabilir|git|tıkla|uygula|çek|tamamla|iyileştir|hızlandır|"
+    r"gider|onar|düzenle|optimize|listele|"
+    r"delete|move|save|send|install|start|run|open|click|edit|update|create|deploy)\b",
+    re.IGNORECASE,
+)
+_INFORMATIONAL_PREFIX: re.Pattern[str] = re.compile(
+    r"^\s*(?:nasıl|neden|niçin|sence|hangi|ne kadar|mümkün mü)\b", re.IGNORECASE,
+)
+_ACTION_EVIDENCE_TOOLS: frozenset[str] = _SIDE_EFFECT_TOOLS - frozenset({
+    "take_screenshot", "ask_user", "user_memory",
+})
+_MUTATION_VERBS: re.Pattern[str] = re.compile(
+    r"\b(?:sil|silebilir|siler|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
+    r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|uygula|"
+    r"tamamla|iyileştir|hızlandır|gider|onar|düzenle|optimize|"
+    r"delete|move|save|send|install|start|run|edit|update|create|deploy)\b",
+    re.IGNORECASE,
+)
+
+_READ_ONLY_SHELL_PROGRAMS: frozenset[str] = frozenset({
+    "cat", "date", "df", "du", "echo", "file", "grep", "head", "id", "ls",
+    "lsof", "ps", "pwd", "rg", "stat", "tail", "uname", "wc", "which", "whoami",
+})
+
+
+def _obviously_read_only_shell(arguments: str) -> bool:
+    """Salt gözlem komutunu dosya/hizmet değişikliği kanıtı sayma; belirsizi modele bırak."""
+    try:
+        parsed = json.loads(arguments or "{}")
+        command = parsed.get("command", "")
+        if not isinstance(command, str) or not command.strip():
+            return False
+        # Yönlendirme ve komut ikamesi görüldüğünde masum görünen program da yazabilir.
+        if re.search(r"[<>\x60]|\$\(", command):
+            return False
+        segments = shell_command_words(command)
+    except (ValueError, AttributeError, ToolError):
+        return False
+    return bool(segments) and all(
+        words and Path(words[0]).name.casefold() in _READ_ONLY_SHELL_PROGRAMS
+        for words in segments
+    )
+
+
+def action_execution_expected(goal: str) -> bool:
+    """Açık uygulama/dosya/hizmet eyleminde gerçek yürütme kanıtı ister."""
+    return not _INFORMATIONAL_PREFIX.search(goal) and bool(_ACTION_VERBS.search(goal))
+
+
+def has_action_evidence(goal: str, steps: List[sm.StepRecord]) -> bool:
+    """Başarılı okuma/keşfi eylem teslimiyle karıştırmaz."""
+    runtime = CURRENT_RUNTIME.get()
+    mutation = bool(_MUTATION_VERBS.search(goal))
+    for step in steps:
+        if not step["ok"]:
+            continue
+        name = step["tool"]
+        if name == "discover_capabilities":
+            continue
+        if mutation and name in {"chrome_active_tab", "cua_get_app"}:
+            continue
+        if mutation and name == "browse_url":
+            try:
+                actions = json.loads(step["args"]).get("actions", [])
+            except (ValueError, AttributeError):
+                actions = []
+            if not isinstance(actions, list) or not any(
+                isinstance(action, dict) and action.get("action") in {"click", "fill", "press"}
+                for action in actions
+            ):
+                continue
+        if mutation and name == "execute_shell" and _obviously_read_only_shell(step["args"]):
+            continue
+        if name in _ACTION_EVIDENCE_TOOLS:
+            return True
+        if name == "take_screenshot" and re.search(r"ekran görüntüsü|screenshot", goal, re.IGNORECASE):
+            return True
+        if name == "user_memory" and memory_mutation_requested(goal):
+            return True
+        entry = runtime.published.get(name) if runtime is not None else None
+        if entry is not None and not entry["readonly"]:
+            return True
+    return False
 
 
 def unmet_wait_status(goal: str, steps: List[sm.StepRecord]) -> Optional[str]:
@@ -865,13 +1149,83 @@ def _call_signature_arguments(call: ToolCallDraft) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {"value": value}
 
 
+def turn_progress_signature(
+    calls: List[ToolCallDraft], results: List[ToolResult], observation_digest: Optional[str],
+    ledger_digest: str, unresolved_deliverables: int,
+) -> str:
+    """GUI'de eylem koordinatını değil gözlenen sonucu; diğer araçlarda hedef/sonucu imzalar."""
+    visual: bool = observation_digest is not None
+    tool_facts: List[Tuple[str, Dict[str, Any]]] = []
+    result_facts: List[str] = []
+    for call, result in zip(calls, results, strict=True):
+        is_screen_action: bool = visual and call["name"] in _SCREEN_ACTION_TOOLS
+        tool_facts.append((
+            call["name"],
+            {} if is_screen_action else _call_signature_arguments(call),
+        ))
+        if is_screen_action and result.get("ok"):
+            result_facts.append("ok")
+        else:
+            result_facts.append(result_text(result)[:TRIMMED_CONTENT_LIMIT])
+    return normalize_progress_signature(
+        tool_facts=tool_facts,
+        result_facts=result_facts,
+        observation_digest=observation_digest,
+        ledger_digest=ledger_digest,
+        unresolved_deliverables=unresolved_deliverables,
+    )
+
+
+def novel_shell_output_progress(
+    calls: List[ToolCallDraft], results: List[ToolResult], seen: frozenset[str],
+) -> Tuple[frozenset[str], bool]:
+    """Yeni başarılı komut çıktısını sınırlı sayıda ilerleme sayar; tekrarları saymaz."""
+    updated = set(seen)
+    progressed = False
+    for call, result in zip(calls, results, strict=True):
+        if call["name"] != "execute_shell" or not result.get("ok"):
+            continue
+        rendered = redact(str(result.get("result", "")))
+        if not rendered.startswith("STDOUT:"):
+            continue
+        stdout = rendered[len("STDOUT:"):].split("\nSTDERR:", 1)[0].strip()
+        if not stdout:
+            continue
+        digest = hashlib.sha256(stdout.encode("utf-8")).hexdigest()
+        if digest not in updated and len(updated) < MAX_NOVEL_SHELL_OUTPUTS:
+            updated.add(digest)
+            progressed = True
+    return frozenset(updated), progressed
+
+
+def host_turn_progress(
+    calls: List[ToolCallDraft], results: List[ToolResult], observation_digest: Optional[str],
+    signature: str, previous_signature: Optional[str],
+) -> bool:
+    """
+    Model STATE yazmasa bile host'un güvenle doğrulayabildiği ilerleme.
+    - Settled görsel gerçekten değiştiyse GUI ilerlemiştir.
+    - Görsel yoksa yalnız deterministik teslim araçları yeni başarılı sonuçla ilerleme sayılır.
+    - Aynı imza (aynı ekran dahil) sırf yeni click/fetch hedefi yüzünden ilerleme sayılmaz.
+    """
+    if previous_signature is None or signature == previous_signature:
+        return False
+    if observation_digest is not None:
+        return True
+    return any(
+        call["name"] in _DETERMINISTIC_PROGRESS_TOOLS and bool(result.get("ok"))
+        for call, result in zip(calls, results, strict=True)
+    )
+
+
 def _fast_loop_prompt(kind: str, ledger: str) -> str:
     ledger_text: str = ledger or "STATE: henüz kalıcı görev kaydı yok"
     if kind == "replan":
         instruction = (
-            "HOST FAST LOOP — YENİDEN PLAN: Anlamlı ilerleme durdu. Yeni keşif açma; aşağıdaki "
-            "STATE'i kullanarak eksik zorunlu işi en az model turu ve araç çağrısıyla tamamlayacak "
-            "tek kısa yol seç."
+            "HOST FAST LOOP — YENİDEN PLAN: Anlamlı ilerleme durdu. Aynı başarısız çağrıyı "
+            "tekrarlama. STATE ve hata sonucundan nedeni çıkar; görevde kullanılabilen araçlarla "
+            "tek somut alternatif dene. Hazır yol yoksa ve hizmet gerektiriyorsa en çok bir hedefli "
+            "yetenek keşfi yap. Zorunlu işi en az turla tamamla."
         )
     else:
         instruction = (
@@ -914,29 +1268,46 @@ def ollama_cloud_ready() -> bool:
     )
 
 
-def create_model_clients() -> Dict[str, Optional[AsyncOpenAI]]:
-    """API istemcilerini ve oturumlu CLI modellerinin kullanılabilirliğini kurar."""
+# Anahtarı eksik olduğu için kullanılamayan profiller bir kez uyarılır: istemciler her
+# kaydetmede yeniden kurulduğu için aynı uyarı her yenilemede tekrar log'a düşmemeli.
+_MISSING_KEY_WARNED: set[str] = set()
+
+
+def create_model_clients() -> Dict[str, AsyncOpenAI]:
+    """
+    Anahtarı tanımlı her API profili için sıcak istemci kurar. Anahtarı eksik profiller
+    sessizce düşmez: hangi ortam değişkeninin gerektiği log'a açık uyarı olarak yazılır.
+    Yerel Ollama profili yalnız seçilen bulut modeli kuruluysa eklenir.
+    """
     timeout: Timeout = Timeout(MODEL_REQUEST_TIMEOUT_SECONDS, connect=MODEL_CONNECT_TIMEOUT_SECONDS)
-    clients: Dict[str, Optional[AsyncOpenAI]] = {
+    clients: Dict[str, AsyncOpenAI] = {
         name: AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"], timeout=timeout, max_retries=0)
         for name, profile in BACKENDS.items()
         if profile["api_key"] and name != "ollama-cloud"
     }
+    # Anahtarı sonradan girilen profil yeniden uyarılabilir hâle gelir.
+    _MISSING_KEY_WARNED.difference_update(clients)
+    for name in BACKENDS:
+        if name in clients or name == "ollama-cloud" or name in _MISSING_KEY_WARNED:
+            continue
+        _MISSING_KEY_WARNED.add(name)
+        logging.warning(
+            "Model profili kullanılamıyor: API anahtarı tanımlı değil",
+            extra={"backend": name, "variable": API_KEY_VARIABLES.get(name, "")},
+        )
     if ollama_cloud_ready():
         profile: BackendProfile = BACKENDS["ollama-cloud"]
         clients["ollama-cloud"] = AsyncOpenAI(
             api_key="ollama", base_url=profile["base_url"], timeout=timeout, max_retries=0,
         )
-    if shutil.which("opencode"):
-        clients["zen-free"] = None
-    if shutil.which("codex"):
-        clients["openai"] = None
     return clients
 
 
-async def close_model_clients(clients: Dict[str, Optional[AsyncOpenAI]]) -> None:
-    """API bağlantı havuzlarını kapatır; oturumlu CLI modellerinde havuz yoktur."""
-    await asyncio.gather(*(client.close() for client in clients.values() if client is not None))
+async def close_model_clients(clients: Optional[Dict[str, AsyncOpenAI]]) -> None:
+    """API bağlantı havuzlarını kapatır. Anahtarsız kurulumda istemci sözlüğü boş olabilir."""
+    if not clients:
+        return
+    await asyncio.gather(*(client.close() for client in clients.values()))
 
 
 def model_request_overrides(
@@ -953,7 +1324,7 @@ def model_request_overrides(
 
 
 async def _stream_completion(
-    client: Optional[AsyncOpenAI], profile: BackendProfile, messages: List[Dict[str, Any]],
+    client: AsyncOpenAI, profile: BackendProfile, messages: List[Dict[str, Any]],
     tool_schemas: List[Dict[str, Any]], session_id: str, emit: EventSink, should_stop: Callable[[], bool],
 ) -> ModelTurn:
     """
@@ -961,23 +1332,25 @@ async def _stream_completion(
     yayınlanır (arayüzde komut harf harf belirir). Durdurma istenirse akış hemen kapatılır ve
     tur finish_reason='stopped' ile döner.
     """
-    if profile["provider"] in ("codex-cli", "opencode-cli"):
-        provider: str = "codex" if profile["provider"] == "codex-cli" else "opencode"
-        return await run_cli_model(provider, profile["model"], messages, tool_schemas, emit, should_stop)
     if client is None:
-        raise CliModelError("API istemcisi bulunamadı.")
+        raise RuntimeError(f"'{profile['provider']}' profili için API istemcisi kurulmadı.")
     headers, extra_body = model_request_overrides(profile, session_id)
-    stream: Any = await client.chat.completions.create(
-        model=profile["model"],
-        messages=messages,
-        tools=tool_schemas,
-        tool_choice="auto",
-        max_tokens=profile["max_tokens"],
-        extra_headers=headers,
-        extra_body=extra_body,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
+    request: Dict[str, Any] = {
+        "model": profile["model"],
+        "messages": messages,
+        "tools": tool_schemas,
+        ("max_completion_tokens" if profile["provider"] == "openai" else "max_tokens"): profile["max_tokens"],
+        "extra_headers": headers,
+        "extra_body": extra_body,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    # OpenAI sözleşmesinde tools varken tool_choice varsayılanı zaten "auto"dur.
+    # Ollama'nın güncel tool-calling örnekleri de tools'u bu ek alan olmadan kullanır;
+    # hot path'te gereksiz request alanı taşımayız.
+    if profile["provider"] != "ollama-cloud":
+        request["tool_choice"] = "auto"
+    stream: Any = await client.chat.completions.create(**request)
     content_parts: List[str] = []
     drafts: List[ToolCallDraft] = []
     previews: Dict[int, str] = {}
@@ -1021,7 +1394,7 @@ async def _stream_completion(
 
 
 async def _call_model_with_retries(
-    clients: Dict[str, Optional[AsyncOpenAI]],
+    clients: Dict[str, AsyncOpenAI],
     messages: List[Dict[str, Any]],
     tool_schemas: List[Dict[str, Any]],
     session_id: str,
@@ -1032,8 +1405,8 @@ async def _call_model_with_retries(
     """
     Model çağrısını attempt_plan'a göre yapar ve yanıt veren backend'i de döner. Kalıcı
     istemci hataları (400/404 vb.) yeniden denenmez. Kimlik/bakiye hatası 401/402/403
-    aynı backend'de beklemeden farklı sağlayıcıya geçer. Zaman aşımında da doğrudan son
-    denemeye atlanır. Yarıda
+    aynı backend'de beklemeden farklı sağlayıcıya geçer (görev boyunca karantinaya alınır).
+    Zaman aşımında da doğrudan son denemeye atlanır. Yarıda
     kesilen bir akış yeniden denenirse önce stream_reset yayınlanır (arayüz o turun akmış
     içeriğini siler, metin iki kez görünmez).
     """
@@ -1057,13 +1430,12 @@ async def _call_model_with_retries(
             return turn, active
         # ssl.SSLError (ör. SSLV3_ALERT_BAD_RECORD_MAC) SDK tarafından sarılmadan akış okumasından
         # yükselebiliyor; geçici bağlantı hatası gibi yeniden denenir (canlı ölçümde görevi bitirdi).
-        except (APIStatusError, APIConnectionError, ssl.SSLError, CliModelError) as error:
+        except (APIStatusError, APIConnectionError, ssl.SSLError) as error:
             status: Optional[int] = error.status_code if isinstance(error, APIStatusError) else None
             if status is not None and status < 500 and status not in (401, 402, 403, 429):
                 raise
             has_alternative = plan[-1] != active
-            cli_failed: bool = isinstance(error, CliModelError)
-            if (status in (401, 402, 403, 429) or cli_failed) and has_alternative and runtime is not None:
+            if status in (401, 402, 403, 429) and has_alternative and runtime is not None:
                 runtime.blocked_backends.add(active)
             if status in (401, 402, 403) and not has_alternative:
                 raise
@@ -1089,7 +1461,7 @@ async def _call_model_with_retries(
                     await runtime.delay(delay)
                 else:
                     await asyncio.sleep(delay)
-            if timed_out or cli_failed or access_failed or (throttled and has_alternative):
+            if timed_out or access_failed or (throttled and has_alternative):
                 attempt = next(
                     (index for index in range(attempt + 1, len(plan)) if plan[index] != active),
                     len(plan),
@@ -1097,7 +1469,7 @@ async def _call_model_with_retries(
             else:
                 attempt += 1
             if attempt < len(plan):
-                if cli_failed or access_failed or throttled:
+                if access_failed or throttled:
                     continue
                 if runtime is not None:
                     await runtime.delay(0.5 * attempt)
@@ -1185,7 +1557,7 @@ async def _observe_after_actions(
 
 
 async def run_agent_with_callback(
-    goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, Optional[AsyncOpenAI]],
+    goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
 ) -> RunReport:
     """
     Hedefi planla-yürüt-gözlemle-onar döngüsüyle çalıştırır; model yanıtını, araç
@@ -1204,8 +1576,8 @@ async def run_agent_with_callback(
         emit({"kind": "notice", "level": "error", "text": failure})
         emit({"kind": "run_finished", "success": False, "outcome": failure,
               "reason": failure, "metrics": initial_metrics})
-        return {"outcome": failure, "success": False, "metrics": initial_metrics,
-                "exchange": make_exchange(goal, failure, [])}
+        return {"outcome": failure, "success": False, "reason": failure,
+                "metrics": initial_metrics, "exchange": make_exchange(goal, failure, [])}
 
     try:
         run_mode, max_iterations, max_wall_clock = resolve_run_limits(options)
@@ -1213,7 +1585,8 @@ async def run_agent_with_callback(
         return startup_failure(error, DEFAULT_BACKEND)
     if not clients:
         return startup_failure(RuntimeError(
-            "Kullanılabilir model yok: Ollama Cloud modeli, Codex/OpenCode CLI veya API bağlantısı gerekli."
+            "Kullanılabilir model yok: Ollama Cloud modeli veya bir API anahtarı "
+            "(OPENAI_API_KEY / OPENCODE_API_KEY / OPENROUTER_API_KEY) gerekli."
         ), DEFAULT_BACKEND)
     available: frozenset[str] = frozenset(clients)
     backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
@@ -1234,22 +1607,30 @@ async def run_agent_with_callback(
         memory_file: str = options.get("memory_file") or str(
             Path(options["state_file"]).with_name("user_memory.json")
         )
+        experience_file: str = options.get("experience_file") or str(
+            Path(options["state_file"]).with_name("experience_memory.json")
+        )
         toolbox: Toolbox = Toolbox(
             memory_file=memory_file,
             allow_memory_mutation=memory_mutation_requested(goal),
+            history_file=options["state_file"],
         )
         session_id: str = str(uuid.uuid4())
         state: sm.StateDict = sm.load_state(options["state_file"])
+        experience_state: experience.ExperienceState = experience.load_experience(experience_file)
+        memory_block: str = user_memory.memory_prompt_block(user_memory.load_memory(memory_file))
         messages: List[Dict[str, Any]] = (
-            [{"role": "system", "content": build_system_prompt(date.today(), goal)}]
+            [{"role": "system", "content": build_system_prompt(date.today(), goal, memory_block)}]
             + to_messages(options["history"])
             + [{"role": "user", "content": goal}]
         )
         service = options.get("integrations") or CapabilityService()
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
-        if not active_chrome_session_goal(goal):
+        if not active_chrome_session_goal(goal) or skills_sh_goal(goal):
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
-        tool_schemas: List[Dict[str, Any]] = build_tool_schemas(goal)
+        tool_schemas: List[Dict[str, Any]] = build_tool_schemas(
+            goal, allow_edit=source_change_expected(goal, options["history"])
+        )
     except Exception as error:
         if service is not None and "integrations" not in options:
             try:
@@ -1270,6 +1651,12 @@ async def run_agent_with_callback(
     tool_cache: Dict[str, ToolResult] = {}
     chrome_visits: Dict[str, int] = {}
     final_length_recoveries: int = 0
+    unexecuted_tool_recoveries: int = 0
+    awaiting_real_tool_call: bool = False
+    source_action_recoveries: int = 0
+    action_evidence_recoveries: int = 0
+    must_change_source: bool = source_change_expected(goal, options["history"])
+    must_execute_action: bool = action_execution_expected(goal)
     task_ledger: str = ""
     fast_loop_policy = FastLoopPolicy(
         soft_uncached_prompt_tokens=SOFT_UNCACHED_PROMPT_TOKEN_BUDGET,
@@ -1278,6 +1665,7 @@ async def run_agent_with_callback(
     fast_loop_state = FastLoopState()
     fast_loop_delivery_entries: int = 0
     fast_loop_stagnation_events: int = 0
+    seen_shell_outputs: frozenset[str] = frozenset()
     observations: int = 0
     observations_reused: int = 0
     duplicate_navigation_count: int = 0
@@ -1288,6 +1676,8 @@ async def run_agent_with_callback(
     usage: TokenUsage = ZERO_USAGE
     model_seconds: float = 0.0
     tool_seconds: float = 0.0
+    experience_tracker: experience.TaskTracker = experience.new_tracker()
+    experience_hints: int = 0
     metrics: sm.EpisodeMetrics
 
     try:
@@ -1300,7 +1690,7 @@ async def run_agent_with_callback(
                 break
 
             runtime.published = dict(runtime.selected)
-            tool_schemas = build_tool_schemas(goal) + [
+            tool_schemas = build_tool_schemas(goal, allow_edit=must_change_source) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)
@@ -1322,7 +1712,7 @@ async def run_agent_with_callback(
                 permanent_failure = current_backend in runtime.blocked_backends
                 emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
                       "reason": (
-                          f"erişim/bakiye/CLI/hız sınırı; {current_backend} bu görevde yeniden denenmeyecek"
+                          f"erişim/bakiye/hız sınırı; {current_backend} bu görevde yeniden denenmeyecek"
                           if permanent_failure else
                           f"geçici hata; yalnız bu tur için fallback, sonraki tur {current_backend} yeniden denenecek"
                       )})
@@ -1334,11 +1724,69 @@ async def run_agent_with_callback(
             messages.append(_assistant_entry(turn))
 
             if not turn["tool_calls"]:
+                if contains_unexecuted_tool_call(turn["content"]):
+                    if unexecuted_tool_recoveries < MAX_UNEXECUTED_TOOL_RECOVERIES:
+                        unexecuted_tool_recoveries += 1
+                        awaiting_real_tool_call = True
+                        emit({"kind": "notice", "level": "warning",
+                              "text": "Model araç çağrısını metin olarak yazdı; hiçbir araç çalışmadı. Gerçek araç çağrısı isteniyor."})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Önceki yanıtta araç çağrısı yalnız metin olarak yazıldı; hiçbir araç çalışmadı. "
+                                "Gerekli işlemi API'nin gerçek tool_calls alanıyla çağır. "
+                                "Bir işlem yapamadıysan tamamlandı deme; somut engeli belirt."
+                            ),
+                        })
+                        continue
+                    outcome = turn["content"]
+                    reason = "model araç çağrısını tekrar yalnız metin olarak yazdı; hiçbir araç çalışmadı"
+                    break
+                if awaiting_real_tool_call:
+                    outcome = turn["content"]
+                    reason = "metinsel araç çağrısından sonra gerçek araç çağrısı yapılmadı"
+                    break
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
                 status_gap = unmet_wait_status(goal, steps)
                 if success and status_gap is not None:
                     success, reason = False, status_gap
+                if success and must_change_source and not any(
+                    step["tool"] in {"write_file", "edit_file"} and step["ok"] for step in steps
+                ):
+                    if source_action_recoveries < MAX_SOURCE_ACTION_RECOVERIES:
+                        source_action_recoveries += 1
+                        emit({"kind": "notice", "level": "warning",
+                              "text": "Kod değişikliği istenmişti; henüz doğrulanmış dosya yazımı yok. Bir kez daha gerçek uygulama isteniyor."})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Bu görevde kod değişikliği istendi fakat hiçbir write_file veya edit_file çağrısı başarıyla çalışmadı. "
+                                "Planı tekrar anlatma veya yeniden onay isteme. Yetkili değişikliği gerçek araç çağrısıyla "
+                                "uygula ve test et; teknik bir engel varsa tam nedenini bildir."
+                            ),
+                        })
+                        outcome, reason, success = "", "", False
+                        continue
+                    success = False
+                    reason = "kod değişikliği istendi fakat hiçbir dosya başarıyla değiştirilmedi"
+                if success and must_execute_action and not has_action_evidence(goal, steps):
+                    if action_evidence_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
+                        action_evidence_recoveries += 1
+                        emit({"kind": "notice", "level": "warning",
+                              "text": "Eylem istendi; başarılı yürütme kanıtı yok. Bir gerçek işlem denemesi isteniyor."})
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                "Bu eylem için başarılı bir yürütme aracı sonucu yok. Okuma veya keşif, "
+                                "işlemin tamamlandığını kanıtlamaz. İstenen eylemi gerçek araçla uygula "
+                                "ve sonucu gözlemle; yapamıyorsan somut engeli bildir."
+                            ),
+                        })
+                        outcome, reason, success = "", "", False
+                        continue
+                    success = False
+                    reason = "eylem istendi fakat başarılı işlem kanıtı yok"
                 if (
                     not success
                     and turn["finish_reason"] == "length"
@@ -1357,6 +1805,7 @@ async def run_agent_with_callback(
                     continue
                 break
 
+            awaiting_real_tool_call = False
             if turn["finish_reason"] == "length":
                 emit({"kind": "notice", "level": "warning",
                       "text": "Yanıt max_tokens sınırında kesildi; araç argümanları eksik olabilir."})
@@ -1375,12 +1824,25 @@ async def run_agent_with_callback(
             duplicate_navigation_notes: List[str] = []
             for call, result in zip(turn["tool_calls"], results, strict=True):
                 ok: bool = bool(result.get("ok"))
-                steps.append(sm.make_step_record(call["name"], call["arguments"], ok, result_text(result)))
+                detail: str = result_text(result)
+                steps.append(sm.make_step_record(call["name"], call["arguments"], ok, detail))
                 if ok and call["name"] == "take_screenshot":
                     pending_shots.append(call)
                 if not ok:
                     failures_in_turn += 1
-                messages.append(_tool_result_to_message(call, result))
+                # Deneyim belleği yalnız hata anında konuşur: aynı hata imzası için doğrulanmış
+                # önceki çözüm ve görev içi tekrar uyarısı araç sonucunun altına eklenir.
+                experience_tracker, observed = experience.observe_result(
+                    experience_state, experience_tracker, call["name"], call["arguments"], ok, detail, iteration,
+                )
+                tool_message: Dict[str, Any] = _tool_result_to_message(call, result)
+                if observed["notes"]:
+                    tool_message = {**tool_message, "content": tool_message["content"] + "\n\n" + "\n\n".join(observed["notes"])}
+                if observed["lesson_id"] is not None:
+                    experience_hints += 1
+                    emit({"kind": "notice", "level": "info",
+                          "text": "Deneyim belleği: bu hata için daha önce doğrulanmış çözüm hatırlatıldı."})
+                messages.append(tool_message)
                 chrome_visits, duplicate_note = update_chrome_visits(chrome_visits, call, result)
                 if duplicate_note is not None:
                     duplicate_navigation_notes.append(duplicate_note)
@@ -1450,18 +1912,23 @@ async def run_agent_with_callback(
             previous_ledger: str = task_ledger
             task_ledger = extract_task_ledger(task_ledger, turn["content"])
             ledger_changed: bool = task_ledger != previous_ledger
-            signature: str = normalize_progress_signature(
-                tool_facts=[
-                    (call["name"], _call_signature_arguments(call))
-                    for call in turn["tool_calls"]
-                ],
-                result_facts=[result_text(result)[:TRIMMED_CONTENT_LIMIT] for result in results],
-                observation_digest=":".join(turn_observation_digests)[:512] or None,
-                ledger_digest=task_ledger,
-                unresolved_deliverables=0 if _ledger_delivery_ready(task_ledger) else 1,
+            unresolved_deliverables: int = 0 if _ledger_delivery_ready(task_ledger) else 1
+            observation_digest: Optional[str] = ":".join(turn_observation_digests)[:512] or None
+            signature: str = turn_progress_signature(
+                turn["tool_calls"], results,
+                observation_digest,
+                task_ledger, unresolved_deliverables,
             )
+            seen_shell_outputs, shell_output_progress = novel_shell_output_progress(
+                turn["tool_calls"], results, seen_shell_outputs,
+            )
+            deterministic_progress: bool = host_turn_progress(
+                turn["tool_calls"], results, observation_digest,
+                signature, fast_loop_state.last_signature,
+            ) or shell_output_progress
             semantic_progress: bool = classify_semantic_progress(
                 ledger_changed=ledger_changed,
+                deterministic_progress=deterministic_progress,
                 has_ledger=bool(task_ledger),
                 previous_signature=fast_loop_state.last_signature,
                 signature=signature,
@@ -1475,10 +1942,11 @@ async def run_agent_with_callback(
                 TurnSignal(
                     signature=signature,
                     semantic_progress=semantic_progress,
-                    unresolved_deliverables=0 if _ledger_delivery_ready(task_ledger) else 1,
+                    unresolved_deliverables=unresolved_deliverables,
                     uncached_prompt_tokens=max(0, usage["prompt_tokens"] - usage["cached_tokens"]),
                     tool_calls=tool_call_count,
                     delivery_ready=_ledger_delivery_ready(task_ledger),
+                    visual_turn=bool(turn_observation_digests),
                 ),
                 fast_loop_policy,
             )
@@ -1519,14 +1987,21 @@ async def run_agent_with_callback(
                 emit({"kind": "notice", "level": "warning", "text": reason})
                 break
         else:
+            success = False
             reason = f"maksimum iterasyon sayısına ({max_iterations}) ulaşıldı"
     except Exception as error:
         outcome, reason = f"Kritik hata: {error}", f"kritik hata: {error}"
         emit({"kind": "notice", "level": "error", "text": outcome})
     finally:
-        history_answer: str = outcome or reason
-        if not success and reason and reason not in history_answer:
-            history_answer = f"[Görev tamamlanamadı: {reason}]\n{history_answer}"
+        history_answer: str = outcome
+        if not success:
+            # Yarım kalan görev etiketlenir ve çalışma kaydı (STATE) sohbet geçmişine taşınır:
+            # kullanıcı "devam et" dediğinde model doğrulanmış bilgileri ve kalan adımları
+            # baştan araştırmadan sürdürür.
+            history_answer = "\n".join(part for part in (
+                f"[Görev tamamlanamadı: {reason}]" if reason else "[Görev tamamlanamadı]",
+                task_ledger, outcome,
+            ) if part)
         exchange: Exchange = make_exchange(goal, history_answer, steps)
         metrics = {
             "turns": turns, "tool_calls": tool_call_count,
@@ -1544,12 +2019,23 @@ async def run_agent_with_callback(
             "duplicate_navigation": duplicate_navigation_count,
             "uncached_prompt_tokens": max(0, usage["prompt_tokens"] - usage["cached_tokens"]),
             "integrations": dict(runtime.metrics),
+            "experience_hints": experience_hints,
+            "experience_candidates": len(experience_tracker["candidates"]) if success else 0,
         }
         cleanup_errors: List[str] = []
         try:
             sm.save_state(options["state_file"], sm.record_episode(state, goal, steps, outcome, success, metrics))
         except Exception as error:
             cleanup_errors.append(f"Bellek kaydı: {type(error).__name__}: {error}")
+        try:
+            if experience.tracker_changes_state(experience_tracker, success):
+                # Görev sürerken başka süreç (UI/Telegram) ders yazmış olabilir: son hâl üzerine işlenir.
+                experience.save_experience(experience_file, experience.finish_task(
+                    experience.load_experience(experience_file), experience_tracker, success,
+                    datetime.now(timezone.utc).isoformat(),
+                ))
+        except Exception as error:
+            cleanup_errors.append(f"Deneyim belleği: {type(error).__name__}: {error}")
         try:
             await toolbox.close_browser()
         except Exception as error:
@@ -1573,7 +2059,8 @@ async def run_agent_with_callback(
             except Exception:
                 logging.exception("Temizlik uyarısı yayınlanamadı")
         emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
-    return {"outcome": outcome, "success": success, "metrics": metrics, "exchange": exchange}
+    return {"outcome": outcome, "success": success, "reason": reason,
+            "metrics": metrics, "exchange": exchange}
 
 
 def print_event(event: AgentEvent) -> None:
@@ -1613,7 +2100,7 @@ def print_event(event: AgentEvent) -> None:
 
 async def run_agent(goal: str) -> RunReport:
     """Hedefi terminale akış olarak basarak çalıştırır (CLI)."""
-    clients: Dict[str, Optional[AsyncOpenAI]] = create_model_clients()
+    clients: Dict[str, AsyncOpenAI] = create_model_clients()
     try:
         options: RunOptions = {"requested_backend": None, "should_stop": lambda: False, "state_file": STATE_FILE, "history": []}
         return await run_agent_with_callback(goal, print_event, options, clients)
@@ -1626,4 +2113,6 @@ if __name__ == "__main__":
     if not cli_goal:
         print("Kullanım: python3 main.py <hedef metni>")
         raise SystemExit(1)
+    # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
+    apply_stored_api_keys()
     asyncio.run(run_agent(cli_goal))

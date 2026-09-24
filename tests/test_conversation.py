@@ -91,11 +91,12 @@ async def test_agent_history_and_all_outcomes(monkeypatch: pytest.MonkeyPatch, t
     assert report["exchange"]["goal"] == "yeni hedef"
     assert report["exchange"]["answer"]
     assert report["success"] == (mode == "success")
+    assert "reason" in report
     assert events[-1]["kind"] == "run_finished"
     assert report["metrics"]["model_seconds"] >= 0
     assert report["metrics"]["tool_seconds"] >= 0
     if received:
-        assert received[0] == {"role": "system", "content": main.build_system_prompt(date.today())}
+        assert received[0] == {"role": "system", "content": main.build_system_prompt(date.today(), None, "")}
         assert received[1:3] == to_messages(history)
         assert received[-1] == {"role": "user", "content": "yeni hedef"}
     if mode == "error":

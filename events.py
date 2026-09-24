@@ -143,23 +143,23 @@ TOOL_LABELS: Dict[str, str] = {
     "discover_capabilities": "Bağlantı keşfi", "outlook_clean": "Posta temizliği",
     "outlook_search": "Posta arama", "outlook_apply_selection": "Posta seçimi",
     "outlook_restore": "Posta geri yükleme",
-    "execute_shell": "Kabuk", "process_list": "Süreçler", "read_file": "Oku", "write_file": "Yaz",
+    "execute_shell": "Kabuk", "process_list": "Süreçler", "read_file": "Oku", "write_file": "Yaz", "edit_file": "Düzenle",
     "web_search": "Ara", "fetch_raw": "Getir", "browse_url": "Tarayıcı", "chrome_active_tab": "Chrome sekmesi", "execute_js": "Node",
     "take_screenshot": "Ekran", "cua_get_app": "Uygulama", "cua_get_ax_state": "Arayüz ağacı",
     "cua_click": "Tıkla", "cua_click_point": "Noktaya tıkla",
     "cua_type_text": "Yaz", "cua_press_key": "Tuş", "cua_submit_text": "Yaz ve gönder",
     "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
-    "capture_photo": "Fotoğraf çek",
+    "capture_photo": "Fotoğraf çek", "ask_user": "Kullanıcıya sor", "user_memory": "Hafıza",
 }
 
 # Önizlemede gösterilen asıl argüman
 _PREVIEW_KEYS: Dict[str, str] = {
     "discover_capabilities": "query", "outlook_restore": "operation_id",
-    "execute_shell": "command", "read_file": "path", "write_file": "path", "web_search": "query",
+    "execute_shell": "command", "read_file": "path", "write_file": "path", "edit_file": "path", "web_search": "query",
     "fetch_raw": "url", "browse_url": "url", "chrome_active_tab": "url", "execute_js": "code", "take_screenshot": "filename",
     "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name",
     "cua_type_text": "text", "cua_press_key": "key", "cua_submit_text": "text",
-    "smart_click": "app_name",
+    "smart_click": "app_name", "ask_user": "question", "user_memory": "action",
 }
 
 

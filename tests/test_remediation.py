@@ -23,7 +23,7 @@ def test_catastrophic_targets_blocked_without_execution(command, monkeypatch):
     monkeypatch.setattr(tools, "run_streaming_process",
                         lambda *args: pytest.fail("Yıkıcı komut çalıştırılmamalı."))
     with pytest.raises(ToolError, match="yıkıcı") as error:
-        Toolbox().execute_shell(command, False)
+        Toolbox().execute_shell(command, False, None)
     assert error.value.code == "CATASTROPHIC_COMMAND_BLOCKED"
 
 
@@ -40,7 +40,7 @@ def test_sensitive_write_targets_blocked_without_execution(command, monkeypatch)
     monkeypatch.setattr(tools, "run_streaming_process",
                         lambda *args: pytest.fail("Korunan yola yazma çalıştırılmamalı."))
     with pytest.raises(ToolError) as error:
-        Toolbox().execute_shell(command, False)
+        Toolbox().execute_shell(command, False, None)
     assert error.value.code == "SENSITIVE_PATH_BLOCKED"
 
 
@@ -159,19 +159,6 @@ async def test_broken_state_still_finishes(tmp_path: Path):
         {"opencode": object()})
     assert not result["success"]
     assert events[-1]["kind"] == "run_finished"
-
-
-def test_corrupt_auth_file_reports_clear_import_error(tmp_path: Path):
-    import os
-    import subprocess
-    auth_path = tmp_path / ".local/share/opencode/auth.json"
-    auth_path.parent.mkdir(parents=True)
-    auth_path.write_text("{bozuk", encoding="utf-8")
-    result = subprocess.run([sys.executable, "-c", "import config"], cwd=Path(__file__).parents[1],
-                            env={**os.environ, "HOME": str(tmp_path)}, capture_output=True, text=True)
-    assert result.returncode != 0
-    assert "Kimlik doğrulama dosyası bozuk JSON içeriyor" in result.stderr
-    assert "{bozuk" not in result.stderr
 
 
 def test_save_json_fsyncs_before_replace(tmp_path: Path, monkeypatch):

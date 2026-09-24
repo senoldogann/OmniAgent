@@ -21,7 +21,9 @@ import httpx
 from keyring.backends.macOS import Keyring
 from openai import AsyncOpenAI
 
-from config import BACKENDS
+from approval import approval_granted
+from capabilities import CapabilityService
+from config import BACKENDS, apply_model_preferences, apply_stored_api_keys
 from conversation import Exchange, trim_history
 from events import AgentEvent, tool_label
 from host_lock import HostBusyError, host_task_lock
@@ -90,6 +92,11 @@ def authorized(message: Dict[str, Any], settings: TelegramSettings) -> bool:
         and chat.get("id") == settings["chat_id"]
         and sender.get("id") == settings["user_id"]
     )
+
+
+def _boolean_field(spec: object) -> bool:
+    """Soru alanı onay kutusu mu? (Telegram'da evet/hayır metniyle yanıtlanır.) Saf."""
+    return isinstance(spec, dict) and spec.get("type") == "boolean"
 
 
 def event_text(event: AgentEvent) -> str:
@@ -541,7 +548,8 @@ class TelegramBridge:
         self.settings = settings
         saved = read_json(offset_path(), {"offset": 0})
         self.offset = int(saved.get("offset", 0)) if isinstance(saved, dict) else 0
-        self.clients: Dict[str, Optional[AsyncOpenAI]] = {}
+        self.clients: Dict[str, AsyncOpenAI] = {}
+        self.integrations: Optional[CapabilityService] = None
         loaded_history = read_json(history_path(), [])
         safe_history = [
             entry for entry in loaded_history
@@ -560,16 +568,28 @@ class TelegramBridge:
         self.goal = ""
 
     async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Soruyu sohbete gönderir ve yetkili yanıtı bekler. "_" ile başlayan alanlar (açıklama,
+        bağlantı) yanıt alanı değildir, mesajda gösterilir. Tek onay kutusu alanı "evet/hayır"
+        metniyle yanıtlanır.
+        """
         if self.pending_answer is not None:
             raise TelegramError("Zaten bir kullanıcı yanıtı bekleniyor.")
         future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
         self.pending_answer = future
-        self.pending_fields = fields
-        names = ", ".join(fields)
+        answerable: Dict[str, Any] = {name: spec for name, spec in fields.items() if not name.startswith("_")}
+        self.pending_fields = answerable
+        notes = "\n".join(str(fields[name]) for name in ("_help", "_url") if fields.get(name))
+        if len(answerable) == 1 and _boolean_field(next(iter(answerable.values()))):
+            instruction = "Onaylamak için 'evet', reddetmek için 'hayır' yazın. /stop iptal eder."
+        elif len(answerable) == 1:
+            instruction = "Yanıtınızı yazın. /stop iptal eder."
+        else:
+            instruction = (f"Alanlar: {', '.join(answerable)}\n"
+                           "Birden çok alan için JSON nesnesi gönderin. /stop iptal eder.")
         await self.api.send(
             self.settings["chat_id"],
-            f"❔ {title[:1800]}\nAlanlar: {names}\n"
-            "Tek alan için yanıtı yazın; birden çok alan için JSON nesnesi gönderin. /stop iptal eder.",
+            f"❔ {title[:1800]}\n" + (f"{notes[:1500]}\n" if notes else "") + instruction,
         )
         try:
             return await future
@@ -578,13 +598,18 @@ class TelegramBridge:
             self.pending_fields = {}
 
     async def _execute(self, goal: str) -> None:
+        # Ayarlar başka süreçte değişmiş olabilir; görev başında güncel modeli yükle.
+        apply_model_preferences()
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
         def emit(event: AgentEvent) -> None:
             loop.call_soon_threadsafe(queue.put_nowait, event)
 
+        if self.integrations is None:
+            self.integrations = CapabilityService()
         options: RunOptions = {
+            "integrations": self.integrations,
             "requested_backend": self.backend,
             "should_stop": self.stop_event.is_set,
             "state_file": STATE_FILE,
@@ -687,8 +712,8 @@ class TelegramBridge:
             return
         try:
             if len(self.pending_fields) == 1:
-                name = next(iter(self.pending_fields))
-                value = {name: text}
+                name, spec = next(iter(self.pending_fields.items()))
+                value = {name: approval_granted(text) if _boolean_field(spec) else text}
             else:
                 value = json.loads(text)
                 if not isinstance(value, dict) or not all(name in value for name in self.pending_fields):
@@ -796,6 +821,8 @@ class TelegramBridge:
                 except (TimeoutError, asyncio.CancelledError):
                     self.active.cancel()
                     await asyncio.gather(self.active, return_exceptions=True)
+            if self.integrations is not None:
+                await self.integrations.close()
             await close_model_clients(self.clients)
             await self.api.close()
 
@@ -896,6 +923,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="OmniAgent Telegram köprüsü")
     parser.add_argument("action", choices=("setup", "run", "install-service"))
     arguments = parser.parse_args()
+    # Arka plan servisi kabuk ortamını miras almaz: Ayarlar'da kayıtlı anahtarları uygula.
+    apply_stored_api_keys()
     try:
         if arguments.action == "setup":
             asyncio.run(setup())

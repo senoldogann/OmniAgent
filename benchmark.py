@@ -8,6 +8,7 @@ Kullanım:
   .venv/bin/python benchmark.py --runs 3 --backend opencode-think --only gun,paralel
   .venv/bin/python benchmark.py --runs 3 --json /tmp/omni_bench.json
   .venv/bin/python benchmark.py --runs 2 --concurrency 1 --only chrome_ilan   # ekranı ve Chrome'u kullanır
+  .venv/bin/python benchmark.py --runs 4 --concurrency 1 --only ogrenme,ogrenme_bos,hafiza
 """
 import argparse
 import asyncio
@@ -15,6 +16,7 @@ import hashlib
 import json
 import random
 import re
+import stat
 import statistics
 import string
 import subprocess
@@ -23,21 +25,44 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
-from typing import Callable, Dict, List, NotRequired, Optional, Tuple, TypedDict
+from threading import Lock, Thread
+from typing import Any, Callable, Dict, List, NotRequired, Optional, Tuple, TypedDict
 from urllib.parse import parse_qs, urlsplit
 
 from openai import AsyncOpenAI
 
+import user_memory
+from config import apply_stored_api_keys
 from integration_runtime import IntegrationMetrics
 from main import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
+from tools import _require_accessibility, press_key_spec, type_unicode_text
 
 CORE_SCENARIOS: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat")
+STRESS_SCENARIOS: Tuple[str, ...] = ("long_research", "stagnation", "self_repair")
+# Hatalardan öğrenme ve kullanıcı hafızası ölçümü. `ogrenme` koşuları aynı deneyim deposunu
+# paylaşır (ilk koşu öğrenir, sonrakiler hatırlatmayla hızlanmalı); `ogrenme_bos` aynı görevi her
+# koşuda boş depoyla çalıştıran kontroldür. Öğrenmenin birikmesi için ardışık koşmalıdır.
+LEARNING_SCENARIOS: Tuple[str, ...] = ("ogrenme", "ogrenme_bos")
+MEMORY_SCENARIOS: Tuple[str, ...] = ("hafiza",)
+SEQUENTIAL_SCENARIOS: Tuple[str, ...] = ("ogrenme", "self_repair")
 # Gerçek ekranı, fareyi ve kullanıcının Chrome'unu kullanan senaryolar: yalnız açıkça seçilince
 # ve eşzamanlılık 1 iken koşar.
 GUI_SCENARIOS: Tuple[str, ...] = ("chrome_ilan",)
 # Takip ve geçmişsiz negatif kontrol ayrı ölçülür; varsayılan başarı/hız paydasını bozmaz.
-SCENARIO_NAMES: Tuple[str, ...] = CORE_SCENARIOS + ("takip", "takip_bos") + GUI_SCENARIOS
+SCENARIO_NAMES: Tuple[str, ...] = (
+    CORE_SCENARIOS + ("takip", "takip_bos") + GUI_SCENARIOS + STRESS_SCENARIOS
+    + LEARNING_SCENARIOS + MEMORY_SCENARIOS
+)
+# Hata mesajı çözümü söylemeyen yerel araç: çözüm ancak --help → kodlar keşfiyle bulunur.
+LEARNING_TOOL_SCRIPT: str = """#!/bin/sh
+case "$*" in
+  "ozet kuzey --birim=adet") echo "OZET: 42";;
+  "--help"|"-h"|"help") echo "Kullanım: veri-araci <komut> [seçenekler]. Hata kodları: veri-araci kodlar";;
+  "kodlar") echo "E17: ozet komutu --birim=<adet|kg> seçeneği ister"; echo "E10: bilinmeyen komut";;
+  ozet*) echo "hata: E17" >&2; exit 2;;
+  *) echo "hata: E10" >&2; exit 1;;
+esac
+"""
 JOB_QUERY: str = "senior software developer"
 # Gerçek iş ilanı sitesi gibi: arama ve ilan detayı gecikmeli XHR ile gelir, arada iskelet animasyonu döner
 JOB_SEARCH_DELAY_SECONDS: float = 0.6
@@ -83,10 +108,105 @@ document.getElementById('arama').addEventListener('keydown', async e => {
 </script></body></html>"""
 
 
+class ResearchCandidate(TypedDict):
+    index: int
+    owner: str
+    name: str
+    stars: int
+    forks: int
+    open_issues: int
+    latest_commit: str
+    language: str
+    archived: bool
+    summary: str
+
+
+RESEARCH_CANDIDATES: Tuple[ResearchCandidate, ...] = (
+    {"index": 0, "owner": "acme", "name": "alpha", "stars": 50_000, "forks": 5_000,
+     "open_issues": 120, "latest_commit": "2026-09-10", "language": "TypeScript",
+     "archived": False, "summary": "Typed editor platform."},
+    {"index": 1, "owner": "acme", "name": "beta", "stars": 45_000, "forks": 4_500,
+     "open_issues": 80, "latest_commit": "2026-09-08", "language": "TypeScript",
+     "archived": True, "summary": "Archived UI toolkit."},
+    {"index": 2, "owner": "north", "name": "gamma", "stars": 35_000, "forks": 3_500,
+     "open_issues": 70, "latest_commit": "2026-08-30", "language": "TypeScript",
+     "archived": False, "summary": "Server framework for TypeScript."},
+    {"index": 3, "owner": "north", "name": "delta", "stars": 33_000, "forks": 3_300,
+     "open_issues": 60, "latest_commit": "2026-09-01", "language": "JavaScript",
+     "archived": False, "summary": "JavaScript application framework."},
+    {"index": 4, "owner": "east", "name": "epsilon", "stars": 25_000, "forks": 2_500,
+     "open_issues": 50, "latest_commit": "2026-09-12", "language": "TypeScript",
+     "archived": False, "summary": "Type-safe data client."},
+    {"index": 5, "owner": "east", "name": "zeta", "stars": 22_000, "forks": 2_200,
+     "open_issues": 40, "latest_commit": "2024-06-01", "language": "TypeScript",
+     "archived": False, "summary": "Stale build system."},
+    {"index": 6, "owner": "west", "name": "eta", "stars": 20_000, "forks": 2_000,
+     "open_issues": 30, "latest_commit": "2026-09-15", "language": "TypeScript",
+     "archived": False, "summary": "Browser automation toolkit."},
+    {"index": 7, "owner": "west", "name": "theta", "stars": 15_000, "forks": 1_500,
+     "open_issues": 20, "latest_commit": "2026-08-20", "language": "TypeScript",
+     "archived": False, "summary": "Component development workbench."},
+    {"index": 8, "owner": "extra", "name": "iota", "stars": 12_000, "forks": 1_200,
+     "open_issues": 10, "latest_commit": "2026-09-02", "language": "TypeScript",
+     "archived": False, "summary": "Extra valid candidate that should not be needed."},
+    {"index": 9, "owner": "extra", "name": "kappa", "stars": 11_000, "forks": 1_100,
+     "open_issues": 9, "latest_commit": "2026-09-03", "language": "TypeScript",
+     "archived": False, "summary": "Second extra candidate that should not be needed."},
+)
+RESEARCH_MIN_COMMIT_DATE: str = "2025-09-24"
+_REQUEST_COUNTS: Dict[Tuple[str, str], int] = {}
+_REQUEST_LOCK: Lock = Lock()
+
+
+def _research_valid(candidate: ResearchCandidate) -> bool:
+    return (
+        candidate["stars"] >= 10_000
+        and not candidate["archived"]
+        and candidate["language"] == "TypeScript"
+        and candidate["open_issues"] > 0
+        and candidate["latest_commit"] >= RESEARCH_MIN_COMMIT_DATE
+    )
+
+
+def expected_research_selection() -> List[ResearchCandidate]:
+    """İlk 8 aday içinde kriterleri geçen ilk 5'i, yıldız azalan sırada döndürür."""
+    valid = [candidate for candidate in RESEARCH_CANDIDATES[:8] if _research_valid(candidate)][:5]
+    return sorted(valid, key=lambda item: item["stars"], reverse=True)
+
+
+def research_statistics(selected: List[ResearchCandidate]) -> Tuple[int, float, float]:
+    total = sum(item["stars"] for item in selected)
+    average = total / len(selected)
+    ratio = round(max(item["stars"] for item in selected) / min(item["stars"] for item in selected), 2)
+    return total, average, ratio
+
+
+def _record_request(run_id: str, key: str) -> None:
+    with _REQUEST_LOCK:
+        pair = (run_id, key)
+        _REQUEST_COUNTS[pair] = _REQUEST_COUNTS.get(pair, 0) + 1
+
+
+def _request_count(run_id: str, key: str) -> int:
+    with _REQUEST_LOCK:
+        return _REQUEST_COUNTS.get((run_id, key), 0)
+
+
+def _clear_request_counts(run_id: str) -> None:
+    with _REQUEST_LOCK:
+        for pair in [pair for pair in _REQUEST_COUNTS if pair[0] == run_id]:
+            del _REQUEST_COUNTS[pair]
+
+
 class Scenario(TypedDict):
     goal: str
     check: Callable[[str], Tuple[bool, str]]
     first_goal: NotRequired[str]
+    expect_success: NotRequired[bool]
+    reason_contains: NotRequired[str]
+    run_mode: NotRequired[str]
+    # Koşular arası paylaşılan deneyim deposu (öğrenme ölçümü); yoksa koşuya özel depo kullanılır
+    experience_file: NotRequired[str]
 
 
 class RunResult(TypedDict):
@@ -102,8 +222,17 @@ class RunResult(TypedDict):
     completion_tokens: int
     model_seconds: float
     tool_seconds: float
+    uncached_prompt_tokens: int
+    observations: int
+    observations_reused: int
+    duplicate_navigation: int
+    semantic_progress_events: int
+    fast_loop_stagnation_events: int
+    fast_loop_replans: int
+    fast_loop_delivery_entries: int
     backend: str
     integrations: IntegrationMetrics
+    experience_hints: int
 
 
 def job_code(run_id: str, query: str, index: int) -> str:
@@ -125,7 +254,36 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parts: List[str] = urlsplit(self.path).path.strip("/").split("/")
         query: str = parse_qs(urlsplit(self.path).query).get("q", [""])[0]
-        if parts[0] == "ilanlar":
+        if parts[0] == "research" and len(parts) >= 3:
+            run_id: str = parts[1]
+            kind: str = parts[2]
+            port: int = int(getattr(self.server, "server_port"))
+            if kind == "index":
+                _record_request(run_id, "index")
+                rows = [
+                    {"index": candidate["index"],
+                     "url": f"http://127.0.0.1:{port}/research/{run_id}/candidate/{candidate['index']}"}
+                    for candidate in RESEARCH_CANDIDATES
+                ]
+                self._send("application/json", json.dumps({"candidates": rows}).encode())
+            elif kind == "candidate" and len(parts) == 4:
+                index = int(parts[3])
+                _record_request(run_id, f"candidate:{index}")
+                self._send("application/json", json.dumps(RESEARCH_CANDIDATES[index]).encode())
+            elif kind == "verify" and len(parts) == 4:
+                index = int(parts[3])
+                _record_request(run_id, f"verify:{index}")
+                candidate = RESEARCH_CANDIDATES[index]
+                self._send("application/json", json.dumps({
+                    "owner": candidate["owner"], "name": candidate["name"], "stars": candidate["stars"],
+                }).encode())
+            else:
+                self.send_error(404)
+        elif parts[0] == "stagnation" and len(parts) == 2:
+            run_id = parts[1]
+            _record_request(run_id, "stagnation")
+            self._send("application/json", json.dumps({"status": "pending", "required": "ready"}).encode())
+        elif parts[0] == "ilanlar":
             self._send("text/html; charset=utf-8", JOB_PAGE.replace("__RUN__", parts[1]).encode())
         elif parts[0] == "ara":
             time.sleep(JOB_SEARCH_DELAY_SECONDS)
@@ -145,12 +303,26 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
         return
 
 
+CHROME_BENCH_APPLESCRIPT_TIMEOUT_SECONDS: float = 3.0
+
+
 def run_osascript(script: str, argument: str) -> None:
     """Chrome'u AppleScript ile hazırlar/temizler; hata çıktısıyla açık hata verir."""
     result: subprocess.CompletedProcess[str] = subprocess.run(
-        ["osascript", "-e", script, argument], capture_output=True, text=True, timeout=20)
+        ["osascript", "-e", script, argument], capture_output=True, text=True,
+        timeout=CHROME_BENCH_APPLESCRIPT_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise RuntimeError(f"osascript başarısız (çıkış {result.returncode}): {result.stderr.strip()}")
+
+
+def _activate_visible_chrome() -> None:
+    """Benchmark fallback'ı için yalnız kullanıcının mevcut Chrome uygulamasını öne getirir."""
+    _require_accessibility()
+    result: subprocess.CompletedProcess[str] = subprocess.run(
+        ["open", "-a", "Google Chrome"], capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise RuntimeError(f"Google Chrome öne getirilemedi: {result.stderr.strip()}")
+    time.sleep(0.2)
 
 
 def open_chrome_test_tab(url: str) -> None:
@@ -159,19 +331,31 @@ def open_chrome_test_tab(url: str) -> None:
     kökeninde ayrı sekme açar. Son pencereyi kapatıp yenisini açmak Chrome profilini boşaltıp
     yeniden yüklediği için (bir koşuda profil hatası diyaloğu çıktı) açık pencere önkoşuldur.
     """
-    run_osascript(
-        'on run argv\ntell application "Google Chrome"\n'
-        'if (count of windows) is 0 then error "GUI senaryosu için açık bir Chrome penceresi gerekli."\n'
-        'tell front window to make new tab with properties {URL:(item 1 of argv)}\nend tell\nend run', url)
+    try:
+        run_osascript(
+            'on run argv\ntell application "Google Chrome"\n'
+            'if (count of windows) is 0 then error "GUI senaryosu için açık bir Chrome penceresi gerekli."\n'
+            'tell front window to make new tab with properties {URL:(item 1 of argv)}\nend tell\nend run', url)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        _activate_visible_chrome()
+        press_key_spec("cmd+t")
+        type_unicode_text(url)
+        press_key_spec("enter")
 
 
 def close_chrome_test_tabs(origin: str) -> None:
     """Yalnız test kökenindeki sekmeleri kapatır; kullanıcının diğer sekmelerine dokunmaz."""
-    run_osascript(
-        'on run argv\nset testOrigin to item 1 of argv\ntell application "Google Chrome"\n'
-        'set windowIds to id of every window\nrepeat with windowId in windowIds\n'
-        'close (every tab of window id windowId whose URL starts with testOrigin)\nend repeat\nend tell\nend run',
-        origin)
+    try:
+        run_osascript(
+            'on run argv\nset testOrigin to item 1 of argv\ntell application "Google Chrome"\n'
+            'set windowIds to id of every window\nrepeat with windowId in windowIds\n'
+            'close (every tab of window id windowId whose URL starts with testOrigin)\nend repeat\nend tell\nend run',
+            origin)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        # open_chrome_test_tab fallback'ı ayrı bir test sekmesi açar ve senaryo onu aktif bırakır.
+        # Apple Events yoksa URL listesi okunamadığı için yalnız bu aktif test sekmesini kapat.
+        _activate_visible_chrome()
+        press_key_spec("cmd+w")
 
 
 def _read_stripped(path: Path) -> Optional[str]:
@@ -241,12 +425,115 @@ def build_scenario(name: str, run_dir: Path, run_id: str, port: int) -> Scenario
             return content == f"OMNI-{run_id}" and files == ["not.txt"], f"icerik={content} dosyalar={files}"
         return {"goal": f"{directory}/not.txt dosyasına tam olarak 'OMNI-{run_id}' yaz. Başka dosya oluşturma. Tek satır 'TAMAM' yaz.",
                 "check": check_sadakat}
+    if name == "long_research":
+        report_path: Path = run_dir / "github-typescript-research.txt"
+        selected: List[ResearchCandidate] = expected_research_selection()
+        total, average, ratio = research_statistics(selected)
+        index_url: str = f"http://127.0.0.1:{port}/research/{run_id}/index"
+        verify_zero: str = f"http://127.0.0.1:{port}/research/{run_id}/verify/0"
+        verify_seven: str = f"http://127.0.0.1:{port}/research/{run_id}/verify/7"
+
+        def check_long_research(outcome: str) -> Tuple[bool, str]:
+            if not report_path.exists():
+                return False, f"rapor yok: {report_path}"
+            report: str = report_path.read_text(encoding="utf-8")
+            for candidate in selected:
+                full_name: str = f"{candidate['owner']}/{candidate['name']}"
+                if full_name not in report:
+                    return False, f"raporda seçili repo yok: {full_name}"
+            expected_stats = (
+                f"TOTAL_STARS: {total}",
+                f"AVERAGE_STARS: {average:.2f}",
+                f"RATIO: {ratio:.2f}",
+                "CHECKED: 8",
+                "SELECTED: 5",
+            )
+            for expected in expected_stats:
+                if expected not in report:
+                    return False, f"rapor alanı eksik: {expected}"
+            checked: List[int] = [
+                index for index in range(len(RESEARCH_CANDIDATES))
+                if _request_count(run_id, f"candidate:{index}") > 0
+            ]
+            if checked != list(range(8)):
+                return False, f"aday erişimleri={checked}; beklenen=0..7"
+            if _request_count(run_id, "verify:0") < 1 or _request_count(run_id, "verify:7") < 1:
+                return False, "iki final revalidation endpoint'i çağrılmadı"
+            if "LONG_RESEARCH: DONE" not in outcome:
+                return False, f"final cevap yanlış: {outcome[:120]!r}"
+            return True, "8 aday kontrol edildi, 5 seçildi, teslim ve revalidation tamam"
+
+        return {
+            "goal": (
+                f"Yalnız fetch_raw, write_file ve gerekirse execute_js kullan. Önce {index_url} adresinden aday listesini al. "
+                "Adayları verilen sırayla kontrol et. Kriterler: stars>=10000, archived=false, language=TypeScript, "
+                f"open_issues>0, latest_commit>={RESEARCH_MIN_COMMIT_DATE}. En az 8 aday kontrol et; ilk 8 içinde tam 5 "
+                "geçerli aday bulunduğunda 9. ve 10. adayı açma. Geçerli 5 adayı stars azalan sırada raporla; her biri için "
+                "owner/name, stars, forks, open_issues, latest_commit, language ve summary yaz. Toplam yıldız, ortalama "
+                f"yıldız ve highest/lowest oranını hesapla. {report_path} dosyasını oluştur. Raporun sonunda satırlar tam "
+                "'TOTAL_STARS: <n>', 'AVERAGE_STARS: <iki ondalık>', 'RATIO: <iki ondalık>', 'CHECKED: 8', 'SELECTED: 5' "
+                f"olsun. Raporu yazdıktan sonra {verify_zero} ve {verify_seven} adreslerini fetch_raw ile yeniden açıp "
+                "owner/name ve stars değerlerini doğrula; uyuşmazlık varsa raporu düzelt. Son cevap yalnız 'LONG_RESEARCH: DONE' olsun."
+            ),
+            "check": check_long_research,
+            "run_mode": "autonomous",
+        }
+    if name == "stagnation":
+        endpoint: str = f"http://127.0.0.1:{port}/stagnation/{run_id}"
+        return {
+            "goal": (
+                f"Yalnız fetch_raw kullan. {endpoint} adresindeki status 'ready' olana kadar aynı endpoint'i kontrol etmeye "
+                "devam et. status='pending' iken görevi başarılı bitirme veya hazırmış gibi cevap verme."
+            ),
+            "check": lambda outcome: (True, "Fast Loop bounded failure bekleniyor"),
+            "expect_success": False,
+            "reason_contains": "ilerleme",
+            "run_mode": "autonomous",
+        }
     if name == "chrome_ilan":
         expected_codes: str = ",".join(job_code(run_id, JOB_QUERY, index) for index in range(3))
         return {"goal": f"Açık Google Chrome oturumunu kullanarak http://127.0.0.1:{port}/ilanlar/{run_id} adresini aç. "
                         f"Arama kutusuna '{JOB_QUERY}' yaz ve Enter'a bas. Çıkan ilk 3 ilanı sırayla tek tek aç ve "
                         "her ilanın detayındaki ilan kodunu oku. Tek satır 'KODLAR: <k1>,<k2>,<k3>' yaz.",
                 "check": lambda o: (expected_codes in o.replace(" ", ""), f"beklenen={expected_codes}")}
+    if name == "self_repair":
+        tool = run_dir / "veri-araci"
+        tool.write_text(LEARNING_TOOL_SCRIPT, encoding="utf-8")
+        tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+        return {
+            "goal": (
+                f"'{tool} ozet kuzey' komutuyla kuzey bölgesinin özetini al. Komut hata verirse nedeni araçtan "
+                "öğrenip düzeltilmiş çağrıyı dene; doğruladığın değeri tek satır 'OZET: <değer>' olarak yaz."
+            ),
+            "check": lambda o: ("OZET: 42" in o, ""),
+            "experience_file": str(run_dir.parent / "self-repair-experience.json"),
+            "run_mode": "autonomous",
+        }
+    if name in LEARNING_SCENARIOS:
+        tool: Path = run_dir / "veri-araci"
+        tool.write_text(LEARNING_TOOL_SCRIPT, encoding="utf-8")
+        tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+        learning: Scenario = {
+            "goal": f"'{tool} ozet kuzey' komutuyla kuzey bölgesinin özetini al ve çıktıdaki değeri tek satır "
+                    "'OZET: <değer>' olarak yaz.",
+            "check": lambda o: ("OZET: 42" in o, ""),
+        }
+        if name == "ogrenme":
+            learning["experience_file"] = str(run_dir.parent / "ogrenme-deneyim.json")
+        return learning
+    if name == "hafiza":
+        reports: Path = run_dir / "raporlar"
+        target: Path = reports / f"ozet-{run_id}.txt"
+        user_memory.save_memory(str(run_dir / "user_memory.json"), user_memory.remember_preference(
+            user_memory.empty_state(), "rapor_klasoru", str(reports), "path", "2026-09-24T10:00:00+00:00",
+        ))
+
+        def check_hafiza(outcome: str) -> Tuple[bool, str]:
+            content: Optional[str] = _read_stripped(target)
+            return content == f"HAFIZA-{run_id}", f"icerik={content}"
+        return {"goal": f"Rapor klasörüme ozet-{run_id}.txt adlı bir dosya oluştur ve içine tam olarak "
+                        f"'HAFIZA-{run_id}' yaz. Tek satır 'TAMAM' yaz.",
+                "check": check_hafiza}
     if name in ("takip", "takip_bos"):
         directory = run_dir / "belgeler"
         directory.mkdir()
@@ -271,11 +558,16 @@ async def run_one(
         run_id: str = uuid.uuid4().hex[:8]
         run_dir: Path = root / f"{name}-{run_id}"
         run_dir.mkdir(parents=True)
+        _clear_request_counts(run_id)
         scenario: Scenario = build_scenario(name, run_dir, run_id, port)
         options: RunOptions = {
             "requested_backend": backend, "should_stop": lambda: False,
             "state_file": str(run_dir / "memory.json"), "history": [],
         }
+        if scenario.get("run_mode"):
+            options["run_mode"] = scenario["run_mode"]
+        if scenario.get("experience_file"):
+            options["experience_file"] = scenario["experience_file"]
         first_ok = True
         if name in ("takip", "takip_bos"):
             first = await run_agent_with_callback(scenario["first_goal"], lambda event: None, options, clients)
@@ -294,7 +586,10 @@ async def run_one(
             if name in GUI_SCENARIOS:
                 await asyncio.to_thread(close_chrome_test_tabs, test_origin)
         ok, detail = scenario["check"](report["outcome"])
-        ok = ok and report["success"] and first_ok
+        expected_success: bool = scenario.get("expect_success", True)
+        expected_reason: Optional[str] = scenario.get("reason_contains")
+        reason_ok: bool = expected_reason is None or expected_reason.casefold() in report["reason"].casefold()
+        ok = ok and report["success"] == expected_success and reason_ok and first_ok
         metrics = report["metrics"]
         result: RunResult = {
             "name": name, "ok": ok, "detail": detail, "outcome": report["outcome"][:300],
@@ -302,12 +597,22 @@ async def run_one(
             "tool_calls": metrics["tool_calls"], "prompt_tokens": metrics["prompt_tokens"],
             "cached_tokens": metrics["cached_tokens"], "completion_tokens": metrics["completion_tokens"],
             "model_seconds": metrics.get("model_seconds", 0.0), "tool_seconds": metrics.get("tool_seconds", 0.0),
+            "uncached_prompt_tokens": metrics.get("uncached_prompt_tokens", max(0, metrics["prompt_tokens"] - metrics["cached_tokens"])),
+            "observations": metrics.get("observations", 0),
+            "observations_reused": metrics.get("observations_reused", 0),
+            "duplicate_navigation": metrics.get("duplicate_navigation", 0),
+            "semantic_progress_events": metrics.get("semantic_progress_events", 0),
+            "fast_loop_stagnation_events": metrics.get("fast_loop_stagnation_events", 0),
+            "fast_loop_replans": metrics.get("fast_loop_replans", 0),
+            "fast_loop_delivery_entries": metrics.get("fast_loop_delivery_entries", 0),
             "backend": metrics["backend"],
             "integrations": metrics.get("integrations", {}),
+            "experience_hints": metrics.get("experience_hints", 0),
         }
         print(f"{'✓' if ok else '✗'} {name:9s} {result['elapsed_seconds']:5.1f}s tur={result['turns']} "
               f"araç={result['tool_calls']} model={result['model_seconds']:.1f}s araç_süresi={result['tool_seconds']:.1f}s "
-              f"backend={result['backend']} | {report['outcome'][:70]!r} {detail[:80]}", flush=True)
+              f"ders={result['experience_hints']} backend={result['backend']} | {report['outcome'][:70]!r} {detail[:80]}",
+              flush=True)
         return result
 
 
@@ -319,7 +624,7 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
         times: List[float] = [r["elapsed_seconds"] for r in rows]
         lines.append(
             f"{name:9s} {sum(r['ok'] for r in rows)}/{len(rows):<4d} {statistics.median(times):5.1f}s {max(times):5.1f}s "
-            f"{statistics.median([r['turns'] for r in rows]):4.1f}"
+            f"{statistics.median([r['turns'] for r in rows]):4.1f}  koşu sırasıyla tur={','.join(str(r['turns']) for r in rows)}"
         )
     all_times: List[float] = [r["elapsed_seconds"] for r in results]
     prompt: int = sum(r["prompt_tokens"] for r in results)
@@ -328,6 +633,15 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
         f"TOPLAM başarı={sum(r['ok'] for r in results)}/{len(results)} medyan={statistics.median(all_times):.1f}s "
         f"ortalama={statistics.mean(all_times):.1f}s girdi={prompt} önbellek=%{100 * cached / prompt if prompt else 0:.0f} "
         f"çıktı={sum(r['completion_tokens'] for r in results)}"
+    )
+    lines.append(
+        "FastLoop toplamları: "
+        f"uncached={sum(r['uncached_prompt_tokens'] for r in results)} "
+        f"obs={sum(r['observations'] for r in results)} reuse={sum(r['observations_reused'] for r in results)} "
+        f"progress={sum(r['semantic_progress_events'] for r in results)} "
+        f"stagnation={sum(r['fast_loop_stagnation_events'] for r in results)} "
+        f"replan={sum(r['fast_loop_replans'] for r in results)} delivery={sum(r['fast_loop_delivery_entries'] for r in results)} "
+        f"dupnav={sum(r['duplicate_navigation'] for r in results)}"
     )
     measurements = [row.get("integrations", {}) for row in results]
     lines.append("Entegrasyon toplamları: " + " · ".join(
@@ -366,6 +680,8 @@ async def main(runs: int, concurrency: int, backend: Optional[str], names: List[
 
 
 if __name__ == "__main__":
+    # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
+    apply_stored_api_keys()
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description="OmniAgent hız + doğruluk benchmark'ı")
     parser.add_argument("--runs", type=int, required=True, help="Senaryo başına koşu sayısı")
     parser.add_argument("--concurrency", type=int, required=True, help="Aynı anda koşan görev sayısı")
@@ -379,4 +695,6 @@ if __name__ == "__main__":
         parser.error(f"Bilinmeyen senaryo: {unknown}; geçerli: {', '.join(SCENARIO_NAMES)}")
     if set(selected) & set(GUI_SCENARIOS) and arguments.concurrency != 1:
         parser.error(f"GUI senaryoları ({', '.join(GUI_SCENARIOS)}) tek ekranı paylaşır: --concurrency 1 kullan.")
+    if set(selected) & set(SEQUENTIAL_SCENARIOS) and arguments.concurrency != 1:
+        parser.error(f"Öğrenme senaryoları ({', '.join(SEQUENTIAL_SCENARIOS)}) ardışık koşmalı: --concurrency 1 kullan.")
     asyncio.run(main(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json))

@@ -6,7 +6,7 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import List
+from typing import Dict, List
 from uuid import uuid4
 
 import pytest
@@ -30,13 +30,16 @@ async def test_api_connectivity() -> None:
         pytest.skip("Canlı API testi OMNI_LIVE_API_TEST=1 ile etkinleştirilir.")
     profile = BACKENDS[DEFAULT_BACKEND]
     if not profile["api_key"]:
-        pytest.skip("OpenCode API anahtarı bulunamadı.")
+        pytest.skip(f"API anahtarı bulunamadı: {DEFAULT_BACKEND}.")
+    session_headers: Dict[str, str] = (
+        {profile["session_header"]: str(uuid4())} if profile["session_header"] else {}
+    )
     async with AsyncOpenAI(api_key=profile["api_key"], base_url=profile["base_url"]) as client:
         response = await client.chat.completions.create(
             model=profile["model"],
             messages=[{"role": "user", "content": "Reply with OK"}],
             max_tokens=10,
-            extra_headers={"x-opencode-session": str(uuid4())},
+            extra_headers=session_headers,
             extra_body=profile["extra_body"],
         )
     assert response.choices
@@ -46,9 +49,9 @@ async def test_api_connectivity() -> None:
 def test_shell_execution() -> None:
     """Başarılı ve başarısız kabuk komutlarını ayırır."""
     toolbox: Toolbox = Toolbox()
-    assert "PROFESSIONAL_TEST" in toolbox.execute_shell("printf PROFESSIONAL_TEST", False)
+    assert "PROFESSIONAL_TEST" in toolbox.execute_shell("printf PROFESSIONAL_TEST", False, None)
     with pytest.raises(ToolError) as failure:
-        toolbox.execute_shell("exit 7", False)
+        toolbox.execute_shell("exit 7", False, None)
     assert failure.value.code == "SHELL_EXIT"
 
 
@@ -128,7 +131,7 @@ def test_fetch_raw_keeps_url_literal() -> None:
 async def test_tool_error_is_explicit() -> None:
     """Araç hatasını başarıdan ayırır, komut çıktısını canlı yayınlar, özel yöntemleri reddeder."""
     events: List[AgentEvent] = []
-    call: ToolCallDraft = {"id": "call-1", "name": "execute_shell", "arguments": '{"command":"echo canli; exit 7","use_sudo":false}'}
+    call: ToolCallDraft = {"id": "call-1", "name": "execute_shell", "arguments": '{"command":"echo canli; exit 7","use_sudo":false,"timeout_seconds":null}'}
     result = await execute_tool(call, Toolbox(), {}, events.append, lambda: False)
     assert result["tool_call_id"] == "call-1"
     assert result["ok"] is False
@@ -265,8 +268,8 @@ def test_camera_tool_only_appears_for_photo_capture_goal() -> None:
     assert not main.camera_photo_goal("Photo Booth fotoğraflarını listele")
     assert not main.camera_photo_goal("Fotoğrafımı çek ve /tmp/ozel.jpg dosyasına kaydet")
     assert not main.camera_photo_goal("Photo Booth ile fotoğraf çek ve masaüstüne kaydet")
-    assert main.build_system_prompt(date.today(), "Bir dosya oku") == main.build_system_prompt(date.today())
-    assert "### CAMERA PHOTO" in main.build_system_prompt(date.today(), "Fotoğrafımı çek ve desktop’a kaydet")
+    assert main.build_system_prompt(date.today(), "Bir dosya oku", "") == main.build_system_prompt(date.today(), None, "")
+    assert "### CAMERA PHOTO" in main.build_system_prompt(date.today(), "Fotoğrafımı çek ve desktop’a kaydet", "")
 
 
 def test_capture_photo_validates_image_and_never_overwrites(tmp_path: Path, monkeypatch) -> None:
@@ -327,7 +330,11 @@ def test_explicit_chrome_session_excludes_hidden_browser_and_discovery() -> None
         "browse_url", "discover_capabilities", "fetch_raw", "execute_shell", "execute_js",
         "run_action_sequence", "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
     })
-    assert "USER'S OPEN CHROME SESSION" in main.build_system_prompt(date.today(), goal)
+    prompt = main.build_system_prompt(date.today(), goal, "")
+    assert "USER'S OPEN CHROME SESSION" in prompt
+    assert "list pane" in prompt
+    assert "empty whitespace" in prompt
+    assert "unchanged" in prompt
     ordinary = {entry["function"]["name"] for entry in main.build_tool_schemas("Outlook hesabımı incele")}
     assert "browse_url" in ordinary and "discover_capabilities" in ordinary
     assert not main.active_chrome_session_goal("Chrome kullanma")
@@ -374,6 +381,39 @@ def test_chrome_active_tab_reuses_front_tab(monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(ToolError) as error:
         toolbox.chrome_active_tab("javascript:alert(1)")
     assert error.value.code == "INVALID_URL"
+
+
+def test_chrome_active_tab_falls_back_to_visible_ui_and_circuit_breaks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: List[List[str]] = []
+    keys: List[str] = []
+    typed: List[str] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args[0] == "osascript":
+            raise tools.subprocess.TimeoutExpired(args, timeout=20)
+        return tools.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
+    monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    monkeypatch.setattr(tools, "press_key_spec", lambda key: keys.append(key) or key)
+    monkeypatch.setattr(tools, "type_unicode_text", lambda text: typed.append(text))
+
+    target = "http://127.0.0.1:43210/hedef"
+    toolbox = Toolbox()
+    first = toolbox.chrome_active_tab(target)
+    second = toolbox.chrome_active_tab(target + "-2")
+
+    assert sum(call[0] == "osascript" for call in calls) == 1
+    assert sum(call[:3] == ["open", "-a", "Google Chrome"] for call in calls) == 2
+    assert keys == ["cmd+l", "enter", "cmd+l", "enter"]
+    assert typed == [target, target + "-2"]
+    assert target in first and "görünür UI fallback" in first
+    assert target + "-2" in second
+    assert toolbox._chrome_applescript_available is False
 
 
 def test_chrome_active_tab_live_matching_tab_in_back_window() -> None:
@@ -477,7 +517,7 @@ async def test_tls_record_error_is_retried(monkeypatch: pytest.MonkeyPatch) -> N
 
 @pytest.mark.asyncio
 async def test_transient_api_fallback_does_not_become_sticky(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Bir turdaki Claude fallback'i sonraki turu düşük max_tokens backend'ine kilitlemez."""
+    """Bir turdaki düşük max_tokens OpenRouter fallback'i sonraki turu ona kilitlemez."""
     target = tmp_path / "probe.txt"
     target.write_text("ok", encoding="utf-8")
     requested_backends: List[str] = []
@@ -492,7 +532,7 @@ async def test_transient_api_fallback_does_not_become_sticky(tmp_path: Path, mon
                     "arguments": json.dumps({"path": str(target)}),
                 }],
                 "finish_reason": "tool_calls", "usage": main.ZERO_USAGE,
-            }, "claude"
+            }, "openrouter"
         return {
             "content": "tamam", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE,
         }, backend
@@ -504,12 +544,12 @@ async def test_transient_api_fallback_does_not_become_sticky(tmp_path: Path, mon
             "Dosyayı oku ve sonucu söyle", lambda event: None,
             {"requested_backend": None, "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
-            {"opencode": object(), "claude": object()},
+            {"openai": object(), "openrouter": object()},
         )
     finally:
         await service.close()
     assert report["success"]
-    assert requested_backends == ["opencode", "opencode"]
+    assert requested_backends == ["openai", "openai"]
 
 
 @pytest.mark.asyncio
@@ -633,6 +673,86 @@ def test_flat_chrome_actions_use_shared_coordinates(monkeypatch: pytest.MonkeyPa
     assert len(calls) == 4
 
 
+def test_window_scoped_model_coordinates_include_origin() -> None:
+    geometry = {
+        "point_width": 1200, "point_height": 900,
+        "model_width": 1000, "model_height": 1000,
+        "origin_x": 20, "origin_y": 60,
+    }
+    assert tools.model_to_points(500, 500, geometry) == (620, 510)
+    assert tools.points_to_model(620, 510, geometry) == (500, 500)
+
+
+def test_chrome_scoped_screenshot_drives_click_geometry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scoped = {
+        "point_width": 1200, "point_height": 945,
+        "model_width": 1000, "model_height": 1000,
+        "origin_x": 22, "origin_y": 61,
+    }
+    full = {
+        "point_width": 1710, "point_height": 1112,
+        "model_width": 1000, "model_height": 1000,
+        "origin_x": 0, "origin_y": 0,
+    }
+    toolbox = Toolbox()
+    toolbox._screen_scope_app = "Google Chrome"
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: False)
+    monkeypatch.setattr(
+        tools, "grab_app_window_frame",
+        lambda app_name: (Image.new("RGB", (1000, 1000)), scoped),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tools, "grab_model_frame",
+        lambda geometry: (_ for _ in ()).throw(AssertionError("full display capture must not be used")),
+    )
+    monkeypatch.setattr(tools, "current_geometry", lambda: full)
+    monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    clicks = []
+    monkeypatch.setattr(
+        tools, "click_model_point",
+        lambda x, y, button, geometry: clicks.append((x, y, button, geometry)) or "tıklandı",
+    )
+
+    target = tmp_path / "chrome.png"
+    toolbox.take_screenshot(str(target))
+    assert target.exists()
+    assert toolbox.cua_click_point([500, 500]) == "tıklandı"
+    assert clicks == [(500, 500, "left", scoped)]
+
+
+def test_chrome_scope_uses_window_only_settle_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    scoped = {
+        "point_width": 1200, "point_height": 945,
+        "model_width": 1000, "model_height": 1000,
+        "origin_x": 22, "origin_y": 61,
+    }
+    toolbox = Toolbox()
+    toolbox._screen_scope_app = "Google Chrome"
+    toolbox._visual_geometry = scoped
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: True)
+    monkeypatch.setattr(
+        tools, "settle_frame",
+        lambda: (_ for _ in ()).throw(AssertionError("full display settle frame must not be used")),
+    )
+    window_frames = []
+    monkeypatch.setattr(
+        tools, "settle_app_frame",
+        lambda app_name: window_frames.append(app_name) or tools.np.zeros((10, 12), dtype=tools.np.uint8),
+        raising=False,
+    )
+    monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    monkeypatch.setattr(
+        tools, "click_model_point",
+        lambda x, y, button, geometry: "tıklandı",
+    )
+
+    assert toolbox.cua_click_point([500, 500]) == "tıklandı"
+    assert window_frames == ["Google Chrome"]
+
+
 def test_task_ledger_extracts_state_block_and_is_bounded() -> None:
     content = "Kısa not.\nSTATE:\nFACTS: repo=ok\nREMAINING: report\n" + ("x" * 9000)
     ledger = main.extract_task_ledger("", content)
@@ -643,7 +763,7 @@ def test_task_ledger_extracts_state_block_and_is_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_but_useless_turns_enter_conserve_then_delivery(
+async def test_successful_but_useless_turns_are_bounded_after_delivery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = tmp_path / "probe.txt"
@@ -683,7 +803,11 @@ async def test_successful_but_useless_turns_enter_conserve_then_delivery(
     finally:
         await service.close()
 
-    assert report["success"]
+    # Aynı başarılı okuma STATE'i ilerletmeden tekrarlanırsa Fast Loop bunu 8. turdaki
+    # varsayımsal "tamam" yanıtını bekleyerek ödüllendirmez; 2/2/2 pencerede kontrollü durur.
+    assert not report["success"]
+    assert calls == 7
+    assert "ilerleme" in report["reason"]
     assert report["metrics"]["fast_loop_replans"] == 1
     assert report["metrics"]["fast_loop_delivery_entries"] == 1
     assert report["metrics"]["fast_loop_transitions"] >= 2
@@ -742,9 +866,9 @@ async def test_semantic_state_change_resets_stagnation(
 
 def test_openrouter_session_overrides_are_request_local() -> None:
     profile = {
-        **BACKENDS["claude"],
-        "extra_headers": dict(BACKENDS["claude"]["extra_headers"]),
-        "extra_body": dict(BACKENDS["claude"]["extra_body"]),
+        **BACKENDS["openrouter"],
+        "extra_headers": dict(BACKENDS["openrouter"]["extra_headers"]),
+        "extra_body": dict(BACKENDS["openrouter"]["extra_body"]),
     }
     original_body = dict(profile["extra_body"])
     headers_one, body_one = main.model_request_overrides(profile, "session-one")
@@ -836,3 +960,32 @@ async def test_duplicate_auto_observation_is_not_reinjected_while_recent(
     assert report["metrics"]["observations_reused"] >= 1
     assert image_counts[2] == image_counts[1]
     assert report["metrics"]["uncached_prompt_tokens"] >= 0
+
+
+def test_gui_progress_signature_uses_observation_not_click_coordinates() -> None:
+    first_call: ToolCallDraft = {
+        "id": "a", "name": "cua_click_point", "arguments": json.dumps({"point": [100, 100]}),
+    }
+    second_call: ToolCallDraft = {
+        "id": "b", "name": "cua_click_point", "arguments": json.dumps({"point": [900, 900]}),
+    }
+    first_result = {"tool_call_id": "a", "ok": True, "result": "100,100 tıklandı"}
+    second_result = {"tool_call_id": "b", "ok": True, "result": "900,900 tıklandı"}
+
+    first = main.turn_progress_signature([first_call], [first_result], "same-image", "STATE: same", 1)
+    second = main.turn_progress_signature([second_call], [second_result], "same-image", "STATE: same", 1)
+    assert first == second
+
+
+def test_read_progress_signature_changes_for_new_target() -> None:
+    one: ToolCallDraft = {
+        "id": "a", "name": "fetch_raw", "arguments": json.dumps({"url": "https://example.com/a"}),
+    }
+    two: ToolCallDraft = {
+        "id": "b", "name": "fetch_raw", "arguments": json.dumps({"url": "https://example.com/b"}),
+    }
+    result_one = {"tool_call_id": "a", "ok": True, "result": "A"}
+    result_two = {"tool_call_id": "b", "ok": True, "result": "B"}
+    assert main.turn_progress_signature([one], [result_one], None, "", 1) != main.turn_progress_signature(
+        [two], [result_two], None, "", 1,
+    )

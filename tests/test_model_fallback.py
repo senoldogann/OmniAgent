@@ -45,7 +45,7 @@ async def test_access_failure_is_quarantined_for_rest_of_task(
             clients, [], [], "oturum", "openai", lambda event: None, lambda: False,
         )
         assert second["content"] == "tamam" and used == "openai"
-        assert attempts == ["ollama-cloud", "codex-cli", "codex-cli"]
+        assert attempts == ["ollama-cloud", "openai", "openai"]
     finally:
         CURRENT_RUNTIME.reset(token)
 
@@ -128,7 +128,7 @@ async def test_retry_after_uses_other_provider_without_sleep(
             "ollama-cloud", lambda event: None, lambda: False,
         )
         assert turn["content"] == "tamam" and used == "openai"
-        assert attempts == ["ollama-cloud", "codex-cli"]
+        assert attempts == ["ollama-cloud", "openai"]
         assert runtime.blocked_backends == {"ollama-cloud"}
     finally:
         CURRENT_RUNTIME.reset(token)
@@ -143,9 +143,10 @@ def test_retry_after_parses_seconds_and_invalid_value() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_unavailable_routes_reach_third_ready_profile(
+async def test_two_blocked_providers_reach_third_ladder_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Erişim hatası alan iki sağlayıcı karantinaya alınır, merdivenin üçüncü basamağı işi bitirir."""
     attempts: list[str] = []
 
     class QuotaError(Exception):
@@ -156,10 +157,8 @@ async def test_two_unavailable_routes_reach_third_ready_profile(
         emit: Any, should_stop: Any,
     ) -> Any:
         attempts.append(profile["provider"])
-        if profile["provider"] == "ollama-cloud":
+        if profile["provider"] in ("ollama-cloud", "openai"):
             raise QuotaError("kota doldu")
-        if profile["provider"] == "codex-cli":
-            raise main.CliModelError("oturum yok")
         return {"content": "üçüncü profil çalıştı", "tool_calls": [],
                 "finish_reason": "stop", "usage": main.ZERO_USAGE}
 
@@ -169,12 +168,12 @@ async def test_two_unavailable_routes_reach_third_ready_profile(
     token = CURRENT_RUNTIME.set(runtime)
     try:
         turn, used = await main._call_model_with_retries(
-            {"ollama-cloud": object(), "openai": None, "zen-free": None}, [], [],
+            {"ollama-cloud": object(), "openai": object(), "openrouter": object()}, [], [],
             "oturum", "ollama-cloud", lambda event: None, lambda: False,
         )
         assert turn["content"] == "üçüncü profil çalıştı"
-        assert used == "zen-free"
-        assert attempts == ["ollama-cloud", "codex-cli", "opencode-cli"]
+        assert used == "openrouter"
+        assert attempts == ["ollama-cloud", "openai", "openrouter"]
         assert runtime.blocked_backends == {"ollama-cloud", "openai"}
     finally:
         CURRENT_RUNTIME.reset(token)

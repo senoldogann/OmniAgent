@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sys
 import uuid
 import webbrowser
@@ -18,9 +19,18 @@ import customtkinter as ctk
 from openai import AsyncOpenAI
 from PIL import Image
 
-from config import BACKENDS, DEFAULT_BACKEND
+import api_keys
+from config import (
+    API_KEY_VARIABLES, BACKENDS, DEFAULT_BACKEND, api_key_source, apply_stored_api_keys,
+    load_api_key, refresh_api_keys, set_api_key, set_backend_model,
+)
 from events import AgentEvent, compact_count, tool_label
+from desktop_status import MenuBarTaskStatus, app_is_active, is_backgrounded, notify_finished, set_dock_badge
 from host_lock import host_task_lock
+from model_catalog import (
+    ModelCatalogError, cached_models, list_provider_models, load_model_preferences,
+    save_model_preferences, valid_model_id,
+)
 from main import (
     RUN_MODE_PROFILES, STATE_FILE, RunOptions, RunReport, close_model_clients,
     create_model_clients, run_agent_with_callback,
@@ -51,7 +61,13 @@ WARNING: str = "#FFC107"
 INFO: str = "#B1B9F9"
 
 MONO_FAMILY: str = "Menlo"
-BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "ollama-cloud", "openai", "zen-free", "opencode", "minimax", "opencode-think", "claude")
+SETTINGS_HINT: str = (
+    "Anahtarlar macOS Keychain'de saklanır ve yalnızca bu makinede kalır. Kaydettiğiniz anda "
+    "ilgili model profili kullanılabilir olur; alanı boş bırakıp Kaydet demek kaydı siler. "
+    "Kayıtlı anahtar, kabukta tanımlı aynı değişkenden önceliklidir ve ajanın çalıştırdığı "
+    "komutlara ortam değişkeni olarak geçmez."
+)
+BACKEND_CHOICES: Tuple[str, ...] = ("Otomatik", "ollama-cloud", "openai", "opencode", "opencode-think", "openrouter")
 RUN_MODE_CHOICES: Tuple[str, ...] = tuple(
     profile["label"] for profile in RUN_MODE_PROFILES.values()
 )
@@ -70,6 +86,13 @@ COPY_SVG: str = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
   <rect x="8" y="8" width="11" height="12" rx="2" stroke="ICON_COLOR" stroke-width="1.8"/>
   <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h2" stroke="ICON_COLOR" stroke-width="1.8" stroke-linecap="round"/>
+</svg>
+"""
+# Diğer ikonlarla aynı boyut ve çizgi ağırlığında dişli: boyut farkı görsel tutarsızlık yaratıyordu.
+GEAR_SVG: str = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <circle cx="12" cy="12" r="3.2" stroke="ICON_COLOR" stroke-width="1.8"/>
+  <path d="M12 3.2v2.4M12 18.4v2.4M3.2 12h2.4M18.4 12h2.4M5.9 5.9l1.7 1.7M16.4 16.4l1.7 1.7M18.1 5.9l-1.7 1.7M7.6 16.4l-1.7 1.7" stroke="ICON_COLOR" stroke-width="1.8" stroke-linecap="round"/>
 </svg>
 """
 
@@ -231,6 +254,8 @@ class OmniUI(ctk.CTk):
         self._voice_icon_active: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT)
         self._voice_icon_busy: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_FAINT)
         self._copy_icon: ctk.CTkImage = _svg_ctk_image(COPY_SVG, TEXT_DIM)
+        self._gear_icon: ctk.CTkImage = _svg_ctk_image(GEAR_SVG, TEXT_DIM)
+        self._menu_status = MenuBarTaskStatus()
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -267,6 +292,8 @@ class OmniUI(ctk.CTk):
         self._tools_by_call: Dict[str, ToolView] = {}
         self._dirty_tools: Dict[str, ToolView] = {}
         self._run_started_at: float = 0.0
+        self._task_status: str = "idle"
+        self._badge_pending: bool = False
         self._turn_streamed_chars: int = 0
         self._completed_tokens: int = 0
         self._activity_verb: str = ""
@@ -277,16 +304,23 @@ class OmniUI(ctk.CTk):
         self._last_shimmer: float = 0.0
         self._last_blink: float = 0.0
         self._last_running_refresh: float = 0.0
+        self._last_menu_check: float = 0.0
 
         # Görevler tek bir kalıcı event loop'ta çalışır ve model istemcilerini paylaşır:
         # her görev sıcak HTTP bağlantılarıyla başlar (TLS el sıkışması tekrarlanmaz).
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, daemon=True).start()
-        self._clients: Dict[str, Optional[AsyncOpenAI]] = create_model_clients()
+        self._clients: Dict[str, AsyncOpenAI] = create_model_clients()
+        # Ayarlar sayfası anahtar kaydederse istemciler yenilenir; görev sürerken beklemeye alınır.
+        self._clients_stale: bool = False
+        self._pending_model_choices: Dict[str, str] = {}
+        self._settings_window: Optional[ctk.CTkToplevel] = None
         self._integrations = CapabilityService()
 
         self.bind("<Escape>", lambda event: self._request_stop())
+        self.bind("<FocusIn>", self._on_focus_return, add="+")
         self.bind("<Command-k>", lambda event: self._clear_transcript())
+        self.bind("<Command-comma>", lambda event: self._open_settings())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._text.configure(state="normal")
         self._render_welcome()
@@ -296,15 +330,19 @@ class OmniUI(ctk.CTk):
         self.after(120, self.entry.focus_set)
         self.after(120, self._style_native_titlebar)
 
-    def _style_native_titlebar(self) -> None:
-        """macOS başlık çubuğunu içerikle aynı arka plan rengine getirir."""
+    def _style_native_titlebar(self, title: Optional[str] = None) -> None:
+        """
+        macOS başlık çubuğunu içerikle aynı arka plan rengine getirir. Başlık verilmezse ana
+        pencereyi hedefler; Ayarlar sayfası da aynı renkle çağırır.
+        """
         if sys.platform != "darwin":
             return
         import AppKit
+        target: str = title or self.title()
         color = AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(
             int(BG[1:3], 16) / 255, int(BG[3:5], 16) / 255, int(BG[5:7], 16) / 255, 1.0)
         for window in AppKit.NSApplication.sharedApplication().windows():
-            if str(window.title()) == self.title():
+            if str(window.title()) == target:
                 window.setTitlebarAppearsTransparent_(True)
                 window.setBackgroundColor_(color)
 
@@ -330,17 +368,29 @@ class OmniUI(ctk.CTk):
             font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
         self.model_label.grid(row=0, column=3, padx=(0, 8))
+        self.task_status_label: ctk.CTkLabel = ctk.CTkLabel(
+            header, text="", text_color=ACCENT,
+            font=ctk.CTkFont(family=MONO_FAMILY, size=11, weight="bold"),
+        )
+        self.task_status_label.grid(row=0, column=2, sticky="e", padx=(0, 12))
         self.copy_btn: ctk.CTkButton = ctk.CTkButton(
             header, text="", image=self._copy_icon, width=30, height=28, corner_radius=8,
             fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
             border_color=BORDER, command=self._copy_transcript, cursor="hand2",
         )
         self.copy_btn.grid(row=0, column=4, padx=(0, 6))
+        # Kopyala düğmesiyle birebir aynı kutu ve ikon boyutu (metin glifi daha küçük kalıyordu).
+        self.settings_btn: ctk.CTkButton = ctk.CTkButton(
+            header, text="", image=self._gear_icon, width=30, height=28, corner_radius=8,
+            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
+            border_color=BORDER, command=self._open_settings, cursor="hand2",
+        )
+        self.settings_btn.grid(row=0, column=5, padx=(0, 6))
         ctk.CTkButton(
             header, text="Temizle", width=64, height=26, corner_radius=8, fg_color="transparent",
             hover_color=SURFACE_RAISED, border_width=1, border_color=BORDER, text_color=TEXT_DIM,
             font=self._ui_font(12, "normal"), command=self._clear_transcript,
-        ).grid(row=0, column=5)
+        ).grid(row=0, column=6)
 
     def _build_transcript(self) -> None:
         frame: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -487,6 +537,361 @@ class OmniUI(ctk.CTk):
             anchor="w", justify="left",
         )
         self.stats_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+
+    # --- Ayarlar sayfası (API anahtarları, Keychain ile senkron) ---
+
+    def _apply_settings(self, values: Dict[str, str]) -> Tuple[List[str], List[str]]:
+        """
+        Ayarlar sayfasındaki değerleri Keychain'e ve süreç-içi depoya uygular; (kaydedilen,
+        başarısız) değişken listelerini döner. Anahtarlar os.environ'a YAZILMAZ: ajanın
+        başlattığı alt süreçler sırrı miras almaz. Değişmeyen alan yazılmaz, boş değer kaydı siler.
+        """
+        changed: List[str] = []
+        failed: List[str] = []
+        for variable in api_keys.KEY_VARIABLES:
+            if variable not in values:
+                continue
+            value: str = values[variable].strip()
+            persisted: str = api_keys.stored_key(variable) or ""
+            # Yalnız hem Keychain'de hem süreç-içi depoda aynı değer duruyorsa yazma atlanır;
+            # kabukta tanımlı bir anahtar birebir yazılsa bile kalıcı kayda geçirilir.
+            if value == persisted and (not value or api_key_source(variable) == "ayarlar"):
+                continue
+            try:
+                api_keys.store_key(variable, value)
+            except Exception as error:
+                # Anahtarın kendisi hiçbir zaman log'a yazılmaz; yalnız hata türü kaydedilir.
+                logging.warning(
+                    "API anahtarı Keychain'e yazılamadı veya silinemedi",
+                    extra={"variable": variable, "error_type": type(error).__name__},
+                )
+                failed.append(variable)
+                continue
+            set_api_key(variable, value)
+            changed.append(variable)
+        if changed:
+            refresh_api_keys()
+        return changed, failed
+
+    def _apply_model_settings(self, values: Dict[str, str]) -> List[str]:
+        """Model seçimlerini kalıcı kaydeder; çalışan görevin modelini değiştirmez."""
+        changed: Dict[str, str] = {}
+        for name, value in values.items():
+            model = value.strip()
+            if name not in BACKENDS or not valid_model_id(model):
+                raise ValueError(f"{name}: geçerli bir model kimliği girin.")
+            current = self._pending_model_choices.get(name, BACKENDS[name]["model"])
+            if model != current:
+                changed[name] = model
+        if changed:
+            selections = load_model_preferences()
+            selections.update(changed)
+            save_model_preferences(selections)
+            self._pending_model_choices.update(changed)
+        return list(changed)
+
+
+    def _rebuild_clients(self) -> None:
+        """Model istemcilerini yeni anahtarlarla kurar; görev sürüyorsa görev bitince uygular."""
+        if self._agent_future is not None and not self._agent_future.done():
+            self._clients_stale = True
+            return
+        replaced: Dict[str, AsyncOpenAI] = self._clients
+        for name, model in self._pending_model_choices.items():
+            set_backend_model(name, model)
+        self._pending_model_choices.clear()
+        self._clients = create_model_clients()
+        self.model_label.configure(text=self._model_text(DEFAULT_BACKEND))
+        self._clients_stale = False
+
+        async def retire() -> None:
+            """Eski bağlantı havuzunu kapatır; kapanış hatası event loop'u düşürmez."""
+            try:
+                await close_model_clients(replaced)
+            except Exception as error:
+                logging.warning("Eski model istemcileri kapatılamadı",
+                                extra={"error_type": type(error).__name__})
+
+        # Eski bağlantı havuzu yalnız burada, çalışan görev yokken kapatılır.
+        asyncio.run_coroutine_threadsafe(retire(), self._loop)
+
+    def _open_settings(self) -> None:
+        """Tema ile uyumlu Ayarlar sayfasını açar; kaydedilen anahtarlar anında etkinleşir."""
+        existing: Optional[ctk.CTkToplevel] = self._settings_window
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+        window: ctk.CTkToplevel = ctk.CTkToplevel(self)
+        self._settings_window = window
+        window.title("OmniAgent — Ayarlar")
+        window.geometry("660x700")
+        window.minsize(560, 450)
+        window.configure(fg_color=BG)
+        window.transient(self)
+        panel: ctk.CTkScrollableFrame = ctk.CTkScrollableFrame(window, fg_color=BG)
+        panel.pack(fill="both", expand=True, padx=6, pady=6)
+        ctk.CTkLabel(
+            panel, text="Ayarlar", text_color=TEXT, font=self._ui_font(17, "bold"), anchor="w",
+        ).pack(anchor="w", padx=12, pady=(8, 0))
+        ctk.CTkLabel(
+            panel, text="API ANAHTARLARI", text_color=TEXT_FAINT, anchor="w",
+            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        ).pack(anchor="w", padx=12, pady=(14, 2))
+        ctk.CTkLabel(
+            panel, text=SETTINGS_HINT, text_color=TEXT_DIM, wraplength=560, justify="left",
+            font=self._ui_font(11, "normal"), anchor="w",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        entries: Dict[str, ctk.CTkEntry] = {}
+        chips: Dict[str, ctk.CTkLabel] = {}
+        for variable in api_keys.KEY_VARIABLES:
+            card: ctk.CTkFrame = ctk.CTkFrame(
+                panel, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
+            )
+            card.pack(fill="x", padx=12, pady=6)
+            card.grid_columnconfigure(0, weight=1)
+            profiles: List[str] = [name for name, var in API_KEY_VARIABLES.items() if var == variable]
+            ctk.CTkLabel(
+                card, text=variable, text_color=TEXT, anchor="w",
+                font=ctk.CTkFont(family=MONO_FAMILY, size=12, weight="bold"),
+            ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 0))
+            chip: ctk.CTkLabel = ctk.CTkLabel(
+                card, text="", anchor="e", font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+            )
+            chip.grid(row=0, column=1, sticky="e", padx=14, pady=(12, 0))
+            entry: ctk.CTkEntry = ctk.CTkEntry(
+                card, show="•", height=32, fg_color=SURFACE_RAISED, border_width=1, border_color=BORDER,
+                text_color=TEXT, placeholder_text="anahtar gir", placeholder_text_color=TEXT_FAINT,
+                font=ctk.CTkFont(family=MONO_FAMILY, size=12),
+            )
+            entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(8, 4))
+            entry.insert(0, load_api_key(variable) or "")
+            entries[variable] = entry
+            chips[variable] = chip
+            detail: str = " · ".join(
+                f"{name} → {BACKENDS[name]['model']} ({BACKENDS[name]['base_url']})" for name in profiles
+            )
+            ctk.CTkLabel(
+                card, text=detail, text_color=TEXT_FAINT, wraplength=520, justify="left", anchor="w",
+                font=ctk.CTkFont(family=MONO_FAMILY, size=9),
+            ).grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 12))
+
+        def refresh_chips() -> None:
+            """Rozet kaynağı da söyler: Ayarlar kaydı kabuk değişkenini geçersiz kılar."""
+            for variable, chip in chips.items():
+                source: str = api_key_source(variable)
+                label: str = {"ayarlar": "ayarlardan", "ortam": "ortam değişkeni"}.get(source, "yok")
+                if source == "ayarlar" and api_keys.key_environment_present(variable):
+                    label = "ayarlardan (kabukta da var)"
+                chip.configure(text=label, text_color=SUCCESS if source != "yok" else TEXT_FAINT)
+
+        refresh_chips()
+
+        ctk.CTkLabel(
+            panel, text="MODELLER", text_color=TEXT_FAINT, anchor="w",
+            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        ).pack(anchor="w", padx=12, pady=(16, 2))
+        ctk.CTkLabel(
+            panel, text="Sağlayıcı modelleri arka planda yüklenir. Seçim sonraki görevde kullanılır.",
+            text_color=TEXT_DIM, wraplength=560, justify="left", anchor="w",
+            font=self._ui_font(11, "normal"),
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+        model_selectors: Dict[str, ctk.CTkComboBox] = {}
+        model_notes: Dict[str, ctk.CTkLabel] = {}
+        for name, profile in BACKENDS.items():
+            card = ctk.CTkFrame(
+                panel, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
+            )
+            card.pack(fill="x", padx=12, pady=5)
+            ctk.CTkLabel(
+                card, text=name, text_color=TEXT, anchor="w",
+                font=ctk.CTkFont(family=MONO_FAMILY, size=11, weight="bold"),
+            ).pack(anchor="w", padx=14, pady=(10, 2))
+            variable = API_KEY_VARIABLES.get(name)
+            key = entries[variable].get().strip() if variable else None
+            choices = list(dict.fromkeys((profile["model"],) + cached_models(profile["provider"], key)))
+            selector = ctk.CTkComboBox(
+                card, values=choices, height=30, fg_color=SURFACE_RAISED,
+                border_color=BORDER, button_color=SURFACE_RAISED,
+                button_hover_color=BORDER, text_color=TEXT, dropdown_fg_color=SURFACE,
+                dropdown_text_color=TEXT, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
+            )
+            selector.pack(fill="x", padx=14, pady=(2, 4))
+            selector.set(profile["model"])
+            model_selectors[name] = selector
+            note = ctk.CTkLabel(
+                card, text="", text_color=TEXT_FAINT, anchor="w",
+                font=ctk.CTkFont(family=MONO_FAMILY, size=9),
+            )
+            note.pack(anchor="w", padx=14, pady=(0, 9))
+            model_notes[name] = note
+
+        generation = [0]
+        active_model_requests: List[Future[Tuple[str, ...]]] = []
+
+        def refresh_models(force: bool = False) -> None:
+            """Ağ işini model döngüsüne verir; Tk yalnız hazır sonucu çizer."""
+            generation[0] += 1
+            for previous in active_model_requests:
+                previous.cancel()
+            active_model_requests.clear()
+            current_generation = generation[0]
+            pending: Dict[str, Future[Tuple[str, ...]]] = {}
+            profiles_by_provider: Dict[str, List[str]] = {}
+            for name, profile in BACKENDS.items():
+                provider = profile["provider"]
+                profiles_by_provider.setdefault(provider, []).append(name)
+                if provider in pending:
+                    continue
+                variable = API_KEY_VARIABLES.get(name)
+                key = entries[variable].get().strip() if variable else None
+                if provider in ("openai", "openrouter") and not key:
+                    for profile_name in profiles_by_provider[provider]:
+                        model_notes[profile_name].configure(text="Liste için API anahtarı girin.")
+                    continue
+                pending[provider] = asyncio.run_coroutine_threadsafe(
+                    list_provider_models(provider, profile["base_url"], key, refresh=force),
+                    self._loop,
+                )
+            active_model_requests.extend(pending.values())
+            for provider in pending:
+                for name in profiles_by_provider[provider]:
+                    model_notes[name].configure(text="Modeller yükleniyor…")
+            if not pending:
+                return
+
+            def poll() -> None:
+                if current_generation != generation[0] or not window.winfo_exists():
+                    return
+                for provider, future in list(pending.items()):
+                    if not future.done():
+                        continue
+                    del pending[provider]
+                    try:
+                        models = future.result()
+                    except ModelCatalogError as error:
+                        message = str(error)
+                    except Exception:
+                        message = "Model listesi alınamadı."
+                    else:
+                        message = f"{len(models)} model · seçim için listeyi açın"
+                        for name in profiles_by_provider[provider]:
+                            selector = model_selectors[name]
+                            selected = selector.get()
+                            selector.configure(values=list(dict.fromkeys((selected,) + models)))
+                            selector.set(selected)
+                    for name in profiles_by_provider[provider]:
+                        model_notes[name].configure(text=message)
+                if pending:
+                    window.after(120, poll)
+
+            window.after(120, poll)
+
+        ctk.CTkButton(
+            panel, text="Modelleri yenile", width=130, height=28, corner_radius=8,
+            fg_color=SURFACE_RAISED, hover_color=BORDER, text_color=TEXT_DIM,
+            font=self._ui_font(11, "normal"), command=lambda: refresh_models(True),
+        ).pack(anchor="w", padx=12, pady=(6, 4))
+        refresh_models()
+        reveal: tk.BooleanVar = tk.BooleanVar(value=False)
+
+        def toggle_visibility() -> None:
+            show: str = "" if reveal.get() else "•"
+            for field in entries.values():
+                field.configure(show=show)
+
+        ctk.CTkCheckBox(
+            panel, text="Anahtarları göster", variable=reveal, command=toggle_visibility,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=BORDER, checkmark_color=BG,
+            text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
+        ).pack(anchor="w", padx=12, pady=(6, 2))
+        status: ctk.CTkLabel = ctk.CTkLabel(
+            panel, text="", text_color=TEXT_FAINT, anchor="w", wraplength=560, justify="left",
+            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        )
+        status.pack(anchor="w", padx=12, pady=(6, 0))
+
+        def close() -> None:
+            generation[0] += 1
+            for request in active_model_requests:
+                request.cancel()
+            self._settings_window = None
+            window.destroy()
+
+        def save() -> None:
+            changed, failed = self._apply_settings(
+                {variable: field.get() for variable, field in entries.items()}
+            )
+            try:
+                model_changed = self._apply_model_settings(
+                    {name: selector.get() for name, selector in model_selectors.items()}
+                )
+                model_error = ""
+            except (OSError, ValueError) as error:
+                model_changed = []
+                model_error = str(error)
+            for variable, field in entries.items():
+                field.delete(0, "end")
+                field.insert(0, load_api_key(variable) or "")
+            refresh_chips()
+            if changed:
+                refresh_models()
+            # Kısmi başarıda da istemciler yenilenir: kaydedilen anahtar beklemesin.
+            if changed or model_changed:
+                self._rebuild_clients()
+            ready: str = ", ".join(sorted(self._clients)) or "yok"
+            suffix: str = " (çalışan görev bitince uygulanacak)" if self._clients_stale else ""
+            # Kabukta kalmaya devam eden değişkenler "silindi" yanılgısını önler.
+            shell_left: List[str] = [
+                variable for variable in changed if api_key_source(variable) == "ortam"
+            ]
+            if shell_left:
+                suffix += f" · kabuk değişkeni hâlâ tanımlı: {', '.join(shell_left)}"
+            if changed:
+                self._text.configure(state="normal")
+                self._new_region([(f"⚙ Ayarlar: {len(changed)} anahtar kaydedildi · hazır profiller: {ready}{suffix}\n",
+                                   ("notice_info",))])
+                self._text.see("end")
+                self._text.configure(state="disabled")
+            if failed or model_error:
+                problems = []
+                if failed:
+                    problems.append("API anahtarı: " + ", ".join(failed))
+                if model_error:
+                    problems.append("Model: " + model_error)
+                status.configure(text="Kaydedilemedi: " + " · ".join(problems), text_color=ERROR)
+                return
+            if not changed and not model_changed:
+                status.configure(text="Değişiklik yok.", text_color=TEXT_FAINT)
+                return
+            status.configure(
+                text=f"Kaydedildi · {len(model_changed)} model · hazır profiller: {ready}{suffix}",
+                text_color=WARNING if self._clients_stale or shell_left else SUCCESS,
+            )
+
+        buttons: ctk.CTkFrame = ctk.CTkFrame(panel, fg_color=BG)
+        buttons.pack(fill="x", padx=12, pady=(10, 14))
+        ctk.CTkButton(
+            buttons, text="Kaydet", width=110, height=32, corner_radius=8, fg_color=ACCENT,
+            hover_color=ACCENT_HOVER, text_color=BG, font=self._ui_font(13, "bold"), command=save,
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Kapat", width=90, height=32, corner_radius=8, fg_color="transparent",
+            hover_color=SURFACE_RAISED, border_width=1, border_color=BORDER, text_color=TEXT_DIM,
+            font=self._ui_font(12, "normal"), command=close,
+        ).pack(side="left", padx=8)
+        window.protocol("WM_DELETE_WINDOW", close)
+        window.after(60, window.lift)
+        self._schedule_titlebar_style(window)
+
+    def _schedule_titlebar_style(self, window: ctk.CTkToplevel) -> None:
+        """
+        Başlık çubuğu stilini macOS penceresi oluştuktan sonra uygular; böylece Ayarlar
+        penceresi de ana pencereyle aynı arka plan renginde görünür.
+        """
+        title: str = window.title()
+        window.after(120, lambda: self._style_native_titlebar(title))
 
     # --- Transkript bölgeleri (etiket tabanlı; her bölge '\n' ile biter, asla boş kalmaz) ---
 
@@ -767,11 +1172,53 @@ class OmniUI(ctk.CTk):
         self._activity.insert("end", "✻ hazır", ("meta",))
         self._activity.configure(state="disabled")
 
+    def _set_task_status(self, phase: str, seconds: float = 0.0) -> None:
+        """Üst sağdaki kısa görev durumunu günceller."""
+        self._task_status = phase
+        elapsed = max(0, int(seconds))
+        labels = {
+            "idle": ("", TEXT_FAINT),
+            "running": (f"{SPINNER_FRAMES[self._spinner_index]} {elapsed} sn", ACCENT),
+            "stopping": ("■ Durduruluyor", WARNING),
+            "done": (f"✓ {elapsed} sn", SUCCESS),
+            "failed": (f"✕ {elapsed} sn", ERROR),
+            "stopped": ("■ Durduruldu", TEXT_FAINT),
+        }
+        label, color = labels[phase]
+        self.task_status_label.configure(text=label, text_color=color)
+
+    def _sync_menu_status(self) -> None:
+        """Arka planda görev sürerken menü çubuğu göstergesini canlı tutar."""
+        background = is_backgrounded(
+            self.state(), self.focus_displayof() is not None, app_is_active())
+        if not background:
+            self._menu_status.hide()
+        elif self._task_status in ("running", "stopping"):
+            self._menu_status.show(f"✻ {SPINNER_FRAMES[self._spinner_index]}",
+                                   "OmniAgent görev üzerinde çalışıyor")
+        elif self._badge_pending:
+            symbol = "✓" if self._task_status == "done" else "!"
+            self._menu_status.show(f"✻ {symbol}", "OmniAgent görevi tamamlandı")
+        else:
+            self._menu_status.hide()
+
+    def _on_focus_return(self, _event: object = None) -> None:
+        """Pencere yeniden görünür olunca tamamlanma rozetini temizler."""
+        if self._badge_pending and self._agent_future is None:
+            set_dock_badge(None)
+            self._badge_pending = False
+        self._menu_status.hide()
+
     def _animate(self, now: float) -> None:
+        if now - self._last_menu_check >= 0.1:
+            self._last_menu_check = now
+            self._sync_menu_status()
         running: bool = self._agent_future is not None and not self._agent_future.done()
         if running and now - self._last_spinner >= SPINNER_INTERVAL:
             self._last_spinner = now
             self._spinner_index = (self._spinner_index + 1) % len(SPINNER_FRAMES)
+            if self._task_status == "running":
+                self._set_task_status("running", now - self._run_started_at)
         if running and now - self._last_shimmer >= SHIMMER_INTERVAL:
             self._last_shimmer = now
             self._shine_index = (self._shine_index + 1) % (len(self._activity_verb) + 8)
@@ -969,6 +1416,7 @@ class OmniUI(ctk.CTk):
         if self._agent_future is not None and not self._agent_future.done():
             self._stop_event.set()
             self._activity_verb = "Durduruluyor"
+            self._set_task_status("stopping")
             for window in list(self._input_windows.values()):
                 window.destroy()
             self._input_windows.clear()
@@ -997,6 +1445,9 @@ class OmniUI(ctk.CTk):
         self._turn_streamed_chars = 0
         self._run_started_at = time.monotonic()
         self._activity_verb = "Düşünüyor"
+        self._set_task_status("running")
+        self._badge_pending = False
+        set_dock_badge("•")
         self.backend_menu.configure(state="disabled")
         self.mode_menu.configure(state="disabled")
         self.voice_btn.configure(state="disabled")
@@ -1040,7 +1491,7 @@ class OmniUI(ctk.CTk):
             return
         window = ctk.CTkToplevel(self)
         self._input_windows[request_id] = window
-        window.title("OmniAgent — Bağlantı ve tercihler")
+        window.title("OmniAgent — Yanıt gerekiyor")
         window.geometry("660x640")
         window.transient(self)
         panel = ctk.CTkScrollableFrame(window, fg_color=BG)
@@ -1093,11 +1544,19 @@ class OmniUI(ctk.CTk):
             self._inbox.put({"event": None, "done": True, "error": "", "report": report})
 
     def _on_run_done(self, error: str, report: Optional[RunReport]) -> None:
+        background = is_backgrounded(
+            self.state(), self.focus_displayof() is not None, app_is_active())
+        elapsed = time.monotonic() - self._run_started_at
+        stopped = self._stop_event.is_set() or bool(report and report.get("reason") == "durduruldu")
+        success = not error and bool(report and report["success"])
         exchange = report["exchange"] if report is not None else make_exchange(
             self._active_goal, f"Kritik hata: {error}", [])
         self._history = trim_history(self._history + [exchange])
         self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
         self._agent_future = None
+        if self._clients_stale:
+            # Görev sürerken kaydedilen anahtarlar biter bitmez uygulanır.
+            self._rebuild_clients()
         for window in list(self._input_windows.values()):
             window.destroy()
         self._input_windows.clear()
@@ -1112,7 +1571,17 @@ class OmniUI(ctk.CTk):
         )
         self.primary_btn.configure(text="↑", fg_color=ACCENT, hover_color=ACCENT_HOVER, text_color=BG)
         self._set_activity_idle()
-        self.entry.focus_set()
+        self._set_task_status("stopped" if stopped else "done" if success else "failed", elapsed)
+        if background and not stopped:
+            set_dock_badge("✓" if success else "!")
+            self._badge_pending = True
+            notify_finished(success, False, elapsed)
+        else:
+            set_dock_badge(None)
+            self._badge_pending = False
+            if not background:
+                self.entry.focus_set()
+        self._sync_menu_status()
 
     def _clear_transcript(self) -> None:
         if self._agent_future is not None:
@@ -1137,6 +1606,8 @@ class OmniUI(ctk.CTk):
         """Pencere kapanırken ses/istemci kaynaklarını kapatıp event loop'u durdurur."""
         self._voice.cancel()
         self._stop_event.set()
+        set_dock_badge(None)
+        self._menu_status.hide()
         async def close_connections() -> None:
             if self._agent_future is not None and not self._agent_future.done():
                 try:
@@ -1145,11 +1616,17 @@ class OmniUI(ctk.CTk):
                     pass
             await self._integrations.close()
             await close_model_clients(self._clients)
-        asyncio.run_coroutine_threadsafe(close_connections(), self._loop).result(timeout=8)
+        try:
+            asyncio.run_coroutine_threadsafe(close_connections(), self._loop).result(timeout=8)
+        except Exception as error:
+            # Kapanış hiçbir durumda pencereyi kapatmayı engellemez.
+            logging.warning("Kapanışta bağlantılar kapatılamadı", extra={"error_type": type(error).__name__})
         self._loop.call_soon_threadsafe(self._loop.stop)
         self.destroy()
 
 
 if __name__ == "__main__":
+    # Finder'dan başlatıldığında ortam değişkenleri miras alınmaz: kayıtlı anahtarları uygula.
+    apply_stored_api_keys()
     app = OmniUI()
     app.mainloop()

@@ -17,6 +17,7 @@ def _signal(
     uncached: int = 0,
     tool_calls: int = 0,
     delivery_ready: bool = False,
+    visual_turn: bool = False,
 ) -> TurnSignal:
     return TurnSignal(
         signature=signature,
@@ -25,7 +26,27 @@ def _signal(
         uncached_prompt_tokens=uncached,
         tool_calls=tool_calls,
         delivery_ready=delivery_ready,
+        visual_turn=visual_turn,
     )
+
+
+def test_default_policy_replans_nonvisual_after_two_stagnant_turns() -> None:
+    state = FastLoopState()
+    first = advance_fast_loop(state, _signal("same"))
+    second = advance_fast_loop(first.state, _signal("same"))
+    assert first.state.phase == "fast"
+    assert second.state.phase == "conserve"
+    assert second.request_replan is True
+
+
+def test_visual_turn_keeps_three_turn_stagnation_tolerance() -> None:
+    state = FastLoopState()
+    first = advance_fast_loop(state, _signal("same", visual_turn=True))
+    second = advance_fast_loop(first.state, _signal("same", visual_turn=True))
+    third = advance_fast_loop(second.state, _signal("same", visual_turn=True))
+    assert second.state.phase == "fast"
+    assert third.state.phase == "conserve"
+    assert third.request_replan is True
 
 
 def test_stagnation_enters_conserve_then_requests_replan() -> None:
@@ -174,5 +195,16 @@ def test_changing_tool_signatures_without_ledger_do_not_fake_progress() -> None:
         has_ledger=True,
         previous_signature="first",
         signature="same-tool",
+        all_failed=False,
+    ) is True
+
+
+def test_deterministic_delivery_progress_counts_without_ledger_delta() -> None:
+    assert classify_semantic_progress(
+        ledger_changed=False,
+        deterministic_progress=True,
+        has_ledger=True,
+        previous_signature="before",
+        signature="after",
         all_failed=False,
     ) is True

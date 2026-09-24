@@ -1,9 +1,11 @@
 """Kullanıcıya ait kalıcı tercih, yol ve karar hafızası.
 
-Bu depoda yalnızca kullanıcı tarafından açıkça istenen kararlı bilgiler saklanır. Kayıtlar
-her görevde otomatik olarak model istemine enjekte edilmez; model yalnızca `user_memory`
-aracı ile gerektiğinde bunları okur. Parola, token, API anahtarı ve benzeri gizli
-bilgiler reddedilir.
+Bu depoda yalnızca kullanıcının açıkça istediği ya da host'un sorduğu onay penceresinde
+onayladığı kararlı bilgiler saklanır. Kayıtlar sistem isteminin sonuna sınırlı bir blok
+olarak eklenir (`memory_prompt_block`): kullanıcı "rapor klasörüm" dediğinde model kaydı
+aramadan bilir. Bu, epizodik görev kayıtlarının enjeksiyonundan farklıdır: onlar başka
+görevlerin yollarını taşıyıp hedef sapmasına yol açıyordu ve enjekte edilmez. Parola,
+token, API anahtarı ve benzeri gizli bilgiler reddedilir.
 """
 from __future__ import annotations
 
@@ -22,6 +24,8 @@ MAX_VALUE_LENGTH: int = 600
 MAX_QUERY_LENGTH: int = 120
 MAX_TIMESTAMP_LENGTH: int = 64
 CATEGORIES: Tuple[str, ...] = ("preference", "path", "decision")
+# Sistem istemine eklenen hafıza bloğunun üst sınırı; aşılırsa en son güncellenen kayıtlar kalır
+MEMORY_PROMPT_LIMIT: int = 2000
 
 _SENSITIVE_TERMS: Tuple[str, ...] = (
     "password", "passcode", "secret", "token", "api key", "api-key", "apikey",
@@ -182,6 +186,29 @@ def forget_preference(state: MemoryState, key: str) -> Tuple[MemoryState, bool]:
         cast(PreferenceRecord, dict(record)) for record in state["preferences"] if record["key"].casefold() != key_folded
     ]
     return {"preferences": remaining}, len(remaining) != len(state["preferences"])
+
+
+def memory_prompt_block(state: MemoryState) -> str:
+    """
+    Sistem isteminin sonuna eklenen kullanıcı hafızası bloğu. Kayıtlar güncellenme sırasıyla
+    ve görevden bağımsız aynı sırada verilir (sağlayıcı önek önbelleği görevler arasında isabet
+    etsin); MEMORY_PROMPT_LIMIT aşılırsa en son güncellenenler kalır. Boş hafıza boş metindir. Saf.
+    """
+    lines: List[str] = [
+        f"- [{record['category']}] {record['key']}: {record['value']}" for record in state["preferences"]
+    ]
+    kept: List[str] = []
+    used: int = 0
+    for line in reversed(lines):
+        if used + len(line) + 1 > MEMORY_PROMPT_LIMIT:
+            break
+        kept.insert(0, line)
+        used += len(line) + 1
+    if not kept:
+        return ""
+    omitted: int = len(lines) - len(kept)
+    note: str = f"\n- (+{omitted} older records: search with user_memory recall)" if omitted else ""
+    return "\n### USER MEMORY (saved by the user)\n" + "\n".join(kept) + note + "\n"
 
 
 def search_preferences(state: MemoryState, query: str = "") -> List[PreferenceRecord]:
