@@ -1062,7 +1062,8 @@ async def _call_model_with_retries(
             if status is not None and status < 500 and status not in (401, 402, 403, 429):
                 raise
             has_alternative = plan[-1] != active
-            if status in (401, 402, 403, 429) and has_alternative and runtime is not None:
+            cli_failed: bool = isinstance(error, CliModelError)
+            if (status in (401, 402, 403, 429) or cli_failed) and has_alternative and runtime is not None:
                 runtime.blocked_backends.add(active)
             if status in (401, 402, 403) and not has_alternative:
                 raise
@@ -1076,7 +1077,6 @@ async def _call_model_with_retries(
                 emit({"kind": "stream_reset", "reason": f"{type(error).__name__} ({active}), yeniden deneniyor"})
                 emitted[0] = False
             timed_out: bool = isinstance(error, APITimeoutError)
-            cli_failed: bool = isinstance(error, CliModelError)
             access_failed: bool = status in (401, 402, 403)
             throttled: bool = status == 429
             if throttled and not has_alternative:
@@ -1322,7 +1322,7 @@ async def run_agent_with_callback(
                 permanent_failure = current_backend in runtime.blocked_backends
                 emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
                       "reason": (
-                          f"erişim/bakiye/hız sınırı; {current_backend} bu görevde yeniden denenmeyecek"
+                          f"erişim/bakiye/CLI/hız sınırı; {current_backend} bu görevde yeniden denenmeyecek"
                           if permanent_failure else
                           f"geçici hata; yalnız bu tur için fallback, sonraki tur {current_backend} yeniden denenecek"
                       )})

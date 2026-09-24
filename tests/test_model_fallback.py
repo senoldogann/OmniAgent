@@ -175,6 +175,6 @@ async def test_two_unavailable_routes_reach_third_ready_profile(
         assert turn["content"] == "üçüncü profil çalıştı"
         assert used == "zen-free"
         assert attempts == ["ollama-cloud", "codex-cli", "opencode-cli"]
-        assert runtime.blocked_backends == {"ollama-cloud"}
+        assert runtime.blocked_backends == {"ollama-cloud", "openai"}
     finally:
         CURRENT_RUNTIME.reset(token)

@@ -147,7 +147,7 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 - **API hataları:** geçici 5xx/bağlantı hatasında aynı backend bir kez yeniden denenir.
   429'da hazır başka profil varsa sağlayıcıya erken yeniden istek atılmadan ona geçilir;
   tek profil varsa Retry-After en çok 30 sn ise beklenir. 401/402/403 ve alternatifli 429
-  görev boyunca karantinaya alınır; sonraki turda aynı başarısız profil çağrılmaz.
+  ve alternatifli CLI hatası görev boyunca karantinaya alınır; sonraki turda aynı başarısız profil çağrılmaz.
   Geçici fallback yalnız o turdadır; kalıcı erişim hatası veya kalite merdiveni geçişi
   mevcut profili görev boyunca değiştirir.
 - **Önbellek:** `claude` profili `cache_control` gönderir (OpenRouter'da Anthropic önek önbelleği

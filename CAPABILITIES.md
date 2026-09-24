@@ -58,7 +58,7 @@ Yeni uzun görev denemelerinde `ollama-cloud`, sekiz adayı kontrol edip raporla
 olmayacak uç noktayı izleyen `stagnation` görevini 12,1 saniyede sınırlandırılmış başarısızlık
 olarak durdurdu (10 tur); iki denemede de ev dizininde istenmeyen dosya oluşmadı.
 
-401/402/403 erişim ve alternatif varken 429 hız sınırı veren model profili yalnız o
+401/402/403 erişim, alternatif varken 429 hız sınırı veya CLI hatası veren model profili yalnız o
 görevde karantinaya alınır; sonraki turda aynı başarısız profile geri dönülmez. 429
 Retry-After sırasında uygun başka model varsa ona hemen geçilir; tek model varsa sağlayıcının
 bildirdiği kısa bekleme uygulanır. Geçici 5xx/ağ hatası ise sınırlı yeniden denemeye tabidir.
