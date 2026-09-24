@@ -20,6 +20,7 @@ from PIL import Image
 
 from config import BACKENDS, DEFAULT_BACKEND
 from events import AgentEvent, compact_count, tool_label
+from host_lock import host_task_lock
 from main import (
     RUN_MODE_PROFILES, STATE_FILE, RunOptions, RunReport, close_model_clients,
     create_model_clients, run_agent_with_callback,
@@ -1013,9 +1014,14 @@ class OmniUI(ctk.CTk):
             "run_mode": selected_mode,
         }
         self._agent_future = asyncio.run_coroutine_threadsafe(
-            run_agent_with_callback(goal, self._post, options, self._clients), self._loop,
+            self._run_exclusive(goal, options), self._loop,
         )
         self._agent_future.add_done_callback(self._on_agent_future_done)
+
+    async def _run_exclusive(self, goal: str, options: RunOptions) -> RunReport:
+        """Telegram ile aynı makineyi eşzamanlı kullanma çakışmasını önler."""
+        with host_task_lock():
+            return await run_agent_with_callback(goal, self._post, options, self._clients)
 
     async def _request_input(self, title: str, fields: Dict[str, object]) -> Dict[str, object]:
         """Model çağırmadan Tk arayüzünden cevap bekler."""

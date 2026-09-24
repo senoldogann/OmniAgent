@@ -1,0 +1,40 @@
+# Telegram uzaktan görev köprüsü
+
+OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır. Ajanın model metni, araç başlangıç/sonuç olayları, komut çıktıları, model değişimi ve görev istatistikleri aynı sohbete akış halinde gönderilir. Ekran görüntüsü aracı başarılı olursa görüntü de gönderilir. Uzun metinler sayfalanır; mevcut sayfa yaklaşık saniyede bir düzenlenir.
+
+## İlk kurulum
+
+1. Telegram'da [@BotFather](https://core.telegram.org/bots/features#botfather) ile size ait bir bot oluşturup tokenı alın.
+2. Mac'te proje dizininde çalıştırın:
+
+   ```sh
+   .venv/bin/python telegram_bridge.py setup
+   ```
+
+3. Token terminalde görünmeden okunur. Komutun gösterdiği `/pair <kod>` mesajını botunuzun **özel sohbetine** 3 dakika içinde gönderin. Botun sohbet ve kullanıcı kimliği `~/Library/Application Support/OmniAgent/telegram.json` dosyasına, token yalnız macOS Keychain'e kaydedilir.
+4. Önce ön planda doğrulayın:
+
+   ```sh
+   .venv/bin/python telegram_bridge.py run
+   ```
+
+5. Oturum açıldığında otomatik başlaması için:
+
+   ```sh
+   .venv/bin/python telegram_bridge.py install-service
+   ```
+
+Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık ve internete bağlı olmalıdır. Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
+
+## Sohbet komutları
+
+- Doğrudan mesaj: yeni görev.
+- `/stop`: çalışan görevi ve kullanıcı yanıtı beklemesini durdurur.
+- `/status`: çalışan hedefi gösterir.
+- `/model auto` veya `/model <profil>`: sonraki görevin modelini seçer. Profil adları `config.BACKENDS` içindedir.
+- `/mode normal`, `/mode long`, `/mode autonomous`: sonraki görevin tur/zaman bütçesini seçer.
+- Entegrasyon soru sorarsa tek alan için düz metin, birden fazla alan için alan adlarını içeren JSON nesnesi gönderin.
+
+Görev geçmişinin son sekiz kaydı yerel `telegram-history.json` dosyasında tutulur. Bot, mesajları yalnız eşleştirilen kullanıcıdan ve özel sohbetten kabul eder. Güncelleme sırası `telegram-offset.json` ile korunur; yeniden başlatma aynı komutu tekrar çalıştırmaz. UI ile Telegram görevi aynı anda ekranı/klavyeyi kullanamaz: ikinci görev hemen “başka görev çalışıyor” yanıtı alır.
+
+Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Bu sürüm metin ve ekran görüntüsü gönderir; dosya/ek yükleme veya sesli mesaj alma henüz uygulanmadı. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.

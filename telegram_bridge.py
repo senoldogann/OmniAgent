@@ -1,0 +1,585 @@
+"""OmniAgent görevlerini eşleştirilmiş özel Telegram sohbetine akışla taşır."""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import getpass
+import json
+import os
+import plistlib
+import secrets
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, TypedDict
+
+import httpx
+from keyring.backends.macOS import Keyring
+from openai import AsyncOpenAI
+
+from config import BACKENDS
+from conversation import Exchange, trim_history
+from events import AgentEvent, tool_label
+from host_lock import HostBusyError, host_task_lock
+from integration_runtime import IntegrationStopped, data_root, read_json, save_json
+from main import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
+
+
+TOKEN_SERVICE = "OmniAgent Telegram"
+TOKEN_ACCOUNT = "bot_token"
+PAGE_LIMIT = 3500
+EDIT_INTERVAL = 1.1
+POLL_SECONDS = 20
+
+
+class TelegramError(RuntimeError):
+    """Bot API veya yapılandırma hatası; tokenı hata metnine taşımaz."""
+
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class TelegramSettings(TypedDict):
+    chat_id: int
+    user_id: int
+
+
+def settings_path() -> Path:
+    return data_root() / "telegram.json"
+
+
+def offset_path() -> Path:
+    return data_root() / "telegram-offset.json"
+
+
+def history_path() -> Path:
+    return data_root() / "telegram-history.json"
+
+
+def load_settings() -> TelegramSettings:
+    """Yetkili özel sohbet ve kullanıcı kimliğini doğrular."""
+    value = read_json(settings_path(), {})
+    if not isinstance(value, dict):
+        raise TelegramError("Telegram yapılandırması geçersiz; setup komutunu çalıştırın.")
+    chat_id, user_id = value.get("chat_id"), value.get("user_id")
+    if not isinstance(chat_id, int) or not isinstance(user_id, int) or chat_id <= 0 or user_id <= 0:
+        raise TelegramError("Telegram eşleştirmesi eksik; setup komutunu çalıştırın.")
+    return {"chat_id": chat_id, "user_id": user_id}
+
+
+def load_token() -> str:
+    """Bot tokenını yalnız macOS Keychain'den alır."""
+    token = Keyring().get_password(TOKEN_SERVICE, TOKEN_ACCOUNT)
+    if not token:
+        raise TelegramError("Telegram bot tokenı Keychain'de yok; setup komutunu çalıştırın.")
+    return token
+
+
+def authorized(message: Dict[str, Any], settings: TelegramSettings) -> bool:
+    """Yalnız eşleştirilmiş kişinin özel sohbetindeki mesajları kabul eder."""
+    chat = message.get("chat")
+    sender = message.get("from")
+    return (
+        isinstance(chat, dict) and isinstance(sender, dict)
+        and chat.get("type") == "private"
+        and chat.get("id") == settings["chat_id"]
+        and sender.get("id") == settings["user_id"]
+    )
+
+
+def event_text(event: AgentEvent) -> str:
+    """Tipli ajan olayunu kısa, okunur Telegram metnine dönüştürür."""
+    kind = event["kind"]
+    if kind == "run_started":
+        return f"▶ {event['goal'][:500]}\nModel: {event['model']} · {event['backend']}\n"
+    if kind == "turn_started":
+        return f"\n↻ Tur {event['turn']}/{event['max_turns']} · {event['backend']}\n"
+    if kind in ("text_delta", "reasoning_delta"):
+        return event["text"]
+    if kind == "tool_started":
+        return f"\n⏺ {tool_label(event['name'])} {event['preview'][:250]}\n"
+    if kind == "tool_output":
+        return f"  {event['text'][:500]}"
+    if kind == "tool_finished":
+        mark = "✓" if event["ok"] else "✗"
+        return f"\n{mark} {event['seconds']:.1f} sn · {event['text'][:800]}\n"
+    if kind == "backend_changed":
+        return f"\n↻ Model değişti: {event['backend']} · {event['reason'][:220]}\n"
+    if kind == "notice":
+        return f"\n! {event['text'][:500]}\n"
+    if kind == "integration_status":
+        progress = f" {event['completed']}/{event['total']}" if event["total"] else ""
+        return f"\n◦ {event['stage']}{progress}: {event['text'][:300]}\n"
+    if kind == "stream_reset":
+        return f"\n↺ Akış sıfırlandı: {event['reason'][:200]}\n"
+    if kind == "run_finished":
+        metrics = event["metrics"]
+        mark = "✓" if event["success"] else "✗"
+        return (
+            f"\n{mark} {event['outcome'][:1200]}\n"
+            f"{metrics['elapsed_seconds']:.1f} sn · {metrics['turns']} tur · "
+            f"{metrics['tool_calls']} araç · {metrics['backend']}\n"
+            f"Token: giriş {metrics['prompt_tokens']}, önbellek {metrics['cached_tokens']}, "
+            f"çıkış {metrics['completion_tokens']}\n"
+        )
+    return ""
+
+
+class TelegramAPI:
+    """Uzun yoklama ve mesaj düzenleme için dar Bot API bağlayıcısı."""
+
+    def __init__(self, token: str, client: Optional[httpx.AsyncClient] = None) -> None:
+        self.token = token
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(35.0, connect=5.0), trust_env=False,
+        )
+        self.owns_client = client is None
+
+    async def close(self) -> None:
+        if self.owns_client:
+            await self.client.aclose()
+
+    async def call(self, method: str, payload: Dict[str, Any]) -> Any:
+        url = f"https://api.telegram.org/bot{self.token}/{method}"
+        for attempt in range(2):
+            try:
+                response = await self.client.post(url, json=payload)
+                body = response.json()
+            except (httpx.HTTPError, ValueError) as error:
+                raise TelegramError(f"{method}: ağ veya yanıt hatası ({type(error).__name__}).") from None
+            if not isinstance(body, dict):
+                raise TelegramError(f"{method}: geçersiz Bot API yanıtı.")
+            if response.status_code == 429 and attempt == 0:
+                parameters = body.get("parameters", {})
+                seconds = parameters.get("retry_after", 1) if isinstance(parameters, dict) else 1
+                try:
+                    delay = min(60, max(0, int(seconds)))
+                except (TypeError, ValueError):
+                    delay = 1
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code != 200 or not body.get("ok"):
+                description = str(body.get("description", "istek başarısız"))[:200]
+                raise TelegramError(f"{method}: HTTP {response.status_code}: {description}", response.status_code)
+            return body.get("result")
+        raise TelegramError(f"{method}: hız sınırı devam ediyor.")
+
+    async def send(self, chat_id: int, text: str) -> int:
+        result = await self.call("sendMessage", {"chat_id": chat_id, "text": text[:PAGE_LIMIT]})
+        if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
+            raise TelegramError("sendMessage: ileti kimliği eksik.")
+        return result["message_id"]
+
+    async def edit(self, chat_id: int, message_id: int, text: str) -> None:
+        await self.call("editMessageText", {
+            "chat_id": chat_id, "message_id": message_id, "text": text[:PAGE_LIMIT],
+        })
+
+    async def send_photo(self, chat_id: int, path: Path) -> None:
+        """Gerçek ekran görüntüsünü eşleştirilmiş sohbete dosya olarak iletir."""
+        mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+        try:
+            with path.open("rb") as source:
+                response = await self.client.post(
+                    f"https://api.telegram.org/bot{self.token}/sendPhoto",
+                    data={"chat_id": str(chat_id)},
+                    files={"photo": (path.name, source, mime)},
+                )
+                body = response.json()
+        except (OSError, httpx.HTTPError, ValueError) as error:
+            raise TelegramError(f"sendPhoto: {type(error).__name__}.") from None
+        if response.status_code != 200 or not isinstance(body, dict) or not body.get("ok"):
+            raise TelegramError(f"sendPhoto: HTTP {response.status_code}.", response.status_code)
+
+
+class TelegramStream:
+    """Ajan olaylarını saniyede en çok bir düzenlemeyle sayfalı canlı metne çevirir."""
+
+    def __init__(self, api: TelegramAPI, chat_id: int) -> None:
+        self.api = api
+        self.chat_id = chat_id
+        self.page = ""
+        self.message_id: Optional[int] = None
+        self.sent = ""
+        self.last_edit = 0.0
+
+    async def append(self, text: str) -> None:
+        remaining = text
+        while remaining:
+            space = PAGE_LIMIT - len(self.page)
+            if space == 0:
+                await self.flush(force=True)
+                self.page = ""
+                self.message_id = None
+                self.sent = ""
+                space = PAGE_LIMIT
+            piece, remaining = remaining[:space], remaining[space:]
+            self.page += piece
+            if remaining:
+                await self.flush(force=True)
+        await self.flush()
+
+    async def flush(self, force: bool = False) -> None:
+        if not self.page or self.page == self.sent:
+            return
+        now = time.monotonic()
+        if self.message_id is not None and not force and now - self.last_edit < EDIT_INTERVAL:
+            return
+        if self.message_id is None:
+            self.message_id = await self.api.send(self.chat_id, self.page)
+        else:
+            await self.api.edit(self.chat_id, self.message_id, self.page)
+        self.sent = self.page
+        self.last_edit = time.monotonic()
+
+
+class TelegramBridge:
+    """Tek özel sohbetten görev başlatır, soruları yanıtlar ve Esc eşdeğeri durdurur."""
+
+    def __init__(self, api: TelegramAPI, settings: TelegramSettings) -> None:
+        self.api = api
+        self.settings = settings
+        saved = read_json(offset_path(), {"offset": 0})
+        self.offset = int(saved.get("offset", 0)) if isinstance(saved, dict) else 0
+        self.clients: Dict[str, Optional[AsyncOpenAI]] = {}
+        loaded_history = read_json(history_path(), [])
+        safe_history = [
+            entry for entry in loaded_history
+            if isinstance(entry, dict) and isinstance(entry.get("goal"), str)
+            and isinstance(entry.get("answer"), str) and isinstance(entry.get("tools"), list)
+            and all(isinstance(tool, str) for tool in entry["tools"])
+        ] if isinstance(loaded_history, list) else []
+        self.history: list[Exchange] = trim_history(safe_history)
+        self.active: Optional[asyncio.Task[None]] = None
+        self.stop_event = threading.Event()
+        self.pending_answer: Optional[asyncio.Future[Dict[str, Any]]] = None
+        self.pending_fields: Dict[str, Any] = {}
+        self.backend: Optional[str] = None
+        self.run_mode = "normal"
+        self.goal = ""
+
+    async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+        if self.pending_answer is not None:
+            raise TelegramError("Zaten bir kullanıcı yanıtı bekleniyor.")
+        future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self.pending_answer = future
+        self.pending_fields = fields
+        names = ", ".join(fields)
+        await self.api.send(
+            self.settings["chat_id"],
+            f"❔ {title[:1800]}\nAlanlar: {names}\n"
+            "Tek alan için yanıtı yazın; birden çok alan için JSON nesnesi gönderin. /stop iptal eder.",
+        )
+        try:
+            return await future
+        finally:
+            self.pending_answer = None
+            self.pending_fields = {}
+
+    async def _execute(self, goal: str) -> None:
+        queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def emit(event: AgentEvent) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        options: RunOptions = {
+            "requested_backend": self.backend,
+            "should_stop": self.stop_event.is_set,
+            "state_file": STATE_FILE,
+            "history": trim_history(self.history),
+            "answer": self.answer,
+            "run_mode": self.run_mode,
+        }
+
+        async def work() -> RunReport:
+            with host_task_lock():
+                return await run_agent_with_callback(goal, emit, options, self.clients)
+
+        worker = asyncio.create_task(work())
+        stream = TelegramStream(self.api, self.settings["chat_id"])
+        screenshot_paths: Dict[str, Path] = {}
+        saw_finished = False
+        try:
+            while not worker.done() or not queue.empty():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.25)
+                except TimeoutError:
+                    await stream.flush()
+                    continue
+                saw_finished = saw_finished or event["kind"] == "run_finished"
+                if event["kind"] == "tool_started" and event["name"] == "take_screenshot":
+                    screenshot_paths[event["call_id"]] = Path(event["preview"]).expanduser()
+                rendered = event_text(event)
+                if rendered:
+                    await stream.append(rendered)
+                if event["kind"] == "tool_finished" and event["ok"]:
+                    image = screenshot_paths.pop(event["call_id"], None)
+                    if image is not None and image.is_file():
+                        try:
+                            await self.api.send_photo(self.settings["chat_id"], image)
+                        except TelegramError as error:
+                            await stream.append(f"\n! Ekran görüntüsü gönderilemedi: {error}\n")
+            report = await worker
+            # Aynı turdaki call_soon_threadsafe olaylarını son sayfadan önce işle.
+            await asyncio.sleep(0)
+            while not queue.empty():
+                event = queue.get_nowait()
+                saw_finished = saw_finished or event["kind"] == "run_finished"
+                rendered = event_text(event)
+                if rendered:
+                    await stream.append(rendered)
+            if not saw_finished:
+                await stream.append(
+                    f"\n{'✓' if report['success'] else '✗'} {report['outcome'][:1200]}\n"
+                )
+            self.history = trim_history(self.history + [report["exchange"]])
+            save_json(history_path(), self.history)
+        except (HostBusyError, TelegramError) as error:
+            try:
+                await stream.append(f"\n✗ {error}\n")
+            except TelegramError:
+                pass
+        except Exception as error:
+            try:
+                await stream.append(f"\n✗ Görev hatası: {type(error).__name__}: {str(error)[:300]}\n")
+            except TelegramError:
+                pass
+        finally:
+            if not worker.done():
+                self.stop_event.set()
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+            self.stop_event.clear()
+            self.goal = ""
+            self.active = None
+            try:
+                await stream.flush(force=True)
+            except TelegramError:
+                pass
+
+    async def _reply_to_question(self, text: str) -> None:
+        future = self.pending_answer
+        if future is None or future.done():
+            return
+        try:
+            if len(self.pending_fields) == 1:
+                name = next(iter(self.pending_fields))
+                value = {name: text}
+            else:
+                value = json.loads(text)
+                if not isinstance(value, dict) or not all(name in value for name in self.pending_fields):
+                    raise ValueError("Gerekli alanları içeren JSON nesnesi bekleniyor.")
+        except ValueError as error:
+            await self.api.send(self.settings["chat_id"], f"Yanıt biçimi hatalı: {error}")
+            return
+        future.set_result(value)
+        await self.api.send(self.settings["chat_id"], "Yanıt alındı; görev sürüyor.")
+
+    async def handle(self, update: Dict[str, Any]) -> None:
+        message = update.get("message")
+        if not isinstance(message, dict) or not authorized(message, self.settings):
+            return
+        text = message.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return
+        text = text.strip()
+        chat_id = self.settings["chat_id"]
+        if text == "/stop":
+            if self.active is None:
+                await self.api.send(chat_id, "Çalışan görev yok.")
+            else:
+                self.stop_event.set()
+                if self.pending_answer is not None and not self.pending_answer.done():
+                    self.pending_answer.set_exception(IntegrationStopped("Kullanıcı tarafından durduruldu."))
+                await self.api.send(chat_id, "Durdurma istendi; çalışan işlem iptal ediliyor.")
+            return
+        if text == "/status":
+            state = f"Çalışıyor: {self.goal[:400]}" if self.active is not None else "Hazır."
+            await self.api.send(chat_id, state)
+            return
+        if text in ("/start", "/help"):
+            await self.api.send(
+                chat_id,
+                "Hedefinizi doğrudan yazın. /stop durdurur, /status durumu gösterir. "
+                "/model <profil> sonraki görevin modelini, /mode <normal|long|autonomous> bütçeyi seçer.",
+            )
+            return
+        if self.pending_answer is not None:
+            await self._reply_to_question(text)
+            return
+        if text.startswith("/model "):
+            selected = text.split(None, 1)[1].strip()
+            if selected != "auto" and selected not in BACKENDS:
+                await self.api.send(chat_id, "Bilinmeyen model profili.")
+                return
+            self.backend = None if selected == "auto" else selected
+            await self.api.send(chat_id, f"Sonraki görev modeli: {selected}.")
+            return
+        if text.startswith("/mode "):
+            selected = text.split(None, 1)[1].strip()
+            if selected not in ("normal", "long", "extended", "autonomous"):
+                await self.api.send(chat_id, "Mod: normal, long veya autonomous.")
+                return
+            self.run_mode = "extended" if selected == "long" else selected
+            await self.api.send(chat_id, f"Sonraki görev modu: {selected}.")
+            return
+        if self.active is not None:
+            await self.api.send(chat_id, "Bir görev çalışıyor. /stop veya /status kullanın.")
+            return
+        self.goal = text
+        self.stop_event.clear()
+        self.active = asyncio.create_task(self._execute(text))
+
+    async def run(self) -> None:
+        self.clients = create_model_clients()
+        try:
+            failures = 0
+            while True:
+                try:
+                    updates = await self.api.call("getUpdates", {
+                        "offset": self.offset, "timeout": POLL_SECONDS,
+                        "allowed_updates": ["message"],
+                    })
+                except TelegramError as error:
+                    if error.status is not None and error.status < 500 and error.status != 429:
+                        raise
+                    failures += 1
+                    await asyncio.sleep(min(8, 2 ** min(failures - 1, 3)))
+                    continue
+                failures = 0
+                if not isinstance(updates, list):
+                    raise TelegramError("getUpdates: liste bekleniyor.")
+                for update in updates:
+                    if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+                        continue
+                    update_id = update["update_id"]
+                    if update_id < self.offset:
+                        continue
+                    self.offset = update_id + 1
+                    # Tekrarlanan uzaktan komut yan etkiyi yeniden başlatmasın.
+                    save_json(offset_path(), {"offset": self.offset})
+                    await self.handle(update)
+        finally:
+            self.stop_event.set()
+            if self.active is not None:
+                try:
+                    await asyncio.wait_for(self.active, timeout=5)
+                except (TimeoutError, asyncio.CancelledError):
+                    self.active.cancel()
+                    await asyncio.gather(self.active, return_exceptions=True)
+            await close_model_clients(self.clients)
+            await self.api.close()
+
+
+async def pair(api: TelegramAPI, nonce: str, timeout: float = 180.0) -> TelegramSettings:
+    """Yerel ekrandaki tek kullanımlık kodu gönderen özel sohbeti yetkilendirir."""
+    deadline = time.monotonic() + timeout
+    offset = -1
+    while time.monotonic() < deadline:
+        updates = await api.call("getUpdates", {
+            "offset": offset, "timeout": min(POLL_SECONDS, max(1, int(deadline - time.monotonic()))),
+            "allowed_updates": ["message"],
+        })
+        if not isinstance(updates, list):
+            continue
+        for update in updates:
+            if not isinstance(update, dict) or not isinstance(update.get("update_id"), int):
+                continue
+            offset = update["update_id"] + 1
+            message = update.get("message")
+            if not isinstance(message, dict) or message.get("text") != f"/pair {nonce}":
+                continue
+            chat, sender = message.get("chat"), message.get("from")
+            if not isinstance(chat, dict) or not isinstance(sender, dict) or chat.get("type") != "private":
+                continue
+            chat_id, user_id = chat.get("id"), sender.get("id")
+            if isinstance(chat_id, int) and isinstance(user_id, int) and chat_id > 0 and user_id > 0:
+                save_json(offset_path(), {"offset": offset})
+                return {"chat_id": chat_id, "user_id": user_id}
+    raise TelegramError("Eşleştirme süresi doldu. setup komutunu yeniden çalıştırın.")
+
+
+async def setup() -> None:
+    token = getpass.getpass("BotFather tokenı (Keychain'e kaydedilir): ").strip()
+    if ":" not in token:
+        raise TelegramError("BotFather tokenı geçersiz görünüyor.")
+    api = TelegramAPI(token)
+    try:
+        identity = await api.call("getMe", {})
+        name = identity.get("username", "bot") if isinstance(identity, dict) else "bot"
+        nonce = secrets.token_urlsafe(12)
+        print(f"Telegram'da @{name} botuna /pair {nonce} gönderin (3 dakika).")
+        settings = await pair(api, nonce)
+        Keyring().set_password(TOKEN_SERVICE, TOKEN_ACCOUNT, token)
+        save_json(settings_path(), settings)
+        await api.send(settings["chat_id"], "OmniAgent eşleştirildi. /help yazarak başlayabilirsiniz.")
+        print("Eşleştirme tamamlandı; token yalnız Keychain'de.")
+    finally:
+        await api.close()
+
+
+def install_service() -> None:
+    """Kullanıcı hesabında yeniden girişte başlayan launchd hizmetini kurar."""
+    load_settings()
+    load_token()
+    label = "com.omniagent.telegram"
+    domain = f"gui/{os.getuid()}"
+    existing = subprocess.run(
+        ["launchctl", "print", f"{domain}/{label}"],
+        capture_output=True, text=True, check=False,
+    )
+    if existing.returncode == 0:
+        print("Telegram hizmeti zaten çalışıyor; yeniden kurulum yapılmadı.")
+        return
+    path = Path.home() / "Library/LaunchAgents" / f"{label}.plist"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "Label": label,
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "run"],
+        "WorkingDirectory": str(Path(__file__).resolve().parent),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "StandardOutPath": str(data_root() / "telegram-stdout.log"),
+        "StandardErrorPath": str(data_root() / "telegram-stderr.log"),
+    }
+    data_root().mkdir(parents=True, exist_ok=True)
+    path.write_bytes(plistlib.dumps(record))
+    path.chmod(0o600)
+    result = subprocess.run(
+        ["launchctl", "bootstrap", domain, str(path)],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        raise TelegramError(f"launchd başlatılamadı: {result.stderr.strip()[:300]}")
+    print(f"Telegram hizmeti kuruldu: {path}")
+
+
+async def run_bridge() -> None:
+    settings = load_settings()
+    api = TelegramAPI(load_token())
+    bridge = TelegramBridge(api, settings)
+    await bridge.run()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="OmniAgent Telegram köprüsü")
+    parser.add_argument("action", choices=("setup", "run", "install-service"))
+    arguments = parser.parse_args()
+    try:
+        if arguments.action == "setup":
+            asyncio.run(setup())
+        elif arguments.action == "install-service":
+            install_service()
+        else:
+            asyncio.run(run_bridge())
+    except (TelegramError, KeyboardInterrupt) as error:
+        print(f"Telegram: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    main()

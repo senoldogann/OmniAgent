@@ -4,7 +4,7 @@ Bu belge, 24 Eylül 2026 itibarıyla kodda bulunan yetenekleri ve bu makinedeki 
 
 ## Görev akışı
 
-Kullanıcı hedefi arayüzden veya CLI'den alınır. Ajan, varsayılan `ollama-cloud` modeliyle kısa bir araç çağırma döngüsü çalıştırır; araç sonucunu görüp gerektiğinde sonraki tura geçer. Bir turda bağımsız okumalar paralel, yan etkili işlemler sırayla çalışır. Composer'daki Normal profil 25 tur/10 dakika, Uzun profil 50 tur/20 dakika, Otonom profil 100 tur/45 dakika bütçe sunar; kullanıcı cevabı bekleme süresi bu bütçeden düşülür. API model akışı ve kabuk çıktısı arayüze canlı gelir; CLI modelleri tamamlanmış turu yayınlar. `Esc` çalışan görevi durdurur.
+Kullanıcı hedefi arayüzden, CLI'den veya eşleştirilmiş özel Telegram sohbetinden alınır. Ajan, varsayılan `ollama-cloud` modeliyle kısa bir araç çağırma döngüsü çalıştırır; araç sonucunu görüp gerektiğinde sonraki tura geçer. Bir turda bağımsız okumalar paralel, yan etkili işlemler sırayla çalışır. Composer'daki Normal profil 25 tur/10 dakika, Uzun profil 50 tur/20 dakika, Otonom profil 100 tur/45 dakika bütçe sunar; kullanıcı cevabı bekleme süresi bu bütçeden düşülür. API model akışı ve kabuk çıktısı arayüze canlı gelir; CLI modelleri tamamlanmış turu yayınlar. `Esc` çalışan görevi durdurur.
 
 Arayüzde model seçimi, sohbet geçmişi, komut/araç önizlemeleri, canlı çıktı, hata ve bağlantı durumları bulunur. Görev bitince alt bölümde toplam süre, model/araç süresi, tur ve araç sayısı, kesin giriş/önbellek/yeni giriş/çıkış/toplam token sayısı görünür. Entegrasyon kullanıldıysa ağ isteği, keşif, kurulum ve bekleme ölçüleri de gösterilir. `⌘K` transkripti ve sohbet bağlamını temizler.
 
@@ -35,6 +35,13 @@ Outlook/Hotmail için yerleşik Microsoft Graph adaptörü bulunur. Kuralı hesa
 
 Genel MCP katmanı `stdio` ve Streamable HTTP bağlantılarını destekler. Yalnız kaynak/sabit sürüm/güven durumu katalogda açıkça tanımlanan paketler otomatik kurulabilir; Python ve Node bağımlılıkları ana ajan ortamından ayrı tutulur. Uzak araçların yalnız ilgili şemaları modele açılır. Skill metinleri yöntem bilgisi sağlar, kendi başlarına hesap erişimi veya yürütme yetkisi sağlamaz. Bu makinede ek güvenilir MCP kaydı **yok**; bilinmeyen registry sonucu incelenmeden kurulmaz.
 
+Telegram köprüsü `telegram_bridge.py` ile ayrı bir uzak arayüzdür; model aracı veya MCP
+değildir. Olay akışı, araç çıktıları, ekran görüntüsü ve süre/token raporu eşleştirilmiş
+sohbete gönderilir; `/stop`, `/status`, `/model`, `/mode` ve kullanıcı sorusuna yanıt
+desteklenir. Token Keychain'de, izin verilen özel sohbet/kullanıcı yerel dosyada tutulur.
+UI ile aynı anda host görevi çalıştırılmaz. Kurulum ve sınırlar [TELEGRAM.md](TELEGRAM.md)
+içindedir; gerçek bot tokenı verilmediği için canlı Telegram testi henüz yapılmadı.
+
 Hazır katalog çözümü ağ beklemesi gerektirmez. Yeni hizmette çevrimiçi keşif toplam 8 saniyeyle, paket kurulumu 60 saniyeyle sınırlıdır. Olumsuz keşif 15 dakika, olumlu keşif 24 saat önbelleklenir. Hazır bağlantılar aynı uygulama oturumunda yeniden kullanılır.
 
 ## Model ve hız davranışı
@@ -50,6 +57,11 @@ Yeni uzun görev denemelerinde `ollama-cloud`, sekiz adayı kontrol edip raporla
 `long_research` görevini 8,3 saniyede doğru tamamladı (6 tur, 13 araç). Hiçbir zaman hazır
 olmayacak uç noktayı izleyen `stagnation` görevini 12,1 saniyede sınırlandırılmış başarısızlık
 olarak durdurdu (10 tur); iki denemede de ev dizininde istenmeyen dosya oluşmadı.
+
+401/402/403 erişim ve alternatif varken 429 hız sınırı veren model profili yalnız o
+görevde karantinaya alınır; sonraki turda aynı başarısız profile geri dönülmez. 429
+Retry-After sırasında uygun başka model varsa ona hemen geçilir; tek model varsa sağlayıcının
+bildirdiği kısa bekleme uygulanır. Geçici 5xx/ağ hatası ise sınırlı yeniden denemeye tabidir.
 
 Son sekiz sohbet alışverişi sınırlı uzunlukta bağlam olarak taşınır. Son 30 görevin ölçüm ve araç adımları yerel epizodik kayıtta tutulur, modele otomatik ders olarak enjekte edilmez. `user_memory.json` ise yalnızca kullanıcının açıkça istediği tercih/yol/karar kayıtlarını tutar; her görevde otomatik olarak okunmaz, gizli bilgileri reddeder ve atomik olarak yazılır. Council, StateTree/time-travel, kendi kendine Python araç üretimi ve AST öngörülü worker bu sürümde bulunmaz.
 

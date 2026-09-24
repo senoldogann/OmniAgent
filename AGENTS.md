@@ -2,6 +2,16 @@
 
 Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kuralları, davranışsal rehberleri ve öncelikli geliştirme hedeflerini içerir.
 
+## Eşzamanlı geliştirme
+- Birden fazla geliştirici ajan aynı anda çalışacaksa her biri ayrı Git worktree/branch kullanır.
+  Aynı `main.py` veya benchmark dosyasını ortak çalışma ağacında eşzamanlı yazmaz.
+- Her ajan yalnız kendi dosyalarını commit eder; kirli çalışma ağacındaki başkasına ait
+  değişiklikleri silmez, stash etmez veya commit'e katmaz. Birleştirme sonrası tam test koşulur.
+- Canlı macOS ekranı ve açık Chrome tek kaynaktır. GUI benchmark'ı kullanıcı veya başka ajan
+  ekranda çalışırken başlatılmaz. UI ve Telegram görevleri `host_lock.py` ile çakışmayı reddeder.
+- UI süreci kodu açılışta yükler; kaynak dosya değişince çalışan süreç kendiliğinden güncellenmez.
+
+
 ## 🛡️ Güvenlik Rayları (Safety Rails)
 Ajan, kendi kaynak kodunu ve host sistemini değiştirebildiği için `tools.py` içinde kod
 seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıdır):
@@ -112,7 +122,8 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 
 ## 🖥️ Arayüz (ui.py)
 - Yalnızca `events.py` olaylarını tüketir; log metni ayrıştırılmaz. Olaylar ajan thread'lerinden
-  kuyruğa gelir, tüm çizim Tk thread'inde ~60 fps'lik tek kare döngüsünde (`_tick`) yapılır.
+  kuyruğa gelir, tüm çizim Tk thread'inde tek `_tick` döngüsünde yapılır. Metin akarken
+  16 ms, boşta 100 ms kullanılır; boş karede büyük transkript yeniden çizilmez.
 - Tasarım dili Claude Code + Codex: nötr koyu yüzeyler, Menlo mono transkript, Claude turuncusu
   (`#D97757`) vurgu; araçlar `⏺ Ad(önizleme)` blokları, komutlar `$` satırları, çıktılar `⎿`
   altında (çalışırken canlı son 6 satır, bitince ilk 4 satır + "… +N satır").
@@ -133,10 +144,12 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   ile değiştirilebilir; seçilen modelin `ollama list` içinde bulunması gerekir.
 - **Kalite merdiveni:** art arda `CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD` (2) tamamen başarısız
   araç turunda `QUALITY_LADDER` boyunca çıkılır: `ollama-cloud` → `openai` → `zen-free`.
-- **API hataları:** geçici 5xx/429/bağlantı hatalarında aynı backend en fazla bir kez yeniden
-  denenir, ardından uygun farklı sağlayıcıya geçilir. 402 bakiye hatasında aynı paralı API
-  beklenmeden atlanır; kalıcı diğer 4xx hataları yeniden denenmez. Fallback yalnız o model
-  turundadır; kalıcı backend değişimi kalite merdiveniyle olur.
+- **API hataları:** geçici 5xx/bağlantı hatasında aynı backend bir kez yeniden denenir.
+  429'da hazır başka profil varsa sağlayıcıya erken yeniden istek atılmadan ona geçilir;
+  tek profil varsa Retry-After en çok 30 sn ise beklenir. 401/402/403 ve alternatifli 429
+  görev boyunca karantinaya alınır; sonraki turda aynı başarısız profil çağrılmaz.
+  Geçici fallback yalnız o turdadır; kalıcı erişim hatası veya kalite merdiveni geçişi
+  mevcut profili görev boyunca değiştirir.
 - **Önbellek:** `claude` profili `cache_control` gönderir (OpenRouter'da Anthropic önek önbelleği
   yalnızca bununla açılır); opencode öneki kendiliğinden önbellekler.
 - **Manuel seçim:** `OMNI_BACKEND=<profil>` ya da arayüzdeki seçim. Yerel CLI veya Ollama modeli
@@ -147,6 +160,21 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   sıcak bağlantı kullanır. CLI istemleri stdin üzerinden gider (süreç argümanlarına yazılmaz),
   45 saniye sınırına ve iptal/süreç grubu temizliğine tabidir. Ollama Cloud kullanım sınırı
   dolarsa CLI yedekleri denenir.
+
+## 📱 Telegram ve yetenek farkındalığı
+- `telegram_bridge.py`, olay akışını eşleştirilmiş özel Telegram sohbetine taşır: metin,
+  düşünme/araç/çıktı/durum olayları, ekran görüntüsü, süre ve token istatistikleri görünür.
+  `/stop`, `/status`, `/model` ve `/mode` desteklenir. Bot tokenı Keychain'de, sohbet
+  ve kullanıcı kimliği özel izinli yerel dosyadadır. Kurulum: [TELEGRAM.md](TELEGRAM.md).
+- Modelin gerçek yürütme yetkisi her turdaki araç şemalarıdır. `discover_capabilities` hazır
+  API/MCP'yi ve gerekirse kısa kaynak keşfini açar; skill dosyası yöntem bilgisidir, hesap
+  erişimi değildir. Kalıcı plugin yalnız güvenilir, sabit sürümlü kayıtla kurulur.
+- Tekrarlı yerel iş için `execute_js` veya temizlenen geçici script kullanılabilir. Görevin
+  istemediği kalıcı aracı ya da kendi kaynak değişikliğini ajan kendiliğinden eklemez.
+- Epizodik kayıtlar otomatik ders olarak modele verilmez: önceki ölçümde hedef sapmasına yol
+  açtı. Kalıcı kullanıcı tercihleri yalnız açık istekle `user_memory` aracına yazılır.
+  Hata öğrenmesi eklenecekse aynı argüman/hata imzasına koşullanmalı ve benchmark ile
+  doğrulanmalıdır. Başarısız çağrı aynı girdilerle sonsuz tekrar edilmez.
 
 ## 🎯 Hedefler
 - [x] `@Chatgpt-System` yeteneklerini `tools.py` içerisine gömmek. (bkz. Plugin Entegrasyonu)
