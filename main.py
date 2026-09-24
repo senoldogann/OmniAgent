@@ -784,7 +784,7 @@ def unmet_wait_status(goal: str, steps: List[sm.StepRecord]) -> Optional[str]:
             continue
         observed = payload["status"].casefold()
         if observed != expected:
-            return f"beklenen status {expected}; son doğrulanan status {observed}"
+            return f"ilerleme yok: beklenen status {expected}; son doğrulanan status {observed}"
         return None
     return "beklenen status doğrulanmadı"
 
