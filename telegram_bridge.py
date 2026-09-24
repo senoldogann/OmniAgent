@@ -559,10 +559,12 @@ def install_service() -> None:
 
 
 async def run_bridge() -> None:
+    """Tek yoklayıcıyı çalıştırır; iki süreç aynı komutu iki kez işlemez."""
     settings = load_settings()
-    api = TelegramAPI(load_token())
-    bridge = TelegramBridge(api, settings)
-    await bridge.run()
+    with host_task_lock(data_root() / "telegram-bridge.lock"):
+        api = TelegramAPI(load_token())
+        bridge = TelegramBridge(api, settings)
+        await bridge.run()
 
 
 def main() -> None:
@@ -576,7 +578,7 @@ def main() -> None:
             install_service()
         else:
             asyncio.run(run_bridge())
-    except (TelegramError, KeyboardInterrupt) as error:
+    except (TelegramError, HostBusyError, KeyboardInterrupt) as error:
         print(f"Telegram: {error}", file=sys.stderr)
         raise SystemExit(1) from None
 
