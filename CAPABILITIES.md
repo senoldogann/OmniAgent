@@ -36,11 +36,13 @@ Outlook/Hotmail için yerleşik Microsoft Graph adaptörü bulunur. Kuralı hesa
 Genel MCP katmanı `stdio` ve Streamable HTTP bağlantılarını destekler. Yalnız kaynak/sabit sürüm/güven durumu katalogda açıkça tanımlanan paketler otomatik kurulabilir; Python ve Node bağımlılıkları ana ajan ortamından ayrı tutulur. Uzak araçların yalnız ilgili şemaları modele açılır. Skill metinleri yöntem bilgisi sağlar, kendi başlarına hesap erişimi veya yürütme yetkisi sağlamaz. Bu makinede ek güvenilir MCP kaydı **yok**; bilinmeyen registry sonucu incelenmeden kurulmaz.
 
 Telegram köprüsü `telegram_bridge.py` ile ayrı bir uzak arayüzdür; model aracı veya MCP
-değildir. Olay akışı, araç çıktıları, ekran görüntüsü ve süre/token raporu eşleştirilmiş
-sohbete gönderilir; `/stop`, `/status`, `/model`, `/mode` ve kullanıcı sorusuna yanıt
-desteklenir. Token Keychain'de, izin verilen özel sohbet/kullanıcı yerel dosyada tutulur.
-UI ile aynı anda host görevi çalıştırılmaz. Kurulum ve sınırlar [TELEGRAM.md](TELEGRAM.md)
-içindedir; gerçek bot tokenı verilmediği için canlı Telegram testi henüz yapılmadı.
+değildir. Varsayılan kısa görünüm yanıtı tek balonda canlı günceller; araç turunda yalnız
+çalışma durumu görünür. `/verbose on` sonraki görevde araç/çıktı/model/süre/token
+ayrıntılarını açar. Ekran görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model`,
+`/mode` ve kullanıcı sorusuna yanıt desteklenir. Token Keychain'de, izin verilen özel
+sohbet/kullanıcı yerel dosyada tutulur. UI ile aynı anda host görevi çalıştırılmaz.
+Kurulum ve sınırlar [TELEGRAM.md](TELEGRAM.md) içindedir. Bu değişiklikte canlı
+Telegram mesajı gönderilmedi; yerel hizmetin çalıştığı doğrulandı.
 
 Hazır katalog çözümü ağ beklemesi gerektirmez. Yeni hizmette çevrimiçi keşif toplam 8 saniyeyle, paket kurulumu 60 saniyeyle sınırlıdır. Olumsuz keşif 15 dakika, olumlu keşif 24 saat önbelleklenir. Hazır bağlantılar aynı uygulama oturumunda yeniden kullanılır.
 

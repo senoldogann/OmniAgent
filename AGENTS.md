@@ -162,10 +162,12 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   dolarsa CLI yedekleri denenir.
 
 ## 📱 Telegram ve yetenek farkındalığı
-- `telegram_bridge.py`, olay akışını eşleştirilmiş özel Telegram sohbetine taşır: metin,
-  düşünme/araç/çıktı/durum olayları, ekran görüntüsü, süre ve token istatistikleri görünür.
-  `/stop`, `/status`, `/model` ve `/mode` desteklenir. Bot tokenı Keychain'de, sohbet
-  ve kullanıcı kimliği özel izinli yerel dosyadadır. Kurulum: [TELEGRAM.md](TELEGRAM.md).
+- `telegram_bridge.py`, eşleştirilmiş özel Telegram sohbetinde varsayılan olarak tek
+  balonda kısa, canlı yanıt gösterir. `/verbose on` sonraki görevde düşünme/araç/çıktı,
+  model, süre ve token ayrıntılarını açar; `/verbose off` kısa görünüme döner. Ekran
+  görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
+  Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
+  Kurulum: [TELEGRAM.md](TELEGRAM.md).
 - Modelin gerçek yürütme yetkisi her turdaki araç şemalarıdır. `discover_capabilities` hazır
   API/MCP'yi ve gerekirse kısa kaynak keşfini açar; skill dosyası yöntem bilgisidir, hesap
   erişimi değildir. Kalıcı plugin yalnız güvenilir, sabit sürümlü kayıtla kurulur.
