@@ -144,6 +144,10 @@ async def test_bridge_streams_real_event_contract_and_stop(monkeypatch: pytest.M
         "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "/mode long",
     }})
     assert bridge.run_mode == "extended"
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "/verbose on",
+    }})
+    assert bridge.verbose
     await bridge.handle(update)
     task = bridge.active
     assert task is not None
@@ -162,6 +166,89 @@ async def test_bridge_streams_real_event_contract_and_stop(monkeypatch: pytest.M
     }})
     assert bridge.active is None
     assert "yasak" not in "\n".join(api.sent)
+
+
+@pytest.mark.asyncio
+async def test_compact_reply_uses_one_message_without_debug_details(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        emit({"kind": "run_started", "goal": goal, "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "turn_started", "turn": 1, "max_turns": 25,
+              "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "text_delta", "text": "Bugün "})
+        emit({"kind": "text_delta", "text": "Perşembe."})
+        metrics = {
+            "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.9, "backend": "ollama-cloud",
+            "prompt_tokens": 3700, "cached_tokens": 3600, "completion_tokens": 12,
+        }
+        emit({"kind": "run_finished", "success": True, "outcome": "Bugün Perşembe.",
+              "reason": "", "metrics": metrics})
+        return {"outcome": "Bugün Perşembe.", "success": True, "reason": "",
+                "metrics": metrics, "exchange": make_exchange(goal, "Bugün Perşembe.", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456},
+        "text": "Bugün günlerden ne?",
+    }})
+    task = bridge.active
+    assert task is not None
+    await task
+    assert len(api.sent) == 1
+    assert api.sent[0] == "Bugün "
+    assert api.edited[-1] == "Bugün Perşembe."
+    transcript = "\n".join(api.sent + api.edited)
+    assert "Model:" not in transcript
+    assert "Token:" not in transcript
+    assert "Tur 1" not in transcript
+    assert "Bugün günlerden ne?" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_compact_tool_turn_hides_state_and_keeps_one_status(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        emit({"kind": "turn_started", "turn": 1, "max_turns": 25,
+              "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "text_delta", "text": "STATE:"})
+        emit({"kind": "text_delta", "text": " gizli çalışma kaydı"})
+        emit({"kind": "tool_started", "call_id": "1", "index": 0,
+              "name": "execute_js", "preview": "2+2"})
+        emit({"kind": "tool_finished", "call_id": "1", "ok": True,
+              "text": "4", "seconds": 0.1})
+        emit({"kind": "turn_started", "turn": 2, "max_turns": 25,
+              "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "text_delta", "text": "Sonuç: 4"})
+        metrics = {
+            "turns": 2, "tool_calls": 1, "elapsed_seconds": 1.1, "backend": "ollama-cloud",
+            "prompt_tokens": 100, "cached_tokens": 0, "completion_tokens": 10,
+        }
+        emit({"kind": "run_finished", "success": True, "outcome": "Sonuç: 4",
+              "reason": "", "metrics": metrics})
+        return {"outcome": "Sonuç: 4", "success": True, "reason": "",
+                "metrics": metrics, "exchange": make_exchange(goal, "Sonuç: 4", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "2+2",
+    }})
+    task = bridge.active
+    assert task is not None
+    await task
+    assert len(api.sent) == 1
+    assert api.sent[0] == "⏳ Çalışıyor…"
+    assert api.edited[-1] == "Sonuç: 4"
+    assert "STATE:" not in "\n".join(api.sent + api.edited)
 
 
 @pytest.mark.asyncio

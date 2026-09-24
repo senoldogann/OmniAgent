@@ -222,6 +222,17 @@ class TelegramStream:
                 await self.flush(force=True)
         await self.flush()
 
+    async def show(self, text: str, force: bool = False) -> None:
+        """Kompakt görünümde aynı mesajı yeniler; uzun finali sayfalara böler."""
+        self.page = text[:PAGE_LIMIT]
+        await self.flush(force=force)
+        if force and len(text) > PAGE_LIMIT:
+            remaining = text[PAGE_LIMIT:]
+            self.page = ""
+            self.message_id = None
+            self.sent = ""
+            await self.append(remaining)
+
     async def flush(self, force: bool = False) -> None:
         if not self.page or self.page == self.sent:
             return
@@ -234,6 +245,43 @@ class TelegramStream:
             await self.api.edit(self.chat_id, self.message_id, self.page)
         self.sent = self.page
         self.last_edit = time.monotonic()
+
+
+class CompactPresenter:
+    """Kısa sohbet için ara olayları tek balonda tutar, son yanıtı yinelenmeden gösterir."""
+
+    def __init__(self, stream: TelegramStream) -> None:
+        self.stream = stream
+        self.turn_text = ""
+        self.hide_turn = False
+        self.finished = False
+
+    async def event(self, event: AgentEvent) -> None:
+        kind = event["kind"]
+        if kind == "turn_started":
+            self.turn_text = ""
+            self.hide_turn = False
+        elif kind == "text_delta" and not self.hide_turn:
+            self.turn_text += event["text"]
+            visible = self.turn_text.lstrip()
+            if "STATE:".startswith(visible.upper()):
+                return
+            if visible.upper().startswith("STATE:"):
+                self.hide_turn = True
+                return
+            await self.stream.show(self.turn_text)
+        elif kind == "tool_started":
+            self.hide_turn = True
+            await self.stream.show("⏳ Çalışıyor…")
+        elif kind == "run_finished":
+            self.finished = True
+            answer = str(event["outcome"]).strip() or str(event["reason"]).strip() or "Yanıt yok."
+            await self.stream.show(answer if event["success"] else f"⚠️ {answer}", force=True)
+
+    async def finish(self, report: RunReport) -> None:
+        if not self.finished:
+            answer = str(report["outcome"]).strip() or str(report.get("reason", "")).strip() or "Yanıt yok."
+            await self.stream.show(answer if report["success"] else f"⚠️ {answer}", force=True)
 
 
 class TelegramBridge:
@@ -259,6 +307,7 @@ class TelegramBridge:
         self.pending_fields: Dict[str, Any] = {}
         self.backend: Optional[str] = None
         self.run_mode = "normal"
+        self.verbose = False
         self.goal = ""
 
     async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -301,6 +350,8 @@ class TelegramBridge:
 
         worker = asyncio.create_task(work())
         stream = TelegramStream(self.api, self.settings["chat_id"])
+        compact = CompactPresenter(stream)
+        verbose = self.verbose
         screenshot_paths: Dict[str, Path] = {}
         saw_finished = False
         try:
@@ -313,9 +364,12 @@ class TelegramBridge:
                 saw_finished = saw_finished or event["kind"] == "run_finished"
                 if event["kind"] == "tool_started" and event["name"] == "take_screenshot":
                     screenshot_paths[event["call_id"]] = Path(event["preview"]).expanduser()
-                rendered = event_text(event)
-                if rendered:
-                    await stream.append(rendered)
+                if verbose:
+                    rendered = event_text(event)
+                    if rendered:
+                        await stream.append(rendered)
+                else:
+                    await compact.event(event)
                 if event["kind"] == "tool_finished" and event["ok"]:
                     image = screenshot_paths.pop(event["call_id"], None)
                     if image is not None and image.is_file():
@@ -329,13 +383,19 @@ class TelegramBridge:
             while not queue.empty():
                 event = queue.get_nowait()
                 saw_finished = saw_finished or event["kind"] == "run_finished"
-                rendered = event_text(event)
-                if rendered:
-                    await stream.append(rendered)
-            if not saw_finished:
-                await stream.append(
-                    f"\n{'✓' if report['success'] else '✗'} {report['outcome'][:1200]}\n"
-                )
+                if verbose:
+                    rendered = event_text(event)
+                    if rendered:
+                        await stream.append(rendered)
+                else:
+                    await compact.event(event)
+            if verbose:
+                if not saw_finished:
+                    await stream.append(
+                        f"\n{'✓' if report['success'] else '✗'} {report['outcome'][:1200]}\n"
+                    )
+            else:
+                await compact.finish(report)
             self.history = trim_history(self.history + [report["exchange"]])
             save_json(history_path(), self.history)
         except (HostBusyError, TelegramError) as error:
@@ -404,12 +464,17 @@ class TelegramBridge:
         if text in ("/start", "/help"):
             await self.api.send(
                 chat_id,
-                "Hedefinizi doğrudan yazın. /stop durdurur, /status durumu gösterir. "
-                "/model <profil> sonraki görevin modelini, /mode <normal|long|autonomous> bütçeyi seçer.",
+                "Hedefinizi yazın. /stop durdurur, /status durumu gösterir. "
+                "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
+                "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar.",
             )
             return
         if self.pending_answer is not None:
             await self._reply_to_question(text)
+            return
+        if text in ("/verbose on", "/verbose off"):
+            self.verbose = text.endswith("on")
+            await self.api.send(chat_id, "Sonraki görev: ayrıntılı akış." if self.verbose else "Sonraki görev: kısa görünüm.")
             return
         if text.startswith("/model "):
             selected = text.split(None, 1)[1].strip()
