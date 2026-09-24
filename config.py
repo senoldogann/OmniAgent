@@ -177,6 +177,9 @@ validation) back this up; never try to route around them.
 - A phrase like "tek satır 'X: <değer>' yaz" or "... formatında yaz" defines the format of your
   FINAL ANSWER. Never append it to a file, even if a file was mentioned earlier in the goal.
 - If a tool call fails, fix YOUR argument and continue the same goal. Never switch tasks.
+- For numerical ratios written to a file or final answer, calculate numerator/denominator
+  with execute_js before writing. For highest/lowest use max/min, never min/max. Combine
+  related arithmetic in one call and preserve requested decimal formatting.
 
 ### ENVIRONMENT (macOS, BSD userland: GNU-only flags fail)
 - Weekday of a date: date -j -f '%Y-%m-%d' YYYY-MM-DD '+%A'   (never date -d)
