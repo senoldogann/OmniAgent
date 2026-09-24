@@ -71,6 +71,16 @@ verdi; örnek sayıları farklı olduğu için bu tek başına kesin hız oranı
 benchmark ev dizininde istenmeyen dosya bulmadı. Bulut kullanım sınırı ve oturum durumu
 görevler arasında değişebilir.
 
+24 Eylül birleşik kodda yeniden ölçüm: dokuz çekirdek senaryo üçer kez 27/27 başarı,
+4,3 saniye medyan verdi. Üçer uzun/takılma koşusu 6/6 beklenen sonucu verdi;
+`long_research` medyanı 28,8 saniye, `stagnation` medyanı 15,0 saniyeydi.
+Bu koşularda model süresi neredeyse toplam sürenin tamamıydı; sağlayıcı gecikmesi
+değişkendir. Tek koşuluk çeviri denemesinde Ollama Cloud yaklaşık 2 saniye,
+GPT-6-Luna/Codex CLI 7,2 saniye, Muse Spark/OpenCode CLI 41,0 saniye sürdü;
+tek örnekten genel hız sıralaması çıkarılmamalıdır. Bu yüzden varsayılan model
+değiştirilmedi. Durum bekleme hedeflerinde son gözlenen JSON status beklenen
+değere ulaşmadıysa modelin erken son yanıtı başarı sayılmaz.
+
 23 Eylül'deki önceki genel benchmark 9 senaryoda üçer koşuyla 27/27 başarı ve 4,95 saniye
 medyan süre verdi. Aynı koşularda sürenin toplam %99,4'ü model çağrılarında geçti; yerel
 araç süresi 27 görevde toplam 0,84 saniyeydi. Fotoğraf görevindeki özel aracın ilk model
