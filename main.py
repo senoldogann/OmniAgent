@@ -721,20 +721,19 @@ def next_quality_backend(current: str, available: frozenset[str]) -> Optional[st
     return next((name for name in later if name in available), None)
 
 
-def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, str, str]:
+def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, ...]:
     """
-    Model çağrısı deneme planı: geçici hatalarda bir aynı sağlayıcı denemesi,
-    ardından hazır alternatif. Paralı profillerde önce yerel Ollama tercih edilir. Saf fonksiyon.
+    Geçici hatada aynı profili bir kez dener, sonra hazır ve farklı profillerin hepsine
+    sırayla geçer. Görev kapsamındaki karantinaya alınmış profiller available dışındadır.
     """
     candidates: Tuple[str, ...] = {
         "ollama-cloud": ("openai", "zen-free"),
         "openai": ("ollama-cloud", "zen-free"),
         "zen-free": ("ollama-cloud", "openai"),
     }.get(backend, ("ollama-cloud", "openai", "zen-free"))
-    fallback: str = next(
-        (name for name in candidates if name != backend and name in available), backend,
+    return (backend, backend) + tuple(
+        name for name in candidates if name != backend and name in available
     )
-    return (backend, backend, fallback)
 
 
 def retry_after_seconds(error: APIStatusError) -> float:
@@ -1016,7 +1015,7 @@ async def _call_model_with_retries(
     """
     runtime = CURRENT_RUNTIME.get()
     available = frozenset(clients) - (runtime.blocked_backends if runtime is not None else set())
-    plan: Tuple[str, str, str] = attempt_plan(backend, available)
+    plan: Tuple[str, ...] = attempt_plan(backend, available)
     emitted: List[bool] = [False]
 
     def tracking_emit(event: AgentEvent) -> None:
@@ -1066,12 +1065,13 @@ async def _call_model_with_retries(
                     await runtime.delay(delay)
                 else:
                     await asyncio.sleep(delay)
-            attempt = (
-                len(plan) - 1
-                if (timed_out or cli_failed or access_failed or (throttled and has_alternative))
-                and attempt < len(plan) - 1
-                else attempt + 1
-            )
+            if timed_out or cli_failed or access_failed or (throttled and has_alternative):
+                attempt = next(
+                    (index for index in range(attempt + 1, len(plan)) if plan[index] != active),
+                    len(plan),
+                )
+            else:
+                attempt += 1
             if attempt < len(plan):
                 if cli_failed or access_failed or throttled:
                     continue

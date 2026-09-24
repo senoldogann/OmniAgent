@@ -140,3 +140,41 @@ def test_retry_after_parses_seconds_and_invalid_value() -> None:
     assert main.retry_after_seconds(error) == 2.5
     response.headers["retry-after"] = "bozuk"
     assert main.retry_after_seconds(error) == 1.0
+
+
+@pytest.mark.asyncio
+async def test_two_unavailable_routes_reach_third_ready_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts: list[str] = []
+
+    class QuotaError(Exception):
+        status_code = 402
+
+    async def fake_stream(
+        client: Any, profile: Any, messages: Any, schemas: Any, session_id: str,
+        emit: Any, should_stop: Any,
+    ) -> Any:
+        attempts.append(profile["provider"])
+        if profile["provider"] == "ollama-cloud":
+            raise QuotaError("kota doldu")
+        if profile["provider"] == "codex-cli":
+            raise main.CliModelError("oturum yok")
+        return {"content": "üçüncü profil çalıştı", "tool_calls": [],
+                "finish_reason": "stop", "usage": main.ZERO_USAGE}
+
+    monkeypatch.setattr(main, "APIStatusError", QuotaError)
+    monkeypatch.setattr(main, "_stream_completion", fake_stream)
+    runtime = IntegrationRuntime(lambda event: None, lambda: False)
+    token = CURRENT_RUNTIME.set(runtime)
+    try:
+        turn, used = await main._call_model_with_retries(
+            {"ollama-cloud": object(), "openai": None, "zen-free": None}, [], [],
+            "oturum", "ollama-cloud", lambda event: None, lambda: False,
+        )
+        assert turn["content"] == "üçüncü profil çalıştı"
+        assert used == "zen-free"
+        assert attempts == ["ollama-cloud", "codex-cli", "opencode-cli"]
+        assert runtime.blocked_backends == {"ollama-cloud"}
+    finally:
+        CURRENT_RUNTIME.reset(token)
