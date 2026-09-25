@@ -25,7 +25,7 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   kaydı izni ilk eksik denemede `CGRequestScreenCaptureAccess` ile BİR KEZ sorulur; uygulama
   sisteme ancak bu çağrıyla kaydolduğu için izin listesinde görünmesi buna bağlıdır. Hata
   metni "Terminal/Python" gibi belirsiz ifade yerine izni alacak uygulamayı adı + bundle
-  kimliğiyle, yoksa eklenecek tam python yolunu ve sayfayı açan komutu yazar; `permissions.py`
+  kimliğiyle, yoksa eklenecek tam python yolunu ve sayfayı açan komutu yazar; `omniagent-permissions`
   aynı tanıyı komut satırında verir.
 - Sırlar süreç ağacına yayılmaz: API anahtarları `os.environ` yerine süreç-içi depoda tutulur,
   alt süreçlere `child_environment()` anahtar değişkenleri çıkarılmış ortam verir ve araç
@@ -183,7 +183,7 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   okumasıyla kanıtlanır: Keychain silmeyi reddederse kayıt "silindi" sayılmaz ve kullanıcı
   açık hata görür (aksi hâlde sır sonraki açılışta geri geliyordu). Sonuç hem sayfada hem
   transkriptte "hazır profiller" olarak görünür.
-- İzin tanısı: `uv run python permissions.py` ekran kaydı durumunu, izni alacak uygulamayı
+- İzin tanısı: `.venv/bin/omniagent-permissions` ekran kaydı ve erişilebilirlik durumunu, izni alacak uygulamayı
   (bundle kimliğiyle) ve eklenecek python ikilisini yazar; `--request` sistem istemini gösterir.
 - Görevler kalıcı bir event loop'ta paylaşımlı model istemcileriyle çalışır; `Esc` durdurur,
   `⌘K` temizler. Composer'da Normal/Uzun/Otonom bütçe profili ve macOS yerel mikrofon
@@ -211,8 +211,10 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   hangi değişkenin gerektiğini BİR KEZ uyarı olarak bildirir ve o görevde kullanılamaz sayılır. Model adları `OMNI_OPENAI_MODEL`, `OMNI_OPENCODE_MODEL`,
   `OMNI_OPENROUTER_MODEL` ve `OMNI_OLLAMA_CLOUD_MODEL` ile değiştirilebilir; seçilen Ollama
   modelinin `ollama list` içinde bulunması gerekir.
-- **Kalite merdiveni:** art arda `CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD` (2) tamamen başarısız
-  araç turunda `QUALITY_LADDER` boyunca çıkılır: `ollama-cloud` → `openai` → `openrouter`.
+- **Kalite merdiveni:** `QUALITY_LADDER` (`ollama-cloud` → `openai` → `openrouter`) başlangıç
+  profilini ve API hatasında denenecek yedek sırasını belirler. Araç hataları model değiştirmez:
+  dış sağlayıcı hatası (arama servisi, ağ) başka modelle düzelmez, yalnız maliyet ve süre ekler
+  (`test_tool_failures_do_not_switch_model_backend`).
 - **API hataları:** geçici 5xx/bağlantı hatasında aynı backend bir kez yeniden denenir.
   429'da hazır başka profil varsa sağlayıcıya erken yeniden istek atılmadan ona geçilir;
   tek profil varsa Retry-After en çok 30 sn ise beklenir. 401/402/403 ve alternatifli 429

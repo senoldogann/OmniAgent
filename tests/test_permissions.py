@@ -108,3 +108,19 @@ def test_tool_error_carries_actionable_help(monkeypatch: pytest.MonkeyPatch, ter
     assert "Terminal" in message
     assert sys.executable in message
     assert "Ekran ve Sistem Sesi Kaydı" in message
+
+
+def test_report_shows_accessibility_status_and_help(monkeypatch: pytest.MonkeyPatch, terminal_owner: None) -> None:
+    """Erişilebilirlik izni yoksa fare/klavye olayları sessizce düşer; tanı bunu da göstermeli."""
+    from types import SimpleNamespace
+
+    from omniagent.platform.macos import permissions
+    from omniagent.tools import gui_input
+
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: True)
+    monkeypatch.setattr(gui_input, "AX", SimpleNamespace(AXIsProcessTrusted=lambda: False))
+    text = permissions.report()
+    assert "Erişilebilirlik: İZİN YOK" in text
+    assert "Privacy_Accessibility" in text
+    monkeypatch.setattr(gui_input, "AX", SimpleNamespace(AXIsProcessTrusted=lambda: True))
+    assert "Erişilebilirlik: izinli" in permissions.report()

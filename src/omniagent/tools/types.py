@@ -18,6 +18,8 @@ FILE_READ_MAX_BYTES: int = 8 * 1024 * 1024
 STREAM_STDOUT_MAX_BYTES: int = 64 * 1024
 STREAM_STDERR_MAX_BYTES: int = 16 * 1024
 STREAM_READ_CHARS: int = 4096
+# Canlı komut çıktısının en geç yayılma aralığı
+STREAM_EMIT_INTERVAL_SECONDS: float = 0.1
 TYPED_TEXT_ECHO_LIMIT: int = 80
 # Telegram Bot API sendDocument üst sınırı
 DELIVERY_MAX_BYTES: int = 50 * 1024 * 1024
@@ -90,6 +92,7 @@ PROCESS_POLL_SECONDS: float = 0.05
 
 # macOS Güvenlik ve Gizlilik Tercih URL'i
 SCREEN_SETTINGS_URL: str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+ACCESSIBILITY_SETTINGS_URL: str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
 
 class ToolError(Exception):

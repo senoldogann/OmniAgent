@@ -1200,7 +1200,7 @@ async def run_agent(goal: str) -> RunReport:
 if __name__ == "__main__":
     cli_goal: str = " ".join(sys.argv[1:]).strip()
     if not cli_goal:
-        print("Kullanım: python3 main.py <hedef metni>")
+        print("Kullanım: omniagent <hedef metni>")
         raise SystemExit(1)
     # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
     apply_stored_api_keys()
