@@ -154,12 +154,15 @@ def build_tool_schemas(goal: Optional[str] = None, allow_edit: bool = False) -> 
     return route_tool_schemas(goal, allow_edit, active_chrome_session_goal(goal))
 
 
-def route_tool_schemas(goal: Optional[str], allow_edit: bool, chrome_session: bool) -> List[Dict[str, Any]]:
+def route_tool_schemas(
+    goal: Optional[str], allow_edit: bool, chrome_session: bool, can_send_files: bool = False,
+) -> List[Dict[str, Any]]:
     """
     Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
     hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu.
     Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
     chrome_session: görev kullanıcının açık Chrome oturumunda yürüyor (bkz. chrome_session_route).
+    can_send_files: görevin dosya teslim kanalı (Telegram sohbeti) var; send_file yalnız o zaman görünür.
     """
     schemas: List[Dict[str, Any]] = [
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
@@ -302,8 +305,10 @@ def route_tool_schemas(goal: Optional[str], allow_edit: bool, chrome_session: bo
         _function_schema(
             "run_action_sequence",
             "Fare/klavye eylemlerini TEK çağrıda sırayla çalıştırır. click/move: point [x, y] (ekran "
-            "görüntüsü/AX uzayı); type: text (her Unicode metin, Türkçe dahil); press: key ('enter', 'tab', "
-            "'escape', 'cmd+c', 'cmd+shift+t'); wait: seconds (en çok 5).",
+            "görüntüsü/AX uzayı); click clicks=2 çift tıklar (dosya/uygulama açma, kelime seçme); drag: "
+            "point'ten to'ya basılı sürükler (dosya taşıma, kaydırıcı, metin seçimi); type: text (her "
+            "Unicode metin, Türkçe dahil); press: key ('enter', 'tab', 'escape', 'cmd+c', 'cmd+shift+t'); "
+            "wait: seconds (en çok 5).",
             {
                 "steps": {
                     "type": "array",
@@ -311,9 +316,11 @@ def route_tool_schemas(goal: Optional[str], allow_edit: bool, chrome_session: bo
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["click", "move", "type", "press", "wait"]},
+                            "action": {"type": "string", "enum": ["click", "drag", "move", "type", "press", "wait"]},
                             "point": POINT_SCHEMA,
+                            "to": {**POINT_SCHEMA, "description": "drag: bırakılacak [x, y] noktası."},
                             "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                            "clicks": {"type": "integer", "enum": [1, 2, 3], "description": "click: 2 çift, 3 üçlü tıklama."},
                             "text": {"type": "string"},
                             "key": {"type": "string"},
                             "seconds": {"type": "number"},
@@ -380,6 +387,16 @@ def route_tool_schemas(goal: Optional[str], allow_edit: bool, chrome_session: bo
                 {"point": POINT_SCHEMA, "text": {"type": "string"}},
             ),
         ])
+    if can_send_files:
+        schemas.append(_function_schema(
+            "send_file",
+            "Bilgisayardaki dosyayı (belge, görsel, rapor, arşiv; en çok 50 MB) kullanıcının Telegram "
+            "sohbetine gönderir. Kullanıcı dosyayı istediğinde veya sonucu dosya olarak ürettiğinde kullan.",
+            {
+                "path": {"type": "string", "description": "Gönderilecek dosyanın yolu."},
+                "caption": {"type": ["string", "null"], "description": "Dosyanın altındaki kısa açıklama veya null."},
+            },
+        ))
     if goal is not None and camera_photo_goal(goal):
         schemas.append(_function_schema(
             "capture_photo",
@@ -396,7 +413,7 @@ def route_tool_schemas(goal: Optional[str], allow_edit: bool, chrome_session: bo
 TOOL_NAMES: frozenset[str] = frozenset(
     schema["function"]["name"]
     for sample in ("fotoğraf çek masaüstüne", "açık Chrome oturumunu kullan")
-    for schema in build_tool_schemas(sample, allow_edit=True)
+    for schema in route_tool_schemas(sample, True, active_chrome_session_goal(sample), can_send_files=True)
 )
 
 # Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
@@ -411,7 +428,7 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
     "cua_fill_field", "cua_click_text", "cua_scroll", "cua_read_scrollable",
-    "user_memory", "ask_user",
+    "user_memory", "ask_user", "send_file",
 })
 
 # Ekranı değiştiren araçlar. Bunlardan sonra görüntü alınmadıysa tur sonunda ekran
@@ -427,7 +444,7 @@ _SCREEN_ACTION_TOOLS: frozenset[str] = frozenset({
 _GUI_VERIFICATION_TOOLS: frozenset[str] = _SCREEN_ACTION_TOOLS - frozenset({"chrome_active_tab"})
 _ACTION_RECEIPT_TOOLS: frozenset[str] = (_SCREEN_ACTION_TOOLS - frozenset({"cua_read_scrollable"})) | frozenset({"take_screenshot"})
 _DETERMINISTIC_PROGRESS_TOOLS: frozenset[str] = frozenset({
-    "write_file", "edit_file", "execute_js", "capture_photo", "user_memory",
+    "write_file", "edit_file", "execute_js", "capture_photo", "user_memory", "send_file",
 })
 _READ_PROGRESS_TOOLS: frozenset[str] = frozenset({
     "web_search", "fetch_raw", "read_file", "browse_url", "cua_read_scrollable",

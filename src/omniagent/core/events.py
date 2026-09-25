@@ -152,6 +152,7 @@ TOOL_LABELS: Dict[str, str] = {
     "cua_read_scrollable": "Baştan sona oku",
     "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
     "capture_photo": "Fotoğraf çek", "ask_user": "Kullanıcıya sor", "user_memory": "Hafıza",
+    "send_file": "Dosya gönder",
 }
 
 # Önizlemede gösterilen asıl argüman
@@ -162,7 +163,7 @@ _PREVIEW_KEYS: Dict[str, str] = {
     "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name",
     "cua_type_text": "text", "cua_press_key": "key", "cua_submit_text": "text",
     "cua_fill_field": "text", "cua_click_text": "text", "cua_scroll": "direction",
-    "smart_click": "app_name", "ask_user": "question", "user_memory": "action",
+    "smart_click": "app_name", "ask_user": "question", "user_memory": "action", "send_file": "path",
 }
 
 

@@ -19,7 +19,7 @@ from urllib.request import urlopen
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 from openai.types import CompletionUsage
-from PIL import Image
+from PIL import Image, ImageOps
 
 from omniagent.config import (
     API_KEY_VARIABLES, BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER,
@@ -171,6 +171,41 @@ def encode_image(path: str) -> str:
     buffer: BytesIO = BytesIO()
     square.save(buffer, format="JPEG", quality=MODEL_IMAGE_QUALITY, subsampling=0)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def encode_attachment_image(path: str) -> str:
+    """
+    Kullanıcının gönderdiği görseli (Telegram fotoğrafı) en-boy oranını koruyarak en uzun kenarı
+    MODEL_SCREEN_SIZE olacak biçimde JPEG q90 4:4:4 base64 metnine çevirir. Ekran görüntüsü gibi
+    kareye sündürülmez: fotoğrafın tıklama koordinat uzayı yoktur, bozulan oran okunaklılığı düşürür.
+    """
+    with Image.open(path) as source:
+        frame: Image.Image = ImageOps.exif_transpose(source).convert("RGB")
+    frame.thumbnail((MODEL_SCREEN_SIZE, MODEL_SCREEN_SIZE), Image.Resampling.LANCZOS)
+    buffer: BytesIO = BytesIO()
+    frame.save(buffer, format="JPEG", quality=MODEL_IMAGE_QUALITY, subsampling=0)
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def user_message_with_images(text: str, image_paths: List[str]) -> Dict[str, Any]:
+    """
+    Görevin ilk kullanıcı mesajı. Ekli görseller modele görüntü olarak verilir; açılamayan görsel
+    sessizce düşmez, yolu ve hatası metne yazılır (model dosyayı yine araçla işleyebilir).
+    """
+    if not image_paths:
+        return {"role": "user", "content": text}
+    images: List[Dict[str, Any]] = []
+    failures: List[str] = []
+    for path in image_paths:
+        try:
+            encoded: str = encode_attachment_image(path)
+        except (OSError, ValueError) as error:
+            failures.append(f"Ek görsel modele verilemedi ({path}): {type(error).__name__}")
+            continue
+        images.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+    note: str = "\n".join(failures)
+    parts: List[Dict[str, Any]] = [{"type": "text", "text": f"{text}\n\n{note}" if note else text}]
+    return {"role": "user", "content": parts + images} if images else {"role": "user", "content": parts[0]["text"]}
 
 
 
@@ -598,17 +633,21 @@ async def run_agent_with_callback(
         state: sm.StateDict = sm.load_state(options["state_file"])
         experience_state: experience.ExperienceState = experience.load_experience(experience_file)
         memory_block: str = user_memory.memory_prompt_block(user_memory.load_memory(memory_file))
+        first_message: Dict[str, Any] = await asyncio.to_thread(
+            user_message_with_images, user_content, options.get("images", []),
+        )
         messages: List[Dict[str, Any]] = (
             [{"role": "system", "content": route_system_prompt(date.today(), goal, memory_block, chrome_session)}]
             + to_messages(options["history"])
-            + [{"role": "user", "content": user_content}]
+            + [first_message]
         )
         service = options.get("integrations") or CapabilityService()
-        runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
+        runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"), options.get("deliver"))
+        can_send_files: bool = runtime.deliver is not None
         if not chrome_session or skills_sh_goal(goal):
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
         tool_schemas: List[Dict[str, Any]] = route_tool_schemas(
-            goal, source_change_expected(goal, options["history"]), chrome_session,
+            goal, source_change_expected(goal, options["history"]), chrome_session, can_send_files,
         )
     except Exception as error:
         if service is not None and "integrations" not in options:
@@ -673,7 +712,7 @@ async def run_agent_with_callback(
                 break
 
             runtime.published = dict(runtime.selected)
-            tool_schemas = route_tool_schemas(goal, must_change_source, chrome_session) + [
+            tool_schemas = route_tool_schemas(goal, must_change_source, chrome_session, can_send_files) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)

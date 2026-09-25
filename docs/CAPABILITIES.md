@@ -24,10 +24,11 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 | Dosya | `read_file`, `write_file` | Dosya okuma/yazma; Python sözdizimi denetimi, önceki sürüm yedeği ve yazma doğrulaması |
 | Web | `web_search`, `fetch_raw`, `browse_url` | Arama; hızlı HTTP/HTML/JSON okuma; kalıcı Playwright sekmesinde DOM eylem dizisi |
 | Açık Chrome oturumu | `chrome_active_tab`, `cua_click_point`, `cua_type_text`, `cua_press_key`, `cua_submit_text`, `cua_fill_field` | Aynı siteye ait açık sekmeyi bulup yüklenmesini bekleme; tek çağrıda arama kutusuna yazıp gönderme; form alanını Enter'a basmadan doldurma |
-| macOS arayüzü | `cua_get_app`, `cua_get_ax_state`, `cua_click`, `smart_click`, `run_action_sequence`, `take_screenshot` | Uygulama açma/öne getirme; erişilebilirlik ağacı; AX veya görsel şablonla tıklama; fare/klavye dizisi; ekran görüntüsünü modele verme |
+| macOS arayüzü | `cua_get_app`, `cua_get_ax_state`, `cua_click`, `smart_click`, `run_action_sequence`, `take_screenshot` | Uygulama açma/öne getirme; erişilebilirlik ağacı; AX veya görsel şablonla tıklama; fare/klavye dizisi (sağ/çift/üçlü tıklama, sürükle-bırak); ekran görüntüsünü modele verme |
 | Ekran metni ve kaydırma (her GUI yolunda) | `cua_click_text`, `cua_scroll`, `cua_read_scrollable` | Görünür metni OCR ile bulup tam ortasına tıklama; paneli kaydırıp içeriğin kayıp kaymadığını (liste/sayfa sonu) ölçme; paneli baştan sona kaydırarak tüm metni tek sonuçta okuma |
 | Entegrasyon | `discover_capabilities` | Yerel kataloğu ve gerektiğinde kısa çevrimiçi keşfi kullanıp görev için uygun API/MCP/skill yolunu bulma |
 | Kullanıcı hafızası | `user_memory` | Açıkça istenen tercih, sık yol ve kararı atomik JSON dosyasında saklama, arama ve silme |
+| Telegram dosya teslimi | `send_file` (yalnız Telegram görevinde) | Bilgisayardaki dosyayı (en çok 50 MB) eşleştirilmiş sohbete belge olarak gönderme |
 
 Çoklu monitörde `take_screenshot(display_index=2)` ikinci ekranı ayrı yakalar. Araç bu ekranı sonraki görüntüler için seçili tutar; ekran görüntüsü, AX merkezleri, OCR kutuları ve tıklama/dizi koordinatları aynı 0-1000 uzaya bağlıdır. Ekran ana monitörün üstünde veya solundaysa negatif global başlangıç hesaba katılır. Ekran yerleşimi değişirse eski koordinatla tıklama reddedilir ve yeni görüntü istenir. Yerel doğrulamada ikinci ekran 1920×1080 olarak yakalandı; gerçek ikinci ekran tıklaması kullanıcı ekranını etkilememek için çalıştırılmadı.
 
@@ -45,7 +46,7 @@ Telegram köprüsü `telegram_bridge.py` ile ayrı bir uzak arayüzdür; model a
 değildir. Varsayılan kısa görünüm yanıtı tek balonda canlı günceller; araç turunda yalnız
 çalışma durumu görünür. `/verbose on` sonraki görevde araç/çıktı/model/süre/token
 ayrıntılarını açar. Ekran görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model`,
-`/mode` ve kullanıcı sorusuna yanıt desteklenir. Token Keychain'de, izin verilen özel
+`/mode` ve kullanıcı sorusuna yanıt desteklenir. Fotoğraf, belge, ses ve video ekleri indirilir; açıklaması görev olur ve görseller modele görüntü olarak verilir. Ajan istenen dosyayı `send_file` ile sohbete gönderir. Token Keychain'de, izin verilen özel
 sohbet/kullanıcı yerel dosyada tutulur. UI ile aynı anda host görevi çalıştırılmaz.
 Ekran kaydı izni eksikse araç "izin yok" demekle kalmaz: izni alacak uygulamayı adı + bundle
 kimliğiyle, yoksa eklenecek tam python yolunu ve Sistem Ayarları komutunu yazar; ilk eksik

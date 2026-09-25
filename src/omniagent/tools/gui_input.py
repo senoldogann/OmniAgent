@@ -25,7 +25,7 @@ _clip = clip_text
 from .screen import (
     current_geometry, parse_point, points_to_model,
     click_model_point, move_model_point, post_scroll,
-    changed_region,
+    changed_region, drag_model_points, multi_click_model_point,
 )
 
 # AX Sabitleri
@@ -240,7 +240,16 @@ def _run_action_step(step: ActionStep, geometry: ScreenGeometry) -> str:
     act = step.get("action")
     if act == "click":
         x, y = parse_point(step["point"])
-        return click_model_point(x, y, str(step.get("button") or "left"), geometry)
+        button = str(step.get("button") or "left")
+        clicks = step.get("clicks") or 1
+        if clicks not in (1, 2, 3):
+            raise ToolError(f"clicks 1, 2 veya 3 olmalı: {clicks!r}", "INVALID_ACTION_PARAMS", False)
+        if clicks == 1:
+            return click_model_point(x, y, button, geometry)
+        return multi_click_model_point(x, y, button, clicks, geometry)
+    if act == "drag":
+        start, end = parse_point(step["point"]), parse_point(step["to"])
+        return drag_model_points(start, end, str(step.get("button") or "left"), geometry)
     if act == "move":
         x, y = parse_point(step["point"])
         return move_model_point(x, y, geometry)

@@ -35,7 +35,7 @@ from omniagent.memory import user as memory
 from omniagent.platform.macos import screen_text as st
 from omniagent.config import redact
 from omniagent.core import state as sm
-from omniagent.integrations.runtime import CURRENT_RUNTIME
+from omniagent.integrations.runtime import CURRENT_RUNTIME, DeliveryFailed
 from omniagent.approval import APPROVAL_TIMEOUT_SECONDS, approval_granted
 
 from . import browser, filesystem, gui_input, screen, system, types as tool_types
@@ -43,7 +43,7 @@ from . import browser, filesystem, gui_input, screen, system, types as tool_type
 from .types import (
     AX_ELEMENT_LIMIT, AX_LABEL_SEARCH_NODES, AX_MESSAGING_TIMEOUT_SECONDS,
     AX_NODE_LIMIT, AX_SCAN_BUDGET_SECONDS, BACKUP_KEEP_PER_FILE,
-    CHROME_LOAD_CHECKS, CHROME_SCRIPT_TIMEOUT_SECONDS,
+    CHROME_LOAD_CHECKS, CHROME_SCRIPT_TIMEOUT_SECONDS, DELIVERY_MAX_BYTES,
     FETCH_ERROR_BODY_LIMIT, FILE_READ_LIMIT, FILE_READ_MAX_BYTES,
     HISTORY_RESULT_LIMIT, JS_TIMEOUT_SECONDS,
     MAX_WAIT_SECONDS, MODEL_SCREEN_SIZE,
@@ -100,6 +100,7 @@ from .screen import (
     screen_capture_owner, screenshot_size, settle_app_frame,
     settle_display_frame, settle_frame, wait_for_screen_settle,
     click_model_point, move_model_point, post_scroll, changed_region,
+    drag_model_points, multi_click_model_point,
 )
 
 from .gui_input import (
@@ -324,6 +325,35 @@ class Toolbox:
             )
         reply = str(answer.get("yanit", "")).strip()
         return f"Kullanıcı yanıtı: {reply}" if reply else "Kullanıcı boş yanıt verdi."
+
+    async def send_file(self, path: str, caption: Optional[str] = None) -> str:
+        """Bilgisayardaki dosyayı kullanıcının kanalına (Telegram sohbeti) gönderir."""
+        runtime = CURRENT_RUNTIME.get()
+        if runtime is None or runtime.deliver is None:
+            raise ToolError(
+                "Dosya teslim kanalı yok (yalnız Telegram görevinde); dosyanın yolunu final yanıtında ver.",
+                "DELIVERY_UNAVAILABLE",
+                False,
+            )
+        target = Path(str(path)).expanduser()
+        if not target.is_file():
+            raise ToolError(f"Gönderilecek dosya bulunamadı: {target}", "FILE_NOT_FOUND", False)
+        size = target.stat().st_size
+        if size == 0:
+            raise ToolError(f"Dosya boş, gönderilmedi: {target}", "FILE_EMPTY", False)
+        if size > DELIVERY_MAX_BYTES:
+            raise ToolError(
+                f"Dosya {size / 1_048_576:.1f} MB; Telegram sınırı {DELIVERY_MAX_BYTES // 1_048_576} MB. "
+                "Sıkıştır veya böl, sonra yeniden gönder.",
+                "FILE_TOO_LARGE",
+                False,
+            )
+        text = redact(_clip(" ".join(str(caption or "").split()), 900))
+        try:
+            await runtime.deliver(target, text)
+        except DeliveryFailed as error:
+            raise ToolError(f"Dosya gönderilemedi: {error}", "DELIVERY_FAILED", True) from error
+        return f"Dosya kullanıcıya gönderildi: {target} ({size / 1024:.0f} KB)"
 
     async def _get_page(self) -> Page:
         return await self._headless_browser.get_page()

@@ -76,7 +76,8 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   oluşursa bildirir. Her değişiklik hız VE doğrulukla birlikte ölçülmelidir.
 - **Araç diyeti:** genel yolda model 19 temel araç ve bir `discover_capabilities` şeması, açık
   Chrome yolunda 14 araç görür (önce 26 temel araç vardı). Masaüstüne fotoğraf çekme hedefinde
-  `capture_photo`, kaynak değişikliği görevinde `edit_file` eklenir. 26 araçlı şemada model
+  `capture_photo`, kaynak değişikliği görevinde `edit_file`, dosya teslim kanalı olan Telegram görevinde
+  `send_file` eklenir. 26 araçlı şemada model
   hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu. Fare/klavye
   adımları `run_action_sequence`, şablon tıklama `smart_click` içindedir.
 - **Paralellik:** bağımsız araç çağrıları `asyncio.gather` ile gerçek paralellikte çalışır; yan
@@ -89,7 +90,9 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - **GUI:** `cua_get_ax_state` gerçek AX ağacından etkileşimli öğeleri (numara, tür, etiket, merkez)
   listeler (Chrome ~150ms, Notlar ~650ms); `cua_click` AXPress ile tıklar. Ekran görüntüsü
   yalnızca AX yetmediğinde gerekir. Metin, klavye düzeninden bağımsız Unicode olaylarıyla yazılır
-  (Türkçe/Fince karakterler ve emoji doğrulandı; pyautogui bunları sessizce atlıyordu).
+  (Türkçe/Fince karakterler ve emoji doğrulandı; pyautogui bunları sessizce atlıyordu). Çift/üçlü
+  tıklama ve sürükleme doğrudan Quartz olaylarıyla gönderilir: pyautogui macOS'ta tıklama durumunu hep 1
+  yazdığı için çift tıklama Finder'da dosya açmıyor, metinde kelime seçmiyordu.
 - **Ekran metni (`screen_text.py`):** macOS Vision OCR tam Retina çözünürlükte satır ve kelime
   kutularını ~200-450 ms'de okur. `cua_click_text` görünür metni bulup tam ortasına tıklar; metin
   birden çok yerdeyse `near` olmadan tıklamaz, adayları konumlarıyla döner; birebir eşleşme yoksa
@@ -236,6 +239,9 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
   Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
   Kurulum: [TELEGRAM.md](docs/TELEGRAM.md).
+- Telegram ekleri (fotoğraf/belge/ses/video, en çok 20 MB) `telegram-inbox/` altına 0600 izinle
+  indirilir; açıklama görev olur, yolu göreve eklenir. Görseller ilk kullanıcı mesajına en-boy oranı
+  korunarak görüntü olarak eklenir (ekran görüntüsü gibi kareye sündürülmez: koordinat uzayı yoktur).
 - Modelin gerçek yürütme yetkisi her turdaki araç şemalarıdır. `discover_capabilities` hazır
   API/MCP'yi ve gerekirse kısa kaynak keşfini açar; skill dosyası yöntem bilgisidir, hesap
   erişimi değildir. Kurulu yerel skill'ler `~/.agents/skills` ve `~/.codex/skills` altında
