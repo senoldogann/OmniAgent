@@ -36,7 +36,7 @@ import experience
 import state_manager as sm
 import user_memory
 from conversation import Exchange, make_exchange, to_messages
-from capabilities import CapabilityService, DISCOVERY_SCHEMA, ToolEntry, discovery_entry, validate_arguments
+from capabilities import CapabilityService, DISCOVERY_SCHEMA, ToolEntry, discovery_entry, skill_install_entry, validate_arguments
 from integration_runtime import (
     AnswerSink, CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime,
     IntegrationStopped, InteractionRequired, data_root,
@@ -195,6 +195,14 @@ def camera_photo_goal(goal: str) -> bool:
 def skills_sh_goal(goal: Optional[str]) -> bool:
     """Kullanıcı skills.sh kaynağını açıkça istedi mi? Saf."""
     return bool(goal and re.search(r"\bskills\.sh\b", goal, re.IGNORECASE))
+
+
+def skill_install_goal(goal: Optional[str]) -> bool:
+    """Açık skill kurulum hedeflerinde aracı yalnız o göreve açar."""
+    lowered = (goal or "").casefold()
+    return any(term in lowered for term in ("skill", "skil", "beceri")) and bool(
+        re.search(r"\b(?:kur|kurmak|kurulum|yükle|yukle|indir|install|ekle)\b", lowered)
+    )
 
 
 def active_chrome_session_goal(goal: Optional[str]) -> bool:
@@ -1628,6 +1636,8 @@ async def run_agent_with_callback(
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"))
         if not active_chrome_session_goal(goal) or skills_sh_goal(goal):
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
+        if skill_install_goal(goal):
+            runtime.selected["install_skill"] = skill_install_entry(service, runtime)
         tool_schemas: List[Dict[str, Any]] = build_tool_schemas(
             goal, allow_edit=source_change_expected(goal, options["history"])
         )

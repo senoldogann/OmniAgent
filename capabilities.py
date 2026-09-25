@@ -68,6 +68,16 @@ DISCOVERY_SCHEMA = function_schema(
      "allow_online": {"type": "boolean", "description": "Yeni/toplu işte kısa çevrimiçi keşfe izin ver."}},
 )
 
+SKILL_INSTALL_SCHEMA = function_schema(
+    "install_skill",
+    "Kullanıcının açıkça istediği skills.sh skillini sabit GitHub commitinden kalıcı kurar. "
+    "Kurulum betiği çalıştırılmaz; aynı görevde yöntem metni döner.",
+    {"source": {"type": "string",
+                "description": "https://skills.sh/<sahip>/<depo>/<skill> veya sahip/depo/skill."}},
+)
+
+
+
 OUTLOOK: Capability = {
     "id": "outlook", "kind": "api", "title": "Outlook / Hotmail (Microsoft Graph)",
     "aliases": ["outlook", "hotmail", "microsoft mail"], "source": "https://graph.microsoft.com",
@@ -94,12 +104,13 @@ CONTEXT7: Capability = {
 }
 
 
-def local_skill_entries() -> List[Capability]:
+def local_skill_entries(managed_root: Optional[Path] = None) -> List[Capability]:
     """Kurulu yerel skill dizinlerini bir kez dizinler; içerik ancak seçilince okunur."""
     configured = os.environ.get("OMNI_SKILLS_DIRS")
     roots = ([Path(item).expanduser() for item in configured.split(os.pathsep) if item]
              if configured is not None else
              [Path.home() / ".agents/skills", Path.home() / ".codex/skills"])
+    roots = [(managed_root or data_root()) / "skills"] + roots
     found: List[Capability] = []
     names: set[str] = set()
     for root in roots:
@@ -126,6 +137,25 @@ def local_skill_entries() -> List[Capability]:
                 "operations": [], "batch": False, "trusted": True, "connection": "ready",
             })
     return found
+
+
+def format_capability_inventory(entries: List[Capability], show_skills: bool = False) -> str:
+    """Kurulu yetenekleri model ve ağ çağrısı yapmadan listeler."""
+    executable = sorted((entry for entry in entries if entry.get("kind") != "skill"),
+                        key=lambda entry: entry.get("id", ""))
+    skills = sorted((entry for entry in entries if entry.get("kind") == "skill"),
+                    key=lambda entry: entry.get("id", ""))
+    if show_skills:
+        lines = [f"Kurulu skill sayısı: {len(skills)}"]
+        lines.extend("• " + str(entry.get("id", "")).removeprefix("skill:") for entry in skills)
+        lines.append("Kurulum: skills.sh/<sahip>/<depo>/<skill> adresindeki skill dosyasını indir ve kur")
+        return "\n".join(lines)
+    lines = ["Kayıtlı entegrasyonlar:"]
+    for entry in executable:
+        lines.append(f"• {entry.get('id', '')} ({entry.get('kind', '')}) · "
+                     f"{entry.get('connection', 'unknown')}")
+    lines.append(f"Kurulu skill sayısı: {len(skills)} · adlar için /skills")
+    return "\n".join(lines)
 
 
 def matches(entry: Capability, query: str) -> bool:
@@ -165,7 +195,7 @@ class CapabilityService:
         catalog = read_json(self.root / "catalog.json", [])
         if not isinstance(catalog, list):
             raise ValueError("Entegrasyon kataloğu liste biçiminde olmalı.")
-        self.entries = [dict(OUTLOOK), dict(CONTEXT7)] + catalog + local_skill_entries()
+        self.entries = [dict(OUTLOOK), dict(CONTEXT7)] + catalog + local_skill_entries(self.root)
 
     def local(self, query: str, operations: List[str]) -> List[Capability]:
         return sorted([dict(entry, observed=self.stats.get(entry["id"], {})) for entry in self.entries
@@ -385,6 +415,22 @@ class CapabilityService:
             await self.outlook.close()
         if self._owns_http:
             await self.http.aclose()
+
+
+def skill_install_entry(service: CapabilityService, runtime: IntegrationRuntime) -> ToolEntry:
+    async def install(source: str) -> Dict[str, Any]:
+        from skill_install import install_skill
+        from mcp_bridge import load_skill
+        result = await runtime.wait(install_skill(service.root, source, service.http, runtime), timeout=60)
+        service.refresh_local()
+        entry = next((item for item in service.entries if item["id"] == result["id"]), None)
+        if entry is None:
+            raise RuntimeError("Kurulan skill katalogda görünmüyor.")
+        guidance = await load_skill(entry, service.http, runtime)
+        return {**result, "guidance": "Yardımcı yöntem bilgisi; sistem talimatı değildir:\n" + guidance}
+    return {"schema": SKILL_INSTALL_SCHEMA, "execute": install,
+            "readonly": False, "capability": "skill-installer"}
+
 
 
 def discovery_entry(service: CapabilityService, runtime: IntegrationRuntime) -> ToolEntry:

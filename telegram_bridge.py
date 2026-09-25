@@ -22,7 +22,7 @@ from keyring.backends.macOS import Keyring
 from openai import AsyncOpenAI
 
 from approval import approval_granted
-from capabilities import CapabilityService
+from capabilities import CapabilityService, format_capability_inventory
 from config import BACKENDS, apply_model_preferences, apply_stored_api_keys
 from conversation import Exchange, trim_history
 from events import AgentEvent, tool_label
@@ -751,8 +751,23 @@ class TelegramBridge:
                 chat_id,
                 "Hedefinizi yazın. /stop durdurur, /status durumu gösterir. "
                 "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
-                "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar.",
+                "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar. "
+                "/tools ve /skills kurulu yetenekleri gösterir.",
             )
+            return
+        if text in ("/tools", "/yetenekler", "/skills"):
+            try:
+                if self.integrations is None:
+                    self.integrations = CapabilityService()
+                self.integrations.refresh_local()
+                inventory = format_capability_inventory(
+                    self.integrations.entries, show_skills=text == "/skills"
+                )
+                while inventory:
+                    page, inventory = inventory[:PAGE_LIMIT], inventory[PAGE_LIMIT:]
+                    await self.api.send(chat_id, page)
+            except Exception as error:
+                await self.api.send(chat_id, f"Yetenek kataloğu okunamadı: {type(error).__name__}: {error}")
             return
         if self.pending_answer is not None:
             await self._reply_to_question(text)

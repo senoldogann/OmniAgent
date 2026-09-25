@@ -31,6 +31,8 @@ Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık 
 - Doğrudan mesaj: yeni görev.
 - `/stop`: çalışan görevi ve kullanıcı yanıtı beklemesini durdurur.
 - `/status`: çalışan hedefi gösterir.
+- `/tools` veya `/yetenekler`: kurulu API/MCP bağlantılarını ve skill sayısını yerel katalogdan gösterir.
+- `/skills`: kurulu skill adlarını yerel katalogdan gösterir. Skill kurmak veya kullanmak için doğal dilde hedef yazın.
 - `/verbose on` veya `/verbose off`: sonraki görevde ayrıntılı veya kısa görünümü seçer; varsayılan kısa görünümdür.
 - `/model auto` veya `/model <profil>`: sonraki görevin modelini seçer. Profil adları `config.BACKENDS` içindedir: `ollama-cloud`, `openai`, `opencode`, `opencode-think`, `openrouter`. İlgili anahtar (`OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`) tanımlı değilse o profil kullanılamaz; anahtarlar arayüzdeki **Ayarlar** sayfasından girilip Keychain'de saklanabilir ve köprü açılışta bunları kendi süreç-içi deposuna alır. Anahtarlar ortam değişkenlerine yazılmaz, alt süreçlere geçmez ve araç çıktısında maskelenir; kayıtlı anahtar kabukta tanımlı bir değişkeni geçersiz kılar.
 - `/mode normal`, `/mode long`, `/mode autonomous`: sonraki görevin tur/zaman bütçesini seçer.

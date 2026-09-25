@@ -38,28 +38,8 @@ from main import (
 from state_manager import EpisodeMetrics
 from markdown_render import render_markdown
 from conversation import Exchange, make_exchange, trim_history
-from capabilities import Capability, CapabilityService
+from capabilities import CapabilityService, format_capability_inventory
 from voice import VoiceInput, VoiceInputError
-
-def format_capability_inventory(entries: List[Capability], show_skills: bool = False) -> str:
-    """Yerel kataloğu model veya ağ çağrısı olmadan kısa metne dönüştürür."""
-    executable = sorted((entry for entry in entries if entry.get("kind") != "skill"),
-                        key=lambda entry: entry.get("id", ""))
-    skills = sorted((entry for entry in entries if entry.get("kind") == "skill"),
-                    key=lambda entry: entry.get("id", ""))
-    if show_skills:
-        lines = [f"Kurulu skill sayısı: {len(skills)}"]
-        lines.extend("• " + str(entry.get("id", "")).removeprefix("skill:") for entry in skills)
-        return "\n".join(lines)
-    lines = ["Kayıtlı entegrasyonlar:"]
-    for entry in executable:
-        name = entry.get("id", "")
-        kind = entry.get("kind", "")
-        status = entry.get("connection", "unknown")
-        lines.append(f"• {name} ({kind}) · {status}")
-    lines.append(f"Kurulu skill sayısı: {len(skills)} · adlar için /skills")
-    return "\n".join(lines)
-
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
