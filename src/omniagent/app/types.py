@@ -54,6 +54,7 @@ class RunOptions(TypedDict):
     answer: NotRequired[AnswerSink]
     deliver: NotRequired[DeliverSink]
     images: NotRequired[List[str]]
+    scheduled_run: NotRequired[bool]
     run_mode: NotRequired[str]
     max_iterations: NotRequired[int]
     max_wall_clock_seconds: NotRequired[float]

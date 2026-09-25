@@ -38,6 +38,16 @@ def checkpoints_dir() -> Path:
     return data_root() / "checkpoints"
 
 
+def schedules_file() -> Path:
+    """Zamanlanmış/yinelenen görev planları (Telegram köprüsü çalıştırır)."""
+    return data_root() / "schedules.json"
+
+
+def telegram_settings_file() -> Path:
+    """Eşleştirilmiş Telegram sohbeti; varlığı zamanlanmış görevleri çalıştıracak köprünün kurulu olduğunu gösterir."""
+    return data_root() / "telegram.json"
+
+
 def backups_dir() -> Path:
     """Dosya düzenleme/yazma araçlarının zaman damgalı yedekleri."""
     return data_root() / "backups"

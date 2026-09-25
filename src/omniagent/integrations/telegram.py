@@ -6,6 +6,7 @@ import asyncio
 import getpass
 import html
 import json
+import logging
 import os
 import plistlib
 import re
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -24,9 +26,11 @@ from openai import AsyncOpenAI
 from omniagent.approval import approval_granted
 from .capabilities import CapabilityService
 from omniagent.config import BACKENDS, apply_model_preferences, apply_stored_api_keys
+from omniagent.core import schedule
 from omniagent.core.conversation import Exchange, trim_history
 from omniagent.core.events import AgentEvent, tool_label
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
+from omniagent.paths import schedules_file, telegram_settings_file
 from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
 
@@ -36,6 +40,8 @@ TOKEN_ACCOUNT = "bot_token"
 PAGE_LIMIT = 3500
 EDIT_INTERVAL = 1.1
 POLL_SECONDS = 20
+# Zamanlanmış görevlerin denetim aralığı (dakika çözünürlüğü için yeterli)
+SCHEDULER_TICK_SECONDS = 30
 # Bot API getFile yalnız 20 MB'a kadar dosya indirir
 DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 UPLOAD_TIMEOUT = httpx.Timeout(300.0, connect=5.0)
@@ -76,7 +82,7 @@ class TelegramAttachment(TypedDict):
 
 
 def settings_path() -> Path:
-    return data_root() / "telegram.json"
+    return telegram_settings_file()
 
 
 def offset_path() -> Path:
@@ -719,7 +725,15 @@ class TelegramBridge:
         except TelegramError as error:
             raise DeliveryFailed(str(error)) from None
 
-    async def _execute(self, goal: str, images: Optional[List[str]] = None) -> None:
+    async def _execute(
+        self, goal: str, images: Optional[List[str]] = None, scheduled_id: Optional[str] = None,
+    ) -> None:
+        if scheduled_id is not None:
+            # Bildirim görevin içinde gider: zamanlayıcı görevi await etmeden atar, araya mesaj giremez
+            try:
+                await self.api.send(self.settings["chat_id"], f"⏰ Zamanlanmış görev başlıyor [{scheduled_id}]: {goal[:500]}")
+            except TelegramError as error:
+                logging.warning("Zamanlanmış görev bildirimi gönderilemedi", extra={"error": str(error)[:200]})
         # Ayarlar başka süreçte değişmiş olabilir; görev başında güncel modeli yükle.
         apply_model_preferences()
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
@@ -742,6 +756,8 @@ class TelegramBridge:
         }
         if images:
             options["images"] = images
+        if scheduled_id is not None:
+            options["scheduled_run"] = True
 
         async def work() -> RunReport:
             with host_task_lock():
@@ -849,6 +865,79 @@ class TelegramBridge:
         future.set_result(value)
         await self.api.send(self.settings["chat_id"], "Yanıt alındı; görev sürüyor.")
 
+    async def scheduler_tick(self, now: datetime) -> None:
+        """
+        Kaçmış eski çalışmaları bildirip atlar; bilgisayar boşsa zamanı gelen ilk planı başlatır.
+        Plan başlarken sonraki zamanına ilerletilir: görev uzun sürse de aynı plan iki kez başlamaz.
+        `self.active` denetimi ile görev ataması arasında await yoktur; aksi hâlde araya giren
+        kullanıcı mesajının görevi ezilirdi.
+        """
+        path = schedules_file()
+        chat_id = self.settings["chat_id"]
+        try:
+            records = schedule.load_schedules(path)
+            records, skipped = schedule.skip_missed(records, now)
+            if skipped:
+                schedule.save_schedules(path, records)
+        except (OSError, ValueError) as error:
+            logging.warning("Plan deposu okunamadı", extra={"error_type": type(error).__name__})
+            return
+        for record in skipped:
+            await self.api.send(chat_id, f"⏰ Kaçırıldı (bilgisayar kapalı/uykudaydı): {record['goal'][:300]}")
+        if self.active is not None:
+            return
+        ready = schedule.due_schedules(records, now)
+        if not ready:
+            return
+        try:
+            with host_task_lock():
+                pass
+        except HostBusyError:
+            return  # arayüzde görev sürüyor; bir sonraki turda yeniden denenir
+        record = ready[0]
+        try:
+            schedule.save_schedules(path, schedule.advance_schedule(records, record["id"], now))
+        except OSError as error:
+            logging.warning("Plan ilerletilemedi", extra={"error_type": type(error).__name__})
+            return
+        self.goal = record["goal"]
+        self.stop_event.clear()
+        self.active = asyncio.create_task(self._execute(record["goal"], scheduled_id=record["id"]))
+
+    async def _scheduler_loop(self) -> None:
+        """Sürekli çalışan hizmette tek bir hata planların tümünü durdurmasın: her tur ayrı korunur."""
+        while True:
+            try:
+                await self.scheduler_tick(datetime.now().astimezone())
+            except TelegramError as error:
+                logging.warning("Zamanlayıcı bildirimi gönderilemedi", extra={"error": str(error)[:200]})
+            except Exception:
+                logging.exception("Zamanlayıcı turu başarısız")
+            await asyncio.sleep(SCHEDULER_TICK_SECONDS)
+
+    async def _schedule_command(self, text: str) -> None:
+        """/schedules planları listeler; /unschedule <kimlik> planı siler."""
+        chat_id = self.settings["chat_id"]
+        path = schedules_file()
+        try:
+            records = schedule.load_schedules(path)
+            if text.startswith("/unschedule"):
+                parts = text.split(None, 1)
+                records, removed = schedule.remove_schedule(records, parts[1] if len(parts) > 1 else "")
+                if removed is None:
+                    await self.api.send(chat_id, "Plan bulunamadı. Kimlikleri /schedules gösterir.")
+                    return
+                schedule.save_schedules(path, records)
+                await self.api.send(chat_id, f"Plan silindi: {schedule.describe_record(removed)}")
+                return
+        except (OSError, ValueError) as error:
+            await self.api.send(chat_id, f"Plan deposu okunamadı: {type(error).__name__}")
+            return
+        if not records:
+            await self.api.send(chat_id, "Planlanmış görev yok. Örnek: \"Her sabah 9'da gündemi özetle\".")
+            return
+        await self.api.send(chat_id, "Planlanmış görevler:\n" + "\n".join(schedule.describe_record(r) for r in records))
+
     async def _start_attachment_task(self, message: Dict[str, Any], attachment: TelegramAttachment) -> None:
         """Eki indirir ve açıklamasıyla (yoksa varsayılan istekle) görevi başlatır."""
         chat_id = self.settings["chat_id"]
@@ -866,6 +955,10 @@ class TelegramBridge:
             path = await self.api.download(attachment["file_id"], inbox_path(), attachment["name"])
         except (OSError, TelegramError) as error:
             await self.api.send(chat_id, f"Ek indirilemedi: {error}")
+            return
+        if self.active is not None:
+            # İndirme sürerken zamanlanmış görev başlamış olabilir; onu ezme
+            await self.api.send(chat_id, f"Bir görev çalışıyor; ek kaydedildi: {path}. Görev bitince yeniden isteyin.")
             return
         caption = message.get("caption")
         goal = attachment_goal(caption if isinstance(caption, str) else "", attachment, path)
@@ -895,6 +988,9 @@ class TelegramBridge:
                     self.pending_answer.set_exception(IntegrationStopped("Kullanıcı tarafından durduruldu."))
                 await self.api.send(chat_id, "Durdurma istendi; çalışan işlem iptal ediliyor.")
             return
+        if text == "/schedules" or text.startswith("/unschedule"):
+            await self._schedule_command(text)
+            return
         if text == "/status":
             state = f"Çalışıyor: {self.goal[:400]}" if self.active is not None else "Hazır."
             await self.api.send(chat_id, state)
@@ -906,7 +1002,8 @@ class TelegramBridge:
                 "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
                 "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar. "
                 "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
-                "ajan istediğiniz dosyaları size buradan geri gönderebilir.",
+                "ajan istediğiniz dosyaları size buradan geri gönderebilir. "
+                "\"Her sabah 9'da …\" gibi görevler planlanır; /schedules listeler, /unschedule <kimlik> siler.",
             )
             return
         if self.pending_answer is not None:
@@ -941,6 +1038,7 @@ class TelegramBridge:
 
     async def run(self) -> None:
         self.clients = create_model_clients()
+        scheduler = asyncio.create_task(self._scheduler_loop())
         try:
             failures = 0
             while True:
@@ -969,6 +1067,8 @@ class TelegramBridge:
                     save_json(offset_path(), {"offset": self.offset})
                     await self.handle(update)
         finally:
+            scheduler.cancel()
+            await asyncio.gather(scheduler, return_exceptions=True)
             self.stop_event.set()
             if self.active is not None:
                 try:

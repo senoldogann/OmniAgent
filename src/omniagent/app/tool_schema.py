@@ -85,6 +85,22 @@ def camera_photo_goal(goal: str) -> bool:
     )
 
 
+_SCHEDULING_INTENT: re.Pattern[str] = re.compile(
+    r"(?:\bher\s+(?:gün|gun|sabah|akşam|aksam|gece|öğlen|oglen|hafta|ay|pazartesi|salı|sali|çarşamba|carsamba|"
+    r"perşembe|persembe|cuma|cumartesi|pazar|saat|\d+\s*(?:dakika|saat|gün|gun))"
+    r"|\bhafta\s*içi|\bhaftaiçi|\b(?:dakikada|saatte|günde|gunde)\s+bir\b|\bsaat\s*\d{1,2}"
+    r"|\b\d{1,2}(?:[:.]\d{2})?['’](?:de|da|te|ta)\b|\bzamanla|\bplanla|\bplanlanm|\bplanlar"
+    r"|\bhat[ıi]rlat|\bevery\s+(?:day|morning|evening|night|week|month|hour|\d+)|\b(?:daily|weekly|hourly)\b"
+    r"|\bremind|\bschedul)",
+    re.IGNORECASE,
+)
+
+
+def scheduling_goal(goal: Optional[str]) -> bool:
+    """Hedef ileri zamanlı/yinelenen bir görev ya da plan yönetimi istiyor mu? Saf."""
+    return bool(goal and _SCHEDULING_INTENT.search(goal))
+
+
 def skills_sh_goal(goal: Optional[str]) -> bool:
     """Kullanıcı skills.sh kaynağını açıkça istedi mi? Saf."""
     return bool(goal and re.search(r"\bskills\.sh\b", goal, re.IGNORECASE))
@@ -156,6 +172,7 @@ def build_tool_schemas(goal: Optional[str] = None, allow_edit: bool = False) -> 
 
 def route_tool_schemas(
     goal: Optional[str], allow_edit: bool, chrome_session: bool, can_send_files: bool = False,
+    can_schedule: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Modelin gördüğü araçlar. Liste bilerek kısa tutulur: ölçümde 26 araçlı şemada model
@@ -163,6 +180,7 @@ def route_tool_schemas(
     Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
     chrome_session: görev kullanıcının açık Chrome oturumunda yürüyor (bkz. chrome_session_route).
     can_send_files: görevin dosya teslim kanalı (Telegram sohbeti) var; send_file yalnız o zaman görünür.
+    can_schedule: hedef zamanlama istiyor ve planları çalıştıracak Telegram köprüsü kurulu.
     """
     schemas: List[Dict[str, Any]] = [
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
@@ -397,6 +415,29 @@ def route_tool_schemas(
                 "caption": {"type": ["string", "null"], "description": "Dosyanın altındaki kısa açıklama veya null."},
             },
         ))
+    if can_schedule:
+        schemas.append(_function_schema(
+            "schedule_task",
+            "Görevi ileri bir zamana veya düzenli tekrara planlar; zamanı gelince görev çalışır ve sonucu "
+            "Telegram sohbetine gelir. add: goal ZAMAN İFADESİ İÇERMEYEN, tek başına anlaşılır görevdir. "
+            "list planları kimlikleriyle gösterir; remove schedule_id ile planı siler.",
+            {
+                "action": {"type": "string", "enum": ["add", "list", "remove"]},
+                "goal": {"type": ["string", "null"], "description": "add: çalıştırılacak görev metni."},
+                "repeat": {
+                    "type": ["string", "null"], "enum": ["once", "daily", "weekly", "interval", None],
+                    "description": "once: at bir kez; daily: her gün time; weekly: weekdays günlerinde time; interval: every_minutes.",
+                },
+                "time": {"type": ["string", "null"], "description": "daily/weekly yerel saat 'SS:DD'."},
+                "weekdays": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string", "enum": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]},
+                },
+                "at": {"type": ["string", "null"], "description": "once: yerel 'YYYY-AA-GGTSS:DD'."},
+                "every_minutes": {"type": ["integer", "null"], "description": "interval: 15-10080 dakika."},
+                "schedule_id": {"type": ["string", "null"], "description": "remove: plan kimliği."},
+            },
+        ))
     if goal is not None and camera_photo_goal(goal):
         schemas.append(_function_schema(
             "capture_photo",
@@ -413,7 +454,9 @@ def route_tool_schemas(
 TOOL_NAMES: frozenset[str] = frozenset(
     schema["function"]["name"]
     for sample in ("fotoğraf çek masaüstüne", "açık Chrome oturumunu kullan")
-    for schema in route_tool_schemas(sample, True, active_chrome_session_goal(sample), can_send_files=True)
+    for schema in route_tool_schemas(
+        sample, True, active_chrome_session_goal(sample), can_send_files=True, can_schedule=True,
+    )
 )
 
 # Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
@@ -428,7 +471,7 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
     "cua_fill_field", "cua_click_text", "cua_scroll", "cua_read_scrollable",
-    "user_memory", "ask_user", "send_file",
+    "user_memory", "ask_user", "send_file", "schedule_task",
 })
 
 # Ekranı değiştiren araçlar. Bunlardan sonra görüntü alınmadıysa tur sonunda ekran
@@ -444,7 +487,7 @@ _SCREEN_ACTION_TOOLS: frozenset[str] = frozenset({
 _GUI_VERIFICATION_TOOLS: frozenset[str] = _SCREEN_ACTION_TOOLS - frozenset({"chrome_active_tab"})
 _ACTION_RECEIPT_TOOLS: frozenset[str] = (_SCREEN_ACTION_TOOLS - frozenset({"cua_read_scrollable"})) | frozenset({"take_screenshot"})
 _DETERMINISTIC_PROGRESS_TOOLS: frozenset[str] = frozenset({
-    "write_file", "edit_file", "execute_js", "capture_photo", "user_memory", "send_file",
+    "write_file", "edit_file", "execute_js", "capture_photo", "user_memory", "send_file", "schedule_task",
 })
 _READ_PROGRESS_TOOLS: frozenset[str] = frozenset({
     "web_search", "fetch_raw", "read_file", "browse_url", "cua_read_scrollable",

@@ -46,7 +46,7 @@ EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "take_screenshot", "cua_get_app", "cua_get_ax_state", "cua_click", "cua_click_point",
     "cua_type_text", "cua_press_key", "cua_submit_text", "smart_click", "run_action_sequence",
     "chrome_active_tab", "capture_photo", "ask_user", "user_memory", "process_list",
-    "discover_capabilities",
+    "discover_capabilities", "schedule_task",
 })
 # Çağrı gösteriminde tek başına yeterli olan ana argüman alanları
 _PRIMARY_ARGUMENTS: Tuple[str, ...] = ("command", "code", "url", "path", "query")
