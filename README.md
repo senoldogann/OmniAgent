@@ -34,4 +34,4 @@ Komut satırı: `.venv/bin/omniagent "<hedef>"`. Telegram köprüsü (`.venv/bin
 - [Geliştirme devir notu](docs/HANDOFF.md)
 - [Ajan geliştirme kuralları](AGENTS.md)
 
-Doğrulama: `.venv/bin/python -m pytest tests/ -q` (macOS dışında pyobjc çerçeveleri `tests/conftest.py` ile sahtelenir; Linux'ta `xvfb-run` ve `python3-tk` gerekir, Keychain/Quartz'a bağlı birkaç test yalnız macOS'ta geçer). Canlı model veya GUI benchmark'ı ayrı koşullarda çalıştırın.
+Doğrulama: `.venv/bin/python -m pytest tests/ -q` (macOS dışında pyobjc çerçeveleri `tests/conftest.py` ile sahtelenir; Linux'ta `xvfb-run` ve `python3-tk` gerekir, Keychain/Quartz'a bağlı birkaç test yalnız macOS'ta koşar). Her PR'da `.github/workflows/tests.yml` paketi gerçek macOS ve Linux üzerinde çalıştırır. Canlı model veya GUI benchmark'ı ayrı koşullarda çalıştırın.
