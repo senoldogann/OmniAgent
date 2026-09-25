@@ -18,8 +18,8 @@ from omniagent.config import API_KEY_VARIABLES, redact
 from .filesystem import _is_sensitive_path, _logical_path
 from .types import (
     PROCESS_POLL_SECONDS, SHELL_MAX_TIMEOUT_SECONDS, SHELL_TIMEOUT_SECONDS,
-    STREAM_READ_CHARS, STREAM_STDERR_MAX_BYTES, STREAM_STDOUT_MAX_BYTES,
-    TOOL_RUNTIME, ToolError, ToolRuntime, clip_text,
+    STREAM_EMIT_INTERVAL_SECONDS, STREAM_READ_CHARS, STREAM_STDERR_MAX_BYTES, STREAM_STDOUT_MAX_BYTES,
+    TIMEOUT_OUTPUT_TAIL, TOOL_RUNTIME, ToolError, ToolRuntime, clip_text,
 )
 
 _clip = clip_text
@@ -36,16 +36,31 @@ def _pump_lines(
     stream: IO[str], lines: List[str], sink: Optional[Callable[[str], None]],
     limit: int, label: str,
 ) -> None:
-    """Pipe'ı tamamen tüketir; saklanan ve UI'ya yayılan çıktıyı bayt sınırında tutar."""
+    """
+    Pipe'ı tamamen tüketir; saklanan ve UI'ya yayılan çıktıyı bayt sınırında tutar. Canlı
+    olaylar 2 KB'ta ya da son yayından 0,1 sn sonra gelen ilk satırda yayılır: yavaş akan
+    komutun (ping, derleme) satırları biriktirilmeden görünür, hızlı akış tek olayda toplanır.
+    """
     used = 0
     truncated = False
     event_parts: List[str] = []
     event_bytes = 0
+    last_emit = 0.0
+
+    def publish(value: str) -> None:
+        # Yayın hatası okuyucu thread'ini öldürüp pipe'ı doldurmasın (süreç bloke olurdu)
+        if sink is None:
+            return
+        try:
+            sink(value)
+        except Exception:
+            logging.warning("Canlı komut çıktısı yayınlanamadı", extra={"stream": label})
 
     def flush_events() -> None:
-        nonlocal event_bytes
-        if event_parts and sink is not None:
-            sink("".join(event_parts))
+        nonlocal event_bytes, last_emit
+        if event_parts:
+            publish("".join(event_parts))
+            last_emit = time.monotonic()
         event_parts.clear()
         event_bytes = 0
 
@@ -67,15 +82,14 @@ def _pump_lines(
                     kept_size = len(kept.encode("utf-8"))
                     used += kept_size
                     event_bytes += kept_size
-                    if event_bytes >= 2048:
+                    if event_bytes >= 2048 or time.monotonic() - last_emit >= STREAM_EMIT_INTERVAL_SECONDS:
                         flush_events()
 
             if len(encoded) > remaining and not truncated:
                 marker = f"\n…[{label} çıktısı {limit} bayt sınırında kırpıldı]\n"
                 lines.insert(0, marker)
                 flush_events()
-                if sink is not None:
-                    sink(marker)
+                publish(marker)
                 truncated = True
 
         flush_events()
@@ -169,25 +183,20 @@ def run_streaming_process(
 
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)
-
-    if stopped:
+    if stopped or timed_out or stalled:
+        # Hata metni modele gider: tam çıktı (64+16 KB) yerine yalnız sonu taşınır
+        partial = output_tail(stdout + (f"\nSTDERR: {stderr}" if stderr else ""), TIMEOUT_OUTPUT_TAIL) or "(yok)"
+        if stopped:
+            raise ToolError(f"Komut kullanıcı tarafından durduruldu. Kısmi çıktı: {partial}", "STOPPED", False)
+        if timed_out:
+            raise ToolError(
+                f"Komut {timeout:g} saniyede tamamlanmadı; süreç grubu sonlandırıldı. Kısmi çıktı: {partial}",
+                "SHELL_TIMEOUT", True,
+            )
         raise ToolError(
-            f"Komut kullanıcı tarafından durduruldu.\nSTDOUT: {stdout}\nSTDERR: {stderr}",
-            "STOPPED",
-            False,
-        )
-    if timed_out:
-        raise ToolError(
-            f"Komut {timeout:g} saniyede tamamlanmadı.\nSTDOUT: {stdout}\nSTDERR: {stderr}",
-            "SHELL_TIMEOUT",
-            True,
-        )
-    if stalled:
-        raise ToolError(
-            f"Komutun ebeveyni bitti ancak bir alt süreç çıktı pipe'ını açık tuttu. "
-            f"STDOUT: {stdout}\nSTDERR: {stderr}",
-            "SHELL_OUTPUT_STALLED",
-            True,
+            "Komutun ebeveyni bitti ancak bir alt süreç çıktı pipe'ını açık tuttu; süreç grubu "
+            f"sonlandırıldı. Kısmi çıktı: {partial}",
+            "SHELL_OUTPUT_STALLED", True,
         )
     return process.returncode, stdout, stderr
 
@@ -218,9 +227,13 @@ def _shell_path(raw: str) -> Optional[Path]:
 
 def _command_words(segment: List[str]) -> List[str]:
     words = list(segment)
-    sudo_opts = {"-u", "-g", "-h", "-p", "-C", "-T", "-R", "-D", "--role", "--type"}
-    env_opts = {"-u", "-C", "-S"}
-    
+    # Değer alan seçenekler: değerleri komut adı sanılmasın (finansal onay sınıflandırması buna dayanır)
+    sudo_opts = {
+        "-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from",
+        "-T", "--command-timeout", "-R", "--chroot", "-D", "--chdir", "--role", "--type",
+    }
+    env_opts = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+
     while words:
         first = Path(words[0]).name
         if first == "sudo":
@@ -287,10 +300,13 @@ def shell_command_words(command: str) -> List[List[str]]:
 
 def resolve_shell_timeout(timeout_seconds: Optional[int]) -> float:
     if timeout_seconds is None: return SHELL_TIMEOUT_SECONDS
-    if not isinstance(timeout_seconds, (int, float)):
-        raise ToolError(f"timeout_seconds tamsayı olmalı; alınan: {timeout_seconds!r}", "INVALID_TIMEOUT", False)
+    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
+        raise ToolError(f"timeout_seconds tamsayı veya null olmalı; alınan: {timeout_seconds!r}", "INVALID_TIMEOUT", False)
     if not 1 <= timeout_seconds <= SHELL_MAX_TIMEOUT_SECONDS:
-        raise ToolError(f"timeout_seconds 1-{SHELL_MAX_TIMEOUT_SECONDS} arasında olmalı.", "INVALID_TIMEOUT", False)
+        raise ToolError(
+            f"timeout_seconds 1-{SHELL_MAX_TIMEOUT_SECONDS} arasında olmalı; alınan: {timeout_seconds}",
+            "INVALID_TIMEOUT", False,
+        )
     return float(timeout_seconds)
 
 def output_tail(text: str, limit: int) -> str:

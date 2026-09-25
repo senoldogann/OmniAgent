@@ -51,7 +51,7 @@ sohbet/kullanıcı yerel dosyada tutulur. UI ile aynı anda host görevi çalı�
 Ekran kaydı izni eksikse araç "izin yok" demekle kalmaz: izni alacak uygulamayı adı + bundle
 kimliğiyle, yoksa eklenecek tam python yolunu ve Sistem Ayarları komutunu yazar; ilk eksik
 denemede macOS'un izin istemi bir kez gösterilir (uygulama sisteme ancak böyle kaydolur).
-`uv run python permissions.py` aynı tanıyı komut satırında verir.
+`.venv/bin/omniagent-permissions` aynı tanıyı (ekran kaydı ve erişilebilirlik) komut satırında verir.
 
 Kurulum ve sınırlar [TELEGRAM.md](TELEGRAM.md) içindedir. Bu değişiklikte canlı
 Telegram mesajı gönderilmedi; yerel hizmetin çalıştığı doğrulandı.

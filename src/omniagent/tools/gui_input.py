@@ -2,264 +2,451 @@
 OmniAgent GUI Girdi Modülü (tools/gui_input.py)
 macOS Erişilebilirlik (AX) ağacı üzerinden yüksek hassasiyetli etkileşim,
 Unicode metin girişi ve koordinat tabanlı fare kontrolü.
+
+AX işlevleri (AXIsProcessTrusted, AXUIElement*, AXValue*) pyobjc'de HIServices'tedir ve
+ApplicationServices modülünden gelir; Quartz modülü bunları içermez.
 """
-import os
-import time
 import json
 import subprocess
-import numpy as np
+import time
+from typing import Dict, List, Optional, Tuple
+
+import AppKit
+import ApplicationServices as AX
 import pyautogui
 import Quartz
-import AppKit
-from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 
+from .screen import (
+    _check_in_model_space, _raise_if_stopped, accessibility_help,
+    click_model_point, current_geometry, drag_model_points, move_model_point,
+    multi_click_model_point, parse_point, points_to_model,
+)
+from .system import child_environment
 from .types import (
     AX_ELEMENT_LIMIT, AX_LABEL_SEARCH_NODES, AX_MESSAGING_TIMEOUT_SECONDS,
-    AX_NODE_LIMIT, AX_SCAN_BUDGET_SECONDS, MODEL_SCREEN_SIZE,
-    UNICODE_CHUNK_DELAY_SECONDS, UNICODE_CHUNK_UNITS,
-    ActionStep, AXElement, ToolError, ScreenGeometry,
-    TYPED_TEXT_ECHO_LIMIT, MAX_WAIT_SECONDS, clip_text,
+    AX_NODE_LIMIT, AX_SCAN_BUDGET_SECONDS, MAX_WAIT_SECONDS,
+    TYPED_TEXT_ECHO_LIMIT, UNICODE_CHUNK_DELAY_SECONDS, UNICODE_CHUNK_UNITS,
+    ActionStep, AXElement, ScreenGeometry, ToolError, clip_text,
 )
 
 _clip = clip_text
-from .screen import (
-    current_geometry, parse_point, points_to_model,
-    click_model_point, move_model_point, post_scroll,
-    changed_region, drag_model_points, multi_click_model_point,
-)
 
-# AX Sabitleri
-AX = Quartz
-_AX_ACTIONABLE_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXSwitch", "AXPopUpButton", "AXMenuItem", "AXTextField", "AXTextArea", "AXSearchField", "AXSlider", "AXStepper"}
-_AX_TEXT_INPUT_ROLES = {"AXTextField", "AXTextArea", "AXSearchField"}
-_AX_SCAN_ATTRIBUTES = ["AXRole", "AXEnabled", "AXPosition", "AXSize", "AXTitle", "AXDescription", "AXPlaceholderValue", "AXValue", "AXChildren"]
+# Listeye giren etkileşimli roller. Satır (AXRow) ve bağlantı (AXLink) Mail/Notlar/Finder
+# listelerinin ve web içeriğinin asıl hedefleridir; etiketsiz satırın metni alt öğeden okunur.
+_AX_ACTIONABLE_ROLES: frozenset[str] = frozenset({
+    "AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXComboBox",
+    "AXTextField", "AXTextArea", "AXLink", "AXMenuItem", "AXDisclosureTriangle", "AXSlider",
+    "AXIncrementor", "AXRow",
+})
+_AX_TEXT_INPUT_ROLES: frozenset[str] = frozenset({"AXTextField", "AXTextArea", "AXComboBox"})
+_AX_SCAN_ATTRIBUTES: List[str] = [
+    "AXRole", "AXChildren", "AXTitle", "AXDescription", "AXValue",
+    "AXPlaceholderValue", "AXPosition", "AXSize", "AXEnabled",
+]
 
-_KEY_ALIASES = {
-    "enter": "Enter", "return": "Enter", "esc": "Escape", "escape": "Escape",
-    "tab": "Tab", "space": "Space", "backspace": "Backspace", "delete": "Delete",
-    "arrowup": "ArrowUp", "arrowdown": "ArrowDown", "arrowleft": "ArrowLeft", "arrowright": "ArrowRight",
-    "cmd": "Meta", "command": "Meta", "meta": "Meta", "ctrl": "Control", "control": "Control",
-    "alt": "Alt", "option": "Alt", "shift": "Shift",
+# Modelin yaygın yazımlarını pyautogui'nin macOS tuş adlarına çevirir. Playwright adları
+# ("Meta", "Control", "ArrowUp") burada geçersizdir: pyautogui bilinmeyen tuşu sessizce atlar
+# ve "cmd+c" yalnız "c" yazar.
+_KEY_ALIASES: Dict[str, str] = {
+    "cmd": "command", "⌘": "command", "meta": "command", "control": "ctrl",
+    "opt": "option", "⌥": "option", "esc": "escape", "del": "delete",
+    "arrowup": "up", "arrowdown": "down", "arrowleft": "left", "arrowright": "right",
 }
 
-def _require_accessibility() -> None:
-    try:
-        Quartz.AXUIElementCreateSystemWide()
-    except Exception:
-        raise ToolError("Erişilebilirlik izni yok. Lütfen Sistem Ayarları > Gizlilik ve Güvenlik > Erişilebilirlik kısmından izin verin.", "AX_PERMISSION", False)
 
-def _ax_attribute(element: object, attribute: str) -> object:
-    error, value = Quartz.AXUIElementCopyAttributeValue(element, attribute, None)
-    return value if error == Quartz.kAXErrorSuccess else None
+def _require_accessibility() -> None:
+    """
+    Sentetik fare/klavye olayları ve AX okuma erişilebilirlik izni ister. İzin yoksa
+    macOS olayları SESSİZCE düşürür; araç 'başarılı' deyip hiçbir şey yapmasın diye
+    açık hata verilir.
+    """
+    if not AX.AXIsProcessTrusted():
+        raise ToolError(accessibility_help(), "AX_PERMISSION", False)
+
 
 def _ax_present(value: object) -> object:
-    if isinstance(value, Quartz.AXValueRef) and Quartz.AXValueGetType(value) == Quartz.kAXValueAXErrorType:
+    """CopyMultipleAttributeValues eksik öznitelikleri AXError tipli AXValue olarak döner; onları None yapar."""
+    if isinstance(value, AX.AXValueRef) and AX.AXValueGetType(value) == AX.kAXValueAXErrorType:
         return None
     return value
 
+
 def _ax_point(value: object) -> Optional[Tuple[float, float]]:
-    if not isinstance(value, Quartz.AXValueRef): return None
-    ok, point = Quartz.AXValueGetValue(value, Quartz.kAXValueCGPointType, None)
+    """AXPosition değerini (x, y) nokta çiftine çevirir."""
+    if not isinstance(value, AX.AXValueRef):
+        return None
+    ok, point = AX.AXValueGetValue(value, AX.kAXValueCGPointType, None)
     return (float(point.x), float(point.y)) if ok else None
 
+
 def _ax_size(value: object) -> Optional[Tuple[float, float]]:
-    if not isinstance(value, Quartz.AXValueRef): return None
-    ok, size = Quartz.AXValueGetValue(value, Quartz.kAXValueCGSizeType, None)
+    """AXSize değerini (genişlik, yükseklik) çiftine çevirir."""
+    if not isinstance(value, AX.AXValueRef):
+        return None
+    ok, size = AX.AXValueGetValue(value, AX.kAXValueCGSizeType, None)
     return (float(size.width), float(size.height)) if ok else None
 
+
+def _ax_attribute(element: object, attribute: str) -> object:
+    """Tek bir AX özniteliğini okur; öğede yoksa None. Yanıtsız uygulama açık hata verir."""
+    error, value = AX.AXUIElementCopyAttributeValue(element, attribute, None)
+    if error == AX.kAXErrorSuccess:
+        return value
+    if error == AX.kAXErrorCannotComplete:
+        raise ToolError("Uygulama erişilebilirlik sorgusuna yanıt vermiyor (meşgul olabilir).", "AX_TIMEOUT", True)
+    return None
+
+
 def _ax_short_text(value: object) -> str:
-    if not isinstance(value, str): return ""
+    """AX metin değerini tek satırlık kısa metne çevirir (metin olmayanlar boş)."""
+    if not isinstance(value, str):
+        return ""
     return " ".join(value.split())[:60]
 
+
 def _ax_descendant_text(element: object) -> str:
-    queue = [element]
-    visited = 0
+    """Etiketsiz öğeler (örn. liste satırları) için ilk alt metni sınırlı genişlikte arar."""
+    queue: List[object] = [element]
+    visited: int = 0
     while queue and visited < AX_LABEL_SEARCH_NODES:
-        node = queue.pop(0)
+        node: object = queue.pop(0)
         visited += 1
-        children = _ax_attribute(node, "AXChildren")
-        for child in (list(children) if children else []):
+        children: object = _ax_attribute(node, "AXChildren")
+        for child in list(children) if children else []:
             if _ax_attribute(child, "AXRole") == "AXStaticText":
-                text = _ax_short_text(_ax_attribute(child, "AXValue"))
-                if text: return text
+                text: str = _ax_short_text(_ax_attribute(child, "AXValue"))
+                if text:
+                    return text
             queue.append(child)
     return ""
 
+
 def scan_ax_elements(root: object) -> Tuple[List[AXElement], List[object], bool]:
-    started = time.monotonic()
-    stack = [root]
-    elements, refs = [], []
-    visited = 0
+    """
+    Pencere ağacını ekran sırasıyla (derinlik öncelikli) tarar; etkileşimli öğeleri ve
+    AX referanslarını döner. Üçüncü değer, öğe/düğüm/süre limiti yüzünden taramanın
+    kısaltıldığını bildirir (sessiz kırpma yok).
+    """
+    started: float = time.monotonic()
+    stack: List[object] = [root]
+    elements: List[AXElement] = []
+    refs: List[object] = []
+    visited: int = 0
     while stack:
-        if len(elements) >= AX_ELEMENT_LIMIT or visited >= AX_NODE_LIMIT or time.monotonic() - started > AX_SCAN_BUDGET_SECONDS:
+        if (len(elements) >= AX_ELEMENT_LIMIT or visited >= AX_NODE_LIMIT
+                or time.monotonic() - started > AX_SCAN_BUDGET_SECONDS):
             return elements, refs, True
-        node = stack.pop()
+        node: object = stack.pop()
         visited += 1
-        error, values = Quartz.AXUIElementCopyMultipleAttributeValues(node, _AX_SCAN_ATTRIBUTES, 0, None)
-        if error != Quartz.kAXErrorSuccess: continue
-        
-        attrs = dict(zip(_AX_SCAN_ATTRIBUTES, values))
-        children = attrs["AXChildren"]
-        if children: stack.extend(reversed(list(children)))
-        
-        role = str(attrs["AXRole"] or "")
-        if role not in _AX_ACTIONABLE_ROLES: continue
-        pos = _ax_point(attrs["AXPosition"])
-        size = _ax_size(attrs["AXSize"])
-        if pos is None or size is None or size[0] <= 0 or size[1] <= 0: continue
-        
-        label = next((t for t in (_ax_short_text(attrs[k]) for k in ("AXTitle", "AXDescription", "AXPlaceholderValue")) if t), "")
-        value = _ax_short_text(attrs["AXValue"]) if role in _AX_TEXT_INPUT_ROLES else ""
-        if not label and not value: label = _ax_descendant_text(node)
-        
-        elements.append({"role": role, "label": label, "value": value, "enabled": attrs["AXEnabled"] is not False, "center_x": pos[0] + size[0] / 2, "center_y": pos[1] + size[1] / 2})
+        error, values = AX.AXUIElementCopyMultipleAttributeValues(node, _AX_SCAN_ATTRIBUTES, 0, None)
+        if error == AX.kAXErrorInvalidUIElement:
+            # Tarama sırasında kaybolan öğe (dinamik arayüz): listede yeri yok
+            continue
+        if error == AX.kAXErrorCannotComplete:
+            raise ToolError("Uygulama erişilebilirlik sorgusuna yanıt vermiyor (meşgul olabilir).", "AX_TIMEOUT", True)
+        if error != AX.kAXErrorSuccess:
+            raise ToolError(f"AX öznitelikleri okunamadı: hata kodu={error}", "AX_READ_FAILED", True)
+        attrs: Dict[str, object] = {
+            name: _ax_present(value) for name, value in zip(_AX_SCAN_ATTRIBUTES, values, strict=True)
+        }
+        children: object = attrs["AXChildren"]
+        if children:
+            stack.extend(reversed(list(children)))
+        role: str = str(attrs["AXRole"] or "")
+        if role not in _AX_ACTIONABLE_ROLES:
+            continue
+        position: Optional[Tuple[float, float]] = _ax_point(attrs["AXPosition"])
+        size: Optional[Tuple[float, float]] = _ax_size(attrs["AXSize"])
+        if position is None or size is None or size[0] <= 0 or size[1] <= 0:
+            continue
+        label: str = next(
+            (text for text in (_ax_short_text(attrs[key]) for key in ("AXTitle", "AXDescription", "AXPlaceholderValue")) if text),
+            "",
+        )
+        value: str = _ax_short_text(attrs["AXValue"]) if role in _AX_TEXT_INPUT_ROLES else ""
+        if not label and not value:
+            label = _ax_descendant_text(node)
+        elements.append({
+            "role": role, "label": label, "value": value,
+            "enabled": attrs["AXEnabled"] is not False,
+            "center_x": position[0] + size[0] / 2, "center_y": position[1] + size[1] / 2,
+        })
         refs.append(node)
     return elements, refs, False
 
-def format_ax_listing(app_name: str, window_title: str, elements: List[AXElement], geometry: ScreenGeometry, truncated: bool) -> str:
-    lines = [f"{app_name} · {window_title!r} · {len(elements)} öğe ({geometry['model_width']}×{geometry['model_height']})"]
-    for i, el in enumerate(elements, 1):
-        x, y = points_to_model(el["center_x"], el["center_y"], geometry)
-        val_str = f" değer={el['value']!r}" if el['value'] else ""
-        pasif_str = " (pasif)" if not el['enabled'] else ""
-        lines.append(f"[{i}] {el['role'].removeprefix('AX')} {el['label']!r}{val_str}{pasif_str} @({x},{y})")
-    if truncated: lines.append("…liste kısaltıldı.")
+
+def format_ax_listing(
+    app_name: str, window_title: str, elements: List[AXElement], geometry: ScreenGeometry, truncated: bool,
+) -> str:
+    """AX öğelerini modele gidecek kompakt listeye çevirir (koordinatlar ortak uzayda). Saf."""
+    lines: List[str] = [
+        f"{app_name} · pencere {window_title!r} · {len(elements)} öğe "
+        f"(koordinatlar ekran görüntüsü/tıklama uzayında, {geometry['model_width']}×{geometry['model_height']})"
+    ]
+    for index, element in enumerate(elements, start=1):
+        x, y = points_to_model(element["center_x"], element["center_y"], geometry)
+        line: str = f"[{index}] {element['role'].removeprefix('AX')} {element['label']!r}"
+        if element["value"]:
+            line += f" değer={element['value']!r}"
+        if not element["enabled"]:
+            line += " (pasif)"
+        lines.append(f"{line} @({x},{y})")
+    if truncated:
+        lines.append("…liste öğe/süre limitiyle kısaltıldı; aranan öğe yoksa take_screenshot kullan.")
     return "\n".join(lines)
 
-def _bundle_name(pid: int) -> str:
-    running = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-    if running is None or running.bundleURL() is None: return ""
-    return str(running.bundleURL().lastPathComponent()).removesuffix(".app")
-
-def _app_pid(app_name: str) -> int:
-    wanted = app_name.casefold()
-    windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
-    for w in list(windows) if windows else []:
-        if str(w.get(Quartz.kCGWindowOwnerName) or "").casefold() == wanted: return int(w[Quartz.kCGWindowOwnerPID])
-    for _name, pid in ( ( _bundle_name(int(w[Quartz.kCGWindowOwnerPID])), int(w[Quartz.kCGWindowOwnerPID]) ) for w in list(windows) if windows ):
-        if _bundle_name(pid).casefold() == wanted: return pid
-    raise ToolError(f"Uygulama bulunamadı: {app_name}", "APP_NOT_RUNNING", True)
 
 def _visible_app_owners() -> List[Tuple[str, int]]:
-    windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
-    owners = []
+    """Normal pencereleri olan uygulamalar (ad, pid), önden arkaya; pencere sunucusundan her zaman günceldir."""
+    windows: object = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionAll | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID,
+    )
+    owners: List[Tuple[str, int]] = []
     for window in list(windows) if windows else []:
-        if int(window.get(Quartz.kCGWindowLayer) or 0) != 0: continue
-        owner = (str(window.get(Quartz.kCGWindowOwnerName) or ""), int(window[Quartz.kCGWindowOwnerPID]))
-        if owner not in owners: owners.append(owner)
+        if int(window.get(Quartz.kCGWindowLayer) or 0) != 0:
+            continue
+        owner: Tuple[str, int] = (str(window.get(Quartz.kCGWindowOwnerName) or ""), int(window[Quartz.kCGWindowOwnerPID]))
+        if owner not in owners:
+            owners.append(owner)
     return owners
 
-def _check_in_model_space(x: int, y: int, geometry: ScreenGeometry) -> bool:
-    return 0 <= x < geometry["model_width"] and 0 <= y < geometry["model_height"]
+
+def _bundle_name(pid: int) -> str:
+    """Uygulamanın yerelleştirilmemiş paket adı (örn. 'Notlar' için 'Notes')."""
+    running: object = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if running is None or running.bundleURL() is None:
+        return ""
+    return str(running.bundleURL().lastPathComponent()).removesuffix(".app")
+
+
+def _app_pid(app_name: str) -> int:
+    """
+    Uygulamanın PID'ini pencere sunucusundan bulur (yerel ad veya paket adıyla).
+    NSWorkspace listesi ana run loop dönmeyen süreçlerde (CLI) güncellenmediği için kullanılmaz.
+    """
+    wanted: str = app_name.casefold()
+    owners: List[Tuple[str, int]] = _visible_app_owners()
+    for name, pid in owners:
+        if name.casefold() == wanted:
+            return pid
+    for _name, pid in owners:
+        if _bundle_name(pid).casefold() == wanted:
+            return pid
+    available: str = ", ".join(sorted({name for name, _ in owners if name})[:20])
+    raise ToolError(
+        f"Penceresi olan çalışan uygulama bulunamadı: {app_name}. Açık uygulamalar: {available}. "
+        "Kapalıysa önce cua_get_app ile başlat.",
+        "APP_NOT_RUNNING", True,
+    )
+
 
 class CUA:
+    """
+    macOS GUI konnektörü: uygulama etkinleştirme ve erişilebilirlik (AX) ağacı
+    üzerinden öğe listeleme/tıklama. Öğe numaraları son listeye göredir.
+    """
+
     def __init__(self) -> None:
+        # Uygulama adı (casefold) -> son listedeki AX referansları (öğe numarası = indeks + 1)
         self._snapshots: Dict[str, List[object]] = {}
 
     def get_app(self, app_name: str) -> str:
-        script = f'tell application {json.dumps(app_name)} to activate'
-        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=8)
-        if res.returncode == 0: return f"{app_name} aktif edildi."
-        raise ToolError(f"Uygulama başlatılamadı: {app_name}", "APP_NOT_FOUND", False)
+        """Uygulamayı osascript ile başlatır/öne getirir."""
+        script: str = f'tell application {json.dumps(app_name)} to activate'
+        result: subprocess.CompletedProcess[str] = subprocess.run(
+            ["osascript", "-e", script], env=child_environment(), capture_output=True, text=True, timeout=8,
+        )
+        if result.returncode == 0:
+            return f"{app_name} aktif edildi ve öne getirildi."
+        raise ToolError(
+            f"Uygulama bulunamadı veya aktif edilemedi: {app_name}, ayrıntı={result.stderr.strip()}",
+            "APP_NOT_FOUND", False,
+        )
 
     def _front_window(self, app_name: str) -> object:
+        """Uygulamanın odaktaki (yoksa ana, yoksa ilk) penceresinin AX öğesini döner."""
         _require_accessibility()
-        app = Quartz.AXUIElementCreateApplication(_app_pid(app_name))
-        for attr in ("AXFocusedWindow", "AXMainWindow"):
-            win = _ax_attribute(app, attr)
-            if win: return win
-        wins = _ax_attribute(app, "AXWindows")
-        if wins: return list(wins)[0]
-        raise ToolError(f"{app_name} için pencere bulunamadı.", "AX_NO_WINDOW", True)
+        application: object = AX.AXUIElementCreateApplication(_app_pid(app_name))
+        # Yanıtsız uygulamada her AX çağrısı varsayılan ~6 sn bloklamasın
+        AX.AXUIElementSetMessagingTimeout(application, AX_MESSAGING_TIMEOUT_SECONDS)
+        for attribute in ("AXFocusedWindow", "AXMainWindow"):
+            window: object = _ax_attribute(application, attribute)
+            if window is not None:
+                return window
+        windows: object = _ax_attribute(application, "AXWindows")
+        if windows:
+            return list(windows)[0]
+        raise ToolError(
+            f"{app_name} uygulamasının bu masaüstünde erişilebilir penceresi yok (başka bir alanda "
+            "veya küçültülmüş olabilir); önce cua_get_app ile öne getir.",
+            "AX_NO_WINDOW", True,
+        )
 
     def list_elements(self, app_name: str, geometry: Optional[ScreenGeometry] = None) -> str:
-        win = self._front_window(app_name)
-        els, refs, truncated = scan_ax_elements(win)
+        """Öndeki pencerenin etkileşimli öğelerini son görülen ekran uzayında listeler."""
+        window: object = self._front_window(app_name)
+        elements, refs, truncated = scan_ax_elements(window)
         self._snapshots[app_name.casefold()] = refs
-        title = _ax_short_text(_ax_attribute(win, "AXTitle"))
-        return format_ax_listing(app_name, title, els, geometry or current_geometry(), truncated)
+        title: str = _ax_short_text(_ax_attribute(window, "AXTitle"))
+        return format_ax_listing(app_name, title, elements, geometry or current_geometry(), truncated)
+
+    def _element_center(self, element: object) -> Tuple[float, float]:
+        """Öğenin merkezini nokta koordinatında döner."""
+        position: Optional[Tuple[float, float]] = _ax_point(_ax_attribute(element, "AXPosition"))
+        size: Optional[Tuple[float, float]] = _ax_size(_ax_attribute(element, "AXSize"))
+        if position is None or size is None:
+            raise ToolError("Öğenin konumu okunamadı; cua_get_ax_state ile listeyi yenile.", "AX_STALE", True)
+        return (position[0] + size[0] / 2, position[1] + size[1] / 2)
 
     def click_element(self, app_name: str, element_id: int) -> str:
+        """
+        Son listedeki öğeye tıklar: metin alanları AXFocused ile odaklanır, diğerleri
+        AXPress alır. AX eylemi desteklenmiyorsa hibrit protokolün koordinat katmanı
+        olarak öğe merkezine gerçek fare tıklaması yapılır (sonuçta açıkça belirtilir).
+        """
         _require_accessibility()
-        refs = self._snapshots.get(app_name.casefold())
-        if not refs or not 1 <= element_id <= len(refs): raise ToolError("Geçersiz öğe.", "INVALID_ELEMENT", True)
-        el = refs[element_id - 1]
-        role = _ax_attribute(el, "AXRole")
+        refs: Optional[List[object]] = self._snapshots.get(app_name.casefold())
+        if refs is None:
+            raise ToolError(f"{app_name} için öğe listesi yok; önce cua_get_ax_state çağır.", "AX_NO_SNAPSHOT", True)
+        if not 1 <= element_id <= len(refs):
+            raise ToolError(f"Geçersiz öğe numarası: {element_id} (geçerli 1-{len(refs)}).", "INVALID_ELEMENT", True)
+        element: object = refs[element_id - 1]
+        role: object = _ax_attribute(element, "AXRole")
         if role in _AX_TEXT_INPUT_ROLES:
-            Quartz.AXUIElementSetAttributeValue(el, "AXFocused", True)
-            return f"[{element_id}] odaklandı."
-        if Quartz.AXUIElementPerformAction(el, "AXPress") == Quartz.kAXErrorSuccess:
-            return f"[{element_id}] tıklandı."
-        pos = _ax_point(_ax_attribute(el, "AXPosition"))
-        size = _ax_size(_ax_attribute(el, "AXSize"))
-        if pos and size:
-            pyautogui.click(round(pos[0] + size[0] / 2), round(pos[1] + size[1] / 2))
-        return f"[{element_id}] fare ile tıklandı."
+            error: int = AX.AXUIElementSetAttributeValue(element, "AXFocused", True)
+            if error == AX.kAXErrorSuccess:
+                return f"[{element_id}] metin alanı odaklandı; run_action_sequence 'type' ile yazabilirsin."
+        else:
+            error = AX.AXUIElementPerformAction(element, "AXPress")
+            if error == AX.kAXErrorSuccess:
+                return f"[{element_id}] öğesine AXPress ile tıklandı."
+        if error == AX.kAXErrorInvalidUIElement:
+            raise ToolError("Öğe artık geçerli değil (arayüz değişti); cua_get_ax_state ile listeyi yenile.", "AX_STALE", True)
+        center_x, center_y = self._element_center(element)
+        pyautogui.click(round(center_x), round(center_y))
+        return f"[{element_id}] öğesi AX eylemini desteklemediği için (hata kodu={error}) merkezine fare ile tıklandı."
 
     def window_bounds(self, app_name: str) -> Tuple[float, float, float, float]:
-        win = self._front_window(app_name)
-        p = _ax_point(_ax_attribute(win, "AXPosition"))
-        s = _ax_size(_ax_attribute(win, "AXSize"))
-        return (p[0], p[1], s[0], s[1])
+        """Öndeki pencerenin (x, y, genişlik, yükseklik) sınırlarını nokta koordinatında döner."""
+        window: object = self._front_window(app_name)
+        position: Optional[Tuple[float, float]] = _ax_point(_ax_attribute(window, "AXPosition"))
+        size: Optional[Tuple[float, float]] = _ax_size(_ax_attribute(window, "AXSize"))
+        if position is None or size is None:
+            raise ToolError(f"Pencere sınırları okunamadı: {app_name}", "WINDOW_BOUNDS_FAILED", True)
+        return (position[0], position[1], size[0], size[1])
+
+
+# --- Klavye: düzenden bağımsız Unicode yazım ve tuş kombinasyonları ---
 
 def unicode_chunks(text: str, max_units: int) -> List[str]:
-    chunks, current, units = [], "", 0
-    for c in text:
-        u = 2 if ord(c) > 0xFFFF else 1
-        if current and units + u > max_units:
-            chunks.append(current); current, units = "", 0
-        current += c; units += u
-    if current: chunks.append(current)
+    """Metni UTF-16 birim sayısı max_units'i aşmayan parçalara böler; vekil çiftler bölünmez. Saf."""
+    chunks: List[str] = []
+    current: str = ""
+    current_units: int = 0
+    for char in text:
+        char_units: int = 2 if ord(char) > 0xFFFF else 1
+        if current and current_units + char_units > max_units:
+            chunks.append(current)
+            current, current_units = "", 0
+        current += char
+        current_units += char_units
+    if current:
+        chunks.append(current)
     return chunks
 
+
 def _post_unicode_chunk(chunk: str) -> None:
-    units = len(chunk.encode("utf-16-le")) // 2
-    event = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
-    Quartz.CGEventKeyboardSetUnicodeString(event, units, chunk)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-    event = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
-    Quartz.CGEventKeyboardSetUnicodeString(event, units, chunk)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+    """Bir Unicode parçasını tek tuş-bas/bırak olay çifti olarak gönderir (tuş kodu yok sayılır)."""
+    units: int = len(chunk.encode("utf-16-le")) // 2
+    for key_down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(None, 0, key_down)
+        # Takılı kalmış bir değiştirici (cmd vb.) yazımı kısayola çevirmesin
+        Quartz.CGEventSetFlags(event, 0)
+        Quartz.CGEventKeyboardSetUnicodeString(event, units, chunk)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
 
 def type_unicode_text(text: str) -> None:
-    for i, line in enumerate(text.replace("\r\n", "\n").split("\n")):
-        if i > 0: pyautogui.press("enter")
+    """
+    Metni klavye düzeninden bağımsız yazar. pyautogui.write ABD tuş kodlarıyla bastığı
+    için Fince/Türkçe düzende noktalamayı bozuyor, eşlemesinde olmayan karakterleri
+    (ç ğ ı ö ş ü) SESSİZCE atlıyor ve karakter başına ~20ms harcıyordu. Satır sonları
+    gerçek Enter tuşu olarak gönderilir.
+    """
+    for line_index, line in enumerate(text.replace("\r\n", "\n").split("\n")):
+        if line_index > 0:
+            pyautogui.press("enter")
         for chunk in unicode_chunks(line, UNICODE_CHUNK_UNITS):
             _post_unicode_chunk(chunk)
             time.sleep(UNICODE_CHUNK_DELAY_SECONDS)
 
+
+def _is_known_key(name: str) -> bool:
+    """Tuş adının bu platformun tuş eşlemesinde gerçekten karşılığı var mı."""
+    mapping: Dict[str, Optional[int]] = pyautogui.platformModule.keyboardMapping
+    return name in mapping and mapping[name] is not None
+
+
+def key_names(spec: str) -> List[str]:
+    """'Cmd+Shift+T' gibi tanımı pyautogui tuş adlarına çevirir. Saf."""
+    return [_KEY_ALIASES.get(part.strip().lower(), part.strip().lower()) for part in spec.split("+")]
+
+
 def press_key_spec(spec: str) -> str:
+    """
+    Tek tuşu ya da 'cmd+shift+t' gibi kombinasyonu basar. Tek karakterlik tuşlar
+    (/, @, ö…) düzenden bağımsız Unicode olarak yazılır. Bilinmeyen tuş adı açık hata
+    verir; pyautogui bilinmeyen tuşları sessizce yok sayıp 'basıldı' dedirtiyordu.
+    """
     if len(spec) == 1:
         type_unicode_text(spec)
-        return f"Yazıldı: {spec}"
-    names = [_KEY_ALIASES.get(part.strip().lower(), part.strip().lower()) for part in spec.split("+")]
-    pyautogui.hotkey(*names)
-    return f"Basıldı: {spec}"
+        return f"Tuş yazıldı: {spec}"
+    names: List[str] = key_names(spec)
+    unknown: List[str] = [name for name in names if not _is_known_key(name)]
+    if unknown:
+        raise ToolError(
+            f"Bilinmeyen tuş: {unknown} (istenen: {spec!r}). Örnekler: enter, tab, escape, space, "
+            "backspace, delete, up, down, pageup, f5, cmd+c, cmd+shift+t.",
+            "INVALID_KEY", False,
+        )
+    if len(names) == 1:
+        pyautogui.press(names[0])
+    else:
+        pyautogui.hotkey(*names)
+    return f"Tuşa basıldı: {spec}"
+
 
 def _run_action_step(step: ActionStep, geometry: ScreenGeometry) -> str:
-    act = step.get("action")
-    if act == "click":
+    """Tek bir fare/klavye adımını çalıştırır; eksik/yanlış alan KeyError/TypeError/ValueError verir."""
+    action: object = step.get("action")
+    if action == "click":
         x, y = parse_point(step["point"])
-        button = str(step.get("button") or "left")
-        clicks = step.get("clicks") or 1
-        if clicks not in (1, 2, 3):
+        button: str = str(step.get("button") or "left")
+        clicks: object = step.get("clicks") or 1
+        if isinstance(clicks, bool) or clicks not in (1, 2, 3):
             raise ToolError(f"clicks 1, 2 veya 3 olmalı: {clicks!r}", "INVALID_ACTION_PARAMS", False)
         if clicks == 1:
             return click_model_point(x, y, button, geometry)
-        return multi_click_model_point(x, y, button, clicks, geometry)
-    if act == "drag":
+        return multi_click_model_point(x, y, button, int(clicks), geometry)
+    if action == "drag":
         start, end = parse_point(step["point"]), parse_point(step["to"])
         return drag_model_points(start, end, str(step.get("button") or "left"), geometry)
-    if act == "move":
+    if action == "move":
         x, y = parse_point(step["point"])
         return move_model_point(x, y, geometry)
-    if act == "type":
-        text = str(step["text"])
+    if action == "type":
+        text: str = str(step["text"])
         type_unicode_text(text)
-        return f"Yazıldı: {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
-    if act == "press":
+        return f"Yazıldı ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
+    if action == "press":
         return press_key_spec(str(step["key"]))
-    if act == "wait":
-        time.sleep(float(step["seconds"]))
-        return f"{step['seconds']}sn beklendi."
-    raise ToolError(f"Geçersiz eylem: {act}", "INVALID_ACTION", False)
+    if action == "wait":
+        seconds: float = float(step["seconds"])
+        if not 0 < seconds <= MAX_WAIT_SECONDS:
+            raise ToolError(f"Bekleme süresi 0-{MAX_WAIT_SECONDS}sn aralığında olmalı: {seconds}", "INVALID_WAIT", False)
+        deadline: float = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            _raise_if_stopped()
+            time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+        return f"{seconds}sn beklendi."
+    raise ToolError(f"Bilinmeyen eylem türü: {action} (click/drag/move/type/press/wait).", "INVALID_ACTION", False)

@@ -62,7 +62,8 @@ def missing_path_hint(path: Path) -> str:
         ancestor = ancestor.parent
     if not ancestor.is_dir(): return ""
     names = sorted(entry.name for entry in ancestor.iterdir())[:15]
-    return f" En yakın mevcut dizin: {ancestor} → içerik: {', '.join(names) or '(boş)'}."
+    return (f" En yakın mevcut dizin: {ancestor} → içerik: {', '.join(names) or '(boş)'}. "
+            "Yolu hedef metninden harf harf kontrol et.")
 
 def clean_html(html: str) -> str:
     if not html: return ""
@@ -78,17 +79,25 @@ def read_full_file(path: str) -> str:
     if _is_sensitive_path(source_path) and not _sensitive_read_allowed():
         raise ToolError(f"Korunan yol erişimi engellendi: {source_path}.", "SENSITIVE_PATH_BLOCKED", False)
     try:
-        if not source_path.is_file():
-            code = "IS_DIRECTORY" if source_path.is_dir() else "NOT_REGULAR_FILE"
+        # stat() önce: olmayan yol FileNotFoundError ile "en yakın dizin" ipucuna düşer
+        # (is_file() False döndüğü için eksik dosya "düzenli dosya değil" sanılıyordu)
+        metadata = source_path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            code = "IS_DIRECTORY" if stat.S_ISDIR(metadata.st_mode) else "NOT_REGULAR_FILE"
             raise ToolError(f"Yol düzenli bir dosya değil: {source_path}", code, False)
-        if source_path.stat().st_size > FILE_READ_MAX_BYTES:
-            raise ToolError(f"Dosya {FILE_READ_MAX_BYTES} bayt sınırını aşıyor: {source_path}", "FILE_TOO_LARGE", False)
-        with source_path.open("r", encoding="utf-8", newline="") as source:
-            return source.read()
-    except FileNotFoundError:
-        raise ToolError(f"Dosya bulunamadı: {source_path}.{missing_path_hint(source_path)}", "FILE_NOT_FOUND", True)
-    except UnicodeDecodeError:
-        raise ToolError(f"Dosya UTF-8 metin değil: {source_path}", "NOT_TEXT", False)
+        if metadata.st_size > FILE_READ_MAX_BYTES:
+            raise ToolError(f"Dosya {FILE_READ_MAX_BYTES} bayt okuma sınırını aşıyor: {source_path}", "FILE_TOO_LARGE", False)
+        with source_path.open("rb") as source:
+            raw = source.read(FILE_READ_MAX_BYTES + 1)
+        if len(raw) > FILE_READ_MAX_BYTES:
+            raise ToolError(f"Dosya okuma sırasında boyut sınırını aştı: {source_path}", "FILE_TOO_LARGE", False)
+        return raw.decode("utf-8")
+    except FileNotFoundError as error:
+        raise ToolError(
+            f"Dosya bulunamadı: {source_path}.{missing_path_hint(source_path)}", "FILE_NOT_FOUND", True,
+        ) from error
+    except UnicodeDecodeError as error:
+        raise ToolError(f"Dosya UTF-8 metin değil (ikili dosya olabilir): {source_path}", "NOT_TEXT", False) from error
 
 def read_file_content(path: str, reader: Optional[Callable[[str], str]] = None) -> str:
     read_fn = reader or read_full_file
@@ -104,7 +113,8 @@ def write_file_content(path: str, content: str, reader: Optional[Callable[[str],
     if destination.suffix == ".py":
         try: compile(content, str(destination), "exec")
         except SyntaxError as e: raise ToolError(f"Sözdizimi hatası: {destination}, {e}", "SYNTAX_INVALID", False) from e
-    
+
+    created_directory: Optional[Path] = None if destination.parent.exists() else destination.parent
     destination.parent.mkdir(parents=True, exist_ok=True)
     existing_mode: Optional[int] = None
     if destination.exists():
@@ -135,7 +145,8 @@ def write_file_content(path: str, content: str, reader: Optional[Callable[[str],
                 True,
             )
 
-        return f"Dosya başarıyla yazıldı ve doğrulandı: {destination}. Yedek dizini: {BACKUP_DIR}"
+        note = f" Yeni dizin oluşturuldu: {created_directory}." if created_directory is not None else ""
+        return f"Dosya yazıldı ve içeriği doğrulandı: {destination} ({len(content)} karakter).{note}"
     finally:
         if temp_path and temp_path.exists():
             temp_path.unlink()
@@ -143,6 +154,10 @@ def write_file_content(path: str, content: str, reader: Optional[Callable[[str],
 def edit_file_content(path: str, old_text: str, new_text: str, reader: Optional[Callable[[str], str]] = None, writer: Optional[Callable[[str, str], str]] = None) -> str:
     read_fn = reader or read_full_file
     write_fn = writer or write_file_content
+    if not isinstance(old_text, str) or not isinstance(new_text, str) or not old_text:
+        raise ToolError("Eski ve yeni metin geçerli olmalı; eski metin boş olamaz.", "INVALID_EDIT", False)
+    destination = Path(path).expanduser()
+    before = destination.stat() if destination.exists() else None
     current = read_fn(path)
     matches = current.count(old_text)
     if matches == 0:
@@ -158,4 +173,12 @@ def edit_file_content(path: str, old_text: str, new_text: str, reader: Optional[
             False,
         )
     updated = current.replace(old_text, new_text, 1)
+    if updated == current:
+        return f"Dosya zaten istenen içerikte: {destination}"
+    after = destination.stat()
+    if before is None or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        # Okuma ile yazma arasında başka biri dosyayı değiştirdiyse onun değişikliği ezilmesin
+        raise ToolError("Dosya düzenleme sırasında değişti; güncel içeriği yeniden oku.", "EDIT_CONFLICT", True)
     return write_fn(path, updated)

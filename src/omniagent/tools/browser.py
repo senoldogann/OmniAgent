@@ -146,7 +146,7 @@ def fetch_raw_content(url: str) -> str:
 def run_chrome_active_tab(url: Optional[str], applescript_available: Optional[bool]) -> Tuple[str, bool]:
     parsed = urlsplit(url) if url else None
     if parsed and (parsed.scheme not in ("https", "http") or not parsed.netloc):
-        raise ToolError("Geçersiz URL.", "INVALID_URL", False)
+        raise ToolError("Chrome sekmesi için http(s) adresi ver.", "INVALID_URL", False)
     origin = f"{parsed.scheme}://{parsed.netloc}/" if parsed else ""
     
     fallback_reason = "önceki AppleScript hatası" if applescript_available is False else None
@@ -167,17 +167,23 @@ def run_chrome_active_tab(url: Optional[str], applescript_available: Optional[bo
     if fallback_reason:
         _require_accessibility()
         try:
-            subprocess.run(["open", "-a", "Google Chrome"], env=child_environment(), capture_output=True, text=True, timeout=5)
-        except Exception as e:
-            raise ToolError(f"UI Fallback başarısız: {type(e).__name__}", "CHROME_SESSION_FAILED", True) from e
+            activated = subprocess.run(["open", "-a", "Google Chrome"], env=child_environment(), capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise ToolError(f"Açık Chrome görünür UI fallback başarısız: {type(e).__name__}", "CHROME_SESSION_FAILED", True) from e
+        if activated.returncode != 0:
+            # Chrome öne gelmediyse ⌘L + URL + Enter öndeki başka uygulamaya (ör. Terminal) yazılırdı
+            raise ToolError(
+                f"Açık Chrome görünür UI fallback başarısız: {activated.stderr.strip() or activated.returncode}",
+                "CHROME_SESSION_FAILED", True,
+            )
         if url:
             press_key_spec("cmd+l"); type_unicode_text(url); press_key_spec("enter")
-            return f"Görünür Chrome sekmesi: {url}\nBaşlık: görünür UI fallback ({fallback_reason}); yükleme otomatik gözlemlenir.", new_as_available
-        return f"Görünür Chrome öne getirildi.\nBaşlık: görünür UI fallback ({fallback_reason}); URL okunamadı.", new_as_available
+            return f"Görünür Chrome sekmesi: {url}\nBaşlık: görünür UI fallback ({fallback_reason}); yükleme otomatik gözlemle doğrulanacak.", new_as_available
+        return f"Görünür Chrome öne getirildi.\nBaşlık: görünür UI fallback ({fallback_reason}); etkin URL AppleScript olmadan okunamadı.", new_as_available
 
-    if result is None: raise ToolError("Chrome sekmesine erişilemedi.", "CHROME_SESSION_FAILED", True)
+    if result is None: raise ToolError("Açık Chrome sekmesine erişilemedi.", "CHROME_SESSION_FAILED", True)
     lines = result.stdout.rstrip("\n").split("\n")
-    if len(lines) < 3: raise ToolError(f"Yanıt hatalı: {result.stdout!r}", "CHROME_SESSION_FAILED", True)
+    if len(lines) < 3: raise ToolError(f"Chrome sekme yanıtı beklenmeyen biçimde: {result.stdout!r}", "CHROME_SESSION_FAILED", True)
     loading = "\nSayfa hâlâ yükleniyor." if lines[-1] == "true" else ""
     return f"Görünür Chrome sekmesi: {lines[0]}\nBaşlık: {' '.join(lines[1:-1])}{loading}", new_as_available
 
@@ -216,26 +222,38 @@ class HeadlessBrowserSession:
 async def browse_page_actions(page: Page, url: Optional[str], actions: List[BrowserAction]) -> str:
     if url:
         try: await page.goto(url, wait_until="domcontentloaded")
-        except PlaywrightError as e: raise ToolError(f"Sayfa açılamadı: {url}, {e}", "PAGE_LOAD_FAILED", True) from e
+        except PlaywrightError as e: raise ToolError(f"Sayfa açılamadı: url={url}, ayrıntı={e}", "PAGE_LOAD_FAILED", True) from e
     elif page.url == "about:blank":
-        raise ToolError("Açık sayfa yok; url ver.", "NO_PAGE", False)
+        raise ToolError("Açık sayfa yok; ilk çağrıda url ver.", "NO_PAGE", False)
 
     for i, action in enumerate(actions):
         kind, selector, value = action.get("action"), str(action.get("selector") or ""), action.get("value")
         try:
             if kind == "click": await page.click(selector)
-            elif kind == "fill" and value: await page.fill(selector, value)
-            elif kind == "press" and value: await page.press(selector, normalize_browser_key(value))
+            # Boş metinle fill alanı temizler; yalnız değer hiç yoksa geçersizdir
+            elif kind == "fill" and value is not None: await page.fill(selector, value)
+            elif kind == "press" and value is not None: await page.press(selector, normalize_browser_key(value))
             elif kind == "wait_for":
                 state = value if value in ("visible", "hidden", "attached", "detached") else "visible"
                 await page.locator(selector).wait_for(state=state)
             else:
-                raise ToolError(f"Geçersiz eylem {i}: {action}", "INVALID_BROWSER_ACTION", False)
+                raise ToolError(
+                    f"Geçersiz tarayıcı eylemi {i}: {action} (click: selector; fill/press: selector + value).",
+                    "INVALID_BROWSER_ACTION", False,
+                )
         except PlaywrightTimeoutError as e:
             elements = await page.evaluate(_PAGE_ELEMENTS_SCRIPT, PAGE_ELEMENT_LIMIT)
-            raise ToolError(f"Zaman aşımı {i} ({kind} {selector}); Öğeler:\n" + "\n".join(elements), "BROWSER_ACTION_TIMEOUT", True) from e
+            raise ToolError(
+                f"Tarayıcı eylemi {i} ({kind} {selector}) {PAGE_ACTION_TIMEOUT_MS}ms içinde yapılamadı "
+                "(öğe yok/görünmez). Sayfadaki öğeler:\n" + "\n".join(elements),
+                "BROWSER_ACTION_TIMEOUT", True,
+            ) from e
 
     if actions: await page.wait_for_load_state("domcontentloaded")
     text = await asyncio.to_thread(clean_html, await page.content())
     elements = await page.evaluate(_PAGE_ELEMENTS_SCRIPT, PAGE_ELEMENT_LIMIT)
-    return f"Tarayıcı: arka planda çalışan ayrı Chromium\nURL: {page.url}\nBaşlık: {await page.title()}\n\n{text}\n\nÖĞELER:\n" + "\n".join(elements)
+    return (
+        "Tarayıcı: arka planda çalışan ayrı Chromium; açık Google Chrome oturumunda görünmez.\n"
+        f"URL: {page.url}\nBaşlık: {await page.title()}\n\n{text}\n\n"
+        'ÖĞELER (seçici — tür "etiket"):\n' + "\n".join(elements)
+    )

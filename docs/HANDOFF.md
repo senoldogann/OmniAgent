@@ -3,6 +3,30 @@
 Kurallar, mimari ve performans kararlarının tek kaynağı `AGENTS.md`'dir; bu not yalnızca
 kaldığı yerden devam etmek için gereken durumu içerir.
 
+## 25 Eylül (akşam) — src-layout refactor gerilemeleri geri alındı
+- `db972bb` araç katmanını yeniden yazarken ölçülmüş davranışı kaybetmişti. Eski `tools.py`,
+  `main.py` ve `config.py` ile fonksiyon düzeyinde karşılaştırıldı; bulunanlar regresyon testleriyle
+  (`tests/test_gui_regressions.py`, `tests/test_tool_regressions.py`) düzeltildi. Testlerin hepsi
+  düzeltmeden önceki kodda başarısız, sonra geçer.
+- En kritikleri: AX işlevleri `Quartz` üzerinden çağrılıyordu (pyobjc'de yalnız
+  `ApplicationServices`'te var) → her GUI aracı "erişilebilirlik izni yok" diyordu; tuş eşlemesi
+  Playwright adlarını (`Meta`) kullanıyordu → `cmd+c`/`cmd+a` yalnız harfi yazıyordu (`cua_submit_text`
+  metni değiştirmek yerine ekliyordu); Unicode yazımda değiştirici bayrakları sıfırlanmıyordu;
+  ekran dışı koordinat, geçersiz tuş ve sınırsız `wait` sessizce çalışıyordu; AX taraması `AXRow`/
+  `AXLink` rollerini ve hata kodlarını kaybetmişti; `cua_click` tıklamadığı hâlde "tıklandı"
+  diyebiliyordu; Chrome açılamazsa ⌘L+URL+Enter öndeki uygulamaya yazılıyordu; eksik dosya
+  "düzenli dosya değil" sayılıyordu; şablon tıklaması en-boy oranlı görüntüde yanlış yere
+  tıklıyordu; canlı komut çıktısı 2 KB birikmeden görünmüyordu.
+- `SYSTEM_PROMPT` ölçülmüş bölümleriyle (hedef sadakati, BSD tuzakları, para/geri alınamaz eylem,
+  kullanıcı hafızası, entegrasyonlar) geri geldi; kaldırılan yol/komut korumalarına atıf yok, dış
+  içerikteki talimatların uygulanmaması açıkça yazılı.
+- Kasıtlı olduğu belgelenmiş değişiklikler korundu: araç hatası model değiştirmez
+  (`test_tool_failures_do_not_switch_model_backend`), yol/kabuk engelleri kapalı, `web_search`
+  haber kategorisi, kaydedilen ekran görüntüsünün gerçek en-boy oranı.
+- Kullanıcı Mac'inde: launchd kaydı eski `telegram_bridge.py` yolunu gösteriyorsa
+  `.venv/bin/omniagent-telegram install-service` kaydı yeni giriş noktasına taşır; UI/Telegram
+  süreçleri yeni kodu yeniden başlatılınca yükler.
+
 ## 25 Eylül — ekran görüşü, tıklama isabeti, kaydırma ve bitiş doğrulaması
 - Kullanıcı şikâyeti: ajan hedefin biraz üstüne tıklıyor ya da ıskalıyor, kaydırmıyor, işi
   bitirmeden "tamamladım" diyor; Telegram'a gelen görüntü yandan daraltılmış. Kayıtlı görevlerde
@@ -47,7 +71,7 @@ kaldığı yerden devam etmek için gereken durumu içerir.
   `config.apply_stored_api_keys()` çağırır. Anahtarlar `os.environ`'a YAZILMAZ: alt süreç
   ortamından çıkarılır (`tools.child_environment`) ve araç çıktısı `redact()` ile maskelenir.
   Kayıtlı anahtar kabuk değişkenini geçersiz kılar.
-- **İzin tanısı:** `uv run python permissions.py` ekran kaydı izin durumunu, izni alacak
+- **İzin tanısı:** `.venv/bin/omniagent-permissions` ekran kaydı ve erişilebilirlik izin durumunu, izni alacak
   uygulamayı (bundle kimliğiyle) ve eklenecek python ikilisini yazar; `--request` macOS izin
   istemini gösterir. Hata metni artık "Terminal/Python" demiyor, izni alacak uygulamayı söyler.
 - **24 Eylül son ölçüm:** `ollama-cloud` 9 temel senaryo × 3 koşuda 27/27 başarı ve 4,0 sn

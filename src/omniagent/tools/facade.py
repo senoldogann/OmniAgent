@@ -96,7 +96,7 @@ from .screen import (
     frame_change_ratio, geometry_for_display_id, geometry_for_display_index,
     grab_app_window_frame, grab_model_frame, gray_frame,
     model_space_size, model_to_points, parse_point, points_to_model,
-    rgb_frame, screen_capture_granted, screen_capture_help,
+    rgb_frame, screen_capture_granted, screen_capture_help, accessibility_help,
     screen_capture_owner, screenshot_size, settle_app_frame,
     settle_display_frame, settle_frame, wait_for_screen_settle,
     click_model_point, move_model_point, post_scroll, changed_region,
@@ -380,7 +380,16 @@ class Toolbox:
         full_command: Union[str, List[str]] = (
             ["sudo", "-n", "/bin/sh", "-c", command] if use_sudo else command
         )
-        returncode, stdout, stderr = run_streaming_process(full_command, not use_sudo, limit)
+        try:
+            returncode, stdout, stderr = run_streaming_process(full_command, not use_sudo, limit)
+        except ToolError as error:
+            if error.code != "SHELL_TIMEOUT":
+                raise
+            raise ToolError(
+                f"{error}\nUzun kurulum/derleme/indirme ise timeout_seconds ver (en çok "
+                f"{SHELL_MAX_TIMEOUT_SECONDS}); büyük çıktı üreten tarama ise kapsamı daralt.",
+                error.code, error.recoverable,
+            ) from error
         if returncode != 0:
             raise ToolError(
                 f"Kabuk komutu başarısız: çıkış={returncode}, "
@@ -437,6 +446,10 @@ class Toolbox:
             settle_note = f" Son eylemden sonra ekranın durulması {waited:.1f}sn beklendi."
 
         if self._screen_scope_app is not None:
+            if display_index is not None:
+                raise ToolError(
+                    "Uygulama penceresi görüntüsünde ekran numarası kullanılamaz.", "DISPLAY_SCOPE_CONFLICT", False,
+                )
             frame, geometry = grab_app_window_frame(self._screen_scope_app)
             display_id = None
         else:
@@ -468,7 +481,8 @@ class Toolbox:
         )
         return (
             f"{scope_label}Ekran görüntüsü {target} dosyasına kaydedildi "
-            f"({geometry['model_width']}×{geometry['model_height']}; koordinatlar aynı uzaydadır)."
+            f"({geometry['model_width']}×{geometry['model_height']}; bu görüntüdeki koordinatlar tıklama "
+            "araçlarıyla aynı uzayda)."
             + settle_note
         )
 
@@ -494,7 +508,12 @@ class Toolbox:
                 ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
                 "-i", "default:none", "-frames:v", "1", "-update", "1", "-y", str(temporary),
             ]
-            returncode, stdout, stderr = run_streaming_process(command, False, 30.0)
+            try:
+                returncode, stdout, stderr = run_streaming_process(command, False, 30.0)
+            except ToolError as error:
+                if error.code != "SHELL_TIMEOUT":
+                    raise
+                raise ToolError("Kamera 30 saniyede kare üretmedi.", "CAMERA_TIMEOUT", True) from error
             if returncode != 0:
                 raise ToolError(
                     f"Kamera çekimi başarısız (çıkış {returncode}): {_clip(stderr or stdout, 600)}",
@@ -527,27 +546,35 @@ class Toolbox:
                 "TEMPLATE_MISSING",
                 False,
             )
+        # Şablon, kaydedilen ekran görüntüsünden kırpılır: eşleşme o dosyanın piksel uzayında
+        # (gerçek en-boy oranı) yapılır, merkez tıklamadan önce ortak 0-1000 uzayına çevrilir.
         geometry = self._input_geometry()
         if self._screen_scope_app is not None:
             frame, geometry = grab_app_window_frame(self._screen_scope_app)
             screen_gray = cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2GRAY)
-            region = screen_gray
             x0 = y0 = 0
+            region = screen_gray
         else:
             screen_gray = cv2.cvtColor(
                 np.array(grab_model_frame(geometry, self._visual_display_id)),
                 cv2.COLOR_RGB2GRAY,
             )
+            frame_height, frame_width = screen_gray.shape
             left, top, width, height = self.cua.window_bounds(app_name)
-            x0, y0 = points_to_model(left, top, geometry)
-            x1, y1 = points_to_model(left + width, top + height, geometry)
-            x0, y0 = max(x0, 0), max(y0, 0)
-            x1, y1 = min(x1, screen_gray.shape[1]), min(y1, screen_gray.shape[0])
+            scale_x = frame_width / geometry["point_width"]
+            scale_y = frame_height / geometry["point_height"]
+            origin_x, origin_y = int(geometry.get("origin_x", 0)), int(geometry.get("origin_y", 0))
+            x0 = max(round((left - origin_x) * scale_x), 0)
+            y0 = max(round((top - origin_y) * scale_y), 0)
+            x1 = min(round((left + width - origin_x) * scale_x), frame_width)
+            y1 = min(round((top + height - origin_y) * scale_y), frame_height)
             if x1 <= x0 or y1 <= y0:
-                raise ToolError(f"Pencere ekran dışında: {app_name}", "WINDOW_OFFSCREEN", True)
+                raise ToolError(
+                    f"Pencere ekran dışında: {app_name} ({left}, {top}, {width}, {height})", "WINDOW_OFFSCREEN", True,
+                )
             region = screen_gray[y0:y1, x0:x1]
         if template.shape[0] > region.shape[0] or template.shape[1] > region.shape[1]:
-            raise ToolError("Şablon pencereden büyük.", "TEMPLATE_TOO_LARGE", False)
+            raise ToolError("Şablon pencereden büyük (ölçek farklı olabilir).", "TEMPLATE_TOO_LARGE", False)
         scores = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
         _, best, _, location = cv2.minMaxLoc(scores)
         if best < confidence:
@@ -556,9 +583,12 @@ class Toolbox:
                 "TARGET_MISSING",
                 True,
             )
-        center_x = x0 + location[0] + template.shape[1] // 2
-        center_y = y0 + location[1] + template.shape[0] // 2
-        return click_model_point(center_x, center_y, "left", geometry) + f" (şablon güveni {best:.2f})"
+        frame_height, frame_width = screen_gray.shape
+        center_x = (x0 + location[0] + template.shape[1] / 2) * geometry["model_width"] / frame_width
+        center_y = (y0 + location[1] + template.shape[0] / 2) * geometry["model_height"] / frame_height
+        model_x = min(int(center_x), geometry["model_width"] - 1)
+        model_y = min(int(center_y), geometry["model_height"] - 1)
+        return click_model_point(model_x, model_y, "left", geometry) + f" (şablon güveni {best:.2f})"
 
     @_screen_input
     def smart_click(
@@ -579,7 +609,7 @@ class Toolbox:
                 return self._click_template(app_name, template_path, confidence)
             except ToolError as error:
                 failures.append(f"şablon: {error}")
-        detail = "; ".join(failures) if failures else "hiç yöntem verilmedi"
+        detail = "; ".join(failures) if failures else "hiç denenmedi (element_id/template_path verilmedi)"
         raise ToolError(
             f"Tüm tıklama yöntemleri başarısız oldu: {app_name}. Katman hataları: {detail}",
             "CLICK_FAILED",
@@ -956,7 +986,7 @@ class Toolbox:
                 steps = json.loads(steps)
             except json.JSONDecodeError as error:
                 raise ToolError(
-                    "steps bir JSON nesne listesi olmalı.",
+                    'steps bir JSON nesne listesi olmalı; örnek: [{"action":"click","point":[100,200]}]',
                     "INVALID_ACTION_PARAMS",
                     False,
                 ) from error
@@ -969,7 +999,7 @@ class Toolbox:
             if not isinstance(step, dict):
                 raise ToolError(
                     f"Eylem {index} nesne olmalı; alınan tür: {type(step).__name__}. "
-                    f"Tamamlanan adımlar: {executed}",
+                    f'Örnek: {{"action":"click","point":[100,200]}}. Tamamlanan adımlar: {executed}',
                     "INVALID_ACTION_PARAMS",
                     False,
                 )
