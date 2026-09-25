@@ -7,9 +7,9 @@ from typing import Any
 import httpx
 import pytest
 
-import telegram_bridge as telegram
-from conversation import make_exchange
-from host_lock import HostBusyError, host_task_lock
+from omniagent.integrations import telegram
+from omniagent.core.conversation import make_exchange
+from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 
 
 class FakeAPI:

@@ -1,6 +1,6 @@
 """Üst durum göstergesinin Tk açmadan doğrulanması."""
 from __future__ import annotations
-import ui
+from omniagent.ui import app as ui
 
 class FakeLabel:
     def __init__(self) -> None:

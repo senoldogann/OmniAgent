@@ -6,9 +6,9 @@ import customtkinter as ctk
 import pytest
 from openai import AsyncOpenAI
 
-import api_keys
-import config
-import ui
+from omniagent.platform.macos import api_keys
+from omniagent import config
+from omniagent.ui import app as ui
 
 
 class FakeKeyring:

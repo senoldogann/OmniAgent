@@ -8,11 +8,11 @@ from typing import Any, Dict, List
 
 import pytest
 
-import main
-import state_manager as sm
-import user_memory
-from capabilities import CapabilityService
-from tools import ToolError, Toolbox
+from omniagent.app import agent as main
+from omniagent.core import state as sm
+from omniagent.memory import user as user_memory
+from omniagent.integrations.capabilities import CapabilityService
+from omniagent.tools import ToolError, Toolbox
 
 
 class ErrorHandler(BaseHTTPRequestHandler):

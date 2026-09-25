@@ -1,5 +1,5 @@
 """Yeni komut çıktısı Fast Loop ilerlemesidir; tekrar ve boş çıktı değildir."""
-import main
+from omniagent.app import agent as main
 
 
 def _call(identifier: str) -> main.ToolCallDraft:

@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-import main
-from capabilities import CapabilityService
+from omniagent.app import agent as main
+from omniagent.integrations.capabilities import CapabilityService
 
 
 @pytest.mark.asyncio

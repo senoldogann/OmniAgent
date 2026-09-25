@@ -6,11 +6,11 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-import approval
-import main
-import telegram_bridge as telegram
-from integration_runtime import CURRENT_RUNTIME, IntegrationRuntime
-from tools import ToolError, Toolbox, shell_command_words
+from omniagent import approval
+from omniagent.app import agent as main
+from omniagent.integrations import telegram
+from omniagent.integrations.runtime import CURRENT_RUNTIME, IntegrationRuntime
+from omniagent.tools import ToolError, Toolbox, shell_command_words
 from test_telegram_bridge import FakeAPI
 
 
@@ -44,6 +44,10 @@ def _audit(tmp_path: Path) -> List[Dict[str, str]]:
     ("bitcoin-cli getbalance", False),
     ("bitcoin-cli sendtoaddress bc1qxyz 0.1", True),
     ("sh -c 'solana transfer abc 1'", True),
+    ("wget --post-data=amount=500 https://api.stripe.com/v1/payment_intents", True),
+    ("python3 -c \"import requests; requests.post('https://api.stripe.com/v1/payment_intents', data={'amount':500})\"", True),
+    ("node -e \"fetch('https://api.stripe.com/v1/payment_intents',{method:'POST'})\"", True),
+    ("python3 -c \"print('https://api.stripe.com/v1/balance')\"", True),
     ("ls -la ~/Desktop", False),
 ])
 def test_shell_financial_classification(command: str, financial: bool) -> None:

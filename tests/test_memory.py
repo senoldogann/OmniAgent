@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-import user_memory
-import main
-from main import ToolCallDraft, build_tool_schemas
-from tools import ToolError, Toolbox
+from omniagent.memory import user as user_memory
+from omniagent.app import agent as main
+from omniagent.app.agent import ToolCallDraft, build_tool_schemas
+from omniagent.tools import ToolError, Toolbox
 
 
 def test_memory_tool_is_exposed_in_base_schema() -> None:

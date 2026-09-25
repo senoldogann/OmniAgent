@@ -6,8 +6,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from integration_runtime import IntegrationRuntime, IntegrationStopped, save_json
-from outlook import OutlookAdapter, GraphError, parse_rule, mail_filter
+from omniagent.integrations.runtime import IntegrationRuntime, IntegrationStopped, save_json
+from omniagent.integrations.outlook import OutlookAdapter, GraphError, parse_rule, mail_filter
 
 
 class Auth:

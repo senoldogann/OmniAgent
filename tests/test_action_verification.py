@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-import main
-from capabilities import CapabilityService
-from conversation import make_exchange
+from omniagent.app import agent as main
+from omniagent.integrations.capabilities import CapabilityService
+from omniagent.core.conversation import make_exchange
 
 
 def test_source_change_intent_inherits_short_followup() -> None:
@@ -22,6 +22,11 @@ def test_source_change_intent_inherits_short_followup() -> None:
     assert main.source_change_expected("Monitör desteği ekle", [])
     assert not main.source_change_expected("Bu kod nasıl çalışıyor?", [])
     assert not main.source_change_expected("Dosyayı oku", [])
+    # Yanıt biçimi olan 'yaz' ve ilan kodu, kaynak kod değişikliği isteği değildir
+    assert not main.source_change_expected(
+        "İlk 3 ilanı aç ve her ilanın kodunu oku. Tek satır 'KODLAR: <k1>,<k2>,<k3>' yaz.", [],
+    )
+    assert not main.source_change_expected("Maaşı en yüksek ilanı bul, ilan kodunu tamamla ve yaz.", [])
 
 
 @pytest.mark.asyncio

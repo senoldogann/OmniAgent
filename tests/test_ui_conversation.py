@@ -5,10 +5,10 @@ from typing import Iterator
 
 import pytest
 
-import ui
-from config import DEFAULT_BACKEND
-from conversation import make_exchange
-from main import ZERO_USAGE
+from omniagent.ui import app as ui
+from omniagent.config import DEFAULT_BACKEND
+from omniagent.core.conversation import make_exchange
+from omniagent.app.agent import ZERO_USAGE
 
 
 @pytest.fixture

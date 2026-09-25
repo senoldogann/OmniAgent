@@ -1,0 +1,273 @@
+"""
+OmniAgent Ekran ve Görüntü Modülü (tools/screen.py)
+Yüksek performanslı ekran yakalama, çoklu monitör yönetimi ve optimize edilmiş durulma (settle) tespiti.
+"""
+import logging
+import os
+import sys
+import time
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+import pyautogui
+import Quartz
+import cv2
+
+from .system import parent_process_name
+from .types import (
+    MODEL_SCREEN_SIZE,
+    SCREENSHOT_MAX_EDGE,
+    SETTLE_CHANGED_RATIO,
+    SETTLE_FRAME_EDGE,
+    SETTLE_MAX_SECONDS,
+    SETTLE_PIXEL_DELTA,
+    SETTLE_POLL_SECONDS,
+    SETTLE_QUIET_SECONDS,
+    SETTLE_REACTION_SECONDS,
+    SCREEN_SETTINGS_URL,
+    TOOL_RUNTIME,
+    ScreenGeometry,
+    ToolError,
+    ToolRuntime,
+)
+
+BUNDLE_APP_NAMES: Dict[str, str] = {
+    "com.apple.Terminal": "Terminal",
+    "com.googlecode.iterm2": "iTerm2",
+    "com.microsoft.VSCode": "Visual Studio Code",
+    "com.apple.dt.Xcode": "Xcode",
+    "com.jetbrains.pycharm": "PyCharm",
+    "dev.warp.Warp-Stable": "Warp",
+    "com.github.wez.wezterm": "WezTerm",
+    "co.zeit.hyper": "Hyper",
+    "com.freebuff.desktop": "Freebuff",
+}
+
+_SCREEN_CAPTURE_REQUESTED: List[bool] = [False]
+
+def model_space_size(point_width: int, point_height: int, max_edge: int) -> Tuple[int, int]:
+    scale = min(1.0, max_edge / max(point_width, point_height))
+    return (round(point_width * scale), round(point_height * scale))
+
+def model_to_points(x: float, y: float, geometry: ScreenGeometry) -> Tuple[int, int]:
+    return (
+        int(geometry.get("origin_x", 0)) + round(x * geometry["point_width"] / geometry["model_width"]),
+        int(geometry.get("origin_y", 0)) + round(y * geometry["point_height"] / geometry["model_height"]),
+    )
+
+def points_to_model(x: float, y: float, geometry: ScreenGeometry) -> Tuple[int, int]:
+    return (
+        round((x - int(geometry.get("origin_x", 0))) * geometry["model_width"] / geometry["point_width"]),
+        round((y - int(geometry.get("origin_y", 0))) * geometry["model_height"] / geometry["point_height"]),
+    )
+
+def current_geometry() -> ScreenGeometry:
+    pw, ph = pyautogui.size()
+    return {"point_width": pw, "point_height": ph, "model_width": MODEL_SCREEN_SIZE, "model_height": MODEL_SCREEN_SIZE}
+
+def active_display_ids() -> List[int]:
+    status, raw_ids, count = Quartz.CGGetActiveDisplayList(32, None, None)
+    if status != Quartz.kCGErrorSuccess or not raw_ids or count < 1:
+        raise ToolError("Ekran listesi okunamadı.", "DISPLAY_LIST_FAILED", True)
+    main_id = int(Quartz.CGMainDisplayID())
+    ids = [int(v) for v in list(raw_ids)[:count]]
+    return sorted(ids, key=lambda v: (v != main_id, float(Quartz.CGDisplayBounds(v).origin.y), float(Quartz.CGDisplayBounds(v).origin.x), v))
+
+def geometry_for_display_id(display_id: int) -> ScreenGeometry:
+    if display_id not in active_display_ids():
+        raise ToolError(f"Ekran bağlı değil: id={display_id}", "DISPLAY_DISCONNECTED", True)
+    bounds = Quartz.CGDisplayBounds(display_id)
+    return {
+        "point_width": round(bounds.size.width), "point_height": round(bounds.size.height),
+        "model_width": MODEL_SCREEN_SIZE, "model_height": MODEL_SCREEN_SIZE,
+        "origin_x": round(bounds.origin.x), "origin_y": round(bounds.origin.y),
+    }
+
+def geometry_for_display_index(display_index: int) -> Tuple[int, ScreenGeometry]:
+    ids = active_display_ids()
+    if not isinstance(display_index, int) or not 1 <= display_index <= len(ids):
+        raise ToolError(f"Ekran numarası 1-{len(ids)} olmalı: {display_index!r}", "INVALID_DISPLAY", False)
+    did = ids[display_index - 1]
+    return did, geometry_for_display_id(did)
+
+def parse_point(value: object) -> Tuple[int, int]:
+    if isinstance(value, (list, tuple)) and len(value) == 2 and all(isinstance(i, (int, float)) and not isinstance(i, bool) for i in value):
+        return round(value[0]), round(value[1])
+    raise ToolError(f"point [x, y] olmalı; alınan: {value!r}", "INVALID_POINT", False)
+
+def screen_capture_owner() -> Dict[str, str]:
+    bundle = os.environ.get("__CFBundleIdentifier", "").strip()
+    return {"bundle_id": bundle, "app_name": BUNDLE_APP_NAMES.get(bundle, ""), "parent_process": parent_process_name(), "python": sys.executable}
+
+def screen_capture_help() -> str:
+    owner = screen_capture_owner()
+    app = owner["app_name"] or owner["parent_process"] or "uygulama"
+    identity = f" ({owner['bundle_id']})" if owner["bundle_id"] else ""
+    return "\n".join((
+        "Ekran kaydı izni yok. Lütfen şu adımları izleyin:",
+        "1) Ayarlar > Gizlilik ve Güvenlik > Ekran ve Sistem Sesi Kaydı bölümünü açın.",
+        f"   Doğrudan ayar bağlantısı: {SCREEN_SETTINGS_URL}",
+        f"2) '{app}'{identity} anahtarını açın.",
+        f"3) Listede yoksa '+' ile python ikilisini ekleyin: {owner['python']}",
+        "4) İzin sonrası uygulamayı yeniden başlatın.",
+    ))
+
+def _request_screen_capture_once() -> None:
+    if _SCREEN_CAPTURE_REQUESTED[0]: return
+    _SCREEN_CAPTURE_REQUESTED[0] = True
+    try: Quartz.CGRequestScreenCaptureAccess()
+    except Exception: pass
+
+def screen_capture_granted(request: bool = False) -> bool:
+    try:
+        if Quartz.CGPreflightScreenCaptureAccess(): return True
+    except Exception: return False
+    if not request: return False
+    _request_screen_capture_once()
+    try: return bool(Quartz.CGPreflightScreenCaptureAccess())
+    except Exception: return False
+
+def _require_screen_capture() -> None:
+    if screen_capture_granted(request=True): return
+    raise ToolError(screen_capture_help(), "SCREEN_CAPTURE_PERMISSION", False)
+
+def _display_image(display_id: int, resolution: int) -> object:
+    image = Quartz.CGWindowListCreateImage(Quartz.CGDisplayBounds(display_id), Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID, resolution)
+    if image is None: raise ToolError(f"Ekran görüntüsü alınamadı: id={display_id}", "SCREEN_CAPTURE_FAILED", True)
+    return image
+
+def _main_display_image(resolution: int) -> object:
+    return _display_image(int(Quartz.CGMainDisplayID()), resolution)
+
+def _bounds_intersect(first: Dict[str, float], second: Dict[str, float]) -> bool:
+    return (float(first.get("X", 0.0)) < float(second.get("X", 0.0)) + float(second.get("Width", 0.0))
+            and float(second.get("X", 0.0)) < float(first.get("X", 0.0)) + float(first.get("Width", 0.0))
+            and float(first.get("Y", 0.0)) < float(second.get("Y", 0.0)) + float(second.get("Height", 0.0))
+            and float(second.get("Y", 0.0)) < float(first.get("Y", 0.0)) + float(first.get("Height", 0.0)))
+
+def _front_app_window_image(app_name: str, image_option: int) -> Tuple[object, ScreenGeometry]:
+    _require_screen_capture()
+    windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
+    wanted = app_name.casefold()
+    entries = list(windows) if windows else []
+    for pos, window in enumerate(entries):
+        if int(window.get(Quartz.kCGWindowLayer) or 0) != 0: continue
+        if str(window.get(Quartz.kCGWindowOwnerName) or "").casefold() != wanted: continue
+        bounds = window.get(Quartz.kCGWindowBounds)
+        if not bounds: continue
+        b = dict(bounds)
+        left, top, width, height = float(b.get("X", 0.0)), float(b.get("Y", 0.0)), float(b.get("Width", 0.0)), float(b.get("Height", 0.0))
+        if width < 2 or height < 2: continue
+        window_id = int(window.get(Quartz.kCGWindowNumber) or 0)
+        owner_pid = int(window.get(Quartz.kCGWindowOwnerPID) or 0)
+        popups = [int(other.get(Quartz.kCGWindowNumber) or 0) for other in entries[:pos]
+                  if int(other.get(Quartz.kCGWindowOwnerPID) or 0) == owner_pid and _bounds_intersect(dict(other.get(Quartz.kCGWindowBounds) or {}), b)]
+        image = Quartz.CGWindowListCreateImageFromArray(Quartz.CGRectMake(left, top, width, height), popups + [window_id], image_option)
+        if image is None: continue
+        return image, {"point_width": round(width), "point_height": round(height), "model_width": MODEL_SCREEN_SIZE, "model_height": MODEL_SCREEN_SIZE, "origin_x": round(left), "origin_y": round(top)}
+    raise ToolError(f"{app_name} için pencere bulunamadı.", "WINDOW_CAPTURE_FAILED", True)
+
+def _draw_scaled(image: object, width: int, height: int, color_space: object, channels: int, bitmap_info: int) -> bytes:
+    buffer = bytearray(width * height * channels)
+    context = Quartz.CGBitmapContextCreate(buffer, width, height, 8, width * channels, color_space, bitmap_info)
+    if context is None: raise ToolError("Çizim bağlamı kurulamadı.", "SCREEN_CAPTURE_FAILED", True)
+    Quartz.CGContextSetInterpolationQuality(context, Quartz.kCGInterpolationHigh)
+    Quartz.CGContextDrawImage(context, Quartz.CGRectMake(0, 0, width, height), image)
+    return bytes(buffer)
+
+def screenshot_size(geometry: ScreenGeometry) -> Tuple[int, int]:
+    return model_space_size(geometry["point_width"], geometry["point_height"], SCREENSHOT_MAX_EDGE)
+
+def rgb_frame(image: object, size: Tuple[int, int]) -> Image.Image:
+    w, h = size
+    pixels = _draw_scaled(image, w, h, Quartz.CGColorSpaceCreateWithName(Quartz.kCGColorSpaceSRGB), 4, Quartz.kCGImageAlphaNoneSkipLast)
+    return Image.frombuffer("RGBX", (w, h), pixels, "raw", "RGBX", 0, 1).convert("RGB")
+
+def gray_frame(image: object, max_edge: int) -> np.ndarray:
+    w, h = model_space_size(Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image), max_edge)
+    pixels = _draw_scaled(image, w, h, Quartz.CGColorSpaceCreateDeviceGray(), 1, Quartz.kCGImageAlphaNone)
+    return np.frombuffer(pixels, dtype=np.uint8).reshape(h, w)
+
+def grab_model_frame(geometry: ScreenGeometry, display_id: Optional[int] = None) -> Image.Image:
+    _require_screen_capture()
+    image = _main_display_image(Quartz.kCGWindowImageDefault) if display_id is None else _display_image(display_id, Quartz.kCGWindowImageDefault)
+    return rgb_frame(image, screenshot_size(geometry))
+
+def grab_app_window_frame(app_name: str) -> Tuple[Image.Image, ScreenGeometry]:
+    image, geometry = _front_app_window_image(app_name, Quartz.kCGWindowImageBoundsIgnoreFraming)
+    return rgb_frame(image, screenshot_size(geometry)), geometry
+
+def settle_app_frame(app_name: str) -> np.ndarray:
+    image, geometry = _front_app_window_image(app_name, Quartz.kCGWindowImageBoundsIgnoreFraming)
+    w, h = model_space_size(geometry["point_width"], geometry["point_height"], SETTLE_FRAME_EDGE)
+    pixels = _draw_scaled(image, w, h, Quartz.CGColorSpaceCreateDeviceGray(), 1, Quartz.kCGImageAlphaNone)
+    return np.frombuffer(pixels, dtype=np.uint8).reshape(h, w)
+
+def settle_frame() -> np.ndarray:
+    image = _main_display_image(Quartz.kCGWindowImageNominalResolution)
+    w, h = model_space_size(Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image), SETTLE_FRAME_EDGE)
+    pixels = _draw_scaled(image, w, h, Quartz.CGColorSpaceCreateDeviceGray(), 1, Quartz.kCGImageAlphaNone)
+    return np.frombuffer(pixels, dtype=np.uint8).reshape(h, w)
+
+def settle_display_frame(display_id: int) -> np.ndarray:
+    image = _display_image(display_id, Quartz.kCGWindowImageNominalResolution)
+    w, h = model_space_size(Quartz.CGImageGetWidth(image), Quartz.CGImageGetHeight(image), SETTLE_FRAME_EDGE)
+    pixels = _draw_scaled(image, w, h, Quartz.CGColorSpaceCreateDeviceGray(), 1, Quartz.kCGImageAlphaNone)
+    return np.frombuffer(pixels, dtype=np.uint8).reshape(h, w)
+
+def frame_change_ratio(previous: np.ndarray, current: np.ndarray, pixel_delta: int) -> float:
+    if previous.shape != current.shape: return 1.0
+    return float(np.mean(np.abs(current.astype(np.int16) - previous.astype(np.int16)) > pixel_delta))
+
+def _raise_if_stopped() -> None:
+    runtime = TOOL_RUNTIME.get()
+    if runtime and runtime["should_stop"](): raise ToolError("Süreç durduruldu.", "STOPPED", False)
+
+def wait_for_screen_settle(baseline: np.ndarray, input_at: float, frame_source: Optional[Callable[[], np.ndarray]] = None) -> float:
+    started = time.monotonic()
+    reference = baseline
+    reacted = False
+    last_change = started
+    source = frame_source or settle_frame
+    while True:
+        _raise_if_stopped()
+        frame = source()
+        now = time.monotonic()
+        if frame_change_ratio(reference, frame, SETTLE_PIXEL_DELTA) > SETTLE_CHANGED_RATIO:
+            reacted, last_change, reference = True, now, frame
+        if (reacted and now - last_change >= SETTLE_QUIET_SECONDS) or (not reacted and now >= input_at + SETTLE_REACTION_SECONDS) or now >= input_at + SETTLE_MAX_SECONDS:
+            return time.monotonic() - started
+        time.sleep(SETTLE_POLL_SECONDS)
+
+def click_model_point(x: int, y: int, button: str, geometry: ScreenGeometry) -> str:
+    px, py = model_to_points(x, y, geometry)
+    pyautogui.click(px, py, button=button)
+    return f"Noktaya tıklandı: ({x}, {y}) -> ({px}, {py})"
+
+def move_model_point(x: int, y: int, geometry: ScreenGeometry) -> str:
+    px, py = model_to_points(x, y, geometry)
+    pyautogui.moveTo(px, py)
+    return f"İmleç taşındı: ({x}, {y}) -> ({px}, {py})"
+
+def post_scroll(dx: float, dy: float) -> None:
+    event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, round(-dy * 10), round(-dx * 10))
+    Quartz.CGEventSetIntegerValueField(event, Quartz.kCGScrollWheelEventIsContinuous, 1)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+def changed_region(before: np.ndarray, after: np.ndarray, anchor: Tuple[int, int], min_share: float) -> Optional[Tuple[int, int, int, int]]:
+    changed = (np.abs(after.astype(np.int16) - before.astype(np.int16)) > SETTLE_PIXEL_DELTA).astype(np.uint8)
+    if not changed.any(): return None
+    grown = cv2.dilate(changed, np.ones((9, 9), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(grown, connectivity=8)
+    min_area = min_share * grown.shape[0] * grown.shape[1]
+    components = [
+        (int(stats[l, cv2.CC_STAT_LEFT]), int(stats[l, cv2.CC_STAT_TOP]), int(stats[l, cv2.CC_STAT_WIDTH]), int(stats[l, cv2.CC_STAT_HEIGHT]), int(stats[l, cv2.CC_STAT_AREA]), l)
+        for l in range(1, count) if stats[l, cv2.CC_STAT_AREA] >= min_area
+    ]
+    if not components: return None
+    ax, ay = anchor
+    around_anchor = [item for item in components if item[0] <= ax < item[0] + item[2] and item[1] <= ay < item[1] + item[3]]
+    chosen = max(around_anchor or components, key=lambda item: item[4])[5]
+    rows, cols = np.nonzero(changed & (labels == chosen))
+    return (int(cols.min()), int(rows.min()), int(cols.max()) + 1, int(rows.max()) + 1)

@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-import main
-from integration_runtime import CURRENT_RUNTIME, IntegrationRuntime
+from omniagent.app import agent as main
+from omniagent.integrations.runtime import CURRENT_RUNTIME, IntegrationRuntime
 
 
 @pytest.mark.asyncio

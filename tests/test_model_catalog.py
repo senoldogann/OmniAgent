@@ -6,7 +6,7 @@ from typing import Any
 import httpx
 import pytest
 
-import model_catalog as catalog
+from omniagent import model_catalog as catalog
 
 
 def test_preferences_are_atomic_and_ignore_corruption(

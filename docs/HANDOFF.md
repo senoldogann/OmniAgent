@@ -1,7 +1,34 @@
-# OmniAgent — Devir Notu (2026-09-24)
+# OmniAgent — Devir Notu (2026-09-25)
 
 Kurallar, mimari ve performans kararlarının tek kaynağı `AGENTS.md`'dir; bu not yalnızca
 kaldığı yerden devam etmek için gereken durumu içerir.
+
+## 25 Eylül — ekran görüşü, tıklama isabeti, kaydırma ve bitiş doğrulaması
+- Kullanıcı şikâyeti: ajan hedefin biraz üstüne tıklıyor ya da ıskalıyor, kaydırmıyor, işi
+  bitirmeden "tamamladım" diyor; Telegram'a gelen görüntü yandan daraltılmış. Kayıtlı görevlerde
+  doğrulandı: OmaLeima formunda onay kutusu, Cloudflare kutusu ve gönder düğmesine 99-178 birim
+  aşağı tıklanıp ekran görülmeden "gönderdim" denildi; LinkedIn'de liste dışındaki boşluğa
+  (x=150) tıklanıp sağ panel hiç değişmeden "tüm ilanlara baktım" denildi.
+- Kök nedenler ve ölçüm (6 gerçek sayfa, 48 DOM hedefi, `gemma4:cloud`): modele giden JPEG q70
+  (4:2:0) isabeti 20/48'e düşürüp noktaları yukarı kaydırıyordu; kare kayıpsız görüntü 38-39/48.
+  gemma4 görüntüyü sabit ~280 tokenlık ızgarada işler. OCR ile metne tıklama eklenince gerçek
+  sistem istemi ve şemalarla uçtan uca isabet 42/48. Ayrıntı: AGENTS.md Koordinat Takibi, GUI.
+- Eklenenler: `screen_text.py` (Vision OCR), `cua_click_text`, `cua_scroll`, `cua_read_scrollable`,
+  `cua_fill_field`; her GUI yolunda otomatik gözlem; "ekran değişmedi" notu; ilk final yanıtta
+  kanıt özetli bitiş doğrulaması; Chrome penceresi görüntüsüne kendi açılır pencereleri; takip
+  mesajında açık Chrome yolunun sürmesi; aynı ekrana dönüşün (A→B→A) ilerleme sayılmaması.
+- Aynı turda düzeltilen önceden var olan iki sezgi hatası: "ilan kodunu … yaz" kaynak kod
+  değişikliği sanılıp "dosya yazılmadı" diye başarısız sayılıyordu (`source_change_expected`);
+  "adresini çek" okuma isteği eylem sanılıp başarılı `fetch_raw` kanıt sayılmıyordu
+  (`action_execution_expected`; çekirdek `json` senaryosu eski kodla 0/2, düzeltmeyle 3/3).
+- Görünmez ekranla ölçüm (`benchmark.py --headless`, gerçek model, son kod): `chrome_maas` 3/3
+  (84-135 sn, 7-9 tur, 10/10 ilan açıldı; önceki sürüm 25 turluk döngüye girip 10 ilanın 3'ünü
+  açmıştı), `chrome_form` 6/7 geçerli gönderim ve dürüst bildirim (15-38 sn, 5-12 tur); başarısız
+  koşu gönderim yapmadan "gönderildi" demedi. Çekirdek benchmark 27/27 (json ayrı koşuyla), medyan
+  4,2 sn; ev dizininde yan etki yok. Tam pytest 300 geçti, 15 atlandı.
+- Canlı ekranda henüz ölçülmedi: gerçek Chrome'da kaydırma olayı yönü/miktarı, select açılır
+  menüsünün pencere görüntüsüne girmesi, `chrome_ilan/chrome_maas/chrome_form` gerçek koşusu.
+  UI ve Telegram süreçleri yeni kodu yeniden başlatılınca yükler.
 
 ## Güncel model durumu
 - `99041f8` ile varsayılan model yerel Ollama API'sinden `gemma4:cloud` oldu. Bu makinede
@@ -58,7 +85,9 @@ kaldığı yerden devam etmek için gereken durumu içerir.
 .venv/bin/python -m pytest tests/ -q                   # canlı API testi: OMNI_LIVE_API_TEST=1
 .venv/bin/python benchmark.py --runs 3 --concurrency 3 # hız + doğruluk ölçümü
 # GUI ölçümü: fareyi/klavyeyi kullanır, açık bir Chrome penceresi gerekir
-.venv/bin/python benchmark.py --runs 3 --concurrency 1 --only chrome_ilan
+.venv/bin/python benchmark.py --runs 3 --concurrency 1 --only chrome_ilan,chrome_maas,chrome_form
+# Aynı GUI senaryoları kullanıcının ekranına dokunmadan (görünmez Chromium, headless_screen.py)
+.venv/bin/python benchmark.py --runs 3 --concurrency 1 --only chrome_maas,chrome_form --headless
 # Gerçek Chrome sekme testi (ekranda geçici pencereler açar)
 OMNI_CHROME_TEST=1 .venv/bin/python -m pytest tests/test_core.py -q -k live_matching_tab
 ```
@@ -90,14 +119,14 @@ Genel senaryolardaki hatalar iki sürümde aynı türdedir (kod önekini düşü
 
 ## Açık konular
 - Ekran görüntüleri `FULL_DETAIL_TURNS` tur sonra hâlâ bağlamdan düşer. `STATE`, metin koruma
-  ve tekrar-URL uyarısı bunu azaltır fakat modelin ekrandaki bir değeri metne hiç aktarmamasını
-  deterministik olarak çözmez. macOS Vision OCR ileride ek güçlendirme olabilir; mevcut sanal
-  ortamda `Vision` Python modülü kurulu değildir.
+  ve tekrar-URL uyarısı bunu azaltır; uzun içerik artık `cua_read_scrollable` ile metin olarak
+  okunur (macOS Vision, `pyobjc-framework-Vision`), ama modelin okuduğu değeri STATE'e aktarması
+  hâlâ modele bağlıdır.
 - Chrome'un AX ağacı web içeriğini vermiyor (`AXManualAccessibility` desteklenmiyor,
   `AXEnhancedUserInterface` ayarlanamıyor); Electron uygulamalarında da AX yalnız pencere
   çerçevesini gösterebiliyor → bu uygulamalarda ekran görüntüsü gerekir.
-- Otomatik gözlem yalnız açık Chrome yolundadır; genel yolda `take_screenshot` durulma
-  beklemesini kullanır ama model gözlemi kendisi ister.
+- Otomatik gözlem her GUI yolundadır. Gerçek Chrome'da kaydırma olaylarının yönü/miktarı ve
+  select açılır menüsünün pencere görüntüsüne girmesi canlı olarak henüz ölçülmedi (bkz. 25 Eylül).
 - Hatalardan kalıcı öğrenme yeniden eklendi ama global görev benzerliği olarak değil:
   `experience.py` yalnız aynı araç + hata imzasında, değiştirilmiş çağrının başarıyla
   doğrulandığı ve görevin tamamlandığı kurtarmayı saklar. Ders yalnız aynı hata tekrar

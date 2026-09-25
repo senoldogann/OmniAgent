@@ -3,7 +3,7 @@ import io
 import json
 import pytest
 
-import main
+from omniagent.app import agent as main
 
 
 class _Response(io.BytesIO):

@@ -5,8 +5,8 @@ from typing import Any
 
 import pytest
 
-import main
-import state_manager as sm
+from omniagent.app import agent as main
+from omniagent.core import state as sm
 
 
 def test_status_goal_uses_last_successful_json_observation() -> None:

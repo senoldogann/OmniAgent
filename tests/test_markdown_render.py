@@ -1,5 +1,5 @@
 """Markdown dönüşümünde komut sadakati ve blok biçimleri."""
-from markdown_render import format_table, parse_blocks, parse_spans, render_markdown
+from omniagent.ui.markdown import format_table, parse_blocks, parse_spans, render_markdown
 
 
 def test_commands_remain_literal() -> None:

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import voice
+from omniagent.platform.macos import voice
 
 
 def test_voice_is_idle_without_native_permission(monkeypatch: pytest.MonkeyPatch) -> None:

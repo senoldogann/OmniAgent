@@ -1,5 +1,5 @@
 """Fast Loop phase controller and semantic-progress tests."""
-from fast_loop import (
+from omniagent.core.fast_loop import (
     FastLoopPolicy,
     FastLoopState,
     TurnSignal,

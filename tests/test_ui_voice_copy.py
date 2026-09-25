@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-import ui
+from omniagent.ui import app as ui
 
 
 class FakeText:

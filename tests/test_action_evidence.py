@@ -5,9 +5,9 @@ from typing import Any
 
 import pytest
 
-import main
-import state_manager as sm
-from capabilities import CapabilityService
+from omniagent.app import agent as main
+from omniagent.core import state as sm
+from omniagent.integrations.capabilities import CapabilityService
 
 
 def _turn(content: str, calls: list[dict[str, str]] | None = None) -> dict[str, Any]:
@@ -215,6 +215,11 @@ def test_polite_action_and_project_repair_open_the_right_tools() -> None:
     )}
     assert "edit_file" in names
     assert not main.action_execution_expected("Kod nasıl çalışıyor?")
+    # URL/veri "çekmek" okumadır; fotoğraf çekmek eylemdir
+    assert not main.action_execution_expected(
+        "fetch_raw ile http://127.0.0.1:8000/json/x adresini çek, 'slideshow.author' değerini yaz.",
+    )
+    assert main.action_execution_expected("Masaüstüne bir fotoğraf çek")
 
 
 def test_read_only_shell_probe_is_not_deletion_evidence() -> None:

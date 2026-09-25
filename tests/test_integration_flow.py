@@ -5,10 +5,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-import main
-from capabilities import CapabilityService
-from integration_runtime import save_json
-from outlook import OutlookAdapter
+from omniagent.app import agent as main
+from omniagent.integrations.capabilities import CapabilityService
+from omniagent.integrations.runtime import save_json
+from omniagent.integrations.outlook import OutlookAdapter
 from tests.test_outlook import Auth, RULE, message
 
 

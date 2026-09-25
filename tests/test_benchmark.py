@@ -2,8 +2,8 @@
 import subprocess
 from pathlib import Path
 
-import benchmark
-import user_memory
+from omniagent.dev import benchmark
+from omniagent.memory import user as user_memory
 
 
 def test_long_research_scenario_requires_full_delivery_contract(tmp_path: Path) -> None:

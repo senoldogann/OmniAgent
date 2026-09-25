@@ -6,10 +6,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from capabilities import CapabilityService, function_schema
-from integration_runtime import CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime, IntegrationStopped
-from main import execute_tool, _execute_tool_calls
-from tools import Toolbox
+from omniagent.integrations.capabilities import CapabilityService, function_schema
+from omniagent.integrations.runtime import CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime, IntegrationStopped
+from omniagent.app.agent import execute_tool, _execute_tool_calls
+from omniagent.tools import Toolbox
 
 
 def runtime(stop=lambda: False):
@@ -139,7 +139,7 @@ async def test_explicit_skills_sh_outlook_search_keeps_graph_separate_and_caches
 
 
 def test_explicit_skill_search_remains_available_in_visible_chrome_mode() -> None:
-    from main import build_tool_schemas, skills_sh_goal
+    from omniagent.app.agent import build_tool_schemas, skills_sh_goal
 
     goal = "Açık Chrome oturumumu kullan ve skills.sh'de Outlook skillini bul"
     assert skills_sh_goal(goal)

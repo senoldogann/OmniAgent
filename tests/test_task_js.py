@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import pytest
-import tools
-from tools import ToolError, Toolbox
+from omniagent import tools
+from omniagent.tools import ToolError, Toolbox
 
 def test_task_js_save_and_reuse_with_json_input(monkeypatch) -> None:
     calls = []

@@ -1,5 +1,5 @@
 """Masaüstü görev durumu testleri."""
-import desktop_status
+from omniagent.platform.macos import desktop_status
 
 def test_background_detection() -> None:
     assert desktop_status.is_backgrounded("iconic", True, True)

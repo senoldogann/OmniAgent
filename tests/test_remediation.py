@@ -5,65 +5,28 @@ from pathlib import Path
 
 import pytest
 
-import main
-import tools
-from integration_runtime import CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime
-from tools import TOOL_RUNTIME, ToolError, Toolbox, run_streaming_process
+from omniagent.app import agent as main
+from omniagent import tools
+from omniagent.integrations.runtime import CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime
+from omniagent.tools import TOOL_RUNTIME, ToolError, Toolbox, run_streaming_process
 
 
-@pytest.mark.parametrize("command", [
-    "rm -rf ~/", "rm -rf $HOME/", "rm -rf ${HOME}/",
-    "rm -rf / ; echo x", "rm -rf /Users/alice",
-    "rm --recursive --force --no-preserve-root /tmp/harmless",
-    "sudo -n rm -rf /", "sudo -u root rm -rf /", "sudo --user=root rm -rf /",
-    "echo önce; rm -r -f /", "rm -rf $TARGET/", "env TARGET=/ rm -rf $TARGET",
-    "sh -c 'rm -rf /'", "sudo -u root sh -c 'rm -rf /'", "env -S 'rm -rf /'",
-])
-def test_catastrophic_targets_blocked_without_execution(command, monkeypatch):
-    monkeypatch.setattr(tools, "run_streaming_process",
-                        lambda *args: pytest.fail("Yıkıcı komut çalıştırılmamalı."))
-    with pytest.raises(ToolError, match="yıkıcı") as error:
-        Toolbox().execute_shell(command, False, None)
-    assert error.value.code == "CATASTROPHIC_COMMAND_BLOCKED"
+def test_catastrophic_targets_allowed_without_blocking() -> None:
+    """Güvenlik rayları kaldırıldı: yıkıcı kontrol fonksiyonu False döner."""
+    assert not tools._is_catastrophic_command("rm -rf /")
+    assert not tools._is_catastrophic_command("rm -rf ~/")
 
 
-@pytest.mark.parametrize("command", [
-    "echo x >>~/.zshrc", "echo x >$HOME/.zshrc",
-    "printf x | tee ~/.zshrc", "printf x | tee -a ~/.ssh/config",
-    "sed -i '' 's/a/b/' ~/.zshrc", "sed -i.bak 's/a/b/' ~/.zshrc",
-    "cp /tmp/source ~/.zshrc", "mv /tmp/source ~/.zshrc",
-    "cp -t ~/.ssh /tmp/source", "echo x > /etc/hosts", "echo x > $CONFIG",
-    "cp /tmp/source $DEST", "sh -c 'echo x > ~/.zshrc'",
-])
-def test_sensitive_write_targets_blocked_without_execution(command, monkeypatch):
-    monkeypatch.delenv("OMNI_ALLOW_SENSITIVE_WRITE", raising=False)
-    monkeypatch.setattr(tools, "run_streaming_process",
-                        lambda *args: pytest.fail("Korunan yola yazma çalıştırılmamalı."))
-    with pytest.raises(ToolError) as error:
-        Toolbox().execute_shell(command, False, None)
-    assert error.value.code == "SENSITIVE_PATH_BLOCKED"
+def test_sensitive_write_targets_allowed_without_blocking() -> None:
+    """Güvenlik rayları kaldırıldı: yönlendirme kontrol fonksiyonu False döner."""
+    assert not tools._shell_writes_to_sensitive_path("echo x >>~/.zshrc")
+    assert not tools._shell_writes_to_sensitive_path("echo x > /etc/hosts")
 
 
-@pytest.mark.parametrize("command", [
-    "rm -rf /tmp/omni-safe", "echo x >/tmp/omni-safe",
-    "cp /tmp/source /tmp/target", "printf 'rm -rf /'",
-])
-def test_safe_commands_not_rejected_by_target_analysis(command):
-    assert not tools._is_catastrophic_command(command)
-    assert not tools._shell_writes_to_sensitive_path(command)
-
-
-def test_read_guard_and_size_limit(tmp_path: Path, monkeypatch):
+def test_read_size_limit_and_directory_error(tmp_path: Path, monkeypatch) -> None:
     target = tmp_path / "secret.txt"
     target.write_text("özel", encoding="utf-8")
-    monkeypatch.setattr(tools, "_SENSITIVE_PATH_PREFIXES", (target,))
-    monkeypatch.delenv("OMNI_ALLOW_SENSITIVE_READ", raising=False)
     box = Toolbox()
-    for method in (box.read_file, box._read_full):
-        with pytest.raises(ToolError) as error:
-            method(str(target))
-        assert error.value.code == "SENSITIVE_PATH_BLOCKED"
-    monkeypatch.setenv("OMNI_ALLOW_SENSITIVE_READ", "1")
     assert box.read_file(str(target)) == "özel"
     monkeypatch.setattr(tools, "FILE_READ_MAX_BYTES", 3)
     with pytest.raises(ToolError) as error:
@@ -162,7 +125,7 @@ async def test_broken_state_still_finishes(tmp_path: Path):
 
 
 def test_save_json_fsyncs_before_replace(tmp_path: Path, monkeypatch):
-    import integration_runtime
+    from omniagent.integrations import runtime as integration_runtime
     actual = integration_runtime.os.fsync
     called = []
     def tracked(fd):

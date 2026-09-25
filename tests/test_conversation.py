@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-import main
-from config import DEFAULT_BACKEND
-from conversation import make_exchange, to_messages, tool_digest, trim_history
-from state_manager import make_step_record
+from omniagent.app import agent as main
+from omniagent.config import DEFAULT_BACKEND
+from omniagent.core.conversation import make_exchange, to_messages, tool_digest, trim_history
+from omniagent.core.state import make_step_record
 
 
 def test_run_mode_budgets_are_bounded_and_overridable() -> None:

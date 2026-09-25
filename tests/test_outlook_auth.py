@@ -5,9 +5,9 @@ from urllib.request import urlopen
 
 import pytest
 
-import outlook_auth
-from integration_runtime import IntegrationRuntime, InteractionRequired
-from outlook_auth import OutlookAuth
+from omniagent.integrations import outlook_auth
+from omniagent.integrations.runtime import IntegrationRuntime, InteractionRequired
+from omniagent.integrations.outlook_auth import OutlookAuth
 
 
 @pytest.mark.asyncio

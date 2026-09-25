@@ -8,23 +8,16 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - Her ajan yalnız kendi dosyalarını commit eder; kirli çalışma ağacındaki başkasına ait
   değişiklikleri silmez, stash etmez veya commit'e katmaz. Birleştirme sonrası tam test koşulur.
 - Canlı macOS ekranı ve açık Chrome tek kaynaktır. GUI benchmark'ı kullanıcı veya başka ajan
-  ekranda çalışırken başlatılmaz. UI ve Telegram görevleri `host_lock.py` ile çakışmayı reddeder.
+  ekranda çalışırken başlatılmaz; o sırada `benchmark.py --headless` aynı GUI senaryolarını gerçek
+  ajan döngüsü ve araç mantığıyla görünmez Chromium'da ölçer (`headless_screen.py`; select menüsü
+  ve Quartz yakalama yolu orada sınanmaz). UI ve Telegram görevleri `host_lock.py` ile çakışmayı reddeder.
 - UI süreci kodu açılışta yükler; kaynak dosya değişince çalışan süreç kendiliğinden güncellenmez.
 
 
 ## 🛡️ Güvenlik Rayları (Safety Rails)
-Ajan, kendi kaynak kodunu ve host sistemini değiştirebildiği için `tools.py` içinde kod
-seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıdır):
-- `write_file`: hassas sistem/kimlik dosyalarına (`~/.ssh`, `/etc`, kabuk profil dosyaları vb.)
-  yazmayı reddeder; `.py` hedeflerinde yazmadan önce `compile()` ile sözdizimini doğrular;
-  üzerine yazmadan önce `.omni_backups/` içine zaman damgalı yedek alır; eksik üst dizinleri
-  oluşturur ve bunu sonuçta açıkça bildirir (yazım hatalı bir yol sessizce dizin açmasın).
-- `execute_shell`: bilinen yıkıcı komut kalıplarını (`rm -rf /`, `mkfs`, fork bomb, disk
-  biçimlendirme vb.), çözülemeyen kabuk değişkeni hedeflerini ve korunan yollara `>`/`>>`/`tee`
-  yönlendirmesini engeller; `sudo` çağrıları yapılandırılmış log ile kaydedilir ve parolasız (`-n`)
-  olmayan sudo oturumlarında güvenli şekilde başarısız olur.
-- `fetch_raw`: yalnızca `http`/`https` adreslerini kabul eder; `file://` ve yönlendirme ile yerel
-  dosya okuma olasılığı kapatılır.
+- Kullanıcı onayıyla `tools.py` içindeki yol engelleri (`~/.ssh`, `/etc` vb.) ve kabuk komut kısıtlamaları kaldırılmıştır; ajan tam sistem erişimine sahiptir.
+- `write_file`: `.py` hedeflerinde yazmadan önce `compile()` ile sözdizimini doğrular; üzerine yazmadan önce `.omni_backups/` içine zaman damgalı yedek alır; eksik üst dizinleri oluşturur ve bunu sonuçta açıkça bildirir.
+- `fetch_raw`: yalnızca `http`/`https` adreslerini kabul eder; `file://` ve yönlendirme ile yerel dosya okuma olasılığı kapatılır.
 - Model yalnızca `main.build_tool_schemas` içindeki araç adlarını çağırabilir; `Toolbox`'ın
   özel yöntemlerine (`_read_full`, `close_browser`…) erişemez.
 - GUI araçları erişilebilirlik veya ekran kaydı izni yoksa açık hata verir (macOS izinsiz
@@ -53,13 +46,19 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 ## 🛠️ @Chatgpt-System Plugin Entegrasyonu
 `@Chatgpt-System` pluginindeki yetenekler `Toolbox` yapısına şu hâlleriyle entegre edildi:
 1. **Süreç Yönetimi:** `process_list` aracı (süreç sayısı + CPU'ya göre en ağır 15 süreç).
-2. **Koordinat Takibi:** tek ortak koordinat uzayı: 1000×1000 kare (`MODEL_SCREEN_SIZE`, ekran
-   oranı korunmaz). Ekran görüntüsü, AX öğe listesi ve bütün tıklama/taşıma noktaları
-   (`point: [x, y]`) bu uzaydadır; Retina piksel ↔ nokta dönüşümünü araçlar yapar. qwen
-   koordinatı 0-1000 normalize, Claude/GPT görüntü pikseli verir; kare görüntüde ikisi aynı
-   sayıdır. Ölçüm: 1280×832 görüntü + ayrı x/y alanlarıyla 10 tıklamada 1 isabet ve 7 bozuk
-   argüman (`"x": [x, y]`); kare görüntü + `point` ile 10/10 isabet, 0 bozuk. Ayrı imleç
-   konumu aracı araç diyetiyle kaldırıldı.
+2. **Koordinat Takibi:** tek ortak koordinat uzayı: her eksen 0-1000 (`MODEL_SCREEN_SIZE`).
+   Modele giden görüntü 1000×1000 karedir (JPEG q90, renk alt örneklemesi kapalı); kaydedilen
+   dosya ve Telegram'a giden görüntü ekranın gerçek en-boy oranını korur. Ekran görüntüsü, AX öğe
+   listesi, OCR kutuları ve bütün tıklama/taşıma noktaları (`point: [x, y]`) bu uzaydadır; Retina
+   piksel ↔ nokta dönüşümünü araçlar yapar. Kare görüntüde piksel veren (GPT, Claude) ve 0-1000
+   normalize veren (gemma, qwen) modellerin sayıları aynıdır. Ölçüm (2026-09-25, 6 gerçek sayfada
+   48 DOM hedefi): gpt-6-luna kare görüntüde 39-42/48, en-boy korunmuş görüntü + normalize
+   koordinatta 12/48; gemma4 kare kayıpsız görüntüde 38-39/48, en-boy korunmuşta 33-37/48. Eski
+   JPEG q70 (4:2:0) gemma4'ü 20/48'e düşürüp noktaları hedefin üstüne kaydırıyordu (medyan
+   -13 px); q90 4:4:4 38/48 verir ve PNG'nin üçte biri boyuttadır (~200 KB; PNG görüntülü isteğe
+   ~0,8 sn ekliyordu). gemma4 görüntüyü boyuttan bağımsız ~280 tokenlık sabit ızgarada işler;
+   küçük metinde piksel hassasiyeti bu yüzden OCR'dan gelir (bkz. GUI). Ayrı x/y alanlarıyla
+   10 tıklamanın 7'sinde bozuk argüman (`"x": [x, y]`) üretildiği için nokta tek `point` alanıdır.
 3. **Oturum ve Yetki:** etkisiz `session_authority_*` araçları kaldırıldı; sudo durumu
    `execute_shell` ile `sudo -n true` çalıştırılarak denetlenir.
 
@@ -75,10 +74,11 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
 - **Ölçüm önce gelir:** `benchmark.py` 9 deterministik senaryoyu gerçek modelle koşturur; başarı
   oranı, medyan/maks süre, tur ve token (önbellek dahil) raporlar, ev dizininde istenmeyen dosya
   oluşursa bildirir. Her değişiklik hız VE doğrulukla birlikte ölçülmelidir.
-- **Araç diyeti:** model 14 temel araç ve bir `discover_capabilities` şeması görür (önce 26
-  temel araç vardı). Masaüstüne fotoğraf çekme hedefinde `capture_photo` eklenir. 26 araçlı
-  şemada model hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10
-  doğruydu. Fare/klavye adımları `run_action_sequence`, şablon tıklama `smart_click` içindedir.
+- **Araç diyeti:** genel yolda model 19 temel araç ve bir `discover_capabilities` şeması, açık
+  Chrome yolunda 14 araç görür (önce 26 temel araç vardı). Masaüstüne fotoğraf çekme hedefinde
+  `capture_photo`, kaynak değişikliği görevinde `edit_file` eklenir. 26 araçlı şemada model
+  hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu. Fare/klavye
+  adımları `run_action_sequence`, şablon tıklama `smart_click` içindedir.
 - **Paralellik:** bağımsız araç çağrıları `asyncio.gather` ile gerçek paralellikte çalışır; yan
   etkili araçlar (`_SIDE_EFFECT_TOOLS`) model sırasıyla seri çalışır (iki tıklama/yazma
   çakışmaz, eylem→gözlem sırası korunur). Her araç sonucunun başında çağrı etiketi vardır;
@@ -90,14 +90,38 @@ seviyesinde koruma katmanı bulunur (sandbox değildir, en iyi çaba korumasıd�
   listeler (Chrome ~150ms, Notlar ~650ms); `cua_click` AXPress ile tıklar. Ekran görüntüsü
   yalnızca AX yetmediğinde gerekir. Metin, klavye düzeninden bağımsız Unicode olaylarıyla yazılır
   (Türkçe/Fince karakterler ve emoji doğrulandı; pyautogui bunları sessizce atlıyordu).
+- **Ekran metni (`screen_text.py`):** macOS Vision OCR tam Retina çözünürlükte satır ve kelime
+  kutularını ~200-450 ms'de okur. `cua_click_text` görünür metni bulup tam ortasına tıklar; metin
+  birden çok yerdeyse `near` olmadan tıklamaz, adayları konumlarıyla döner; birebir eşleşme yoksa
+  sonuç bunu söyler. Ölçüm (48 hedef, gemma4, gerçek sistem istemi ve şemalar): uçtan uca
+  isabet 20/48'den 42/48'e çıktı; model 48 hedefin 44'ünde metin aracını seçti. Görünür metni
+  olmayan ikonda araç açık hata verir, model noktaya tıklar.
+- **Kaydırma ve baştan sona okuma:** `cua_scroll` imleci panelin üstüne götürüp piksel birimli
+  sürekli kaydırma olayları gönderir ve içeriğin kayıp kaymadığını ölçer; "KAYMADI" o yönde
+  içeriğin bittiğinin kanıtıdır. `cua_read_scrollable` paneli başa döndürür, görünür yüksekliğin
+  %80'i kadar adımlarla sonuna kadar kaydırıp her görünümü OCR ile okur, kenardaki kesik satırları
+  ve sayfa örtüşmesini atar (sayıları farklı satırlar asla aynı sayılmaz), paneli yeniden başa
+  döndürür ve tüm metni tek sonuçta verir. Kayan panel, fark maskesinin imleci içeren bileşeniyle
+  bulunur; başka yerdeki animasyon karışmaz. Örtüşme bulunamazsa araya "olası atlama" işareti
+  konur, sessiz atlama olmaz.
 - **Eylem → gözlem:** `take_screenshot`, son ekran girdisinden sonra sabit uyku yerine ekranın
   durulmasını bekler: girdi öncesi kareye göre tepki (≤1 sn), ardından 0,45 sn sakinlik, en çok
   3 sn. Karşılaştırma son değişim karesine göredir; yükleme iskeletinin düşük kontrastlı
   parıltısı ancak böyle yakalandı. Yakalama Quartz + CoreGraphics ile ~55 ms (screencapture alt
   süreci ~260 ms idi).
-- **Açık Chrome yolu:** eylem içeren her tur, görüntü istenmediyse ekran durulunca otomatik
-  gözlemle biter (ayrı "ekran görüntüsü al" turu yok). `chrome_active_tab` aynı kökenli sekmeyi
-  kimlikle bulup yüklenmesini bekler; ara/gönder tek `cua_submit_text` çağrısıdır. Chrome AX
+- **Eylem sonu gözlem ve bitiş doğrulaması:** her GUI yolunda eylem içeren tur, görüntü
+  istenmediyse ekran durulunca otomatik gözlemle biter (ayrı "ekran görüntüsü al" turu yok;
+  eskiden yalnız açık Chrome yolundaydı). Gözlem öncekiyle piksel piksel aynıysa host modele
+  eylemin ıskaladığını söyler. Ekranda tıklama/yazma/kaydırma yapılan görev, ilk final yanıtta
+  bir kez güncel ekranla doğrulama turuna döner: her zorunlu madde (dolu alan, işaretli kutu,
+  gönderim onayı, listenin sonu) kanıtla eşleşmeden bitmez. Canlı kayıtta model formun yarısını
+  doldurup "gönderdim", paneli kaydırmadan "tüm ilanlara baktım" demişti.
+- **Açık Chrome yolu:** `chrome_active_tab` aynı kökenli sekmeyi kimlikle bulup yüklenmesini
+  bekler; ara/gönder tek `cua_submit_text`, çok alanlı form `cua_fill_field` (Enter'a basmaz)
+  çağrısıdır. Takip mesajı ("devam et", "formda eksik alan var") 'chrome' kelimesi geçmese de
+  önceki görev bu yolda yürüdüyse ve yerel dosya/kabuk işine geçilmiyorsa aynı yolda sürer.
+  Pencere görüntüsü Chrome'un önündeki kendi açılır pencerelerini (select menüsü, otomatik
+  doldurma) de içerir; başka uygulamaların pencereleri karışmaz. Chrome AX
   ağacı web içeriğini vermediği (`AXManualAccessibility` desteklenmiyor, `AXEnhancedUserInterface`
   ayarlanamıyor) için AX araçları bu yolda kapalıdır. `benchmark.py --only chrome_ilan
   --concurrency 1` (2026-09-23): önce 1/2 başarı, medyan 73 sn, 14-24 tur → sonra 3/3, medyan

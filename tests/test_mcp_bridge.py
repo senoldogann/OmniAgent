@@ -8,9 +8,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-import mcp_bridge
-from integration_runtime import IntegrationRuntime
-from mcp_bridge import MCPBridge, install_package, load_skill, run_install
+from omniagent.integrations import mcp as mcp_bridge
+from omniagent.integrations.runtime import IntegrationRuntime
+from omniagent.integrations.mcp import MCPBridge, install_package, load_skill, run_install
 
 FIXTURE = Path(__file__).parent / "fixtures/mcp_server.py"
 

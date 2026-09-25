@@ -7,8 +7,8 @@ from typing import List
 
 import pytest
 
-import tools
-from tools import ToolError
+from omniagent import tools
+from omniagent.tools import ToolError
 
 
 class FakeQuartz:

@@ -6,9 +6,9 @@ from typing import Any
 import pytest
 from PIL import Image
 
-import main
-import tools
-from tools import ToolError, Toolbox, model_to_points
+from omniagent.app import agent as main
+from omniagent import tools
+from omniagent.tools import ToolError, Toolbox, model_to_points
 
 
 def _bounds(x: int, y: int, width: int, height: int) -> Any:

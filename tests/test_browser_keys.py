@@ -1,7 +1,7 @@
 """Gerçek görevde görülen küçük harf Enter hatasının regresyon testi."""
 import pytest
 
-from tools import Toolbox, normalize_browser_key
+from omniagent.tools import Toolbox, normalize_browser_key
 
 
 def test_browser_key_aliases_keep_playwright_chords() -> None:

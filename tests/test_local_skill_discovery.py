@@ -1,8 +1,8 @@
 """Kurulu skill keşfi; dosya yöntemi olarak kalır, araç yetkisi vermez."""
 from __future__ import annotations
 import pytest
-from capabilities import CapabilityService, local_skill_entries
-from integration_runtime import IntegrationRuntime
+from omniagent.integrations.capabilities import CapabilityService, local_skill_entries
+from omniagent.integrations.runtime import IntegrationRuntime
 
 @pytest.mark.asyncio
 async def test_local_skill_discovery_uses_no_network_and_no_tools(tmp_path, monkeypatch) -> None:

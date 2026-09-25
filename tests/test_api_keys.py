@@ -4,11 +4,11 @@ from typing import Dict, Iterator, Optional, Set
 
 import pytest
 
-import api_keys
-import config
-import main
-import tools
-import ui
+from omniagent.platform.macos import api_keys
+from omniagent import config
+from omniagent.app import agent as main
+from omniagent import tools
+from omniagent.ui import app as ui
 
 # Sır olduğu için asla log'a/transcripte düşmemesi gereken sınama değeri.
 SECRET: str = "canli-gizli-anahtar-12345"
@@ -212,6 +212,22 @@ def test_result_text_masks_secret_values() -> None:
     assert config.SECRET_PLACEHOLDER in masked
     failure: main.ToolResult = {"ok": False, "error_type": "TOOL_ERROR", "error": f"kapı reddetti: {SECRET}"}
     assert SECRET not in main.result_text(failure)
+
+
+def test_tool_message_masks_secret_values_before_model_boundary() -> None:
+    """Tool sonucu modele dönen mesajda da aynı redaction sınırından geçer."""
+    config.set_api_key("OPENAI_API_KEY", SECRET)
+    call: main.ToolCallDraft = {
+        "id": "secret-1", "name": "read_file", "arguments": '{"path": "/tmp/example"}',
+    }
+    success: main.ToolResult = {"ok": True, "result": f"token={SECRET}"}
+    failure: main.ToolResult = {
+        "ok": False, "error_type": "TOOL_ERROR", "error": f"reddedildi: {SECRET}",
+    }
+
+    assert SECRET not in main._tool_result_to_message(call, success)["content"]
+    assert SECRET not in main._tool_result_to_message(call, failure)["content"]
+    assert config.SECRET_PLACEHOLDER in main._tool_result_to_message(call, success)["content"]
 
 
 def test_short_values_are_not_masked() -> None:

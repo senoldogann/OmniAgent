@@ -9,11 +9,11 @@ from typing import Any, Dict
 
 import pytest
 
-import config
-import main
+from omniagent import config
+from omniagent.app import agent as main
 
 PROBE: str = (
-    "import json, config;"
+    "import json; from omniagent import config;"
     "print(json.dumps({"
     "'backends': sorted(config.BACKENDS),"
     "'ladder': list(config.QUALITY_LADDER),"

@@ -6,10 +6,10 @@ from typing import Any, Dict, List
 
 import pytest
 
-import experience
-import main
-from capabilities import CapabilityService
-from events import AgentEvent
+from omniagent.memory import experience
+from omniagent.app import agent as main
+from omniagent.integrations.capabilities import CapabilityService
+from omniagent.core.events import AgentEvent
 
 TOOL_SCRIPT: str = """#!/bin/sh
 case "$*" in

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "omniagent"
 version = "0.1.0"
@@ -12,11 +16,11 @@ dependencies = [
     "opencv-python>=5.0.0.93",
     "numpy>=2.4.6",
     "ddgs>=9.16.0",
-    "pyobjc-framework-ApplicationServices>=12.2.2",
-    "pyobjc-framework-Cocoa>=12.2.2",
-    "pyobjc-framework-Quartz>=12.2.2",
-    "pyobjc-framework-AVFoundation>=12.2.2",
-    "pyobjc-framework-Speech>=12.2.2",
+    "pyobjc-framework-ApplicationServices>=12.2.2; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=12.2.2; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=12.2.2; sys_platform == 'darwin'",
+    "pyobjc-framework-AVFoundation>=12.2.2; sys_platform == 'darwin'",
+    "pyobjc-framework-Speech>=12.2.2; sys_platform == 'darwin'",
     "customtkinter>=6.0.0",
     "mcp>=1.20,<2",
     "msal>=1.34,<2",
@@ -24,7 +28,15 @@ dependencies = [
     "httpx>=0.28,<1",
     "jsonschema>=4.23,<5",
     "requests>=2.32,<3",
+    "pyobjc-framework-vision>=12.2.2; sys_platform == 'darwin'",
 ]
+
+[project.scripts]
+omniagent = "omniagent.cli:main"
+omniagent-ui = "omniagent.ui.app:main"
+omniagent-telegram = "omniagent.integrations.telegram:main"
+omniagent-benchmark = "omniagent.dev.benchmark:main"
+omniagent-permissions = "omniagent.platform.macos.permissions:main"
 
 [dependency-groups]
 dev = [
@@ -33,8 +45,11 @@ dev = [
 ]
 
 [tool.uv]
-# Düz modüllerden oluşan bir uygulama: paket olarak kurulmaz, yalnızca bağımlılıkları yönetilir
-package = false
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omniagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = [".", "src"]

@@ -2,10 +2,11 @@
 
 import pytest
 
-from config import API_KEY_VARIABLES, BACKENDS
-from integration_runtime import IntegrationRuntime
-from main import _stream_completion
-from mcp_bridge import run_install
+from omniagent.config import API_KEY_VARIABLES, BACKENDS
+from omniagent.integrations.runtime import IntegrationRuntime
+from omniagent.integrations import mcp as mcp_bridge
+from omniagent.app.agent import _stream_completion
+from omniagent.integrations.mcp import run_install
 
 
 class EmptyStream:
@@ -72,7 +73,7 @@ async def test_mcp_installer_does_not_inherit_provider_keys(monkeypatch):
         return CompletedProcess()
 
     monkeypatch.setenv(API_KEY_VARIABLES["openai"], "test-secret")
-    monkeypatch.setattr("mcp_bridge.asyncio.create_subprocess_exec", fake_create)
+    monkeypatch.setattr(mcp_bridge.asyncio, "create_subprocess_exec", fake_create)
     await run_install(["fake-installer"], IntegrationRuntime(lambda event: None, lambda: False), 1)
     assert API_KEY_VARIABLES["openai"] not in captured["env"]
     assert captured["env"]["PATH"]
@@ -81,7 +82,7 @@ async def test_mcp_installer_does_not_inherit_provider_keys(monkeypatch):
 def test_local_helper_process_does_not_inherit_provider_keys(monkeypatch):
     from subprocess import CompletedProcess
 
-    import tools
+    from omniagent import tools
 
     captured = {}
 

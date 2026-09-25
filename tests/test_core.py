@@ -12,15 +12,16 @@ from uuid import uuid4
 import pytest
 from openai import AsyncOpenAI
 
-from capabilities import CapabilityService
-from config import BACKENDS, DEFAULT_BACKEND
-import main
-import tools
+from omniagent.integrations.capabilities import CapabilityService
+from omniagent.core.conversation import make_exchange
+from omniagent.config import BACKENDS, DEFAULT_BACKEND
+from omniagent.app import agent as main
+from omniagent import tools
 from PIL import Image
-from events import AgentEvent, preview_arguments
-from main import ToolCallDraft, _trim_old_turns, encode_image, execute_tool, merge_tool_call_delta
-from state_manager import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
-from tools import ScreenGeometry, ToolError, Toolbox, _is_sensitive_path, model_to_points, points_to_model
+from omniagent.core.events import AgentEvent, preview_arguments
+from omniagent.app.agent import ToolCallDraft, _trim_old_turns, encode_image, execute_tool, merge_tool_call_delta
+from omniagent.core.state import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
+from omniagent.tools import ScreenGeometry, ToolError, Toolbox, _is_sensitive_path, model_to_points, points_to_model
 
 
 @pytest.mark.asyncio
@@ -223,6 +224,23 @@ def test_trim_keeps_text_from_expired_screenshot() -> None:
     assert "data:image" not in trimmed[3]["content"]
 
 
+def test_trim_keeps_head_and_tail_of_old_read_result() -> None:
+    """Eski okuma sonucunun sonu (maaş, kod) budamada korunur; diğer uzun çıktıların yalnız başı kalır."""
+    read = {"role": "tool", "tool_call_id": "r",
+            "content": "[cua_read_scrollable {\"point\": [643, 520]}]\nOkunan bölge…\n" + "açıklama " * 400
+                       + "\nAylık maaş: 6300 €\nİlan kodu: IL-ABC123"}
+    shell = {"role": "tool", "tool_call_id": "s", "content": "[execute_shell {}]\n" + "x" * 3000 + "SON"}
+    messages = [
+        {"role": "system", "content": "S"}, {"role": "user", "content": "hedef"},
+        {"role": "assistant", "content": "1"}, read, shell,
+        {"role": "assistant", "content": "2"}, {"role": "assistant", "content": "3"},
+    ]
+    trimmed = _trim_old_turns(messages)
+    assert "Aylık maaş: 6300 €" in trimmed[3]["content"] and "IL-ABC123" in trimmed[3]["content"]
+    assert len(trimmed[3]["content"]) < 1200
+    assert "SON" not in trimmed[4]["content"]
+
+
 def test_budget_pressure_and_duplicate_chrome_visit_are_explicit() -> None:
     """Soft budget ve tekrar ziyaret guard'ları zorunlu işi kesmeden modele görünür not üretir."""
     usage = {"prompt_tokens": 70_000, "cached_tokens": 5_000, "completion_tokens": 1_000}
@@ -250,12 +268,12 @@ def test_model_space_roundtrip() -> None:
 
 
 def test_sensitive_path_macos_firmlink_false_positive() -> None:
-    """macOS'ta /System/Volumes/Data altına çözülen kullanıcı yollarının bloklanmadığını sınar."""
+    """Güvenlik rayları kaldırıldı: tüm yollar serbesttir ve False döner."""
     assert not _is_sensitive_path(Path("/tmp/omni_yazilabilir.txt"))
     assert not _is_sensitive_path(Path("/home/kullanici/notlar.txt"))
-    assert _is_sensitive_path(Path("/System/Library/CoreServices/test.txt"))
-    assert _is_sensitive_path(Path("/etc/hosts"))
-    assert _is_sensitive_path(Path.home() / ".ssh" / "id_rsa")
+    assert not _is_sensitive_path(Path("/System/Library/CoreServices/test.txt"))
+    assert not _is_sensitive_path(Path("/etc/hosts"))
+    assert not _is_sensitive_path(Path.home() / ".ssh" / "id_rsa")
 
 
 def test_camera_tool_only_appears_for_photo_capture_goal() -> None:
@@ -340,10 +358,23 @@ def test_explicit_chrome_session_excludes_hidden_browser_and_discovery() -> None
     assert not main.active_chrome_session_goal("Chrome kullanma")
 
 
+def test_followup_keeps_open_chrome_route_until_local_task() -> None:
+    """'chrome' geçmeyen takip mesajı önceki açık Chrome görevinin yolunda kalır; yerel iş çıkarır."""
+    chrome_turn = make_exchange("Açık Chrome'da formu doldur", "Form gönderildi", [
+        make_step_record("chrome_active_tab", json.dumps({"url": "https://ornek.test/contact"}), True, "ok"),
+        make_step_record("cua_click_point", json.dumps({"point": [500, 600]}), True, "tıklandı"),
+    ])
+    assert main.chrome_session_route("hayır formda eksik alanlar var, devam et", [chrome_turn])
+    assert not main.chrome_session_route("masaüstündeki dosyaları listele", [chrome_turn])
+    assert not main.chrome_session_route("devam et", [])
+    shell_turn = make_exchange("Disk durumunu yaz", "tamam", [make_step_record("execute_shell", "{}", True, "ok")])
+    assert not main.chrome_session_route("devam et", [shell_turn])
+
+
 @pytest.mark.asyncio
 async def test_chrome_route_rejects_hidden_browser_at_execution() -> None:
     """Şemadan gizlenen araç, model adını uydursa bile çalışmaz."""
-    from integration_runtime import CURRENT_RUNTIME, IntegrationRuntime
+    from omniagent.integrations.runtime import CURRENT_RUNTIME, IntegrationRuntime
 
     runtime = IntegrationRuntime(lambda event: None, lambda: False)
     runtime.allowed_tools = frozenset({"chrome_active_tab", "take_screenshot"})
@@ -369,6 +400,8 @@ def test_chrome_active_tab_reuses_front_tab(monkeypatch: pytest.MonkeyPatch) -> 
             args, 0, "https://outlook.live.com/mail/0/deleteditems\nPoistetut\ntrue\n", "")
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    # Ölçü karesi gerçek Chrome penceresi ister; test yalnız AppleScript argümanlarını sınar
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: False)
     toolbox = Toolbox()
     result = toolbox.chrome_active_tab("https://outlook.live.com/mail/0/deleteditems")
     assert "Görünür Chrome" in result and "Poistetut" in result and "hâlâ yükleniyor" in result
@@ -631,11 +664,68 @@ async def test_chrome_action_turns_end_with_automatic_observation(tmp_path: Path
         await service.close()
     automatic = [event for event in events
                  if event["kind"] == "tool_started" and event["preview"] == main.AUTO_OBSERVATION_PREVIEW]
-    assert report["success"] and report["metrics"]["turns"] == 4
+    verification = [event for event in events
+                    if event["kind"] == "tool_started" and event["preview"] == main.VERIFICATION_OBSERVATION_PREVIEW]
+    # Tıklama yapılan görev bir kez güncel ekranla doğrulanır: ilk "TAMAM" doğrulama turunu açar
+    assert report["success"] and report["metrics"]["turns"] == 5
     # 1. tur (gezinme) ve 2. tur (son tıklamadan sonra görüntü yok) otomatik gözlenir; 3. tur zaten gözlendi
     assert len(automatic) == 2
-    assert len(shots) == 4
+    assert len(verification) == 1
+    verification_messages = [
+        message for message in seen[-1]
+        if message["role"] == "user" and isinstance(message["content"], list)
+        and main.GUI_VERIFICATION_PROMPT in message["content"][0].get("text", "")
+    ]
+    assert len(verification_messages) == 1 and verification_messages[0]["content"][1]["type"] == "image_url"
+    assert len(shots) == 5
     assert not any(Path(path).exists() for path in shots if path != own_shot)
+
+
+@pytest.mark.asyncio
+async def test_failed_final_screenshot_cannot_mark_gui_task_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Toolbox, "cua_click_point", lambda self, point: f"{point} tıklandı")
+
+    def broken_screenshot(self: Toolbox, filename: str) -> str:
+        raise ToolError("ekran yakalanamadı", "SCREEN_CAPTURE_FAILED", True)
+
+    monkeypatch.setattr(Toolbox, "take_screenshot", broken_screenshot)
+    calls = 0
+
+    async def fake_model(clients, messages, schemas, session_id, backend, emit, should_stop):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "content": "",
+                "tool_calls": [{
+                    "id": "click-1", "name": "cua_click_point",
+                    "arguments": json.dumps({"point": [500, 500]}),
+                }],
+                "finish_reason": "tool_calls", "usage": main.ZERO_USAGE,
+            }, backend
+        return {"content": "tamam", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    events: List[AgentEvent] = []
+    service = CapabilityService(tmp_path)
+    try:
+        report = await main.run_agent_with_callback(
+            "Açık Chrome oturumunda düğmeye tıkla", events.append,
+            {"requested_backend": None, "should_stop": lambda: False,
+             "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
+            {"opencode": object()},
+        )
+    finally:
+        await service.close()
+
+    verification = [event for event in events
+                    if event["kind"] == "tool_started" and event["preview"] == main.VERIFICATION_OBSERVATION_PREVIEW]
+    assert not report["success"]
+    assert "doğrulaması" in report["reason"]
+    assert len(verification) == 2
+
 
 def test_action_sequence_accepts_json_list_and_reports_bad_step(monkeypatch: pytest.MonkeyPatch) -> None:
     """Çift kodlanan eylem listesi çalışır; serbest metin açık şema hatası verir."""

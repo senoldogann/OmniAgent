@@ -8,10 +8,10 @@ from typing import Iterator
 import customtkinter as ctk
 import pytest
 
-import api_keys
-import config
-import model_catalog
-import ui
+from omniagent.platform.macos import api_keys
+from omniagent import config
+from omniagent import model_catalog
+from omniagent.ui import app as ui
 
 
 def _widgets(root: object, kind: type) -> Iterator[object]:
@@ -74,7 +74,7 @@ def test_settings_lists_profiles_and_persists_selected_model(
 def test_saved_choice_updates_runtime_and_openai_request_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    import config
+    from omniagent import config
 
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     original_model = config.BACKENDS["openai"]["model"]
