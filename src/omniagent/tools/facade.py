@@ -13,6 +13,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -34,7 +35,8 @@ import types as _py_types
 from omniagent.memory import user as memory
 from omniagent.platform.macos import screen_text as st
 from omniagent.config import redact
-from omniagent.core import state as sm
+from omniagent.core import schedule, state as sm
+from omniagent.paths import schedules_file
 from omniagent.integrations.runtime import CURRENT_RUNTIME, DeliveryFailed
 from omniagent.approval import APPROVAL_TIMEOUT_SECONDS, approval_granted
 
@@ -354,6 +356,47 @@ class Toolbox:
         except DeliveryFailed as error:
             raise ToolError(f"Dosya gönderilemedi: {error}", "DELIVERY_FAILED", True) from error
         return f"Dosya kullanıcıya gönderildi: {target} ({size / 1024:.0f} KB)"
+
+    def schedule_task(
+        self,
+        action: str,
+        goal: Optional[str] = None,
+        repeat: Optional[str] = None,
+        time: Optional[str] = None,
+        weekdays: Optional[List[str]] = None,
+        at: Optional[str] = None,
+        every_minutes: Optional[int] = None,
+        schedule_id: Optional[str] = None,
+    ) -> str:
+        """Görevi ileri bir zamana/düzenli tekrara planlar, planları listeler veya siler."""
+        now = datetime.now().astimezone()
+        path = schedules_file()
+        normalized = str(action or "").strip().casefold()
+        try:
+            records = schedule.load_schedules(path)
+            if normalized == "list":
+                if not records:
+                    return "Planlanmış görev yok."
+                return "Planlanmış görevler:\n" + "\n".join(schedule.describe_record(record) for record in records)
+            if normalized == "remove":
+                records, removed = schedule.remove_schedule(records, schedule_id or "")
+                if removed is None:
+                    raise ToolError(f"Plan bulunamadı: {schedule_id!r}. Önce action=list ile kimliği gör.", "SCHEDULE_NOT_FOUND", True)
+                schedule.save_schedules(path, records)
+                return f"Plan silindi: {schedule.describe_record(removed)}"
+            if normalized != "add":
+                raise ToolError(f"action add, list veya remove olmalı; alınan: {action!r}", "INVALID_SCHEDULE", False)
+            spec = schedule.build_spec(repeat, time, weekdays, at, every_minutes)
+            records, record = schedule.add_schedule(records, goal or "", spec, now, secrets.token_hex(3))
+            schedule.save_schedules(path, records)
+        except schedule.ScheduleError as error:
+            raise ToolError(str(error), "INVALID_SCHEDULE", True) from error
+        except (OSError, ValueError) as error:
+            raise ToolError(f"Plan deposu okunamadı/yazılamadı: {error}", "SCHEDULE_IO", True) from error
+        return (
+            f"Plan eklendi: {schedule.describe_record(record)}. Zamanı gelince Telegram köprüsü görevi "
+            "çalıştırır ve sonucu sohbete gönderir."
+        )
 
     async def _get_page(self) -> Page:
         return await self._headless_browser.get_page()

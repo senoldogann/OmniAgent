@@ -51,6 +51,7 @@ from omniagent.app.tool_schema import (
     continues_chrome_session,
     memory_mutation_requested,
     route_tool_schemas,
+    scheduling_goal,
     screen_reading_schemas,
     skills_sh_goal,
 )
@@ -147,7 +148,7 @@ from omniagent.core.checkpoint import (
     format_checkpoint_scratchpad, save_checkpoint,
 )
 from omniagent.integrations.capabilities import CapabilityService, ToolEntry, discovery_entry, validate_arguments
-from omniagent.paths import migrate_legacy_runtime_data, state_file
+from omniagent.paths import migrate_legacy_runtime_data, state_file, telegram_settings_file
 from omniagent.integrations.runtime import (
     AnswerSink, CURRENT_RUNTIME, CURRENT_SERVICE, IntegrationRuntime,
     IntegrationStopped, InteractionRequired, data_root,
@@ -644,10 +645,14 @@ async def run_agent_with_callback(
         service = options.get("integrations") or CapabilityService()
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"), options.get("deliver"))
         can_send_files: bool = runtime.deliver is not None
+        # Planı Telegram köprüsü çalıştırır; zamanlanmış görevin kendisi yeniden plan kuramaz
+        can_schedule: bool = (
+            not options.get("scheduled_run", False) and scheduling_goal(goal) and telegram_settings_file().is_file()
+        )
         if not chrome_session or skills_sh_goal(goal):
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
         tool_schemas: List[Dict[str, Any]] = route_tool_schemas(
-            goal, source_change_expected(goal, options["history"]), chrome_session, can_send_files,
+            goal, source_change_expected(goal, options["history"]), chrome_session, can_send_files, can_schedule,
         )
     except Exception as error:
         if service is not None and "integrations" not in options:
@@ -712,7 +717,7 @@ async def run_agent_with_callback(
                 break
 
             runtime.published = dict(runtime.selected)
-            tool_schemas = route_tool_schemas(goal, must_change_source, chrome_session, can_send_files) + [
+            tool_schemas = route_tool_schemas(goal, must_change_source, chrome_session, can_send_files, can_schedule) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)

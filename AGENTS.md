@@ -77,7 +77,7 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - **Araç diyeti:** genel yolda model 19 temel araç ve bir `discover_capabilities` şeması, açık
   Chrome yolunda 14 araç görür (önce 26 temel araç vardı). Masaüstüne fotoğraf çekme hedefinde
   `capture_photo`, kaynak değişikliği görevinde `edit_file`, dosya teslim kanalı olan Telegram görevinde
-  `send_file` eklenir. 26 araçlı şemada model
+  `send_file`, zamanlama niyetli hedefte (köprü eşleştirilmişse) `schedule_task` eklenir. 26 araçlı şemada model
   hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu. Fare/klavye
   adımları `run_action_sequence`, şablon tıklama `smart_click` içindedir.
 - **Paralellik:** bağımsız araç çağrıları `asyncio.gather` ile gerçek paralellikte çalışır; yan
@@ -241,6 +241,10 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
   Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
   Kurulum: [TELEGRAM.md](docs/TELEGRAM.md).
+- Zamanlanmış görevler (`core/schedule.py`, `schedules.json`): yerel duvar saatiyle hesaplanır (yaz saati
+  geçişinde kaymaz); köprü 30 sn'de bir denetler, kaçan çalışmayı 6 saat içinde bir kez yetiştirir,
+  eskisini atlayıp bildirir; host kilidi meşgulse bekletir. Zamanlanmış çalışmada `schedule_task`
+  kapalıdır (kendini çoğaltmaz). `/schedules` ve `/unschedule` modelsiz yönetir.
 - Telegram ekleri (fotoğraf/belge/ses/video, en çok 20 MB) `telegram-inbox/` altına 0600 izinle
   indirilir; açıklama görev olur, yolu göreve eklenir. Görseller ilk kullanıcı mesajına en-boy oranı
   korunarak görüntü olarak eklenir (ekran görüntüsü gibi kareye sündürülmez: koordinat uzayı yoktur).

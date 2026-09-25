@@ -34,7 +34,24 @@ Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık 
 - `/verbose on` veya `/verbose off`: sonraki görevde ayrıntılı veya kısa görünümü seçer; varsayılan kısa görünümdür.
 - `/model auto` veya `/model <profil>`: sonraki görevin modelini seçer. Profil adları `config.BACKENDS` içindedir: `ollama-cloud`, `openai`, `opencode`, `opencode-think`, `openrouter`. İlgili anahtar (`OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`) tanımlı değilse o profil kullanılamaz; anahtarlar arayüzdeki **Ayarlar** sayfasından girilip Keychain'de saklanabilir ve köprü açılışta bunları kendi süreç-içi deposuna alır. Anahtarlar ortam değişkenlerine yazılmaz, alt süreçlere geçmez ve araç çıktısında maskelenir; kayıtlı anahtar kabukta tanımlı bir değişkeni geçersiz kılar.
 - `/mode normal`, `/mode long`, `/mode autonomous`: sonraki görevin tur/zaman bütçesini seçer.
+- `/schedules`: planlanmış görevleri kimlik, kural ve sonraki çalışma zamanıyla listeler.
+- `/unschedule <kimlik>`: planı siler.
 - Entegrasyon soru sorarsa tek alan için düz metin, birden fazla alan için alan adlarını içeren JSON nesnesi gönderin.
+
+## Zamanlanmış görevler
+
+"Her sabah 9'da gündemi özetle", "hafta içi 18:00'de yedek al", "2 saatte bir sitemi kontrol et" veya
+"yarın 14:30'da toplantıyı hatırlat" gibi istekler (Telegram'dan ya da arayüzden) plan olarak saklanır.
+Planları sürekli açık Telegram köprüsü çalıştırır: zamanı gelen görev sohbete "⏰ Zamanlanmış görev
+başlıyor" mesajıyla başlar ve sonucu normal görev gibi gelir. Bu yüzden planlar yalnız köprü eşleştirilmiş
+ve çalışırken yürür.
+
+- Kurallar: bir kez (tarih-saat), her gün, haftanın seçili günleri veya 15 dakika-7 gün arası aralık.
+  Saatler Mac'in yerel saatidir; yaz saati geçişinde de aynı yerel saatte çalışır. En çok 20 plan tutulur.
+- Bilgisayar kapalı/uykudayken kaçan çalışma 6 saat içindeyse bir kez yetişilir; daha eskisi atlanır ve
+  sohbete "Kaçırıldı" yazılır.
+- Arayüzde görev sürerken zamanı gelen plan beklemeye alınır ve kilit boşalınca başlar.
+- Zamanlanmış görev yeni plan kuramaz (kendini çoğaltmaz); para hareketi onayı gibi kurallar aynen geçerlidir.
 
 ## Dosya alışverişi
 
