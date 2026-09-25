@@ -245,6 +245,10 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   geçişinde kaymaz); köprü 30 sn'de bir denetler, kaçan çalışmayı 6 saat içinde bir kez yetiştirir,
   eskisini atlayıp bildirir; host kilidi meşgulse bekletir. Zamanlanmış çalışmada `schedule_task`
   kapalıdır (kendini çoğaltmaz). `/schedules` ve `/unschedule` modelsiz yönetir.
+- Açıklamasız Telegram sesli mesajı komuttur: `integrations/transcription.py` OpenAI Speech-to-Text ile
+  (kullanıcının OpenAI anahtarı; `gpt-transcribe`, yoksa `whisper-1`) yazıya çevirir, anlaşılan metni önce
+  sohbete yazar. macOS Speech launchd altındaki Python sürecinde TCC izni alamadığı için kullanılmaz;
+  anahtar yoksa ses hiçbir yere gönderilmez.
 - Telegram ekleri (fotoğraf/belge/ses/video, en çok 20 MB) `telegram-inbox/` altına 0600 izinle
   indirilir; açıklama görev olur, yolu göreve eklenir. Görseller ilk kullanıcı mesajına en-boy oranı
   korunarak görüntü olarak eklenir (ekran görüntüsü gibi kareye sündürülmez: koordinat uzayı yoktur).

@@ -63,7 +63,12 @@ ve çalışırken yürür.
 - **Sizden istenen dosyalar:** Telegram görevlerinde ajan `send_file` aracıyla bilgisayardaki bir dosyayı (en çok
   50 MB) sohbete belge olarak gönderebilir: "masaüstündeki rapor.pdf'i bana gönder" gibi.
 - Bir soruya yanıt beklenirken veya görev çalışırken gelen ek yeni görev başlatmaz; bot durumu yazar.
+- **Sesli komut:** açıklamasız sesli mesaj, OpenAI API anahtarı tanımlıysa (arayüzde ⚙ Ayarlar) yazıya çevrilir;
+  bot önce "🎙️ Anlaşılan: …" diye metni gösterir, sonra komut olarak çalıştırır. Ses kaydı bunun için
+  OpenAI'a gönderilir (`gpt-transcribe`, hesapta yoksa `whisper-1`; `OMNI_TRANSCRIBE_MODEL` ile değişir).
+  Anahtar yoksa hiçbir şey gönderilmez ve bot nasıl etkinleştirileceğini yazar. Açıklamalı sesli mesajda
+  açıklama görevdir.
 
 Görev geçmişinin son sekiz kaydı yerel `telegram-history.json` dosyasında tutulur. Bot, mesajları yalnız eşleştirilen kullanıcıdan ve özel sohbetten kabul eder. Güncelleme sırası `telegram-offset.json` ile korunur; yeniden başlatma aynı komutu tekrar çalıştırmaz. UI ile Telegram görevi aynı anda ekranı/klavyeyi kullanamaz: ikinci görev hemen “başka görev çalışıyor” yanıtı alır.
 
-Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Sesli mesaj dosya olarak kaydedilir; metne çevirme ayrı bir konuşma tanıma aracı gerektirir ve ajan bunu kurulu araçlarla dener. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.
+Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Sesli komutların yazıya çevrilmesi OpenAI anahtarı gerektirir; macOS konuşma tanıması arka plandaki launchd sürecinde izin alamadığı için kullanılmaz. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.

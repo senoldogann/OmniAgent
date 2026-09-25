@@ -32,6 +32,7 @@ from omniagent.core.events import AgentEvent, tool_label
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 from omniagent.paths import schedules_file, telegram_settings_file
 from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
+from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
 
 
@@ -55,7 +56,6 @@ _ATTACHMENT_KINDS = (
 )
 _DEFAULT_ATTACHMENT_REQUESTS = {
     "fotoğraf": "Gönderdiğim görseli incele ve ne gördüğünü kısaca anlat.",
-    "sesli mesaj": "Gönderdiğim sesli mesajı metne çevir ve içindeki isteği yerine getir.",
 }
 
 
@@ -956,12 +956,26 @@ class TelegramBridge:
         except (OSError, TelegramError) as error:
             await self.api.send(chat_id, f"Ek indirilemedi: {error}")
             return
+        caption = message.get("caption")
+        caption = caption.strip() if isinstance(caption, str) else ""
+        if attachment["kind"] == "sesli mesaj" and not caption:
+            # Açıklamasız sesli mesaj bir komuttur: yazıya çevrilir, anlaşılan metin önce gösterilir
+            try:
+                transcript = await transcribe_audio(path)
+            except TranscriptionUnavailable as error:
+                await self.api.send(chat_id, f"🎙️ {error} İsteğinizi yazı olarak da gönderebilirsiniz.")
+                return
+            except (OSError, TranscriptionFailed) as error:
+                await self.api.send(chat_id, f"🎙️ Sesli mesaj yazıya çevrilemedi: {error}")
+                return
+            await self.api.send(chat_id, f"🎙️ Anlaşılan: {transcript[:1500]}")
+            goal = transcript
+        else:
+            goal = attachment_goal(caption, attachment, path)
         if self.active is not None:
-            # İndirme sürerken zamanlanmış görev başlamış olabilir; onu ezme
+            # İndirme/yazıya çevirme sürerken zamanlanmış görev başlamış olabilir; onu ezme
             await self.api.send(chat_id, f"Bir görev çalışıyor; ek kaydedildi: {path}. Görev bitince yeniden isteyin.")
             return
-        caption = message.get("caption")
-        goal = attachment_goal(caption if isinstance(caption, str) else "", attachment, path)
         self.goal = goal
         self.stop_event.clear()
         self.active = asyncio.create_task(self._execute(goal, [str(path)] if attachment["image"] else None))
