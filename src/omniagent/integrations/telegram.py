@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, TypedDict
+from typing import Any, Dict, List, Optional, TypedDict
 
 import httpx
 from keyring.backends.macOS import Keyring
@@ -27,7 +27,7 @@ from omniagent.config import BACKENDS, apply_model_preferences, apply_stored_api
 from omniagent.core.conversation import Exchange, trim_history
 from omniagent.core.events import AgentEvent, tool_label
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
-from .runtime import IntegrationStopped, data_root, read_json, save_json
+from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
 
 
@@ -36,6 +36,21 @@ TOKEN_ACCOUNT = "bot_token"
 PAGE_LIMIT = 3500
 EDIT_INTERVAL = 1.1
 POLL_SECONDS = 20
+# Bot API getFile yalnız 20 MB'a kadar dosya indirir
+DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
+UPLOAD_TIMEOUT = httpx.Timeout(300.0, connect=5.0)
+DOWNLOAD_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+# Görsel olarak modele verilecek belge türleri (svg/heic Pillow'da güvenilir açılmaz)
+_IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"})
+# Mesaj alanı -> kullanıcıya/modele gösterilen ek türü
+_ATTACHMENT_KINDS = (
+    ("document", "belge"), ("voice", "sesli mesaj"), ("audio", "ses dosyası"),
+    ("video", "video"), ("video_note", "görüntülü not"),
+)
+_DEFAULT_ATTACHMENT_REQUESTS = {
+    "fotoğraf": "Gönderdiğim görseli incele ve ne gördüğünü kısaca anlat.",
+    "sesli mesaj": "Gönderdiğim sesli mesajı metne çevir ve içindeki isteği yerine getir.",
+}
 
 
 class TelegramError(RuntimeError):
@@ -51,6 +66,15 @@ class TelegramSettings(TypedDict):
     user_id: int
 
 
+class TelegramAttachment(TypedDict):
+    """Mesajdaki tek dosya eki (Bot API alanlarından ayıklanmış)."""
+    file_id: str
+    kind: str
+    name: Optional[str]
+    size: int
+    image: bool
+
+
 def settings_path() -> Path:
     return data_root() / "telegram.json"
 
@@ -61,6 +85,52 @@ def offset_path() -> Path:
 
 def history_path() -> Path:
     return data_root() / "telegram-history.json"
+
+
+def inbox_path() -> Path:
+    """Sohbetten gelen eklerin kaydedildiği yerel dizin."""
+    return data_root() / "telegram-inbox"
+
+
+def message_attachment(message: Dict[str, Any]) -> Optional[TelegramAttachment]:
+    """
+    Mesajdaki fotoğraf/belge/ses/video ekini ayıklar; fotoğrafın en büyük boyutu seçilir.
+    Belge olarak gönderilen yaygın görseller de görsel sayılır (sıkıştırılmamış fotoğraf). Saf.
+    """
+    photos = message.get("photo")
+    if isinstance(photos, list):
+        sizes = [item for item in photos if isinstance(item, dict) and isinstance(item.get("file_id"), str)]
+        if sizes:
+            largest = max(sizes, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0))
+            return {"file_id": largest["file_id"], "kind": "fotoğraf", "name": None,
+                    "size": int(largest.get("file_size") or 0), "image": True}
+    for field, kind in _ATTACHMENT_KINDS:
+        item = message.get(field)
+        if isinstance(item, dict) and isinstance(item.get("file_id"), str):
+            name = item.get("file_name")
+            return {
+                "file_id": item["file_id"], "kind": kind,
+                "name": name if isinstance(name, str) and name.strip() else None,
+                "size": int(item.get("file_size") or 0),
+                "image": field == "document" and item.get("mime_type") in _IMAGE_MIME_TYPES,
+            }
+    return None
+
+
+def safe_file_name(name: str) -> str:
+    """Uzak dosya adını yerel, tek bileşenli ve güvenli bir ada çevirir. Saf."""
+    base = Path(name.replace("\\", "/")).name
+    cleaned = re.sub(r"[^\w.\- ]+", "_", base).strip(" .")
+    return cleaned[:120] or "ek"
+
+
+def attachment_goal(caption: str, attachment: TelegramAttachment, path: Path) -> str:
+    """Ek mesajını görev metnine çevirir: açıklama görevdir, yoksa türüne uygun varsayılan istek. Saf."""
+    request = caption.strip() or _DEFAULT_ATTACHMENT_REQUESTS.get(
+        attachment["kind"], "Gönderdiğim dosyayı incele ve içeriğini kısaca özetle.",
+    )
+    size_kb = max(1, round(path.stat().st_size / 1024)) if path.exists() else 0
+    return f"{request}\n\n[Telegram eki ({attachment['kind']}, {size_kb} KB) kaydedildi: {path}]"
 
 
 def load_settings() -> TelegramSettings:
@@ -223,6 +293,51 @@ class TelegramAPI:
             raise TelegramError(f"sendPhoto: {type(error).__name__}.") from None
         if response.status_code != 200 or not isinstance(body, dict) or not body.get("ok"):
             raise TelegramError(f"sendPhoto: HTTP {response.status_code}.", response.status_code)
+
+    async def send_document(self, chat_id: int, path: Path, caption: str = "") -> None:
+        """Dosyayı özgün adıyla ve sıkıştırılmadan sohbete gönderir."""
+        data = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption[:1000]
+        try:
+            with path.open("rb") as source:
+                response = await self.client.post(
+                    f"https://api.telegram.org/bot{self.token}/sendDocument",
+                    data=data,
+                    files={"document": (path.name, source, "application/octet-stream")},
+                    timeout=UPLOAD_TIMEOUT,
+                )
+                body = response.json()
+        except (OSError, httpx.HTTPError, ValueError) as error:
+            raise TelegramError(f"sendDocument: {type(error).__name__}.") from None
+        if response.status_code != 200 or not isinstance(body, dict) or not body.get("ok"):
+            description = str(body.get("description", ""))[:200] if isinstance(body, dict) else ""
+            raise TelegramError(f"sendDocument: HTTP {response.status_code}: {description}", response.status_code)
+
+    async def download(self, file_id: str, directory: Path, preferred_name: Optional[str]) -> Path:
+        """
+        getFile ile sohbet ekini indirir ve yalnız kullanıcıya açık dosya olarak kaydeder. Ad,
+        zaman damgası önekiyle çakışmasız yapılır; token hata metnine taşınmaz.
+        """
+        info = await self.call("getFile", {"file_id": file_id})
+        remote = info.get("file_path") if isinstance(info, dict) else None
+        if not isinstance(remote, str) or not remote:
+            raise TelegramError("getFile: dosya yolu yok (dosya 20 MB sınırını aşmış olabilir).")
+        try:
+            response = await self.client.get(
+                f"https://api.telegram.org/file/bot{self.token}/{remote}", timeout=DOWNLOAD_TIMEOUT,
+            )
+        except httpx.HTTPError as error:
+            raise TelegramError(f"dosya indirme: {type(error).__name__}.") from None
+        if response.status_code != 200:
+            raise TelegramError(f"dosya indirme: HTTP {response.status_code}.", response.status_code)
+        directory.mkdir(parents=True, exist_ok=True)
+        name = safe_file_name(preferred_name or Path(remote).name)
+        target = directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}-{name}"
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as sink:
+            sink.write(response.content)
+        return target
 
 
 class TelegramStream:
@@ -597,7 +712,14 @@ class TelegramBridge:
             self.pending_answer = None
             self.pending_fields = {}
 
-    async def _execute(self, goal: str) -> None:
+    async def deliver(self, path: Path, caption: str) -> None:
+        """send_file aracının teslim kanalı: dosyayı eşleştirilmiş sohbete belge olarak gönderir."""
+        try:
+            await self.api.send_document(self.settings["chat_id"], path, caption)
+        except TelegramError as error:
+            raise DeliveryFailed(str(error)) from None
+
+    async def _execute(self, goal: str, images: Optional[List[str]] = None) -> None:
         # Ayarlar başka süreçte değişmiş olabilir; görev başında güncel modeli yükle.
         apply_model_preferences()
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
@@ -615,8 +737,11 @@ class TelegramBridge:
             "state_file": STATE_FILE,
             "history": trim_history(self.history),
             "answer": self.answer,
+            "deliver": self.deliver,
             "run_mode": self.run_mode,
         }
+        if images:
+            options["images"] = images
 
         async def work() -> RunReport:
             with host_task_lock():
@@ -724,9 +849,37 @@ class TelegramBridge:
         future.set_result(value)
         await self.api.send(self.settings["chat_id"], "Yanıt alındı; görev sürüyor.")
 
+    async def _start_attachment_task(self, message: Dict[str, Any], attachment: TelegramAttachment) -> None:
+        """Eki indirir ve açıklamasıyla (yoksa varsayılan istekle) görevi başlatır."""
+        chat_id = self.settings["chat_id"]
+        if self.pending_answer is not None:
+            await self.api.send(chat_id, "Bir soruya yanıt bekleniyor; lütfen yanıtı metin olarak yazın.")
+            return
+        if self.active is not None:
+            await self.api.send(chat_id, "Bir görev çalışıyor. /stop veya /status kullanın.")
+            return
+        if attachment["size"] > DOWNLOAD_LIMIT_BYTES:
+            await self.api.send(chat_id, "Dosya 20 MB'tan büyük; Telegram botları bunu indiremez. "
+                                         "Dosyayı bulut bağlantısıyla veya bilgisayardan paylaşın.")
+            return
+        try:
+            path = await self.api.download(attachment["file_id"], inbox_path(), attachment["name"])
+        except (OSError, TelegramError) as error:
+            await self.api.send(chat_id, f"Ek indirilemedi: {error}")
+            return
+        caption = message.get("caption")
+        goal = attachment_goal(caption if isinstance(caption, str) else "", attachment, path)
+        self.goal = goal
+        self.stop_event.clear()
+        self.active = asyncio.create_task(self._execute(goal, [str(path)] if attachment["image"] else None))
+
     async def handle(self, update: Dict[str, Any]) -> None:
         message = update.get("message")
         if not isinstance(message, dict) or not authorized(message, self.settings):
+            return
+        attachment = message_attachment(message)
+        if attachment is not None:
+            await self._start_attachment_task(message, attachment)
             return
         text = message.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -751,7 +904,9 @@ class TelegramBridge:
                 chat_id,
                 "Hedefinizi yazın. /stop durdurur, /status durumu gösterir. "
                 "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
-                "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar.",
+                "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar. "
+                "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
+                "ajan istediğiniz dosyaları size buradan geri gönderebilir.",
             )
             return
         if self.pending_answer is not None:

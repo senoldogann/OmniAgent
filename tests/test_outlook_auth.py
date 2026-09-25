@@ -1,5 +1,6 @@
 """OAuth döngüsü, Keychain ve eksik bağlantı önkoşulları."""
 import json
+import sys
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -19,6 +20,7 @@ async def test_missing_client_id_without_ui(tmp_path: Path, monkeypatch):
     await auth.close()
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Outlook token deposu macOS Keychain gerektirir")
 @pytest.mark.asyncio
 async def test_browser_oauth_code_and_token_never_enter_events(tmp_path: Path, monkeypatch):
     saved = {}

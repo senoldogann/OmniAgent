@@ -17,6 +17,10 @@ import cv2
 from .system import parent_process_name
 from .types import (
     MODEL_SCREEN_SIZE,
+    MOUSE_DRAG_HOLD_SECONDS,
+    MOUSE_DRAG_STEP_SECONDS,
+    MOUSE_DRAG_STEPS,
+    MOUSE_MULTI_CLICK_GAP_SECONDS,
     SCREENSHOT_MAX_EDGE,
     SETTLE_CHANGED_RATIO,
     SETTLE_FRAME_EDGE,
@@ -249,6 +253,61 @@ def move_model_point(x: int, y: int, geometry: ScreenGeometry) -> str:
     px, py = model_to_points(x, y, geometry)
     pyautogui.moveTo(px, py)
     return f"İmleç taşındı: ({x}, {y}) -> ({px}, {py})"
+
+def _mouse_event_types(button: str) -> Tuple[int, int, int, int]:
+    """Düğmenin (basma, bırakma, sürükleme, düğme kodu) Quartz olay türleri."""
+    if button == "left":
+        return (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp,
+                Quartz.kCGEventLeftMouseDragged, Quartz.kCGMouseButtonLeft)
+    if button == "right":
+        return (Quartz.kCGEventRightMouseDown, Quartz.kCGEventRightMouseUp,
+                Quartz.kCGEventRightMouseDragged, Quartz.kCGMouseButtonRight)
+    if button == "middle":
+        return (Quartz.kCGEventOtherMouseDown, Quartz.kCGEventOtherMouseUp,
+                Quartz.kCGEventOtherMouseDragged, Quartz.kCGMouseButtonCenter)
+    raise ToolError(f"button left, right veya middle olmalı: {button!r}", "INVALID_BUTTON", False)
+
+def _post_mouse_event(kind: int, px: float, py: float, button_code: int, click_state: int = 0) -> None:
+    event = Quartz.CGEventCreateMouseEvent(None, kind, (px, py), button_code)
+    if click_state:
+        Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, click_state)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+def multi_click_model_point(x: int, y: int, button: str, clicks: int, geometry: ScreenGeometry) -> str:
+    """
+    Çift/üçlü tıklama. pyautogui macOS'ta her tıklamayı ayrı tek tıklama olarak gönderir
+    (kCGMouseEventClickState hep 1): Finder dosyayı açmaz, metin kelime/satır seçmez.
+    Burada her basma/bırakma çiftine artan tıklama durumu yazılır.
+    """
+    down, up, _, code = _mouse_event_types(button)
+    px, py = model_to_points(x, y, geometry)
+    pyautogui.moveTo(px, py)
+    for state in range(1, clicks + 1):
+        _post_mouse_event(down, px, py, code, state)
+        _post_mouse_event(up, px, py, code, state)
+        time.sleep(MOUSE_MULTI_CLICK_GAP_SECONDS)
+    name = {2: "Çift", 3: "Üçlü"}.get(clicks, f"{clicks}x")
+    return f"{name} tıklandı: ({x}, {y}) -> ({px}, {py})"
+
+def drag_model_points(start: Tuple[int, int], end: Tuple[int, int], button: str, geometry: ScreenGeometry) -> str:
+    """
+    Basılı tutup sürükler ve bırakır (dosya taşıma, kaydırıcı, metin seçimi, pencere taşıma).
+    Basıştan sonra kısa bekleme ve ara sürükleme olayları uygulamanın sürüklemeyi tanıması
+    içindir; tek sıçramalı olayda Finder ve web sürükle-bırak alanları bırakmayı yok sayar.
+    """
+    down, up, dragged, code = _mouse_event_types(button)
+    sx, sy = model_to_points(start[0], start[1], geometry)
+    ex, ey = model_to_points(end[0], end[1], geometry)
+    pyautogui.moveTo(sx, sy)
+    _post_mouse_event(down, sx, sy, code, 1)
+    time.sleep(MOUSE_DRAG_HOLD_SECONDS)
+    for step in range(1, MOUSE_DRAG_STEPS + 1):
+        ratio = step / MOUSE_DRAG_STEPS
+        _post_mouse_event(dragged, sx + (ex - sx) * ratio, sy + (ey - sy) * ratio, code)
+        time.sleep(MOUSE_DRAG_STEP_SECONDS)
+    time.sleep(MOUSE_DRAG_HOLD_SECONDS)
+    _post_mouse_event(up, ex, ey, code, 1)
+    return f"Sürüklendi: ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
 
 def post_scroll(dx: float, dy: float) -> None:
     event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, round(-dy * 10), round(-dx * 10))

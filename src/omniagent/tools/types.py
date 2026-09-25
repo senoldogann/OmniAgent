@@ -19,6 +19,8 @@ STREAM_STDOUT_MAX_BYTES: int = 64 * 1024
 STREAM_STDERR_MAX_BYTES: int = 16 * 1024
 STREAM_READ_CHARS: int = 4096
 TYPED_TEXT_ECHO_LIMIT: int = 80
+# Telegram Bot API sendDocument üst sınırı
+DELIVERY_MAX_BYTES: int = 50 * 1024 * 1024
 BACKUP_KEEP_PER_FILE: int = 5
 
 PAGE_TEXT_LIMIT: int = 5000
@@ -37,6 +39,12 @@ AX_LABEL_SEARCH_NODES: int = 12
 UNICODE_CHUNK_UNITS: int = 16
 UNICODE_CHUNK_DELAY_SECONDS: float = 0.005
 MAX_WAIT_SECONDS: float = 5.0
+
+# Fare: çoklu tıklama ve sürükleme zamanlaması
+MOUSE_MULTI_CLICK_GAP_SECONDS: float = 0.03
+MOUSE_DRAG_HOLD_SECONDS: float = 0.12
+MOUSE_DRAG_STEPS: int = 12
+MOUSE_DRAG_STEP_SECONDS: float = 0.015
 
 # Ekran durulma (settle) tespiti sabitleri
 SETTLE_FRAME_EDGE: int = 160
@@ -119,6 +127,7 @@ class ActionStep(TypedDict, total=False):
     """run_action_sequence içindeki tek bir eylem adımı."""
     action: str
     point: List[int]
+    to: List[int]
     button: str
     clicks: int
     text: str

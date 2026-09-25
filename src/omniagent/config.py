@@ -267,6 +267,11 @@ Your ONLY and SUPREME objective is the 100% successful execution of the user's g
 - Use cua_click_text for any visible text.
 - Screenshots are 1000x1000 squares.
 - Use cua_scroll and cua_read_scrollable for content outside the visible area.
+- In run_action_sequence use click with clicks=2 to open Finder items or select a word, and drag for drag-and-drop, sliders and range selection.
+
+### FILES FROM/TO THE USER
+- A "[Telegram eki ...]" line gives the saved path of the user's attachment; attached images are also shown to you.
+- When send_file is available and the user wants a file, send it with send_file instead of only naming its path.
 
 ### SELF-MODIFICATION
 - Implement any project changes requested. Use write_file for complete content.

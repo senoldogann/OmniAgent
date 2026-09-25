@@ -6,16 +6,17 @@ macOS üzerinde yerel araçlar, açık Chrome, web, model sağlayıcıları ve i
 
 ```sh
 uv sync
-.venv/bin/python ui.py
+.venv/bin/omniagent-ui
 ```
 
-Komut satırı: `.venv/bin/python main.py "<hedef>"`. Telegram köprüsü için [kurulum kılavuzuna](docs/TELEGRAM.md) bakın.
+Komut satırı: `.venv/bin/omniagent "<hedef>"`. Telegram köprüsü (`.venv/bin/omniagent-telegram`) için
+[kurulum kılavuzuna](docs/TELEGRAM.md) bakın. İzin tanısı: `.venv/bin/omniagent-permissions`.
 
 ## Dizinler
 
 | Yol | İçerik |
 | --- | --- |
-| `*.py` (kök) | Düz Python modülleri ve doğrudan çalıştırılan giriş noktaları. Import ve launchd yolları nedeniyle burada kalırlar. |
+| `src/omniagent/` | Uygulama paketi: ajan döngüsü (`app/`), araçlar (`tools/`), entegrasyonlar ve Telegram (`integrations/`), arayüz (`ui/`), macOS katmanı (`platform/macos/`). |
 | `tests/` | Otomatik testler. |
 | `docs/` | Kullanım, entegrasyon ve geliştirme belgeleri. |
 | `docs/superpowers/` | Tarihsel tasarım ve uygulama planları. |
@@ -33,4 +34,4 @@ Komut satırı: `.venv/bin/python main.py "<hedef>"`. Telegram köprüsü için 
 - [Geliştirme devir notu](docs/HANDOFF.md)
 - [Ajan geliştirme kuralları](AGENTS.md)
 
-Doğrulama: `.venv/bin/python -m pytest tests/ -q`. Canlı model veya GUI benchmark'ı ayrı koşullarda çalıştırın.
+Doğrulama: `.venv/bin/python -m pytest tests/ -q` (macOS dışında pyobjc çerçeveleri `tests/conftest.py` ile sahtelenir; Linux'ta `xvfb-run` ve `python3-tk` gerekir, Keychain/Quartz'a bağlı birkaç test yalnız macOS'ta koşar). Her PR'da `.github/workflows/tests.yml` paketi gerçek macOS ve Linux üzerinde çalıştırır. Canlı model veya GUI benchmark'ı ayrı koşullarda çalıştırın.

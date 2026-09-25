@@ -142,6 +142,7 @@ async def test_tool_error_is_explicit() -> None:
     assert (await execute_tool(private, Toolbox(), {}, events.append, lambda: False))["error_type"] == "UnknownTool"
 
 
+@pytest.mark.skipif(not tools.screen_capture_granted(), reason="Ekran kaydı izni yok (Linux veya başsız CI Mac'i)")
 def test_vision_capture(tmp_path: Path) -> None:
     """Gerçek ekran görüntüsünün ortak koordinat uzayında kaydedildiğini sınar."""
     toolbox: Toolbox = Toolbox()

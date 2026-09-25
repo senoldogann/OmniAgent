@@ -1,5 +1,6 @@
 """Ayarlar sayfasının anahtar deposu, süreç-içi kullanım ve sır sızıntısı regresyonları."""
 import os
+import sys
 from typing import Dict, Iterator, Optional, Set
 
 import pytest
@@ -12,6 +13,10 @@ from omniagent.ui import app as ui
 
 # Sır olduğu için asla log'a/transcripte düşmemesi gereken sınama değeri.
 SECRET: str = "canli-gizli-anahtar-12345"
+
+# Üretim kodu Keychain'i bilinçli olarak yalnız macOS'ta açar; bu testler sahte anahtarlıkla
+# da olsa o yolu sınar ve macOS CI işinde koşar.
+macos_keychain = pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain gerektirir")
 
 
 class FakeKeyring:
@@ -86,6 +91,7 @@ def test_key_variables_match_profile_mapping() -> None:
     assert set(api_keys.KEY_VARIABLES) == set(config.API_KEY_VARIABLES.values())
 
 
+@macos_keychain
 def test_store_and_clear_roundtrip(keychain: FakeKeyring) -> None:
     """Kaydedilen anahtar kırpılır; boş değer kaydı siler; kayıt yokken silmek hata vermez."""
     api_keys.store_key("OPENAI_API_KEY", "  gizli-anahtar  ")
@@ -95,6 +101,7 @@ def test_store_and_clear_roundtrip(keychain: FakeKeyring) -> None:
     api_keys.store_key("OPENAI_API_KEY", "")
 
 
+@macos_keychain
 def test_store_key_verifies_that_delete_actually_happened(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Silmeyi reddeden Keychain sessizce yutulmaz: kayıt hâlâ duruyorsa açık hata verilir.
@@ -107,6 +114,7 @@ def test_store_key_verifies_that_delete_actually_happened(monkeypatch: pytest.Mo
     assert api_keys.stored_key("OPENAI_API_KEY") == "eski-anahtar"
 
 
+@macos_keychain
 def test_stored_keys_returns_only_filled_records(keychain: FakeKeyring) -> None:
     """Hidrasyon yalnız dolu kayıtları görür; boş kayıt profil kurmaya yetmez."""
     api_keys.store_key("OPENAI_API_KEY", "kayitli-openai")
@@ -114,6 +122,7 @@ def test_stored_keys_returns_only_filled_records(keychain: FakeKeyring) -> None:
     assert api_keys.stored_keys() == {"OPENAI_API_KEY": "kayitli-openai"}
 
 
+@macos_keychain
 def test_apply_stored_api_keys_uses_runtime_store_not_environment(
     keychain: FakeKeyring, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -143,6 +152,7 @@ def test_environment_only_key_still_works_without_keychain_record(
     assert config.api_key_source("OPENROUTER_API_KEY") == "ortam"
 
 
+@macos_keychain
 def test_settings_apply_writes_keychain_and_runtime_store(
     keychain: FakeKeyring,
 ) -> None:
@@ -173,6 +183,7 @@ def test_settings_apply_reports_keychain_failure(monkeypatch: pytest.MonkeyPatch
     assert config.load_api_key("OPENCODE_API_KEY") is None
 
 
+@macos_keychain
 def test_settings_apply_keeps_successful_key_on_partial_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -7,7 +7,7 @@ from omniagent.core import state as sm
 from omniagent.core.conversation import Exchange
 from omniagent.core.events import TokenUsage
 from omniagent.integrations.capabilities import CapabilityService
-from omniagent.integrations.runtime import AnswerSink
+from omniagent.integrations.runtime import AnswerSink, DeliverSink
 
 
 class RunModeProfile(TypedDict):
@@ -52,6 +52,8 @@ class RunOptions(TypedDict):
     history: List[Exchange]
     integrations: NotRequired[CapabilityService]
     answer: NotRequired[AnswerSink]
+    deliver: NotRequired[DeliverSink]
+    images: NotRequired[List[str]]
     run_mode: NotRequired[str]
     max_iterations: NotRequired[int]
     max_wall_clock_seconds: NotRequired[float]

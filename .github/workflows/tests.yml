@@ -1,0 +1,64 @@
+# Test paketi iki platformda koşar:
+# - macOS: gerçek pyobjc (Quartz, AppKit, Vision), gerçek Tk arayüzü ve Keychain yolları.
+# - Linux: macOS çerçeveleri tests/conftest.py ile sahtelenir; hızlı mantık doğrulaması.
+# Başsız runner'da ekran kaydı/erişilebilirlik izni yoktur; canlı GUI testleri kendini atlar.
+name: Testler
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS (gerçek pyobjc)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      OMNI_UI_TEST: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Bağımlılıklar
+        run: uv sync --frozen --python "${{ steps.python.outputs.python-path }}"
+      - name: pytest
+        run: uv run --frozen python -m pytest tests/ -q -rs
+
+  linux:
+    name: Linux (sahte macOS çerçeveleri)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Sanal ekran
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          touch ~/.Xauthority
+      - name: Bağımlılıklar
+        run: uv sync --frozen --python "${{ steps.python.outputs.python-path }}"
+      - name: pytest
+        run: xvfb-run -a uv run --frozen python -m pytest tests/ -q -rs

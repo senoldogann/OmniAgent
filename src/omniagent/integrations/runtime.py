@@ -13,6 +13,8 @@ from omniagent.paths import data_root
 
 T = TypeVar("T")
 AnswerSink = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+# Dosyayı kullanıcının kanalına (Telegram sohbeti) teslim eder: (yol, başlık)
+DeliverSink = Callable[[Path, str], Awaitable[None]]
 
 
 class IntegrationMetrics(TypedDict):
@@ -32,6 +34,10 @@ class InteractionRequired(Exception):
 
 class IntegrationStopped(Exception):
     """Esc sonrasında yeni dış eylem başlatılmasını engeller."""
+
+
+class DeliveryFailed(Exception):
+    """Kullanıcı kanalına dosya teslimi başarısız oldu (ağ, boyut, kanal hatası)."""
 
 
 def read_json(path: Path, default: Any) -> Any:
@@ -58,10 +64,11 @@ def save_json(path: Path, value: Any) -> None:
 class IntegrationRuntime:
     """Dış araçların görev kapsamındaki iptal ve UI bağlantısı."""
     def __init__(self, emit: EventSink, should_stop: Callable[[], bool],
-                 answer: Optional[AnswerSink] = None) -> None:
+                 answer: Optional[AnswerSink] = None, deliver: Optional[DeliverSink] = None) -> None:
         self.emit = emit
         self.should_stop = should_stop
         self.answer = answer
+        self.deliver = deliver
         self.metrics: IntegrationMetrics = {
             "discovery_seconds": 0.0, "install_seconds": 0.0, "network_seconds": 0.0,
             "wait_seconds": 0.0, "user_wait_seconds": 0.0, "network_requests": 0,

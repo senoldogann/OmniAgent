@@ -8,20 +8,20 @@ OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır.
 2. Mac'te proje dizininde çalıştırın:
 
    ```sh
-   .venv/bin/python telegram_bridge.py setup
+   .venv/bin/omniagent-telegram setup
    ```
 
 3. Token terminalde görünmeden okunur. Komutun gösterdiği `/pair <kod>` mesajını botunuzun **özel sohbetine** 3 dakika içinde gönderin. Botun sohbet ve kullanıcı kimliği `~/Library/Application Support/OmniAgent/telegram.json` dosyasına, token yalnız macOS Keychain'e kaydedilir.
 4. Önce ön planda doğrulayın:
 
    ```sh
-   .venv/bin/python telegram_bridge.py run
+   .venv/bin/omniagent-telegram run
    ```
 
 5. Oturum açıldığında otomatik başlaması için:
 
    ```sh
-   .venv/bin/python telegram_bridge.py install-service
+   .venv/bin/omniagent-telegram install-service
    ```
 
 Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık ve internete bağlı olmalıdır. Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
@@ -36,6 +36,17 @@ Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık 
 - `/mode normal`, `/mode long`, `/mode autonomous`: sonraki görevin tur/zaman bütçesini seçer.
 - Entegrasyon soru sorarsa tek alan için düz metin, birden fazla alan için alan adlarını içeren JSON nesnesi gönderin.
 
+## Dosya alışverişi
+
+- **Size gelen dosyalar:** fotoğraf, belge, ses, sesli mesaj veya video gönderebilirsiniz. Ekin açıklaması (caption)
+  görev olur; açıklama yoksa türüne uygun varsayılan istek kullanılır ("görseli incele", "dosyayı özetle").
+  Ek `~/Library/Application Support/OmniAgent/telegram-inbox/` altına yalnız size açık (0600) izinle kaydedilir ve
+  yolu göreve eklenir. Fotoğraflar ve belge olarak gönderilen JPEG/PNG/WebP/GIF/BMP görseller modele ayrıca
+  görüntü olarak verilir (en-boy oranı korunur). Telegram botları en çok 20 MB indirebilir; daha büyük ek görev başlatmaz.
+- **Sizden istenen dosyalar:** Telegram görevlerinde ajan `send_file` aracıyla bilgisayardaki bir dosyayı (en çok
+  50 MB) sohbete belge olarak gönderebilir: "masaüstündeki rapor.pdf'i bana gönder" gibi.
+- Bir soruya yanıt beklenirken veya görev çalışırken gelen ek yeni görev başlatmaz; bot durumu yazar.
+
 Görev geçmişinin son sekiz kaydı yerel `telegram-history.json` dosyasında tutulur. Bot, mesajları yalnız eşleştirilen kullanıcıdan ve özel sohbetten kabul eder. Güncelleme sırası `telegram-offset.json` ile korunur; yeniden başlatma aynı komutu tekrar çalıştırmaz. UI ile Telegram görevi aynı anda ekranı/klavyeyi kullanamaz: ikinci görev hemen “başka görev çalışıyor” yanıtı alır.
 
-Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Bu sürüm metin ve ekran görüntüsü gönderir; dosya/ek yükleme veya sesli mesaj alma henüz uygulanmadı. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.
+Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Sesli mesaj dosya olarak kaydedilir; metne çevirme ayrı bir konuşma tanıma aracı gerektirir ve ajan bunu kurulu araçlarla dener. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.
