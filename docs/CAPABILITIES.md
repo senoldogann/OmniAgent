@@ -47,7 +47,7 @@ Telegram köprüsü `telegram_bridge.py` ile ayrı bir uzak arayüzdür; model a
 değildir. Varsayılan kısa görünüm yanıtı tek balonda canlı günceller; araç turunda yalnız
 çalışma durumu görünür. `/verbose on` sonraki görevde araç/çıktı/model/süre/token
 ayrıntılarını açar. Ekran görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model`,
-`/mode` ve kullanıcı sorusuna yanıt desteklenir. Fotoğraf, belge, ses ve video ekleri indirilir; açıklaması görev olur ve görseller modele görüntü olarak verilir. Ajan istenen dosyayı `send_file` ile sohbete gönderir. Zamanlanmış görevleri köprü çalıştırır; `/schedules` ve `/unschedule` planları yönetir. Token Keychain'de, izin verilen özel
+`/mode` ve kullanıcı sorusuna yanıt desteklenir. Fotoğraf, belge, ses ve video ekleri indirilir; açıklaması görev olur ve görseller modele görüntü olarak verilir. Ajan istenen dosyayı `send_file` ile sohbete gönderir. Zamanlanmış görevleri köprü çalıştırır; `/schedules` ve `/unschedule` planları yönetir. Açıklamasız sesli mesaj, OpenAI anahtarı tanımlıysa yazıya çevrilip komut olarak çalıştırılır (ses OpenAI'a gönderilir). Token Keychain'de, izin verilen özel
 sohbet/kullanıcı yerel dosyada tutulur. UI ile aynı anda host görevi çalıştırılmaz.
 Ekran kaydı izni eksikse araç "izin yok" demekle kalmaz: izni alacak uygulamayı adı + bundle
 kimliğiyle, yoksa eklenecek tam python yolunu ve Sistem Ayarları komutunu yazar; ilk eksik
