@@ -486,3 +486,20 @@ async def test_bridge_reuses_integration_connections_between_tasks(
     finally:
         if bridge.integrations is not None:
             await bridge.integrations.close()
+
+
+@pytest.mark.asyncio
+async def test_local_inventory_commands_do_not_start_agent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    for command in ("/tools", "/skills"):
+        await bridge.handle({"message": {
+            "chat": {"id": 123, "type": "private"},
+            "from": {"id": 456}, "text": command,
+        }})
+    assert "context7" in api.sent[0]
+    assert "Kurulu skill sayısı" in api.sent[1]
+    assert bridge.active is None
+    if bridge.integrations is not None:
+        await bridge.integrations.close()
