@@ -141,6 +141,24 @@ _INFORMATIONAL_PREFIX: re.Pattern[str] = re.compile(
 _ACTION_EVIDENCE_TOOLS: frozenset[str] = _SIDE_EFFECT_TOOLS - frozenset({
     "take_screenshot", "ask_user", "user_memory",
 })
+# Ekranın görüntüsünü isteyen ifadeler: "ekran görüntüsü al", "ekranın resmini gönder",
+# "ekran fotoğrafı", "ekranı göster", "ss at", "screenshot". "ekranda ne var" görüntü istemez.
+_SCREENSHOT_REQUEST: re.Pattern[str] = re.compile(
+    r"\bekran\w*\s+(?:görüntü|resim|resm|foto)\w*"
+    r"|\bekran(?:ı|ını|i|ini)\s+(?:göster|gönder|yolla|at)\w*"
+    r"|\bscreen\s?(?:shot|capture)\w*|\bss\s+(?:al|at|gönder|yolla)\w*",
+    re.IGNORECASE,
+)
+
+
+def screenshot_requested(goal: str) -> bool:
+    """
+    Kullanıcı ekranın görüntüsünü istiyor mu. Telegram köprüsü görüntüyü yalnız bu durumda
+    sohbete gönderir; host bu hedefte take_screenshot'ı istenen eylemin kanıtı sayar. Saf.
+    """
+    return bool(_SCREENSHOT_REQUEST.search(goal))
+
+
 _MUTATION_VERBS: re.Pattern[str] = re.compile(
     r"\b(?:sil|silebilir|siler|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
     r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|uygula|"
@@ -216,7 +234,7 @@ def has_action_evidence(goal: str, steps: List[sm.StepRecord]) -> bool:
             continue
         if name in _ACTION_EVIDENCE_TOOLS:
             return True
-        if name == "take_screenshot" and re.search(r"ekran görüntüsü|screenshot", goal, re.IGNORECASE):
+        if name == "take_screenshot" and screenshot_requested(goal):
             return True
         if name == "user_memory" and memory_mutation_requested(goal):
             return True

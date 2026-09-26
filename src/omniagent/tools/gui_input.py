@@ -176,6 +176,16 @@ def scan_ax_elements(root: object) -> Tuple[List[AXElement], List[object], bool]
     return elements, refs, False
 
 
+# Electron/web görünümlü uygulamalar (Claude, VS Code, Slack…) AX ağacında yalnız pencere düğmelerini
+# verir. Canlı Telegram görevinde model burada öğe arayıp bulamayınca hiç tıklamadan vazgeçti (26 Eylül).
+AX_EMPTY_HINT: str = (
+    "Bu pencerenin erişilebilirlik ağacı içerik vermiyor (Electron/web görünümlü uygulama olabilir); "
+    "aradığın öğe bu listede çıkmaz. Görünür metne (menü, düğme, sekme, ayar adı) cua_click_text ile "
+    "tıkla; bulamazsa sonuçtaki benzer metinlerden seç. Metni olmayan ikona take_screenshot "
+    "görüntüsündeki noktayla tıkla. Uygulama ayarları çoğu macOS uygulamasında cmd+, ile açılır."
+)
+
+
 def format_ax_listing(
     app_name: str, window_title: str, elements: List[AXElement], geometry: ScreenGeometry, truncated: bool,
 ) -> str:
@@ -194,6 +204,8 @@ def format_ax_listing(
         lines.append(f"{line} @({x},{y})")
     if truncated:
         lines.append("…liste öğe/süre limitiyle kısaltıldı; aranan öğe yoksa take_screenshot kullan.")
+    if not any(element["label"] or element["value"] for element in elements):
+        lines.append(AX_EMPTY_HINT)
     return "\n".join(lines)
 
 

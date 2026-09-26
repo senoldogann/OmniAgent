@@ -94,7 +94,13 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   yapar ve sayfadaki öğeleri hazır seçicileriyle döner (yanlış seçici 30sn değil 5sn'de düşer).
 - **GUI:** `cua_get_ax_state` gerçek AX ağacından etkileşimli öğeleri (numara, tür, etiket, merkez)
   listeler (Chrome ~150ms, Notlar ~650ms); `cua_click` AXPress ile tıklar. Ekran görüntüsü
-  yalnızca AX yetmediğinde gerekir. Metin, klavye düzeninden bağımsız Unicode olaylarıyla yazılır
+  yalnızca AX yetmediğinde gerekir. Electron/web görünümlü pencerede (Claude, VS Code, Slack) AX
+  yalnız etiketsiz pencere düğmelerini verir; liste bunu söyleyip modeli `cua_click_text`'e ve
+  ayarlar için `cmd+,` kısayoluna yönlendirir (`AX_EMPTY_HINT`). Canlı başarısız Telegram görevinin
+  yeniden oynatımında (gemma4, gerçek ekran görüntüsü, sahte ekran araçları) eyleme geçme 6/10 →
+  10/10 oldu; eski kodun eylemleri sağ üste körlemesine tıklamaydı, yenisi 10/10 `cmd+,`. Ayarla
+  ilgisiz kontrol hedefinde ("Artifacts bölümünü aç") iki sürüm de 6/6 `cua_click_text` seçti.
+  Metin, klavye düzeninden bağımsız Unicode olaylarıyla yazılır
   (Türkçe/Fince karakterler ve emoji doğrulandı; pyautogui bunları sessizce atlıyordu). Çift/üçlü
   tıklama ve sürükleme doğrudan Quartz olaylarıyla gönderilir: pyautogui macOS'ta tıklama durumunu hep 1
   yazdığı için çift tıklama Finder'da dosya açmıyor, metinde kelime seçmiyordu.
@@ -242,8 +248,12 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 ## 📱 Telegram ve yetenek farkındalığı
 - `telegram_bridge.py`, eşleştirilmiş özel Telegram sohbetinde varsayılan olarak tek
   balonda kısa, canlı yanıt gösterir. `/verbose on` sonraki görevde düşünme/araç/çıktı,
-  model, süre ve token ayrıntılarını açar; `/verbose off` kısa görünüme döner. Ekran
-  görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
+  model, süre ve token ayrıntılarını açar; `/verbose off` kısa görünüme döner. Model ekrana
+  bakmak için de `take_screenshot` çağırır; bu gözlemler kısa görünümde sohbete gitmez. Görüntü
+  yalnız hedef istediyse (`policy.screenshot_requested`: "ekran görüntüsü/resmi gönder", "ekranı
+  göster", "ss at") görev sonunda tek kez gider; ayrıntılı görünüm hepsini anında gönderir. Köprü
+  süreci proje kökünde çalışır: launchd `/` (salt okunur) dizininde başlatır ve göreli yollar
+  "Read-only file system" ile düşüyordu. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
   Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
   Kurulum: [TELEGRAM.md](docs/TELEGRAM.md).
 - Uzaktan bakım (`integrations/maintenance.py`): `/update` `git pull --ff-only` (yerel değişikliğe dokunmaz),
