@@ -173,6 +173,16 @@ _READ_ONLY_SHELL_PROGRAMS: frozenset[str] = frozenset({
 })
 
 
+def _obviously_read_only_segment(words: List[str]) -> bool:
+    """Yalnız açık gözlem komutlarını mutasyon kanıtının dışında tut."""
+    if not words:
+        return False
+    program = Path(words[0]).name.casefold()
+    return program in _READ_ONLY_SHELL_PROGRAMS or (
+        program == "git" and len(words) >= 2 and words[1].casefold() == "status"
+    )
+
+
 def _obviously_read_only_shell(arguments: str) -> bool:
     """Salt gözlem komutunu dosya/hizmet değişikliği kanıtı sayma; belirsizi modele bırak."""
     try:
@@ -186,10 +196,7 @@ def _obviously_read_only_shell(arguments: str) -> bool:
         segments = shell_command_words(command)
     except (ValueError, AttributeError, ToolError):
         return False
-    return bool(segments) and all(
-        words and Path(words[0]).name.casefold() in _READ_ONLY_SHELL_PROGRAMS
-        for words in segments
-    )
+    return bool(segments) and all(_obviously_read_only_segment(words) for words in segments)
 
 
 # "adresini/sayfayı/veriyi çek" okuma (fetch) isteğidir, "fotoğraf çek" gibi eylem değildir
