@@ -164,3 +164,143 @@ def test_lesson_file_masks_secrets(tmp_path: Path) -> None:
     stored: str = path.read_text(encoding="utf-8")
     assert "abcdefghijklmnop123456" not in stored
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def _browser_read(url: str, body: str = "Hedef sayfanın okunabilen gerçek içeriği") -> str:
+    return (
+        "Tarayıcı: arka planda çalışan ayrı Chromium.\n"
+        f"URL: {url}\nBaşlık: Örnek\n\nSAYFA METNİ:\n{body}\n\n"
+        'ÖĞELER (seçici — tür "etiket"):\n'
+    )
+
+
+def test_cross_tool_candidate_requires_same_readonly_page_with_content() -> None:
+    url = "https://example.com/items?id=42"
+    failed = json.dumps({"url": url})
+    browser = json.dumps({"url": url, "actions": []})
+    candidate = experience.pair_route_candidate(failed, "HTTP 403", browser, _browser_read(url))
+    assert candidate is not None
+    assert candidate["tool"] == "fetch_raw"
+    assert candidate["fixed_tool"] == "browse_url"
+    assert candidate["failed_tokens"] == []
+    assert candidate["target_hash"]
+    assert candidate["error_key"].startswith("sha256:")
+
+    assert experience.pair_route_candidate(failed, "HTTP 403", json.dumps({"url": url + "&p=2", "actions": []}), _browser_read(url + "&p=2")) is None
+    assert experience.pair_route_candidate(failed, "HTTP 403", browser, _browser_read("https://example.com/login")) is None
+    spoofed = _browser_read("https://example.com/login", f"URL: {url}\nBaşlık: Sahte\n\niçerik")
+    assert experience.pair_route_candidate(failed, "HTTP 403", browser, spoofed) is None
+    multiline_title = (
+        "Tarayıcı: arka planda çalışan ayrı Chromium.\n"
+        f"URL: {url}\nBaşlık: İlk satır\n\nİkinci başlık satırı\n\n"
+        'ÖĞELER (seçici — tür "etiket"):\n'
+    )
+    assert experience.pair_route_candidate(failed, "HTTP 403", browser, multiline_title) is None
+    assert experience.pair_route_candidate(failed, "HTTP 403", json.dumps({"url": url, "actions": [{"action": "click", "selector": "button"}]}), _browser_read(url)) is None
+    assert experience.pair_route_candidate(failed, "HTTP 403", browser, _browser_read(url, "")) is None
+    assert experience.pair_route_candidate(
+        failed, "HTTP 403", browser,
+        _browser_read(url, 'A\n\nSAYFA METNİ:\n\n\nÖĞELER (örnek)\nB'),
+    ) is not None
+    assert experience.pair_route_candidate(json.dumps({"url": "https://[invalid"}), "bad", browser, _browser_read(url)) is None
+
+
+def test_cross_tool_lesson_is_goal_scoped_and_feedback_uses_fixed_tool(tmp_path: Path) -> None:
+    url = "https://example.com/items?user=A"
+    failure = "ToolError: HTTP 403 " + "çok uzun hata " * 30
+    fetch = json.dumps({"url": url})
+    browser = json.dumps({"url": url, "actions": []})
+    tracker = experience.new_tracker()
+    tracker, _ = experience.observe_result(experience.empty_state(), tracker, "fetch_raw", fetch, False, failure, 1)
+    tracker, _ = experience.observe_result(experience.empty_state(), tracker, "browse_url", browser, True, _browser_read(url), 2)
+    assert experience.finish_task(experience.empty_state(), tracker, False, "t0")["lessons"] == []
+    learned = experience.finish_task(experience.empty_state(), tracker, True, "t0")
+    assert len(learned["lessons"]) == 1
+    assert learned["lessons"][0]["fixed_tool"] == "browse_url"
+
+    different = experience.new_tracker()
+    different, unrelated = experience.observe_result(learned, different, "fetch_raw", json.dumps({"url": "https://example.com/items?user=B"}), False, failure, 1)
+    assert unrelated["lesson_id"] is None
+
+    same = experience.new_tracker()
+    same, observed = experience.observe_result(learned, same, "fetch_raw", fetch, False, failure, 1)
+    assert observed["lesson_id"] is not None
+    assert "browse_url" in "\n".join(observed["notes"])
+    same, _ = experience.observe_result(learned, same, "browse_url", browser, True, _browser_read(url), 2)
+    updated = experience.finish_task(learned, same, True, "t1")
+    assert (updated["lessons"][0]["uses"], updated["lessons"][0]["helped"]) == (1, 1)
+
+    wrong = experience.new_tracker()
+    wrong, _ = experience.observe_result(learned, wrong, "fetch_raw", fetch, False, failure, 1)
+    wrong, _ = experience.observe_result(
+        learned, wrong, "browse_url", json.dumps({"url": "https://example.com/items?user=B", "actions": []}),
+        True, _browser_read("https://example.com/items?user=B"), 2,
+    )
+    wrong, _ = experience.observe_result(learned, wrong, "browse_url", browser, True, _browser_read(url), 3)
+    unhelpful = experience.finish_task(learned, wrong, False, "t2")
+    assert (unhelpful["lessons"][0]["uses"], unhelpful["lessons"][0]["helped"]) == (1, 0)
+
+    mutating = experience.new_tracker()
+    mutating, _ = experience.observe_result(learned, mutating, "fetch_raw", fetch, False, failure, 1)
+    mutating, _ = experience.observe_result(
+        learned, mutating, "browse_url",
+        json.dumps({"url": url, "actions": [{"action": "click", "selector": "button"}]}),
+        True, _browser_read(url), 2,
+    )
+    assert experience.finish_task(learned, mutating, False, "t3")["lessons"][0]["helped"] == 0
+
+    path = tmp_path / "deneyim.json"
+    experience.save_experience(str(path), updated)
+    persisted = path.read_text(encoding="utf-8")
+    assert "user=A" not in persisted
+    assert "çok uzun hata" not in persisted
+
+
+def test_cross_tool_lesson_persists_no_url_components(tmp_path: Path) -> None:
+    url = "https://alice:secret-userinfo@example.com/reset/secret-path?session=secret-query"
+    candidate = experience.pair_route_candidate(
+        json.dumps({"url": url}), "ToolError: fetch failed for " + url,
+        json.dumps({"url": url, "actions": []}), _browser_read(url),
+    )
+    assert candidate is not None
+    path = tmp_path / "deneyim.json"
+    experience.save_experience(str(path), experience.merge_candidates(experience.empty_state(), [candidate], "t"))
+    persisted = path.read_text(encoding="utf-8")
+    for secret in ("secret-userinfo", "secret-path", "secret-query", "alice", "example.com"):
+        assert secret not in persisted
+
+
+def test_legacy_lesson_id_and_counters_survive_merge(tmp_path: Path) -> None:
+    failed = json.dumps({"command": "veri-araci ozet kuzey"})
+    fixed = json.dumps({"command": "veri-araci ozet kuzey --birim=adet"})
+    candidate = experience.pair_candidate("execute_shell", failed, "E17", fixed)
+    assert candidate is not None
+    original = experience.merge_candidates(experience.empty_state(), [candidate], "t0")
+    legacy = {key: value for key, value in original["lessons"][0].items() if key not in ("fixed_tool", "target_hash")}
+    legacy["uses"] = 2
+    legacy["helped"] = 1
+    path = tmp_path / "eski-deneyim.json"
+    path.write_text(json.dumps({"lessons": [legacy]}), encoding="utf-8")
+    loaded = experience.load_experience(str(path))["lessons"][0]
+    merged = experience.merge_candidates({"lessons": [loaded]}, [candidate], "t1")
+    assert len(merged["lessons"]) == 1
+    assert merged["lessons"][0]["id"] == original["lessons"][0]["id"]
+    assert (merged["lessons"][0]["uses"], merged["lessons"][0]["helped"]) == (2, 1)
+
+
+def test_same_tool_and_cross_tool_lessons_do_not_overwrite_each_other() -> None:
+    url = "https://example.com/items?id=42"
+    failure = "HTTP 403"
+    same = experience.pair_candidate(
+        "fetch_raw", json.dumps({"url": url}), failure,
+        json.dumps({"url": url + "&format=json"}),
+    )
+    route = experience.pair_route_candidate(
+        json.dumps({"url": url}), failure,
+        json.dumps({"url": url, "actions": []}), _browser_read(url),
+    )
+    assert same is not None and route is not None
+    state = experience.merge_candidates(experience.empty_state(), [same, route], "t0")
+    assert len(state["lessons"]) == 2
+    assert len({item["id"] for item in state["lessons"]}) == 2
+    assert {item["fixed_tool"] for item in state["lessons"]} == {"fetch_raw", "browse_url"}

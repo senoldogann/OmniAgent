@@ -141,6 +141,7 @@ async def test_browse_fill_with_empty_text_clears_the_field() -> None:
     result = await browser.browse_page_actions(page, None, [{"action": "fill", "selector": "#q", "value": ""}])  # type: ignore[arg-type]
     assert page.filled == [("#q", "")]
     assert "açık Google Chrome oturumunda görünmez" in result
+    assert "\n\nSAYFA METNİ:\nForm\n\nÖĞELER" in result
 
 
 def test_chrome_fallback_never_types_into_another_app(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -252,8 +252,9 @@ async def browse_page_actions(page: Page, url: Optional[str], actions: List[Brow
     if actions: await page.wait_for_load_state("domcontentloaded")
     text = await asyncio.to_thread(clean_html, await page.content())
     elements = await page.evaluate(_PAGE_ELEMENTS_SCRIPT, PAGE_ELEMENT_LIMIT)
+    title = " ".join((await page.title()).split())
     return (
         "Tarayıcı: arka planda çalışan ayrı Chromium; açık Google Chrome oturumunda görünmez.\n"
-        f"URL: {page.url}\nBaşlık: {await page.title()}\n\n{text}\n\n"
+        f"URL: {page.url}\nBaşlık: {title}\n\nSAYFA METNİ:\n{text}\n\n"
         'ÖĞELER (seçici — tür "etiket"):\n' + "\n".join(elements)
     )
