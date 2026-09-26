@@ -1,6 +1,6 @@
 # Telegram uzaktan görev köprüsü
 
-OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır. Varsayılan kısa görünüm Telegram'ın yerel zengin taslağında **Düşünüyor…** durumunu, araç çalışırken kısa adını ve komut önizlemesini animasyonlu gösterir. Model metni aynı taslakta akar; görev bitince Markdown vurguları ve bağlantıları korunarak normal Telegram mesajı gönderilir. Boş satırlar kompakt görünümde ayıklanır; kod bloklarının içindeki satırlar korunur. Taslaklar geçicidir; sohbet geçmişinde ayrı ara mesajlar bırakmaz. Bot API zengin taslağı desteklemiyorsa mevcut tek mesajı güncelleyen yol kullanılır. Hedef, tur, model ve token dökümü tekrarlanmaz. `/verbose on` sonraki görevlerde model metni, araç/komut olayları, model değişimi ve istatistikleri gösteren ayrıntılı akışı açar; `/verbose off` kısa görünüme döner. Ekran görüntüsü aracı başarılı olursa görüntü ayrıca gönderilir. Uzun metinler sayfalanır.
+OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır. Varsayılan kısa görünüm Telegram'ın yerel zengin taslağında **Düşünüyor…** durumunu, araç çalışırken kısa adını ve komut önizlemesini animasyonlu gösterir. Model metni aynı taslakta akar; görev bitince Markdown vurguları ve bağlantıları korunarak normal Telegram mesajı gönderilir. Boş satırlar kompakt görünümde ayıklanır; kod bloklarının içindeki satırlar korunur. Taslaklar geçicidir; sohbet geçmişinde ayrı ara mesajlar bırakmaz. Bot API zengin taslağı desteklemiyorsa mevcut tek mesajı güncelleyen yol kullanılır. Hedef, tur, model ve token dökümü tekrarlanmaz. `/verbose on` sonraki görevlerde model metni, araç/komut olayları, model değişimi ve istatistikleri gösteren ayrıntılı akışı açar; `/verbose off` kısa görünüme döner. Ajan ekrana bakmak için ekran görüntüsü alır ama kısa görünümde bunları size göndermez; görüntüyü istediğinizde ("ekran görüntüsü gönder", "ekranın resmini at", "ekranı göster") görevin son görüntüsü tek kez gelir. `/verbose on` iken alınan her görüntü anında gelir. Uzun metinler sayfalanır.
 
 ## İlk kurulum
 
@@ -24,7 +24,7 @@ OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır.
    .venv/bin/omniagent-telegram install-service
    ```
 
-Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık ve internete bağlı olmalıdır; köprü açıkken Mac prize takılıysa uyumaz (pilde uyuyabilir, uyuyan Mac mesaj alamaz). Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
+Hizmet `launchd` kullanıcı oturumunda çalışır; köprü süreci proje kökünde çalışır, ajanın göreli dosya yolları (ekran görüntüsü, dosya yazma, kabuk) orada çözülür. `install-service` çalışan eski köprünün launchd'den tamamen kalkmasını bekler, launchd geçici hata verirse yeniden dener. Bilgisayar açık ve internete bağlı olmalıdır; köprü açıkken Mac prize takılıysa uyumaz (pilde uyuyabilir, uyuyan Mac mesaj alamaz). Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
 
 ## Sohbet komutları
 

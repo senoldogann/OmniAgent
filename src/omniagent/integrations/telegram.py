@@ -38,6 +38,7 @@ from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, s
 from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
 from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
+from omniagent.app.policy import screenshot_requested
 
 
 TOKEN_SERVICE = "OmniAgent Telegram"
@@ -739,6 +740,16 @@ class TelegramBridge:
         except TelegramError as error:
             raise DeliveryFailed(str(error)) from None
 
+    async def _send_screenshot(self, stream: TelegramStream, image: Path) -> None:
+        """Ekran görüntüsünü fotoğraf olarak gönderir; dosya kaybolduysa ya da gönderim düştüyse akışa yazar."""
+        if not image.is_file():
+            await stream.append(f"\n! Ekran görüntüsü dosyası bulunamadı: {image}\n")
+            return
+        try:
+            await self.api.send_photo(self.settings["chat_id"], image)
+        except TelegramError as error:
+            await stream.append(f"\n! Ekran görüntüsü gönderilemedi: {error}\n")
+
     async def _execute(
         self, goal: str, images: Optional[List[str]] = None, scheduled_id: Optional[str] = None,
     ) -> None:
@@ -782,7 +793,12 @@ class TelegramBridge:
         live = TelegramDraftStream(self.api, self.settings["chat_id"], stream)
         compact = CompactPresenter(live)
         verbose = self.verbose
+        # Model ekrana bakmak için de take_screenshot çağırır; her gözlemi sohbete göndermek sohbeti
+        # dolduruyordu. Ayrıntılı görünüm hepsini anında gönderir; kısa görünüm yalnız kullanıcı
+        # görüntü istediyse ve görev sonunda son görüntüyü tek kez gönderir.
+        send_final_screenshot = not verbose and screenshot_requested(goal)
         screenshot_paths: Dict[str, Path] = {}
+        final_screenshot: Optional[Path] = None
         saw_finished = False
         try:
             while not worker.done() or not queue.empty():
@@ -805,11 +821,10 @@ class TelegramBridge:
                     await compact.event(event)
                 if event["kind"] == "tool_finished" and event["ok"]:
                     image = screenshot_paths.pop(event["call_id"], None)
-                    if image is not None and image.is_file():
-                        try:
-                            await self.api.send_photo(self.settings["chat_id"], image)
-                        except TelegramError as error:
-                            await stream.append(f"\n! Ekran görüntüsü gönderilemedi: {error}\n")
+                    if image is not None and verbose:
+                        await self._send_screenshot(stream, image)
+                    elif image is not None:
+                        final_screenshot = image
             report = await worker
             # Aynı turdaki call_soon_threadsafe olaylarını son sayfadan önce işle.
             await asyncio.sleep(0)
@@ -828,6 +843,8 @@ class TelegramBridge:
                         f"\n{'✓' if report['success'] else '✗'} {report['outcome'][:1200]}\n"
                     )
             else:
+                if send_final_screenshot and final_screenshot is not None:
+                    await self._send_screenshot(stream, final_screenshot)
                 await compact.finish(report)
             self.history = trim_history(self.history + [report["exchange"]])
             save_json(history_path(), self.history)
@@ -1246,6 +1263,11 @@ async def setup() -> None:
 
 
 SERVICE_LABEL = "com.omniagent.telegram"
+# bootout sonrası eski kaydın kalkmasını bekleme (launchd çıkış süresi 5 sn) ve bootstrap denemeleri
+SERVICE_UNLOAD_TIMEOUT_SECONDS: float = 15.0
+SERVICE_POLL_SECONDS: float = 0.25
+BOOTSTRAP_ATTEMPTS: int = 3
+BOOTSTRAP_RETRY_SECONDS: float = 1.0
 
 
 def bridge_command(announce: bool = False) -> List[str]:
@@ -1294,25 +1316,50 @@ def install_service() -> None:
     data_root().mkdir(parents=True, exist_ok=True)
     _write_service_plist(path, build_launchd_record())
 
-    existing = subprocess.run(
-        ["launchctl", "print", target],
-        capture_output=True, text=True, check=False,
-    )
-    if existing.returncode == 0:
-        stopped = subprocess.run(
-            ["launchctl", "bootout", target],
-            capture_output=True, text=True, check=False,
-        )
+    if _launchctl(["print", target]).returncode == 0:
+        stopped = _launchctl(["bootout", target])
         if stopped.returncode != 0:
             raise TelegramError(f"Eski Telegram hizmeti durdurulamadı: {stopped.stderr.strip()[:300]}")
-
-    result = subprocess.run(
-        ["launchctl", "bootstrap", domain, str(path)],
-        capture_output=True, text=True, check=False,
-    )
-    if result.returncode != 0:
-        raise TelegramError(f"launchd başlatılamadı: {result.stderr.strip()[:300]}")
+        _wait_until_unloaded(target)
+    _bootstrap_service(domain, path)
     print(f"Telegram hizmeti kuruldu/güncellendi: {path}")
+
+
+def _launchctl(arguments: List[str]) -> "subprocess.CompletedProcess[str]":
+    """launchctl'i çıktısını yakalayarak çalıştırır; dönüş kodunu çağıran denetler."""
+    return subprocess.run(["launchctl", *arguments], capture_output=True, text=True, check=False)
+
+
+def _wait_until_unloaded(target: str) -> None:
+    """
+    bootout döndüğünde launchd eski köprüyü hâlâ kapatıyor olabilir; bu arada yapılan bootstrap
+    "5: Input/output error" ile düşüp hizmeti kapalı bırakıyordu (26 Eylül, canlı). Uzaktayken
+    bu, köprünün geri gelmemesi demekti. Kayıt kalkana kadar sınırlı süre beklenir.
+    """
+    deadline = time.monotonic() + SERVICE_UNLOAD_TIMEOUT_SECONDS
+    while _launchctl(["print", target]).returncode == 0:
+        if time.monotonic() >= deadline:
+            raise TelegramError(
+                f"Eski Telegram hizmeti {SERVICE_UNLOAD_TIMEOUT_SECONDS:.0f} sn içinde kalkmadı: {target}"
+            )
+        time.sleep(SERVICE_POLL_SECONDS)
+
+
+def _bootstrap_service(domain: str, path: Path) -> None:
+    """Kaydı yükler; launchd geçici hata verirse uyarıyla yeniden dener, sonunda son hatayı yükseltir."""
+    stderr = ""
+    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
+        result = _launchctl(["bootstrap", domain, str(path)])
+        if result.returncode == 0:
+            return
+        stderr = result.stderr.strip()[:300]
+        if attempt < BOOTSTRAP_ATTEMPTS:
+            logging.warning(
+                "launchd bootstrap başarısız; yeniden denenecek",
+                extra={"attempt": attempt, "returncode": result.returncode, "stderr": stderr},
+            )
+            time.sleep(BOOTSTRAP_RETRY_SECONDS)
+    raise TelegramError(f"launchd başlatılamadı ({BOOTSTRAP_ATTEMPTS} deneme): {stderr}")
 
 
 async def run_bridge(announce: bool = False) -> None:
@@ -1337,6 +1384,11 @@ def main() -> None:
         elif arguments.action == "install-service":
             install_service()
         else:
+            # launchd süreci salt okunur `/` dizininde başlatır: modelin göreli yolları (ekran
+            # görüntüsü, write_file, kabuk) "Read-only file system" ile düşüyor, her ekran görevi
+            # bir tur kaybediyordu. Köprü, refactor öncesindeki gibi proje kökünde çalışır; plist
+            # yerine burada ayarlanır ki /update sonrası execv ile gelen kod da uygulasın.
+            os.chdir(project_root())
             asyncio.run(run_bridge(arguments.announce))
     except RestartRequested:
         # Kilit ve bağlantılar kapandı; aynı PID yeni kodu yükler (launchd hizmeti kesilmez)

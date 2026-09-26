@@ -3,6 +3,27 @@
 Kurallar, mimari ve performans kararlarının tek kaynağı `AGENTS.md`'dir; bu not yalnızca
 kaldığı yerden devam etmek için gereken durumu içerir.
 
+## 26 Eylül (sabah) — Telegram'da ekran görüntüsü seli, çalışma dizini, install-service yarışı
+- Kullanıcı şikâyeti: Telegram'da "en basit görevi bile yapamıyor, sürekli ekran resmi atıyor". Kayıtlarda
+  web, kabuk ve dosya görevleri başarılı; sorun masaüstü uygulamasındaki ekran görevlerinde.
+- Ekran resmi seli: köprü, modelin gözlem için aldıkları dahil her başarılı `take_screenshot`'ı sohbete
+  gönderiyordu. Kısa görünüm artık yalnız hedef görüntü istediyse (`policy.screenshot_requested`) son
+  görüntüyü görev sonunda bir kez gönderir; `/verbose on` hepsini anında gönderir. Aynı sezgi eylem
+  kanıtında da kullanılır: "ekran resmi gönder" eski dar desene uymadığı için görüntü kanıt sayılmıyordu.
+- Çalışma dizini: `db972bb` launchd kaydındaki `WorkingDirectory`'yi kaldırmıştı; köprü `/` dizininde
+  çalışıyor, Telegram'dan gelen her ekran görevinde ilk `take_screenshot` `Errno 30 Read-only file system`
+  ile düşüp bir tur kaybettiriyordu. Köprü açılışta proje köküne geçer (plist yerine süreçte, ki `/update`
+  sonrası execv de uygulasın).
+- `install-service`: çalışan köprüde bootout'tan hemen sonraki bootstrap `5: Input/output error` verip
+  hizmeti kapalı bıraktı (canlı; elle yeniden yüklendi). Artık kayıt kalkana kadar en çok 15 sn bekler,
+  bootstrap'ı 3 kez uyarıyla dener, sonra son hatayı yükseltir.
+- Boş AX (Electron) ipucu ve A/B ölçümü AGENTS.md GUI bölümündedir (eyleme geçme 6/10 → 10/10). Düzenek:
+  gerçek model, istem ve şemalar, canlı görevdeki gerçek ekran görüntüsü; ekran araçları sahte, canlı
+  ekrana olay gitmedi. Canlı ekranda ölçülmedi: `cmd+,` sonrası Claude ayarlarında kullanım bölümünü bulup
+  değeri okuma.
+- Doğrulama: tam pytest 419 geçti, 15 atlandı (7 yeni test eski kodda başarısız); çekirdek benchmark 27/27,
+  medyan 3,7 sn, ev dizininde yan etki yok.
+
 ## 26 Eylül — Telegram'dan uzaktan bakım
 - Mac'teki başka bir ajan izin listesi yüzünden `uv`/`.venv/bin/omniagent-*` çalıştıramadı; köprü eski
   kodla kaldı. `/update` (git pull + gerekirse uv sync + yeniden başlatma), `/restart` ve `/doctor`
@@ -14,15 +35,16 @@ kaldığı yerden devam etmek için gereken durumu içerir.
   `/doctor` sürümü ve izinleri doğrular.
 - GitHub Actions artık iş başlatıyor (önceki PR'larda 0 dakika/`runner_id` 0 ile hiç başlamıyordu).
   PR #6'da ilk kez gerçek pyobjc'li macOS işi koştu: 417 geçti, 2 atlandı (canlı API ve canlı Chrome
-  testleri); Linux işi de yeşil. Kullanıcının Mac'inde canlı ekran/Telegram denemesi yapılmadı.
+  testleri); Linux işi de yeşil.
 - `omniagent-benchmark` refactor'den beri çalışmıyordu (betik async `main(runs, …)`'i argümansız
-  çağırıyordu; belgelerdeki kök `benchmark.py` yok). #8 ile düzeldi; refactor sonrası kodun gerçek
-  modelle ölçümü hâlâ yapılmadı: Mac'te `/update` sonrası Telegram'dan
-  `.venv/bin/omniagent-benchmark --runs 3 --concurrency 3` çalıştırılabilir.
+  çağırıyordu; belgelerdeki kök `benchmark.py` yok). #8 ile düzeldi. Refactor sonrası kodun gerçek
+  modelle ilk ölçümü (`255c8f3`, kullanıcının Mac'i): 27/27, medyan 4,5 sn, önbellek %96.
 - Uzaktan kullanım: köprü prizdeyken Mac'i uyanık tutar (`caffeinate -s -w <pid>`); GUI kapıları kilitli
   ekrana olay göndermez (`SCREEN_LOCKED`), kilitsiz uyuyan ekranı uyandırır; `/doctor` ikisini gösterir.
-  Gerçek Quartz oturum sözlüğü ve `pmset` doğrulaması macOS CI'da koşar; kullanıcının Mac'inde kilitli
-  ekranla canlı deneme yapılmadı.
+  Gerçek Quartz oturum sözlüğü ve `pmset` doğrulaması macOS CI'da koşar. Kullanıcının Mac'inde canlı
+  kilit denemesi köprüyle aynı launchd bağlamında yapıldı: ekran ve fare/klavye kapıları `SCREEN_LOCKED`
+  ile durdu, ekran görevi "ekran kilitli" yanıtı verdi, dosya listeleme normal çalıştı. `/doctor`
+  karşılığı: izinler, uyku engeli (`caffeinate -s -w <pid>`) ve sürüm ✓.
 
 ## 25 Eylül (akşam) — src-layout refactor gerilemeleri geri alındı
 - `db972bb` araç katmanını yeniden yazarken ölçülmüş davranışı kaybetmişti. Eski `tools.py`,

@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from omniagent.app import agent as main
+from omniagent.app import policy
 from omniagent.core import state as sm
 from omniagent.integrations.capabilities import CapabilityService
 
@@ -238,3 +239,25 @@ def test_read_only_shell_probe_is_not_deletion_evidence() -> None:
     assert main.has_action_evidence("Bu dosyayı sil", write_steps)
     redirected = json.dumps({"command": "echo yeni > /tmp/deneme.txt"})
     assert not main._obviously_read_only_shell(redirected)
+
+
+def test_screenshot_request_follows_real_telegram_goals() -> None:
+    """Telegram'dan gelen gerçek hedefler: görüntü isteyenler ve yalnız ekrana baktıranlar."""
+    for goal in (
+        "Peki ekran resmi gönderme şansın var mı", "Ekranın görüntüsünü al ve ne olduğunu söyle",
+        "EKRANIN FOTOĞRAFINI ÇEK", "ekranı göster", "ss at", "take a screenshot",
+    ):
+        assert policy.screenshot_requested(goal), goal
+    for goal in (
+        "Önde açık olan IDE daki ajanın kullanım limiti ne kadar kalmış kontrol eder misin",
+        "Evet bul ve aç ardından bana limitin ne kadar kaldığını söylr",
+        "ekranda ne görüyorsun ?", "sonucu ekranda göster", "fotoğraf çek masaüstüne kaydet",
+    ):
+        assert not policy.screenshot_requested(goal), goal
+
+
+def test_screenshot_is_evidence_only_when_user_asked_for_the_screen_image() -> None:
+    """'ekran resmi gönder' eski dar desene uymadığı için alınan görüntü kanıt sayılmıyordu."""
+    steps = [sm.make_step_record("take_screenshot", '{"filename":"ekran.png"}', True, "Kaydedildi")]
+    assert main.has_action_evidence("ekran resmi gönder", steps)
+    assert not main.has_action_evidence("Ayarları aç", steps)

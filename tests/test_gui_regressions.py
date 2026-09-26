@@ -258,3 +258,15 @@ def test_screenshot_rejects_display_index_inside_window_scope(tmp_path: Path) ->
     with pytest.raises(ToolError) as error:
         box.take_screenshot(str(tmp_path / "x.png"), 2)
     assert error.value.code == "DISPLAY_SCOPE_CONFLICT"
+
+
+def test_empty_ax_tree_points_model_to_text_click() -> None:
+    """Electron penceresi yalnız etiketsiz pencere düğmelerini verir; model OCR ile tıklamaya yönlendirilir."""
+    buttons: List[Dict[str, Any]] = [
+        {"role": "AXButton", "label": "", "value": "", "enabled": True, "center_x": x, "center_y": 20.0}
+        for x in (14.0, 34.0, 54.0)
+    ]
+    listing = gui_input.format_ax_listing("Claude", "Claude", buttons, GEOMETRY, False)
+    assert gui_input.AX_EMPTY_HINT in listing
+    labeled: List[Dict[str, Any]] = [{**buttons[0], "label": "Ayarlar"}]
+    assert gui_input.AX_EMPTY_HINT not in gui_input.format_ax_listing("Notlar", "Notlar", labeled, GEOMETRY, False)

@@ -486,3 +486,43 @@ async def test_bridge_reuses_integration_connections_between_tasks(
     finally:
         if bridge.integrations is not None:
             await bridge.integrations.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("goal", "expected"), [
+    ("Önde açık olan IDE daki ajanın kullanım limiti ne kadar kalmış kontrol eder misin", []),
+    ("Ekran görüntüsü alıp gönderir misin", ["ikinci.png"]),
+])
+async def test_compact_sends_only_requested_final_screenshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, goal: str, expected: list[str],
+) -> None:
+    """Kısa görünüm modelin gözlem görüntülerini göndermez; görüntü istenirse yalnız sonuncusu bir kez gider."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    images = [tmp_path / "birinci.png", tmp_path / "ikinci.png"]
+    for image in images:
+        image.write_bytes(b"PNG")
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        for index, image in enumerate(images):
+            emit({"kind": "tool_started", "call_id": f"ekran{index}", "index": 0,
+                  "name": "take_screenshot", "preview": str(image)})
+            emit({"kind": "tool_finished", "call_id": f"ekran{index}", "ok": True,
+                  "text": "Ekran alındı", "seconds": 0.1})
+        metrics = {
+            "turns": 3, "tool_calls": 2, "elapsed_seconds": 1.0, "backend": "ollama-cloud",
+            "prompt_tokens": 100, "cached_tokens": 0, "completion_tokens": 10,
+        }
+        emit({"kind": "run_finished", "success": True, "outcome": "Tamam.", "reason": "", "metrics": metrics})
+        return {"outcome": "Tamam.", "success": True, "reason": "",
+                "metrics": metrics, "exchange": make_exchange(goal, "Tamam.", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": goal,
+    }})
+    task = bridge.active
+    assert task is not None
+    await task
+    assert [path.name for path in api.photos] == expected
