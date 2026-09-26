@@ -3,8 +3,10 @@ Deneyim belleği: hatalardan kalıcı öğrenme.
 
 Ders yalnız DOĞRULANMIŞ bir kurtarmadan çıkarılır: aynı araçta başarısız bir çağrıdan sonra
 argümanı değiştirilmiş ve ilişkili (ortak belirteçli) bir çağrı başarılı olmuş ve görev de
-başarıyla bitmiş olmalıdır. Ders görev başında modele VERİLMEZ; yalnız aynı araç aynı hata
-imzasını benzer (aynı hatalı) argümanla yeniden ürettiğinde o araç sonucunun altına eklenir.
+başarıyla bitmiş olmalıdır. Ayrıca başarısız `fetch_raw` çağrısı, aynı tam URL'yi salt okunur
+`browse_url` ile içerik döndürerek kurtarırsa görev sonunda alternatif yol öğrenilir. Ders görev
+başında modele VERİLMEZ; yalnız aynı araç aynı hata imzasını aynı hedefte yeniden ürettiğinde
+o araç sonucunun altına eklenir.
 Önceki ölçümde her göreve eklenen "benzer görev rotaları" alakasız ipuçları ve başka görevlerin
 yollarını taşıyıp hedef sapmasına yol açmıştı; hata anına koşullanan ders başarılı yolu
 etkilemez. Hatırlatılan dersten sonra aynı aracın ilk çağrısı başarılıysa ders işe yaramış
@@ -20,6 +22,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, TypedDict
+from urllib.parse import SplitResult, urlsplit
 
 from omniagent.config import redact
 
@@ -69,6 +72,8 @@ class Lesson(TypedDict):
     """Doğrulanmış kurtarmadan çıkarılan ders: eşleşme anahtarları, gösterim ve etki sayaçları."""
     id: str
     tool: str
+    fixed_tool: str
+    target_hash: str
     error_key: str
     failed_tokens: List[str]
     failed_call: str
@@ -86,6 +91,8 @@ class ExperienceState(TypedDict):
 class LessonCandidate(TypedDict):
     """Görev içinde doğrulanan, görev başarıyla biterse kalıcılaşacak ders adayı."""
     tool: str
+    fixed_tool: str
+    target_hash: str
     error_key: str
     failed_tokens: List[str]
     failed_call: str
@@ -239,6 +246,69 @@ def lesson_id(tool: str, key: str, tokens: List[str]) -> str:
     return hashlib.sha256(f"{tool}|{key}|{' '.join(tokens)}".encode("utf-8")).hexdigest()[:12]
 
 
+def route_error_key(detail: str) -> str:
+    """Çapraz araç dersinde kırpılmamış hata imzası; ham hata kalıcı belleğe yazılmaz."""
+    digest: str = hashlib.sha256(normalize_text(detail).encode("utf-8")).hexdigest()
+    return "sha256:" + digest
+
+
+def route_lesson_id(tool: str, fixed_tool: str, key: str, target_hash: str) -> str:
+    """Eski aynı-araç kimliklerine dokunmadan alternatif yol için ayrı kimlik üretir."""
+    return hashlib.sha256(f"route|{tool}|{fixed_tool}|{key}|{target_hash}".encode("utf-8")).hexdigest()[:12]
+
+
+def _target_url(arguments: str) -> Optional[str]:
+    """Araç JSON'undaki tam HTTP(S) URL'yi yalnız görev sırasında döner."""
+    parsed: object = _parse_arguments(arguments)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("url"), str):
+        return None
+    url: str = parsed["url"]
+    try:
+        parts: SplitResult = urlsplit(url)
+    except ValueError:
+        return None
+    return url if parts.scheme in ("http", "https") and parts.netloc else None
+
+
+def _target_hash(arguments: str) -> Optional[str]:
+    url: Optional[str] = _target_url(arguments)
+    return hashlib.sha256(url.encode("utf-8")).hexdigest() if url is not None else None
+
+
+def _read_browser_result(detail: str, url: str) -> bool:
+    """Salt okunur gezinmenin aynı URL'de temiz sayfa metni döndürdüğünü doğrular."""
+    lines: List[str] = detail.splitlines()
+    if (len(lines) < 6 or not lines[0].startswith("Tarayıcı: ")
+            or lines[1] != f"URL: {url}" or not lines[2].startswith("Başlık: ")
+            or lines[3] != "" or lines[4] != "SAYFA METNİ:"):
+        return False
+    before_elements: str = detail.rsplit("\n\nÖĞELER (", 1)[0]
+    if before_elements == detail:
+        return False
+    title_and_body: str = before_elements.split(f"\nURL: {url}\nBaşlık: ", 1)[1]
+    marker: str = "\n\nSAYFA METNİ:\n"
+    return bool(title_and_body.split(marker, 1)[1].strip())
+
+
+def pair_route_candidate(
+    failed_arguments: str, failed_detail: str, fixed_arguments: str, fixed_detail: str,
+) -> Optional[LessonCandidate]:
+    """Aynı hedef URL'de başarısız ham okuma ve başarılı salt okunur tarayıcı okumasını eşler."""
+    url: Optional[str] = _target_url(failed_arguments)
+    fixed_url: Optional[str] = _target_url(fixed_arguments)
+    parsed: object = _parse_arguments(fixed_arguments)
+    if (url is None or fixed_url != url or not isinstance(parsed, dict)
+            or parsed.get("actions") != [] or not _read_browser_result(fixed_detail, url)):
+        return None
+    return {
+        "tool": "fetch_raw", "fixed_tool": "browse_url",
+        "target_hash": hashlib.sha256(url.encode("utf-8")).hexdigest(),
+        "error_key": route_error_key(failed_detail), "failed_tokens": [],
+        "failed_call": "fetch_raw(<aynı hedef URL>)",
+        "fixed_call": "browse_url(<aynı hedef URL>, actions=[])",
+    }
+
+
 def pair_candidate(tool: str, failed_arguments: str, failed_detail: str, fixed_arguments: str) -> Optional[LessonCandidate]:
     """
     Başarısız çağrıyı izleyen başarılı çağrı onun düzeltmesi mi? Argümanlar farklı olmalı ve
@@ -250,20 +320,31 @@ def pair_candidate(tool: str, failed_arguments: str, failed_detail: str, fixed_a
     failed_tokens: List[str] = argument_tokens(failed_arguments)
     if coverage(failed_tokens, argument_tokens(fixed_arguments)) < FIX_COVERAGE:
         return None
-    return {"tool": tool, "error_key": error_key(failed_detail), "failed_tokens": failed_tokens,
+    return {"tool": tool, "fixed_tool": tool, "target_hash": "",
+            "error_key": error_key(failed_detail), "failed_tokens": failed_tokens,
             "failed_call": display_call(failed_arguments), "fixed_call": display_call(fixed_arguments)}
 
 
-def match_lesson(state: ExperienceState, tool: str, key: str, tokens: List[str]) -> Optional[Lesson]:
-    """Aynı araç + aynı hata anahtarı + benzer (aynı hatalı) argümanlı en iyi dersi döner. Saf."""
+def match_lesson(
+    state: ExperienceState, tool: str, key: str, tokens: List[str],
+    route_key: Optional[str] = None, target_hash: Optional[str] = None,
+) -> Optional[Lesson]:
+    """Eski benzer-argüman veya yeni tam-hedef eşleşmesinde en uygun dersi döner. Saf."""
     best: Optional[Tuple[float, float, str]] = None
     chosen: Optional[Lesson] = None
     for lesson in state["lessons"]:
-        if lesson["tool"] != tool or lesson["error_key"] != key:
+        if lesson["tool"] != tool:
             continue
-        score: float = similarity(lesson["failed_tokens"], tokens)
-        if score < MATCH_SIMILARITY:
-            continue
+        if lesson["target_hash"]:
+            if lesson["error_key"] != route_key or lesson["target_hash"] != target_hash:
+                continue
+            score: float = 1.0
+        else:
+            if lesson["error_key"] != key:
+                continue
+            score = similarity(lesson["failed_tokens"], tokens)
+            if score < MATCH_SIMILARITY:
+                continue
         rank: Tuple[float, float, str] = (
             score, lesson["helped"] / lesson["uses"] if lesson["uses"] else 0.0, lesson["updated_at"],
         )
@@ -279,7 +360,7 @@ def lesson_hint(lesson: Lesson) -> str:
     return (
         f"DENEYİM BELLEĞİ: Aynı hata daha önce doğrulanmış bir değişiklikle çözüldü{track}.\n"
         f"  Başarısız: {lesson['failed_call']}\n"
-        f"  Çalışan:   {lesson['fixed_call']}\n"
+        f"  Çalışan ({lesson['fixed_tool']}): {lesson['fixed_call']}\n"
         "Farkı bu göreve uyarla (yol, ad ve kimlik değerlerini bu görevin hedefinden al); "
         "durum farklıysa başka bir yol dene."
     )
@@ -301,18 +382,32 @@ def observe_result(
     """
     Bir araç sonucunu görev izleyicisine işler. Önceki turda ders gösterilmiş araç yeniden
     çağrıldıysa dersin işe yarayıp yaramadığı kaydedilir. Başarılı sonuç, aynı aracın bekleyen
-    başarısızlıklarından en yenisini kapsıyorsa ders adayı olur; o hata ve aynı imzalı daha eski
-    hatalar kapanır, keşif adımları bekleyenleri kapatmaz. Başarısız sonuçta tekrar uyarısı ve eşleşen
+    başarısızlıklarından en yenisini kapsıyorsa ders adayı olur; uygun salt okunur tarayıcı okuması
+    aynı URL'deki başarısız ham okumayı da aday yapar. Başarısız sonuçta tekrar uyarısı ve eşleşen
     ders notu üretilir; bir ders görev başına en çok bir kez gösterilir. Saf: yeni izleyici döner.
     """
     if tool in EXCLUDED_TOOLS:
         return tracker, {"notes": [], "lesson_id": None}
     pending: Dict[str, Tuple[str, int]] = dict(tracker["pending"])
     feedback: List[Tuple[str, bool]] = list(tracker["feedback"])
-    waiting: Optional[Tuple[str, int]] = pending.get(tool)
-    if waiting is not None and turn > waiting[1]:
-        feedback.append((waiting[0], ok))
-        del pending[tool]
+    for failed_tool, waiting in list(pending.items()):
+        learned: Optional[Lesson] = next(
+            (item for item in state["lessons"] if item["id"] == waiting[0]), None,
+        )
+        expected_tool: str = learned["fixed_tool"] if learned is not None else failed_tool
+        if tool == expected_tool and turn > waiting[1]:
+            if learned is not None and learned["target_hash"]:
+                target_url: Optional[str] = _target_url(arguments)
+                parsed_arguments: object = _parse_arguments(arguments)
+                helped: bool = bool(
+                    ok and _target_hash(arguments) == learned["target_hash"]
+                    and isinstance(parsed_arguments, dict) and parsed_arguments.get("actions") == []
+                    and target_url is not None and _read_browser_result(detail, target_url)
+                )
+            else:
+                helped = ok
+            feedback.append((waiting[0], helped))
+            del pending[failed_tool]
     counts: Dict[str, int] = dict(tracker["failure_counts"])
     open_failures: Dict[str, List[Tuple[str, str]]] = {
         name: list(items) for name, items in tracker["open_failures"].items()
@@ -322,13 +417,29 @@ def observe_result(
     notes: List[str] = []
     shown_id: Optional[str] = None
     if ok:
+        if tool == "browse_url":
+            route_failures: List[Tuple[str, str]] = open_failures.get("fetch_raw", [])
+            for position in range(len(route_failures) - 1, -1, -1):
+                failed_arguments, failed_detail = route_failures[position]
+                route_candidate: Optional[LessonCandidate] = pair_route_candidate(
+                    failed_arguments, failed_detail, arguments, detail,
+                )
+                if route_candidate is None:
+                    continue
+                route_key: str = "|".join((route_candidate["tool"], route_candidate["error_key"],
+                                            route_candidate["fixed_tool"], route_candidate["target_hash"]))
+                candidates[route_key] = route_candidate
+                open_failures["fetch_raw"] = [
+                    item for index, item in enumerate(route_failures) if index != position
+                ]
+                break
         waiting_failures: List[Tuple[str, str]] = open_failures.get(tool, [])
         for position in range(len(waiting_failures) - 1, -1, -1):
             failed_arguments, failed_detail = waiting_failures[position]
             candidate: Optional[LessonCandidate] = pair_candidate(tool, failed_arguments, failed_detail, arguments)
             if candidate is None:
                 continue
-            candidates[f"{tool}|{candidate['error_key']}"] = candidate
+            candidates[f"{tool}|{candidate['error_key']}|{candidate['fixed_tool']}|{candidate['target_hash']}"] = candidate
             open_failures[tool] = [
                 item for index, item in enumerate(waiting_failures)
                 if index > position or (index < position and error_key(item[1]) != candidate["error_key"])
@@ -341,7 +452,9 @@ def observe_result(
         counts[signature] = counts.get(signature, 0) + 1
         if counts[signature] >= REPEAT_WARNING_THRESHOLD:
             notes.append(repeat_warning(counts[signature]))
-        lesson: Optional[Lesson] = match_lesson(state, tool, key, argument_tokens(arguments))
+        lesson: Optional[Lesson] = match_lesson(
+            state, tool, key, argument_tokens(arguments), route_error_key(detail), _target_hash(arguments),
+        )
         if lesson is not None and lesson["id"] not in shown:
             notes.append(lesson_hint(lesson))
             shown.append(lesson["id"])
@@ -361,8 +474,11 @@ def merge_candidates(state: ExperienceState, candidates: List[LessonCandidate], 
     for candidate in candidates:
         existing: Optional[int] = next(
             (index for index, lesson in enumerate(lessons)
-             if lesson["tool"] == candidate["tool"] and lesson["error_key"] == candidate["error_key"]
-             and similarity(lesson["failed_tokens"], candidate["failed_tokens"]) >= MATCH_SIMILARITY),
+             if lesson["tool"] == candidate["tool"] and lesson["fixed_tool"] == candidate["fixed_tool"]
+             and lesson["target_hash"] == candidate["target_hash"]
+             and lesson["error_key"] == candidate["error_key"]
+             and (bool(candidate["target_hash"]) or
+                  similarity(lesson["failed_tokens"], candidate["failed_tokens"]) >= MATCH_SIMILARITY)),
             None,
         )
         if existing is not None:
@@ -371,8 +487,13 @@ def merge_candidates(state: ExperienceState, candidates: List[LessonCandidate], 
                                  "updated_at": timestamp}
             continue
         lessons.append({
-            "id": lesson_id(candidate["tool"], candidate["error_key"], candidate["failed_tokens"]),
-            "tool": candidate["tool"], "error_key": candidate["error_key"],
+            "id": (
+                route_lesson_id(candidate["tool"], candidate["fixed_tool"], candidate["error_key"], candidate["target_hash"])
+                if candidate["target_hash"] else
+                lesson_id(candidate["tool"], candidate["error_key"], candidate["failed_tokens"])
+            ),
+            "tool": candidate["tool"], "fixed_tool": candidate["fixed_tool"],
+            "target_hash": candidate["target_hash"], "error_key": candidate["error_key"],
             "failed_tokens": candidate["failed_tokens"], "failed_call": candidate["failed_call"],
             "fixed_call": candidate["fixed_call"], "created_at": timestamp, "updated_at": timestamp,
             "uses": 0, "helped": 0,
@@ -434,8 +555,13 @@ def _lesson(value: object, index: int) -> Lesson:
         count: object = value.get(field)
         if not isinstance(count, int) or isinstance(count, bool) or count < 0:
             raise ValueError(f"lessons[{index}].{field} negatif olmayan tamsayı olmalı")
+    fixed_tool: object = value.get("fixed_tool", value["tool"])
+    target_hash: object = value.get("target_hash", "")
+    if not isinstance(fixed_tool, str) or not isinstance(target_hash, str):
+        raise ValueError(f"lessons[{index}] fixed_tool/target_hash metin olmalı")
     return {
-        "id": value["id"], "tool": value["tool"], "error_key": value["error_key"],
+        "id": value["id"], "tool": value["tool"], "fixed_tool": fixed_tool,
+        "target_hash": target_hash, "error_key": value["error_key"],
         "failed_tokens": list(tokens), "failed_call": value["failed_call"],
         "fixed_call": value["fixed_call"], "created_at": value["created_at"],
         "updated_at": value["updated_at"], "uses": value["uses"], "helped": value["helped"],
