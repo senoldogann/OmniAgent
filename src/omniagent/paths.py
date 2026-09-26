@@ -53,9 +53,14 @@ def backups_dir() -> Path:
     return data_root() / "backups"
 
 
+def project_root() -> Path:
+    """Kaynak deposunun kökü (düzenlenebilir kurulumda git çalışma ağacı)."""
+    return Path(__file__).resolve().parents[2]
+
+
 def legacy_project_root() -> Path:
     """Src-layout öncesi canlı runtime dosyalarının bulunduğu proje kökünü döndürür."""
-    return Path(__file__).resolve().parents[2]
+    return project_root()
 
 
 def _copy_missing_tree(source: Path, destination: Path) -> bool:

@@ -36,6 +36,9 @@ Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık 
 - `/mode normal`, `/mode long`, `/mode autonomous`: sonraki görevin tur/zaman bütçesini seçer.
 - `/schedules`: planlanmış görevleri kimlik, kural ve sonraki çalışma zamanıyla listeler.
 - `/unschedule <kimlik>`: planı siler.
+- `/update`: kodu günceller ve köprüyü yeni kodla yeniden başlatır (bkz. Uzaktan bakım).
+- `/restart`: köprüyü yalnız yeniden başlatır; diskteki kodu yükler.
+- `/doctor`: sürümü, hizmet türünü, ekran kaydı/erişilebilirlik iznini, hazır modelleri, sesli komut durumunu ve plan sayısını gösterir.
 - Entegrasyon soru sorarsa tek alan için düz metin, birden fazla alan için alan adlarını içeren JSON nesnesi gönderin.
 
 ## Zamanlanmış görevler
@@ -52,6 +55,31 @@ ve çalışırken yürür.
   sohbete "Kaçırıldı" yazılır.
 - Arayüzde görev sürerken zamanı gelen plan beklemeye alınır ve kilit boşalınca başlar.
 - Zamanlanmış görev yeni plan kuramaz (kendini çoğaltmaz); para hareketi onayı gibi kurallar aynen geçerlidir.
+
+## Uzaktan bakım
+
+Bilgisayar başında olmadan köprü güncellenebilir:
+
+- `/update` proje dizininde `git pull --ff-only` çalıştırır. Yerel değişiklik veya ayrışmış geçmiş varsa
+  hiçbir şeye dokunmaz, git'in hatasını yazar. `pyproject.toml` ya da `uv.lock` değiştiyse `uv sync --frozen`
+  çalışır (uv PATH'te yoksa `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`, `/usr/local/bin` aranır);
+  eşitleme başarısızsa köprü eski kodla çalışmayı sürdürür. Sonra alınan commit'ler yazılır ve köprü
+  yeniden başlar.
+- Karşılaştırma çalışan kodun commit'ine göredir: kod başka yoldan (Terminal, başka bir ajan) çekilmiş ama
+  köprü yeniden başlatılmamışsa `/update` bunu da yeni kod sayar. `/doctor` bu durumu "çalışan köprü daha
+  eski kodla" diye gösterir.
+- Yeniden başlatma aynı süreç kimliğiyle yapılır (`execv`): launchd hizmeti kesilmez, elle başlatılmış köprü
+  de aynı terminalde sürer. Yeni süreç açılınca sohbete "✓ Köprü yeniden başladı: <commit> · <tarih>" yazar.
+  Görev çalışırken `/update` ve `/restart` reddedilir; bakım sürerken zamanı gelen plan başlatılmaz, yeni
+  süreçte çalışır. Yeniden başlatma komutu tekrar işlenmez (güncelleme sırası önceden kaydedilir).
+- Masaüstü arayüzü ayrı süreçtir; yeni kodu yeniden açılınca yükler.
+- `/doctor` izinleri köprü sürecinin kendi gözünden denetler (launchd hizmetinde izni python ikilisi alır) ve
+  eksik izinde Sistem Ayarları'na eklenecek tam python yolunu yazar.
+
+Bu komutları bilmeyen eski bir köprü çalışıyorsa bir kez Mac'te `git pull` ve
+`.venv/bin/omniagent-telegram install-service` çalıştırılır. Bilgisayar başında değilseniz aynı komutu
+Telegram'dan OmniAgent'a çalıştırtabilirsiniz: komut ayrı oturumda çalıştığı için köprü kapanırken yarıda
+kalmaz, yeni köprüyü başlatır; o görevin yanıtı gelmeyebilir, ~15 sn sonra `/doctor` yazın.
 
 ## Dosya alışverişi
 

@@ -25,12 +25,15 @@ from openai import AsyncOpenAI
 
 from omniagent.approval import approval_granted
 from .capabilities import CapabilityService
-from omniagent.config import BACKENDS, apply_model_preferences, apply_stored_api_keys
+from omniagent.config import API_KEY_VARIABLES, BACKENDS, apply_model_preferences, apply_stored_api_keys, load_api_key
 from omniagent.core import schedule
 from omniagent.core.conversation import Exchange, trim_history
 from omniagent.core.events import AgentEvent, tool_label
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
-from omniagent.paths import schedules_file, telegram_settings_file
+from omniagent.platform.macos.permissions import accessibility_granted
+from omniagent.paths import project_root, schedules_file, telegram_settings_file
+from omniagent.tools.screen import screen_capture_granted
+from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, source_version, sync_dependencies
 from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
 from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
@@ -65,6 +68,10 @@ class TelegramError(RuntimeError):
     def __init__(self, message: str, status: Optional[int] = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class RestartRequested(Exception):
+    """Köprü yeni kodla yeniden başlamalı: run() temizliği yapar, main() aynı komutu execv eder."""
 
 
 class TelegramSettings(TypedDict):
@@ -687,6 +694,10 @@ class TelegramBridge:
         self.run_mode = "normal"
         self.verbose = False
         self.goal = ""
+        # Çalışan kodun commit'i (run() başında okunur); /update ve /doctor diskteki kodla karşılaştırır
+        self.loaded_commit: Optional[str] = None
+        # /update veya /restart sürerken zamanlayıcı görev başlatmaz
+        self.maintenance = False
 
     async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -870,7 +881,8 @@ class TelegramBridge:
         Kaçmış eski çalışmaları bildirip atlar; bilgisayar boşsa zamanı gelen ilk planı başlatır.
         Plan başlarken sonraki zamanına ilerletilir: görev uzun sürse de aynı plan iki kez başlamaz.
         `self.active` denetimi ile görev ataması arasında await yoktur; aksi hâlde araya giren
-        kullanıcı mesajının görevi ezilirdi.
+        kullanıcı mesajının görevi ezilirdi. Bakım (/update, /restart) sürerken görev başlamaz:
+        yeniden başlatma yeni başlamış görevi keserdi.
         """
         path = schedules_file()
         chat_id = self.settings["chat_id"]
@@ -884,7 +896,7 @@ class TelegramBridge:
             return
         for record in skipped:
             await self.api.send(chat_id, f"⏰ Kaçırıldı (bilgisayar kapalı/uykudaydı): {record['goal'][:300]}")
-        if self.active is not None:
+        if self.active is not None or self.maintenance:
             return
         ready = schedule.due_schedules(records, now)
         if not ready:
@@ -937,6 +949,74 @@ class TelegramBridge:
             await self.api.send(chat_id, "Planlanmış görev yok. Örnek: \"Her sabah 9'da gündemi özetle\".")
             return
         await self.api.send(chat_id, "Planlanmış görevler:\n" + "\n".join(schedule.describe_record(r) for r in records))
+
+    def _doctor_facts(self) -> DoctorFacts:
+        """Köprünün sürümünü, izinlerini ve hazır yeteneklerini toplar (git çağırır; iş parçacığında)."""
+        root = project_root()
+        head = head_commit(root)
+        try:
+            planned: Optional[int] = len(schedule.load_schedules(schedules_file()))
+        except (OSError, ValueError):
+            planned = None
+        return {
+            "version": source_version(root),
+            "stale": head is not None and self.loaded_commit is not None and head != self.loaded_commit,
+            "service": "launchd hizmeti" if os.environ.get("XPC_SERVICE_NAME") == SERVICE_LABEL
+            else "elle başlatılmış süreç",
+            "python": sys.executable,
+            "screen_capture": screen_capture_granted(),
+            "accessibility": accessibility_granted(),
+            "models": sorted(self.clients),
+            "voice": bool(load_api_key(API_KEY_VARIABLES["openai"])),
+            "schedules": planned,
+        }
+
+    async def _update_notes(self) -> Optional[List[str]]:
+        """
+        Kodu çeker, bağımlılıklar değiştiyse eşitler. Yeniden başlatılacaksa özet satırlarını döner;
+        kod güncelse veya bir adım başarısızsa sonucu sohbete yazar ve None döner.
+        """
+        chat_id = self.settings["chat_id"]
+        root = project_root()
+        await self.api.send(chat_id, "Güncelleme denetleniyor (git pull)…")
+        result = await asyncio.to_thread(pull_updates, root, self.loaded_commit)
+        if not result["ok"] or not result["changed"]:
+            await self.api.send(chat_id, result["message"])
+            return None
+        notes = [result["message"], *result["commits"]]
+        if result["dependencies_changed"]:
+            await self.api.send(chat_id, "Bağımlılıklar değişti; eşitleniyor (uv sync)…")
+            failure = await asyncio.to_thread(sync_dependencies, root)
+            if failure is not None:
+                await self.api.send(chat_id, "\n".join(
+                    notes + [failure, "Köprü eski kodla çalışmayı sürdürüyor; sorun giderilince /restart."]
+                ))
+                return None
+            notes.append("Bağımlılıklar eşitlendi.")
+        return notes + ["Masaüstü arayüzü açıksa yeni kodu yeniden açılınca yükler."]
+
+    async def _maintenance_command(self, text: str) -> None:
+        """
+        /doctor durumu raporlar. /update kodu çekip köprüyü yeni kodla yeniden başlatır; /restart
+        yalnız yeniden başlatır. Görev çalışırken yeniden başlatılmaz.
+        """
+        chat_id = self.settings["chat_id"]
+        if text == "/doctor":
+            facts = await asyncio.to_thread(self._doctor_facts)
+            await self.api.send(chat_id, "\n".join(doctor_lines(facts)))
+            return
+        if self.active is not None:
+            await self.api.send(chat_id, "Bir görev çalışıyor; bitince ya da /stop sonrası yeniden deneyin.")
+            return
+        self.maintenance = True
+        try:
+            notes = await self._update_notes() if text == "/update" else []
+            if notes is None:
+                return
+            await self.api.send(chat_id, "\n".join(notes + ["Yeniden başlatılıyor…"]))
+        finally:
+            self.maintenance = False
+        raise RestartRequested()
 
     async def _start_attachment_task(self, message: Dict[str, Any], attachment: TelegramAttachment) -> None:
         """Eki indirir ve açıklamasıyla (yoksa varsayılan istekle) görevi başlatır."""
@@ -1009,6 +1089,9 @@ class TelegramBridge:
             state = f"Çalışıyor: {self.goal[:400]}" if self.active is not None else "Hazır."
             await self.api.send(chat_id, state)
             return
+        if text in ("/doctor", "/update", "/restart"):
+            await self._maintenance_command(text)
+            return
         if text in ("/start", "/help"):
             await self.api.send(
                 chat_id,
@@ -1017,7 +1100,9 @@ class TelegramBridge:
                 "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar. "
                 "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
                 "ajan istediğiniz dosyaları size buradan geri gönderebilir. "
-                "\"Her sabah 9'da …\" gibi görevler planlanır; /schedules listeler, /unschedule <kimlik> siler.",
+                "\"Her sabah 9'da …\" gibi görevler planlanır; /schedules listeler, /unschedule <kimlik> siler. "
+                "/update kodu günceller ve köprüyü yeniden başlatır, /restart yalnız yeniden başlatır, "
+                "/doctor sürümü ve izinleri gösterir.",
             )
             return
         if self.pending_answer is not None:
@@ -1050,10 +1135,18 @@ class TelegramBridge:
         self.stop_event.clear()
         self.active = asyncio.create_task(self._execute(text))
 
-    async def run(self) -> None:
+    async def run(self, announce: bool = False) -> None:
+        """Güncellemeleri yoklar. `announce`: /update veya /restart sonrası açılışı sohbete bildirir."""
         self.clients = create_model_clients()
+        self.loaded_commit = await asyncio.to_thread(head_commit, project_root())
         scheduler = asyncio.create_task(self._scheduler_loop())
         try:
+            if announce:
+                version = await asyncio.to_thread(source_version, project_root())
+                try:
+                    await self.api.send(self.settings["chat_id"], f"✓ Köprü yeniden başladı: {version}")
+                except TelegramError as error:
+                    logging.warning("Açılış bildirimi gönderilemedi", extra={"error": str(error)[:200]})
             failures = 0
             while True:
                 try:
@@ -1146,6 +1239,12 @@ async def setup() -> None:
 SERVICE_LABEL = "com.omniagent.telegram"
 
 
+def bridge_command(announce: bool = False) -> List[str]:
+    """Köprüyü bu yorumlayıcıyla çalıştıran komut; launchd kaydı ve /restart aynı komutu kullanır."""
+    command = [sys.executable, "-m", "omniagent.integrations.telegram", "run"]
+    return command + ["--announce"] if announce else command
+
+
 def service_plist_path() -> Path:
     """Kullanıcı LaunchAgent plist yolunu tek yerde tanımlar."""
     return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
@@ -1156,12 +1255,7 @@ def build_launchd_record() -> Dict[str, Any]:
     root = data_root()
     return {
         "Label": SERVICE_LABEL,
-        "ProgramArguments": [
-            sys.executable,
-            "-m",
-            "omniagent.integrations.telegram",
-            "run",
-        ],
+        "ProgramArguments": bridge_command(),
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": str(root / "telegram-stdout.log"),
@@ -1212,18 +1306,19 @@ def install_service() -> None:
     print(f"Telegram hizmeti kuruldu/güncellendi: {path}")
 
 
-async def run_bridge() -> None:
+async def run_bridge(announce: bool = False) -> None:
     """Tek yoklayıcıyı çalıştırır; iki süreç aynı komutu iki kez işlemez."""
     settings = load_settings()
     with host_task_lock(data_root() / "telegram-bridge.lock"):
         api = TelegramAPI(load_token())
         bridge = TelegramBridge(api, settings)
-        await bridge.run()
+        await bridge.run(announce)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="OmniAgent Telegram köprüsü")
     parser.add_argument("action", choices=("setup", "run", "install-service"))
+    parser.add_argument("--announce", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
     # Arka plan servisi kabuk ortamını miras almaz: Ayarlar'da kayıtlı anahtarları uygula.
     apply_stored_api_keys()
@@ -1233,7 +1328,12 @@ def main() -> None:
         elif arguments.action == "install-service":
             install_service()
         else:
-            asyncio.run(run_bridge())
+            asyncio.run(run_bridge(arguments.announce))
+    except RestartRequested:
+        # Kilit ve bağlantılar kapandı; aynı PID yeni kodu yükler (launchd hizmeti kesilmez)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(sys.executable, bridge_command(announce=True))
     except (TelegramError, HostBusyError, KeyboardInterrupt) as error:
         print(f"Telegram: {error}", file=sys.stderr)
         raise SystemExit(1) from None
