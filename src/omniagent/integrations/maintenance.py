@@ -14,6 +14,7 @@ import subprocess
 from typing import Callable, Dict, List, Optional, Sequence, TypedDict
 
 from omniagent.tools.system import child_environment
+from omniagent.tools.types import ScreenSession
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 DEPENDENCY_FILES: frozenset[str] = frozenset({"pyproject.toml", "uv.lock"})
@@ -45,6 +46,8 @@ class DoctorFacts(TypedDict):
     python: str
     screen_capture: bool
     accessibility: bool
+    screen: ScreenSession
+    keep_awake: bool
     models: List[str]
     voice: bool
     schedules: Optional[int]
@@ -145,6 +148,17 @@ def source_version(root: Path, runner: Runner = subprocess.run) -> str:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else "bilinmiyor"
 
 
+def screen_line(session: ScreenSession) -> str:
+    """Ekranın uzaktan kullanılabilirliği: kilitliyken yalnız ekran dışı görevler çalışır. Saf."""
+    if not session["on_console"]:
+        return "✗ Ekran: başka kullanıcı oturumu önde; ekran/klavye görevleri çalışmaz"
+    if session["locked"]:
+        return "✗ Ekran kilitli: ekran/klavye görevleri çalışmaz; kabuk, dosya ve web görevleri çalışır"
+    if session["asleep"]:
+        return "✓ Ekran uykuda ama kilitsiz (ekran görevi gelince uyandırılır)"
+    return "✓ Ekran açık ve kilitsiz"
+
+
 def doctor_lines(facts: DoctorFacts) -> List[str]:
     """Durum raporunun satırları; eksik izin için izni alacak python yolunu da söyler. Saf."""
     def mark(ok: bool) -> str:
@@ -159,6 +173,9 @@ def doctor_lines(facts: DoctorFacts) -> List[str]:
         + ("" if facts["screen_capture"] else " yok: ekran görüntüsü ve OCR çalışmaz"),
         f"{mark(facts['accessibility'])} Erişilebilirlik izni"
         + ("" if facts["accessibility"] else " yok: fare/klavye olayları düşer"),
+        screen_line(facts["screen"]),
+        f"{mark(facts['keep_awake'])} Uyku engeli"
+        + (" (prizdeyken Mac uyumaz)" if facts["keep_awake"] else " yok: Mac uyursa köprü yanıt vermez"),
         f"Hazır modeller: {', '.join(facts['models']) or 'yok'}",
         f"{mark(facts['voice'])} Sesli komut" + ("" if facts["voice"] else " kapalı: OpenAI API anahtarı yok"),
         f"Planlanmış görev: {schedules}",

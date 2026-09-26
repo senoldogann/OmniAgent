@@ -29,3 +29,6 @@ if sys.platform != "darwin":
     sys.modules["Quartz"].CGPreflightScreenCaptureAccess.return_value = False
     sys.modules["Quartz"].CGRequestScreenCaptureAccess.return_value = False
     sys.modules["ApplicationServices"].AXIsProcessTrusted.return_value = False
+    # Oturum açık ve konsolda, ekran uyanık: kilit denetimi sahte değerle "kilitli" sanılmasın.
+    sys.modules["Quartz"].CGSessionCopyCurrentDictionary.return_value = {"kCGSSessionOnConsoleKey": True}
+    sys.modules["Quartz"].CGDisplayIsAsleep.return_value = False

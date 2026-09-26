@@ -15,6 +15,14 @@ kaldığı yerden devam etmek için gereken durumu içerir.
 - GitHub Actions artık iş başlatıyor (önceki PR'larda 0 dakika/`runner_id` 0 ile hiç başlamıyordu).
   PR #6'da ilk kez gerçek pyobjc'li macOS işi koştu: 417 geçti, 2 atlandı (canlı API ve canlı Chrome
   testleri); Linux işi de yeşil. Kullanıcının Mac'inde canlı ekran/Telegram denemesi yapılmadı.
+- `omniagent-benchmark` refactor'den beri çalışmıyordu (betik async `main(runs, …)`'i argümansız
+  çağırıyordu; belgelerdeki kök `benchmark.py` yok). #8 ile düzeldi; refactor sonrası kodun gerçek
+  modelle ölçümü hâlâ yapılmadı: Mac'te `/update` sonrası Telegram'dan
+  `.venv/bin/omniagent-benchmark --runs 3 --concurrency 3` çalıştırılabilir.
+- Uzaktan kullanım: köprü prizdeyken Mac'i uyanık tutar (`caffeinate -s -w <pid>`); GUI kapıları kilitli
+  ekrana olay göndermez (`SCREEN_LOCKED`), kilitsiz uyuyan ekranı uyandırır; `/doctor` ikisini gösterir.
+  Gerçek Quartz oturum sözlüğü ve `pmset` doğrulaması macOS CI'da koşar; kullanıcının Mac'inde kilitli
+  ekranla canlı deneme yapılmadı.
 
 ## 25 Eylül (akşam) — src-layout refactor gerilemeleri geri alındı
 - `db972bb` araç katmanını yeniden yazarken ölçülmüş davranışı kaybetmişti. Eski `tools.py`,

@@ -53,6 +53,8 @@ Ekran kaydı izni eksikse araç "izin yok" demekle kalmaz: izni alacak uygulamay
 kimliğiyle, yoksa eklenecek tam python yolunu ve Sistem Ayarları komutunu yazar; ilk eksik
 denemede macOS'un izin istemi bir kez gösterilir (uygulama sisteme ancak böyle kaydolur).
 `.venv/bin/omniagent-permissions` aynı tanıyı (ekran kaydı ve erişilebilirlik) komut satırında verir.
+Ekran kilitliyse GUI araçları kilit ekranına tıklamadan/yazmadan "ekran kilitli" hatasıyla durur; kilitsiz
+ama uyuyan ekran uyandırılır. Telegram köprüsü açıkken prizdeki Mac uyumaz.
 
 Kurulum ve sınırlar [TELEGRAM.md](TELEGRAM.md) içindedir. Bu değişiklikte canlı
 Telegram mesajı gönderilmedi; yerel hizmetin çalıştığı doğrulandı.

@@ -19,7 +19,7 @@ import Quartz
 from .screen import (
     _check_in_model_space, _raise_if_stopped, accessibility_help,
     click_model_point, current_geometry, drag_model_points, move_model_point,
-    multi_click_model_point, parse_point, points_to_model,
+    multi_click_model_point, parse_point, points_to_model, require_unlocked_screen,
 )
 from .system import child_environment
 from .types import (
@@ -58,10 +58,11 @@ def _require_accessibility() -> None:
     """
     Sentetik fare/klavye olayları ve AX okuma erişilebilirlik izni ister. İzin yoksa
     macOS olayları SESSİZCE düşürür; araç 'başarılı' deyip hiçbir şey yapmasın diye
-    açık hata verilir.
+    açık hata verilir. Kilitli ekrana olay gönderilmez (bkz. require_unlocked_screen).
     """
     if not AX.AXIsProcessTrusted():
         raise ToolError(accessibility_help(), "AX_PERMISSION", False)
+    require_unlocked_screen()
 
 
 def _ax_present(value: object) -> object:
