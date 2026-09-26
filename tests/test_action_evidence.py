@@ -241,6 +241,63 @@ def test_read_only_shell_probe_is_not_deletion_evidence() -> None:
     assert not main._obviously_read_only_shell(redirected)
 
 
+def test_git_status_is_observation_not_mutation_evidence() -> None:
+    status = json.dumps({"command": "git status --short"})
+    steps = [sm.make_step_record("execute_shell", status, True, "Çıkış Kodu: 0")]
+    assert main._obviously_read_only_shell(status)
+    assert not main.has_action_evidence("Bu dosyayı sil", steps)
+    assert main.has_action_evidence("Dosyaları listele", steps)
+    assert not main._obviously_read_only_shell(json.dumps({
+        "command": "git status --short; rm -f /tmp/deneme.txt",
+    }))
+    assert not main._obviously_read_only_shell(json.dumps({
+        "command": "git status --short > /tmp/durum.txt",
+    }))
+
+
+@pytest.mark.asyncio
+async def test_git_status_then_false_delete_claim_stays_unverified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    turns = 0
+    events: list[dict[str, Any]] = []
+
+    async def fake_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str,
+        backend: str, emit: Any, should_stop: Any,
+    ) -> tuple[dict[str, Any], str]:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return _turn("", [{
+                "id": "status-1", "name": "execute_shell",
+                "arguments": json.dumps({"command": "git status --short"}),
+            }]), backend
+        emit({"kind": "text_delta", "text": "Dosya silindi."})
+        return _turn("Dosya silindi."), backend
+
+    async def fake_execute(calls: Any, toolbox: Any, cache: Any, emit: Any, should_stop: Any) -> Any:
+        return [{"tool_call_id": "status-1", "ok": True, "result": "Çıkış Kodu: 0"}]
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    monkeypatch.setattr(main, "_execute_tool_calls", fake_execute)
+    service = CapabilityService(tmp_path)
+    try:
+        report = await main.run_agent_with_callback(
+            "Bu dosyayı sil", events.append,
+            {"requested_backend": None, "should_stop": lambda: False,
+             "state_file": str(tmp_path / "memory.json"), "history": [],
+             "integrations": service}, {"ollama-cloud": object()},
+        )
+    finally:
+        await service.close()
+    assert turns == 3  # İlk sonuçtan sonra kanıtsız final için bir kurtarma turu.
+    assert not report["success"]
+    assert report["outcome"].startswith("Doğrulanmadı:")
+    assert "Dosya silindi." not in str(events)
+    assert "Dosya silindi." not in report["exchange"]["answer"]
+
+
 def test_screenshot_request_follows_real_telegram_goals() -> None:
     """Telegram'dan gelen gerçek hedefler: görüntü isteyenler ve yalnız ekrana baktıranlar."""
     for goal in (

@@ -156,6 +156,8 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   beklenir; delivery aşamasında 2 anlamsız tur bounded-stop üretir. 24 Eylül 3 koşuluk stress
   ölçümünde `long_research` 3/3 başarı, 6 tur/13 araç ve 8,5 sn medyan; `stagnation` 3/3
   beklenen bounded-failure, 7 tur ve 5,4 sn medyan verdi (önceki politika 10 turdu).
+  Mutasyon hedefinde `git status` salt gözlemdir; başarılı `execute_shell` sonucu olsa da
+  tek başına işlem kanıtı sayılmaz. Zincirli yazma komutları ayrıca değerlendirilir.
 - **Zaman sınırları:** model isteği 30sn (bağlantı 5sn) ve SDK içi yeniden deneme kapalıdır
   (SDK varsayılanı 600sn + 2 gizli deneme idi); composer'da Normal 25 tur/10dk,
   Uzun 50 tur/20dk, Otonom 100 tur/45dk bütçeleri sunar. Dört ardışık tamamen başarısız
