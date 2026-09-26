@@ -58,4 +58,4 @@ runtime tarafından açılır; prompt talimatı tek güvenlik sınırı değildi
 tespiti best-effort bir denylist/desen filtresidir ve evrensel secret scanner garantisi vermez.
 `recall` hafızayı değiştirmediği için mutation capability olmadan kullanılabilir.
 
-Test: `OMNI_UI_TEST=1 .venv/bin/python -m pytest -q`. Hız karşılaştırması için `benchmark.py --runs 3 --json ...` kullanılır.
+Test: `OMNI_UI_TEST=1 .venv/bin/python -m pytest -q`. Hız karşılaştırması için `.venv/bin/omniagent-benchmark --runs 3 --concurrency 3 --json ...` kullanılır.

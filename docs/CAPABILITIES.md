@@ -104,7 +104,7 @@ Açık Chrome yönlendirmesi sonrasında son genel Qwen benchmark'ı 27/27 başa
 4,0 saniye medyan verdi.
 
 Görünür Chrome'da arama yapıp ilk üç ilanın kodunu okuyan yerel GUI senaryosunda
-(`benchmark.py --only chrome_ilan --concurrency 1`, gecikmeli XHR ve yükleme iskeletli sayfa)
+(`omniagent-benchmark --only chrome_ilan --concurrency 1`, gecikmeli XHR ve yükleme iskeletli sayfa)
 önceki sürüm 2 koşuda 1 başarı, 73 saniye medyan ve 14-24 tur verdi; güncel sürüm 3/3 başarı,
 30 saniye medyan ve 6 tur verdi. Aynı anda koşulan genel benchmark'ta güncel sürüm 42/45,
 önceki sürüm 44/45 başarı ve 4,7/4,6 saniye medyan verdi; hatalar iki sürümde de aynı türdeydi

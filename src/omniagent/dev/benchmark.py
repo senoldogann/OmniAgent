@@ -4,12 +4,13 @@ koşturur; başarı oranı, medyan/en kötü süre, tur ve token (önbellek dahi
 Her optimizasyon yalnızca süreyle değil, doğrulukla birlikte ölçülsün diye vardır.
 
 Kullanım:
-  .venv/bin/python benchmark.py --runs 3 --concurrency 3
-  .venv/bin/python benchmark.py --runs 3 --backend opencode-think --only gun,paralel
-  .venv/bin/python benchmark.py --runs 3 --json /tmp/omni_bench.json
-  .venv/bin/python benchmark.py --runs 2 --concurrency 1 --only chrome_ilan   # ekranı ve Chrome'u kullanır
-  .venv/bin/python benchmark.py --runs 2 --concurrency 1 --only chrome_maas,chrome_form   # kaydırma + form doğrulaması
-  .venv/bin/python benchmark.py --runs 4 --concurrency 1 --only ogrenme,ogrenme_bos,hafiza
+  .venv/bin/omniagent-benchmark --runs 3 --concurrency 3
+  .venv/bin/omniagent-benchmark --runs 3 --concurrency 3 --backend opencode-think --only gun,paralel
+  .venv/bin/omniagent-benchmark --runs 3 --concurrency 3 --json /tmp/omni_bench.json
+  .venv/bin/omniagent-benchmark --runs 2 --concurrency 1 --only chrome_ilan   # ekranı ve Chrome'u kullanır
+  .venv/bin/omniagent-benchmark --runs 2 --concurrency 1 --only chrome_maas,chrome_form   # kaydırma + form doğrulaması
+  .venv/bin/omniagent-benchmark --runs 2 --concurrency 1 --only chrome_maas,chrome_form --headless  # görünmez Chromium
+  .venv/bin/omniagent-benchmark --runs 4 --concurrency 1 --only ogrenme,ogrenme_bos,hafiza
 """
 import argparse
 import asyncio
@@ -28,7 +29,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Callable, Dict, List, NotRequired, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, NotRequired, Optional, Sequence, Tuple, TypedDict
 from urllib.parse import parse_qs, urlsplit
 
 from openai import AsyncOpenAI
@@ -852,7 +853,7 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
     return "\n".join(lines)
 
 
-async def main(
+async def run_benchmark(
     runs: int, concurrency: int, backend: Optional[str], names: List[str], json_path: Optional[str],
     gui_stage: GuiStage,
 ) -> None:
@@ -883,9 +884,8 @@ async def main(
         Path(json_path).write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-if __name__ == "__main__":
-    # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
-    apply_stored_api_keys()
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    """`omniagent-benchmark` giriş noktası: argümanları doğrular ve seçilen senaryoları koşturur."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(description="OmniAgent hız + doğruluk benchmark'ı")
     parser.add_argument("--runs", type=int, required=True, help="Senaryo başına koşu sayısı")
     parser.add_argument("--concurrency", type=int, required=True, help="Aynı anda koşan görev sayısı")
@@ -894,7 +894,7 @@ if __name__ == "__main__":
     parser.add_argument("--json", default=None, help="Ham sonuçların yazılacağı JSON dosyası")
     parser.add_argument("--headless", action="store_true",
                         help="GUI senaryolarını kullanıcının ekranı yerine görünmez Chromium'da koş (headless_screen.py)")
-    arguments: argparse.Namespace = parser.parse_args()
+    arguments: argparse.Namespace = parser.parse_args(argv)
     selected: List[str] = [name for name in arguments.only.split(",") if name]
     unknown: List[str] = [name for name in selected if name not in SCENARIO_NAMES]
     if unknown:
@@ -903,14 +903,20 @@ if __name__ == "__main__":
         parser.error(f"GUI senaryoları ({', '.join(GUI_SCENARIOS)}) tek ekranı paylaşır: --concurrency 1 kullan.")
     if set(selected) & set(SEQUENTIAL_SCENARIOS) and arguments.concurrency != 1:
         parser.error(f"Öğrenme senaryoları ({', '.join(SEQUENTIAL_SCENARIOS)}) ardışık koşmalı: --concurrency 1 kullan.")
+    # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
+    apply_stored_api_keys()
     if not arguments.headless:
-        asyncio.run(main(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json,
-                         CHROME_STAGE))
+        asyncio.run(run_benchmark(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json,
+                                  CHROME_STAGE))
     else:
         headless_page: HeadlessPage = HeadlessPage()
         try:
             install_headless_screen(headless_page)
-            asyncio.run(main(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json,
-                             headless_stage(headless_page)))
+            asyncio.run(run_benchmark(arguments.runs, arguments.concurrency, arguments.backend, selected,
+                                      arguments.json, headless_stage(headless_page)))
         finally:
             headless_page.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -117,14 +117,14 @@ kaldığı yerden devam etmek için gereken durumu içerir.
 
 ## Çalıştırma
 ```bash
-.venv/bin/python ui.py                                 # akışlı arayüz
-.venv/bin/python main.py "<hedef>"                     # CLI (terminale akış)
+.venv/bin/omniagent-ui                                 # akışlı arayüz
+.venv/bin/omniagent "<hedef>"                          # CLI (terminale akış)
 .venv/bin/python -m pytest tests/ -q                   # canlı API testi: OMNI_LIVE_API_TEST=1
-.venv/bin/python benchmark.py --runs 3 --concurrency 3 # hız + doğruluk ölçümü
+.venv/bin/omniagent-benchmark --runs 3 --concurrency 3 # hız + doğruluk ölçümü
 # GUI ölçümü: fareyi/klavyeyi kullanır, açık bir Chrome penceresi gerekir
-.venv/bin/python benchmark.py --runs 3 --concurrency 1 --only chrome_ilan,chrome_maas,chrome_form
+.venv/bin/omniagent-benchmark --runs 3 --concurrency 1 --only chrome_ilan,chrome_maas,chrome_form
 # Aynı GUI senaryoları kullanıcının ekranına dokunmadan (görünmez Chromium, headless_screen.py)
-.venv/bin/python benchmark.py --runs 3 --concurrency 1 --only chrome_maas,chrome_form --headless
+.venv/bin/omniagent-benchmark --runs 3 --concurrency 1 --only chrome_maas,chrome_form --headless
 # Gerçek Chrome sekme testi (ekranda geçici pencereler açar)
 OMNI_CHROME_TEST=1 .venv/bin/python -m pytest tests/test_core.py -q -k live_matching_tab
 ```

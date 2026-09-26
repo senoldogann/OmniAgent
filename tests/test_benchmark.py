@@ -131,3 +131,37 @@ def test_close_chrome_test_tabs_falls_back_to_active_test_tab(monkeypatch) -> No
 
     assert shell_calls == [["open", "-a", "Google Chrome"]]
     assert keys == ["cmd+w"]
+
+
+def test_command_line_entry_point_validates_and_runs_selected_scenarios(monkeypatch) -> None:
+    """`omniagent-benchmark` betiği argümansız çağrılan senkron main'i çalıştırır."""
+    import pytest
+
+    runs: list[tuple] = []
+    applied: list[bool] = []
+
+    async def fake_run(*arguments) -> None:
+        runs.append(arguments)
+
+    monkeypatch.setattr(benchmark, "run_benchmark", fake_run)
+    monkeypatch.setattr(benchmark, "apply_stored_api_keys", lambda: applied.append(True))
+    benchmark.main(["--runs", "2", "--concurrency", "3", "--only", "gun,json"])
+    assert runs == [(2, 3, None, ["gun", "json"], None, benchmark.CHROME_STAGE)] and applied == [True]
+
+    for invalid in (["--runs", "1", "--concurrency", "2", "--only", "chrome_ilan"],
+                    ["--runs", "1", "--concurrency", "1", "--only", "yok"]):
+        with pytest.raises(SystemExit):
+            benchmark.main(invalid)
+    assert len(runs) == 1 and applied == [True]  # geçersiz argümanda anahtar deposuna dokunulmaz
+
+    closed: list[bool] = []
+
+    class FakePage:
+        def close(self) -> None:
+            closed.append(True)
+
+    monkeypatch.setattr(benchmark, "HeadlessPage", FakePage)
+    monkeypatch.setattr(benchmark, "install_headless_screen", lambda page: None)
+    monkeypatch.setattr(benchmark, "headless_stage", lambda page: "görünmez sahne")
+    benchmark.main(["--runs", "1", "--concurrency", "1", "--only", "chrome_maas", "--headless"])
+    assert runs[-1][-1] == "görünmez sahne" and closed == [True]
