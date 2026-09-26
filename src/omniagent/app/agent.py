@@ -678,6 +678,9 @@ async def run_agent_with_callback(
     action_evidence_recoveries: int = 0
     must_change_source: bool = source_change_expected(goal, options["history"])
     must_execute_action: bool = action_execution_expected(goal)
+    guarded_final_output: bool = (
+        must_change_source or must_execute_action or unmet_wait_status(goal, []) is not None
+    )
     gui_verified: bool = False
     gui_verification_failures: int = 0
     task_ledger: str = ""
@@ -724,18 +727,39 @@ async def run_agent_with_callback(
             messages_for_model = inject_task_ledger_into_messages(messages, host_task_ledger)
             emit({"kind": "turn_started", "turn": iteration, "max_turns": max_iterations,
                   "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
+
+            def emit_model_event(event: AgentEvent) -> None:
+                # Kanıt kapısına tabi görevde modelin erken "yaptım" metnini hiçbir yüzeye
+                # aktarma. Kabul edilen nihai metin aşağıda host kararıyla yayınlanır.
+                if guarded_final_output and event["kind"] in ("text_delta", "reasoning_delta"):
+                    return
+                emit(event)
+
             model_started: float = time.monotonic()
             try:
                 turn, used_backend = await _call_model_with_retries(
-                    clients, messages_for_model, tool_schemas, session_id, current_backend, emit, options["should_stop"],
+                    clients, messages_for_model, tool_schemas, session_id, current_backend,
+                    emit_model_event, options["should_stop"],
                 )
             finally:
                 model_elapsed: float = time.monotonic() - model_started
                 model_seconds += model_elapsed
             turns += 1
             usage = add_usage(usage, turn["usage"])
-            emit({"kind": "model_finished", "turn": iteration,
-                  "seconds": round(model_elapsed, 2), "usage": turn["usage"]})
+            model_finished_event: AgentEvent = {
+                "kind": "model_finished", "turn": iteration,
+                "seconds": round(model_elapsed, 2), "usage": turn["usage"],
+            }
+            if not guarded_final_output:
+                emit(model_finished_event)
+
+            def finish_guarded_turn(visible_text: Optional[str] = None) -> None:
+                """Kabul edilen metni model turunu kapatmadan önce göster; her turu bir kez kapat."""
+                if not guarded_final_output:
+                    return
+                if visible_text:
+                    emit({"kind": "text_delta", "text": visible_text})
+                emit(model_finished_event)
             if used_backend != current_backend:
                 permanent_failure = current_backend in runtime.blocked_backends
                 emit({"kind": "backend_changed", "backend": used_backend, "model": BACKENDS[used_backend]["model"],
@@ -747,6 +771,7 @@ async def run_agent_with_callback(
                 if permanent_failure:
                     current_backend = used_backend
             if turn["finish_reason"] == "stopped":
+                finish_guarded_turn()
                 outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
             messages.append(_assistant_entry(turn))
@@ -766,19 +791,24 @@ async def run_agent_with_callback(
                                 "Bir işlem yapamadıysan tamamlandı deme; somut engeli belirt."
                             ),
                         })
+                        finish_guarded_turn()
                         continue
-                    outcome = turn["content"]
                     reason = "model araç çağrısını tekrar yalnız metin olarak yazdı; hiçbir araç çalışmadı"
+                    outcome = f"Doğrulanmadı: {reason}" if guarded_final_output else turn["content"]
+                    finish_guarded_turn(outcome)
                     break
                 if awaiting_real_tool_call:
-                    outcome = turn["content"]
                     reason = "metinsel araç çağrısından sonra gerçek araç çağrısı yapılmadı"
+                    outcome = f"Doğrulanmadı: {reason}" if guarded_final_output else turn["content"]
+                    finish_guarded_turn(outcome)
                     break
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
                 status_gap = unmet_wait_status(goal, steps)
                 if success and status_gap is not None:
                     success, reason = False, status_gap
+                    if guarded_final_output:
+                        outcome = f"Doğrulanmadı: {reason}"
                 if success and must_change_source and not any(
                     step["tool"] in {"write_file", "edit_file"} and step["ok"] for step in steps
                 ):
@@ -795,9 +825,12 @@ async def run_agent_with_callback(
                             ),
                         })
                         outcome, reason, success = "", "", False
+                        finish_guarded_turn()
                         continue
                     success = False
                     reason = "kod değişikliği istendi fakat hiçbir dosya başarıyla değiştirilmedi"
+                    if guarded_final_output:
+                        outcome = f"Doğrulanmadı: {reason}"
                 if success and must_execute_action and not has_action_evidence(goal, steps):
                     if action_evidence_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
                         action_evidence_recoveries += 1
@@ -812,15 +845,19 @@ async def run_agent_with_callback(
                             ),
                         })
                         outcome, reason, success = "", "", False
+                        finish_guarded_turn()
                         continue
                     success = False
                     reason = "eylem istendi fakat başarılı işlem kanıtı yok"
+                    if guarded_final_output:
+                        outcome = f"Doğrulanmadı: {reason}"
                 if success and not gui_verified and gui_verification_needed(steps):
                     # Ekranda iş yapan görev bir kez güncel ekranla doğrulanmadan bitmez: canlı kayıtta
                     # model formun yarısını doldurup "gönderdim", paneli kaydırmadan "tüm ilanlara
                     # baktım" dedi. Bitiş anındaki gözlem tahmini değil, gerçek son durumu gösterir.
                     emit({"kind": "notice", "level": "info",
                           "text": "Bitiş doğrulaması: güncel ekranla her zorunlu madde kontrol ediliyor."})
+                    finish_guarded_turn()
                     verification_started: float = time.monotonic()
                     try:
                         observation, observation_step, _digest = await _observe_after_actions(
@@ -862,9 +899,14 @@ async def run_agent_with_callback(
                         ),
                     })
                     outcome, reason = "", ""
+                    finish_guarded_turn()
                     continue
+                if guarded_final_output and not success and turn["finish_reason"] in ("length", "content_filter"):
+                    outcome = f"Doğrulanmadı: {reason}"
+                finish_guarded_turn(outcome)
                 break
 
+            finish_guarded_turn()
             awaiting_real_tool_call = False
             if turn["finish_reason"] == "length":
                 emit({"kind": "notice", "level": "warning",
@@ -1084,12 +1126,17 @@ async def run_agent_with_callback(
     finally:
         history_answer: str = outcome
         if not success:
-            # Yarım kalan görev etiketlenir ve çalışma kaydı (STATE) sohbet geçmişine taşınır:
-            # kullanıcı "devam et" dediğinde model doğrulanmış bilgileri ve kalan adımları
-            # baştan araştırmadan sürdürür.
+            # Yarım kalan görev etiketlenir ve güvenilir çalışma kaydı geçmişe taşınır:
+            # kullanıcı "devam et" dediğinde doğrulanmış bilgileri yeniden aramaz.
+            # Kanıt kapısına tabi görevde modelin kendi STATE beyanı doğrulanmış değildir;
+            # yalnız gerçek araç çıktılarından ayıklanan host gerçeklerini geçmişe taşı.
+            history_ledger: str = (
+                format_ledger_prompt({**host_task_ledger, "model_state": ""})
+                if guarded_final_output else combined_ledger or task_ledger
+            )
             history_answer = "\n".join(part for part in (
                 f"[Görev tamamlanamadı: {reason}]" if reason else "[Görev tamamlanamadı]",
-                combined_ledger or task_ledger, outcome,
+                history_ledger, outcome,
             ) if part)
         exchange: Exchange = make_exchange(goal, history_answer, steps)
         metrics = {

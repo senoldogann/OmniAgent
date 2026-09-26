@@ -94,6 +94,14 @@ tool call korunurken tek request 0,727→0,628 saniye ölçüldü. Eski Codex/Op
 sınırı ve API bakiyesi görevler arasında değişebilir. Durum bekleme hedeflerinde son gözlenen
 JSON status beklenen değere ulaşmadıysa modelin erken son yanıtı başarı sayılmaz.
 
+Kaynak kodu değiştirme, eylem gerçekleştirme ve durum bekleme hedeflerinde modelin tur içindeki
+metin ve düşünme akışı, host sonuca karar verene kadar kullanıcıya gösterilmez. Kabul edilen
+son yanıt veya kısa `Doğrulanmadı: ...` sonucu model turu kapanmadan yayımlanır; araç
+olayları akmaya devam eder. Başarısız görev geçmişine modelin doğrulanmamış `STATE` beyanı
+alınmaz; yalnız araç çıktılarından çıkarılmış host gerçekleri korunur. Bu kapı mevcut eylem,
+kaynak yazımı ve durum kanıtını uygular; hedefteki bütün alt maddeler için genel bir doğrulama
+garantisi vermez.
+
 23 Eylül'deki önceki genel benchmark 9 senaryoda üçer koşuyla 27/27 başarı ve 4,95 saniye
 medyan süre verdi. Aynı koşularda sürenin toplam %99,4'ü model çağrılarında geçti; yerel
 araç süresi 27 görevde toplam 0,84 saniyeydi. Fotoğraf görevindeki özel aracın ilk model

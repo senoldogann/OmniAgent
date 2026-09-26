@@ -165,6 +165,10 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   satır satır) `events.py`'deki tipli olaylarla yayınlanır; yarıda kesilen akış yeniden
   denenirse önce `stream_reset` gelir. Durdurma isteği model akışını ve çalışan komutu (süreç
   grubuyla) anında keser.
+  Kaynak değişikliği, eylem ve durum bekleme hedeflerinde modelin metin ve düşünme parçaları
+  host kararı öncesinde kullanıcıya aktarılmaz; kabul edilen son yanıt veya `Doğrulanmadı`
+  sonucu `model_finished` öncesinde yayınlanır. Başarısız korunan görevin geçmişine
+  doğrulanmamış model `STATE` beyanı yazılmaz; araç kaynaklı host gerçekleri korunur.
 - **Bellek:** `cognitive_memory.json` son 30 görevi ölçümleriyle kaydeder ve modele geri
   enjekte EDİLMEZ. `user_memory.json` ise yalnızca kullanıcının açıkça istediği tercih, sık yol
   ve karar kayıtlarını atomik olarak tutar; kısa kayıtlar her görev başında sistem bağlamına
