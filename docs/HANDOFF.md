@@ -1,7 +1,19 @@
-# OmniAgent — Devir Notu (2026-09-25)
+# OmniAgent — Devir Notu (2026-09-26)
 
 Kurallar, mimari ve performans kararlarının tek kaynağı `AGENTS.md`'dir; bu not yalnızca
 kaldığı yerden devam etmek için gereken durumu içerir.
+
+## 26 Eylül — Telegram'dan uzaktan bakım
+- Mac'teki başka bir ajan izin listesi yüzünden `uv`/`.venv/bin/omniagent-*` çalıştıramadı; köprü eski
+  kodla kaldı. `/update` (git pull + gerekirse uv sync + yeniden başlatma), `/restart` ve `/doctor`
+  eklendi (`integrations/maintenance.py`). Sonraki güncellemeler telefondan yapılır.
+- Bağımlılık dosyaları `db972bb`'den beri değişmedi; düzenlenebilir kurulumda yeni kod için `uv sync`
+  gerekmez, köprünün yeniden başlaması yeter.
+- Tek seferlik geçiş: bu komutları bilmeyen köprü için Mac'te `git pull` ve
+  `.venv/bin/omniagent-telegram install-service` (ya da Telegram'dan OmniAgent'a aynı komut). Sonra
+  `/doctor` sürümü ve izinleri doğrular.
+- GitHub Actions bu özel depoda iş başlatmıyor (0 faturalı dakika, `runner_id` 0): hesap faturalama
+  sorunu. Testler Linux'ta xvfb ile koşuldu; macOS'ta canlı koşu yapılmadı.
 
 ## 25 Eylül (akşam) — src-layout refactor gerilemeleri geri alındı
 - `db972bb` araç katmanını yeniden yazarken ölçülmüş davranışı kaybetmişti. Eski `tools.py`,

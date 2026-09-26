@@ -241,6 +241,12 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   görüntüsü ayrıca gönderilir. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
   Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
   Kurulum: [TELEGRAM.md](docs/TELEGRAM.md).
+- Uzaktan bakım (`integrations/maintenance.py`): `/update` `git pull --ff-only` (yerel değişikliğe dokunmaz),
+  `pyproject.toml`/`uv.lock` değiştiyse `uv sync --frozen`, sonra yeniden başlatma; `/restart` yalnız
+  yeniden başlatır; `/doctor` sürümü, izinleri (köprü sürecinin kendi TCC izni), modelleri ve planları
+  raporlar. Fark çalışan kodun commit'ine göre hesaplanır; başka yoldan çekilmiş kod da yüklenir.
+  Yeniden başlatma `execv` ile aynı PID'dir (launchd hizmeti kesilmez), yeni süreç sohbete açıldığını
+  yazar. Görev sürerken reddedilir; bakım sırasında zamanlayıcı görev başlatmaz.
 - Zamanlanmış görevler (`core/schedule.py`, `schedules.json`): yerel duvar saatiyle hesaplanır (yaz saati
   geçişinde kaymaz); köprü 30 sn'de bir denetler, kaçan çalışmayı 6 saat içinde bir kez yetiştirir,
   eskisini atlayıp bildirir; host kilidi meşgulse bekletir. Zamanlanmış çalışmada `schedule_task`
