@@ -31,8 +31,9 @@ from omniagent.core.conversation import Exchange, trim_history
 from omniagent.core.events import AgentEvent, tool_label
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 from omniagent.platform.macos.permissions import accessibility_granted
+from omniagent.platform.macos.power import start_keep_awake, stop_keep_awake
 from omniagent.paths import project_root, schedules_file, telegram_settings_file
-from omniagent.tools.screen import screen_capture_granted
+from omniagent.tools.screen import screen_capture_granted, screen_session
 from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, source_version, sync_dependencies
 from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
 from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
@@ -698,6 +699,8 @@ class TelegramBridge:
         self.loaded_commit: Optional[str] = None
         # /update veya /restart sürerken zamanlayıcı görev başlatmaz
         self.maintenance = False
+        # Köprü açıkken prizdeki Mac'in uyumasını engelleyen caffeinate süreci (run() yönetir)
+        self.keep_awake: Optional["subprocess.Popen[bytes]"] = None
 
     async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -966,6 +969,8 @@ class TelegramBridge:
             "python": sys.executable,
             "screen_capture": screen_capture_granted(),
             "accessibility": accessibility_granted(),
+            "screen": screen_session(),
+            "keep_awake": self.keep_awake is not None and self.keep_awake.poll() is None,
             "models": sorted(self.clients),
             "voice": bool(load_api_key(API_KEY_VARIABLES["openai"])),
             "schedules": planned,
@@ -1139,6 +1144,7 @@ class TelegramBridge:
         """Güncellemeleri yoklar. `announce`: /update veya /restart sonrası açılışı sohbete bildirir."""
         self.clients = create_model_clients()
         self.loaded_commit = await asyncio.to_thread(head_commit, project_root())
+        self.keep_awake = start_keep_awake(os.getpid())
         scheduler = asyncio.create_task(self._scheduler_loop())
         try:
             if announce:
@@ -1174,6 +1180,9 @@ class TelegramBridge:
                     save_json(offset_path(), {"offset": self.offset})
                     await self.handle(update)
         finally:
+            # Önce: /restart execv'den sonra yenisini kurar, eski engel geride kalmasın
+            stop_keep_awake(self.keep_awake)
+            self.keep_awake = None
             scheduler.cancel()
             await asyncio.gather(scheduler, return_exceptions=True)
             self.stop_event.set()

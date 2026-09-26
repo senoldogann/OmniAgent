@@ -4,6 +4,7 @@ Yüksek performanslı ekran yakalama, çoklu monitör yönetimi ve optimize edil
 """
 import logging
 import os
+import subprocess
 import sys
 import time
 from typing import Callable, Dict, List, Optional, Tuple
@@ -14,9 +15,10 @@ import pyautogui
 import Quartz
 import cv2
 
-from .system import parent_process_name
+from .system import child_environment, parent_process_name
 from .types import (
     ACCESSIBILITY_SETTINGS_URL,
+    DISPLAY_WAKE_SECONDS,
     MODEL_SCREEN_SIZE,
     MOUSE_DRAG_HOLD_SECONDS,
     MOUSE_DRAG_STEP_SECONDS,
@@ -33,6 +35,7 @@ from .types import (
     SCREEN_SETTINGS_URL,
     TOOL_RUNTIME,
     ScreenGeometry,
+    ScreenSession,
     ToolError,
     ToolRuntime,
 )
@@ -153,9 +156,71 @@ def screen_capture_granted(request: bool = False) -> bool:
     try: return bool(Quartz.CGPreflightScreenCaptureAccess())
     except Exception: return False
 
+SCREEN_LOCKED_HELP: str = (
+    "Mac'in ekranı kilitli: ekran görüntüsü, tıklama ve yazma kilit ekranında işe yaramaz ve yazılanlar "
+    "parola alanına gidebilir. Kilidi yalnız kullanıcı açabilir; parola denemeyin, kilidi aşmaya çalışmayın. "
+    "Ekran gerektirmeyen yolla (kabuk, dosya, görünmez tarayıcı) sürdürün ya da kullanıcıdan Mac'in "
+    "kilidini açmasını isteyin."
+)
+OTHER_CONSOLE_HELP: str = (
+    "Mac'te şu an başka bir kullanıcı oturumu önde: bu oturumun ekranı ve klavyesi kullanılamaz. "
+    "Ekran gerektirmeyen yolla sürdürün ya da kullanıcıya bildirin."
+)
+
+def screen_session() -> ScreenSession:
+    """
+    Oturum sözlüğünden kilit ve konsol durumunu, ana ekranın uyku durumunu okur. Bilgi
+    alınamazsa (GUI oturumu yok, API hatası) engellemez: açık ve uyanık oturum sayılır.
+    """
+    try:
+        session = Quartz.CGSessionCopyCurrentDictionary() or {}
+        return {
+            "locked": bool(session.get("CGSSessionScreenIsLocked", False)),
+            "on_console": bool(session.get("kCGSSessionOnConsoleKey", True)),
+            "asleep": bool(Quartz.CGDisplayIsAsleep(Quartz.CGMainDisplayID())),
+        }
+    except Exception as error:
+        logging.warning("Oturum durumu okunamadı", extra={"error_type": type(error).__name__})
+        return {"locked": False, "on_console": True, "asleep": False}
+
+def screen_lock_problem(session: ScreenSession) -> Optional[str]:
+    """Ekran/klavye eylemini engelleyen oturum durumunun açıklaması; engel yoksa None. Saf."""
+    if not session["on_console"]: return OTHER_CONSOLE_HELP
+    if session["locked"]: return SCREEN_LOCKED_HELP
+    return None
+
+def _wake_display() -> None:
+    """Kullanıcı etkinliği bildirir (caffeinate -u) ve ekranın açılmasını kısa süre bekler."""
+    try:
+        subprocess.Popen(
+            ["/usr/bin/caffeinate", "-u", "-t", "2"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_environment(),
+        )
+    except OSError as error:
+        logging.warning("Ekran uyandırılamadı", extra={"error_type": type(error).__name__})
+        return
+    deadline = time.monotonic() + DISPLAY_WAKE_SECONDS
+    while screen_session()["asleep"] and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+def require_unlocked_screen() -> None:
+    """
+    Kilitli ekrana tıklanmasını ve yazılmasını önler: yazılanlar parola alanına gidebilir.
+    Kilitsiz ama uyuyan ekran uyandırılır; aksi hâlde görüntü karanlık gelirdi. Uyanınca kilit
+    ekranı çıkabileceği için durum yeniden okunur.
+    """
+    session = screen_session()
+    if session["asleep"] and screen_lock_problem(session) is None:
+        _wake_display()
+        session = screen_session()
+    problem = screen_lock_problem(session)
+    if problem is not None:
+        raise ToolError(problem, "SCREEN_LOCKED", False)
+
 def _require_screen_capture() -> None:
-    if screen_capture_granted(request=True): return
-    raise ToolError(screen_capture_help(), "SCREEN_CAPTURE_PERMISSION", False)
+    if not screen_capture_granted(request=True):
+        raise ToolError(screen_capture_help(), "SCREEN_CAPTURE_PERMISSION", False)
+    require_unlocked_screen()
 
 def _display_image(display_id: int, resolution: int) -> object:
     image = Quartz.CGWindowListCreateImage(Quartz.CGDisplayBounds(display_id), Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID, resolution)

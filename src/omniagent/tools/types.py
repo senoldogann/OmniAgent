@@ -56,6 +56,8 @@ SETTLE_POLL_SECONDS: float = 0.03
 SETTLE_REACTION_SECONDS: float = 1.0
 SETTLE_QUIET_SECONDS: float = 0.45
 SETTLE_MAX_SECONDS: float = 3.0
+# Uyuyan ekranın kullanıcı etkinliği bildirimiyle açılmasını bekleme sınırı
+DISPLAY_WAKE_SECONDS: float = 2.0
 
 # Chrome sekme ve AppleScript zaman aşımları
 CHROME_LOAD_CHECKS: int = 80
@@ -124,6 +126,13 @@ class ScreenGeometry(TypedDict):
     model_height: int
     origin_x: NotRequired[int]
     origin_y: NotRequired[int]
+
+
+class ScreenSession(TypedDict):
+    """Konsol oturumunun kilit durumu ve ana ekranın uyku durumu (izin gerektirmez)."""
+    locked: bool
+    on_console: bool
+    asleep: bool
 
 
 class ActionStep(TypedDict, total=False):

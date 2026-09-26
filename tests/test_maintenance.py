@@ -1,11 +1,13 @@
 """Telegram'dan bakım: git ile güncelleme, bağımlılık eşitleme, durum raporu ve yeniden başlatma."""
 import asyncio
+import os
 import re
 import subprocess
 import sys
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -112,16 +114,27 @@ def test_doctor_lines_name_missing_permissions_and_the_python_to_allow() -> None
     facts: maintenance.DoctorFacts = {
         "version": "abc1234 · 26.09.2026 09:15", "stale": True, "service": "launchd hizmeti",
         "python": "/Users/me/OmniAgent/.venv/bin/python", "screen_capture": True, "accessibility": False,
+        "screen": {"locked": True, "on_console": True, "asleep": True}, "keep_awake": False,
         "models": ["ollama-cloud", "openai"], "voice": False, "schedules": 2,
     }
     lines = maintenance.doctor_lines(facts)
     assert lines[0] == "Sürüm: abc1234 · 26.09.2026 09:15 (çalışan köprü daha eski kodla; yüklemek için /restart)"
     assert "✓ Ekran kaydı izni" in lines and "✗ Erişilebilirlik izni yok: fare/klavye olayları düşer" in lines
+    assert "✗ Ekran kilitli: ekran/klavye görevleri çalışmaz; kabuk, dosya ve web görevleri çalışır" in lines
+    assert "✗ Uyku engeli yok: Mac uyursa köprü yanıt vermez" in lines
     assert "Hazır modeller: ollama-cloud, openai" in lines and "✗ Sesli komut kapalı: OpenAI API anahtarı yok" in lines
     assert lines[-1].endswith("/Users/me/OmniAgent/.venv/bin/python")
-    granted = maintenance.doctor_lines({**facts, "stale": False, "accessibility": True, "schedules": None})
+    granted = maintenance.doctor_lines({
+        **facts, "stale": False, "accessibility": True, "schedules": None, "keep_awake": True,
+        "screen": {"locked": False, "on_console": True, "asleep": True},
+    })
     assert granted[0] == "Sürüm: abc1234 · 26.09.2026 09:15" and "Planlanmış görev: okunamadı" in granted
+    assert "✓ Ekran uykuda ama kilitsiz (ekran görevi gelince uyandırılır)" in granted
+    assert "✓ Uyku engeli (prizdeyken Mac uyumaz)" in granted
     assert not any(".venv/bin/python" in line for line in granted)
+    assert maintenance.screen_line({"locked": False, "on_console": False, "asleep": False}).startswith(
+        "✗ Ekran: başka kullanıcı oturumu önde")
+    assert maintenance.screen_line({"locked": False, "on_console": True, "asleep": False}) == "✓ Ekran açık ve kilitsiz"
 
 
 # --- Telegram komutları ---
@@ -281,7 +294,9 @@ async def test_doctor_reports_version_permissions_and_capabilities_even_during_a
     monkeypatch.setattr(telegram, "screen_capture_granted", lambda: False)
     monkeypatch.setattr(telegram, "accessibility_granted", lambda: True)
     monkeypatch.setattr(telegram, "load_api_key", lambda variable: None)
+    monkeypatch.setattr(telegram, "screen_session", lambda: {"locked": True, "on_console": True, "asleep": False})
     monkeypatch.setenv("XPC_SERVICE_NAME", telegram.SERVICE_LABEL)
+    bridge.keep_awake = SimpleNamespace(poll=lambda: None)  # type: ignore[assignment]
     bridge.active = asyncio.create_task(asyncio.sleep(10))
     await bridge.handle(message("/doctor"))
     bridge.active.cancel()
@@ -290,6 +305,8 @@ async def test_doctor_reports_version_permissions_and_capabilities_even_during_a
     assert report[0] == "Sürüm: bbbbbbb · 26.09.2026 12:00 (çalışan köprü daha eski kodla; yüklemek için /restart)"
     assert "Hizmet: launchd hizmeti" in report and "✗ Ekran kaydı izni yok: ekran görüntüsü ve OCR çalışmaz" in report
     assert "✓ Erişilebilirlik izni" in report and "Hazır modeller: ollama-cloud, openai" in report
+    assert "✗ Ekran kilitli: ekran/klavye görevleri çalışmaz; kabuk, dosya ve web görevleri çalışır" in report
+    assert "✓ Uyku engeli (prizdeyken Mac uyumaz)" in report
     assert "Planlanmış görev: 0" in report and report[-1].endswith(sys.executable)
 
 
@@ -300,12 +317,19 @@ async def test_run_announces_restart_and_cleans_up_before_restarting(
     monkeypatch.setattr(telegram, "create_model_clients", lambda: {})
     monkeypatch.setattr(telegram, "head_commit", lambda root: "a" * 40)
     monkeypatch.setattr(telegram, "source_version", lambda root: "aaaaaaa · 26.09.2026 12:00")
+    awake = SimpleNamespace(poll=lambda: None)
+    started: List[int] = []
+    stopped: List[Any] = []
+    monkeypatch.setattr(telegram, "start_keep_awake", lambda pid: started.append(pid) or awake)
+    monkeypatch.setattr(telegram, "stop_keep_awake", lambda process: stopped.append(process))
     api = MaintenanceAPI([{"update_id": 41, **message("/restart")}])
     bridge = new_bridge(api, tmp_path, monkeypatch)
     with pytest.raises(telegram.RestartRequested):
         await bridge.run(announce=True)
     assert api.sent == ["✓ Köprü yeniden başladı: aaaaaaa · 26.09.2026 12:00", "Yeniden başlatılıyor…"]
     assert api.closed and bridge.loaded_commit == "a" * 40
+    # Uyku engeli köprü süreciyle kuruldu ve execv'den önce kaldırıldı (yenisi birikmez)
+    assert started == [os.getpid()] and stopped == [awake] and bridge.keep_awake is None
     # Yeni süreç /restart komutunu yeniden işlemez
     assert telegram.read_json(telegram.offset_path(), {}) == {"offset": 42}
 

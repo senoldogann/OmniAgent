@@ -24,7 +24,7 @@ OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır.
    .venv/bin/omniagent-telegram install-service
    ```
 
-Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık ve internete bağlı olmalıdır. Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
+Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık ve internete bağlı olmalıdır; köprü açıkken Mac prize takılıysa uyumaz (pilde uyuyabilir, uyuyan Mac mesaj alamaz). Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
 
 ## Sohbet komutları
 
@@ -38,7 +38,7 @@ Hizmet `launchd` kullanıcı oturumunda çalışır. Bilgisayar açık, uyanık 
 - `/unschedule <kimlik>`: planı siler.
 - `/update`: kodu günceller ve köprüyü yeni kodla yeniden başlatır (bkz. Uzaktan bakım).
 - `/restart`: köprüyü yalnız yeniden başlatır; diskteki kodu yükler.
-- `/doctor`: sürümü, hizmet türünü, ekran kaydı/erişilebilirlik iznini, hazır modelleri, sesli komut durumunu ve plan sayısını gösterir.
+- `/doctor`: sürümü, hizmet türünü, ekran kaydı/erişilebilirlik iznini, ekranın kilit/uyku durumunu, uyku engelini, hazır modelleri, sesli komut durumunu ve plan sayısını gösterir.
 - Entegrasyon soru sorarsa tek alan için düz metin, birden fazla alan için alan adlarını içeren JSON nesnesi gönderin.
 
 ## Zamanlanmış görevler
@@ -80,6 +80,17 @@ Bu komutları bilmeyen eski bir köprü çalışıyorsa bir kez Mac'te `git pull
 `.venv/bin/omniagent-telegram install-service` çalıştırılır. Bilgisayar başında değilseniz aynı komutu
 Telegram'dan OmniAgent'a çalıştırtabilirsiniz: komut ayrı oturumda çalıştığı için köprü kapanırken yarıda
 kalmaz, yeni köprüyü başlatır; o görevin yanıtı gelmeyebilir, ~15 sn sonra `/doctor` yazın.
+
+## Uzaktayken ekran ve uyku
+
+- Köprü açıkken `caffeinate -s` ile Mac prize takılıyken uyumaz; ekran kapanabilir. Pilde Mac normal
+  uyur ve uyuduğunda köprü yanıt vermez; uzaktan erişim için prize takılı bırakın.
+- Ekran/klavye görevi geldiğinde kapalı ama kilitsiz ekran uyandırılır.
+- Ekran kilitliyse (ya da başka kullanıcı oturumu öndeyse) ajan kilit ekranına hiçbir şey tıklamaz veya
+  yazmaz; araç "ekran kilitli" diye hemen durur. Kilidi yalnız siz açabilirsiniz. Kabuk, dosya, dosya
+  gönderme ve görünmez tarayıcıyla yapılan web görevleri kilitliyken de çalışır.
+- Uzaktan ekran görevi için Mac'in kilidi açık kalmalıdır. Bu, ekran kapanınca parola sorma ayarına
+  (Sistem Ayarları > Kilit Ekranı) bağlıdır; ayarı değiştirmek güvenlik kararıdır ve sizindir.
 
 ## Dosya alışverişi
 

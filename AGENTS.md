@@ -27,6 +27,11 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   metni "Terminal/Python" gibi belirsiz ifade yerine izni alacak uygulamayı adı + bundle
   kimliğiyle, yoksa eklenecek tam python yolunu ve sayfayı açan komutu yazar; `omniagent-permissions`
   aynı tanıyı komut satırında verir.
+- Kilitli ekrana olay gönderilmez: iki GUI kapısı (`_require_accessibility`, `_require_screen_capture`)
+  oturum sözlüğünü okur; ekran kilitliyse veya konsolda başka kullanıcı öndeyse hiçbir tıklama/yazma
+  yapılmadan `SCREEN_LOCKED` ile durulur (kilit ekranına yazılanlar parola alanına giderdi). Kilitsiz
+  ama uyuyan ekran `caffeinate -u` ile uyandırılır; kilitli ekran boşuna aydınlatılmaz. Oturum bilgisi
+  okunamazsa engellenmez. Görünmez benchmark ekranı bu kapıları zaten devre dışı bırakır.
 - Sırlar süreç ağacına yayılmaz: API anahtarları `os.environ` yerine süreç-içi depoda tutulur,
   alt süreçlere `child_environment()` anahtar değişkenleri çıkarılmış ortam verir ve araç
   çıktısı modele/transcripte gitmeden önce `redact()` ile maskelenir. Böylece model
@@ -247,6 +252,9 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   raporlar. Fark çalışan kodun commit'ine göre hesaplanır; başka yoldan çekilmiş kod da yüklenir.
   Yeniden başlatma `execv` ile aynı PID'dir (launchd hizmeti kesilmez), yeni süreç sohbete açıldığını
   yazar. Görev sürerken reddedilir; bakım sırasında zamanlayıcı görev başlatmaz.
+- Köprü açıkken `caffeinate -s -w <pid>` (`platform/macos/power.py`) prizdeki Mac'in uyumasını
+  engeller; pilde Mac normal uyur, ekran uykusu engellenmez. Yeniden başlatmadan önce kaldırılır.
+  `/doctor` ekranın kilit/uyku durumunu ve uyku engelini de gösterir.
 - Zamanlanmış görevler (`core/schedule.py`, `schedules.json`): yerel duvar saatiyle hesaplanır (yaz saati
   geçişinde kaymaz); köprü 30 sn'de bir denetler, kaçan çalışmayı 6 saat içinde bir kez yetiştirir,
   eskisini atlayıp bildirir; host kilidi meşgulse bekletir. Zamanlanmış çalışmada `schedule_task`
