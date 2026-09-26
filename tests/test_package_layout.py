@@ -27,6 +27,7 @@ def test_project_is_installable_src_package_with_entry_points() -> None:
 
 def test_script_targets_exist_and_root_has_no_production_python_files() -> None:
     import importlib
+    import inspect
 
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     for target in project["project"]["scripts"].values():
@@ -34,6 +35,13 @@ def test_script_targets_exist_and_root_has_no_production_python_files() -> None:
         module = importlib.import_module(module_name)
         entry = getattr(module, attribute, None)
         assert callable(entry), f"Entry point callable bulunamadı: {target}"
+        # Konsol betiği hedefi argümansız ve senkron çağırır; coroutine döndüren hedef hiç çalışmaz
+        assert not inspect.iscoroutinefunction(entry), f"Entry point async olamaz: {target}"
+        assert all(
+            parameter.default is not inspect.Parameter.empty or parameter.kind in (
+                inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            for parameter in inspect.signature(entry).parameters.values()
+        ), f"Entry point argümansız çağrılabilmeli: {target}"
 
     assert list(ROOT.glob("*.py")) == []
 

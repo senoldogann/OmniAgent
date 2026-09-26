@@ -8,7 +8,7 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - Her ajan yalnız kendi dosyalarını commit eder; kirli çalışma ağacındaki başkasına ait
   değişiklikleri silmez, stash etmez veya commit'e katmaz. Birleştirme sonrası tam test koşulur.
 - Canlı macOS ekranı ve açık Chrome tek kaynaktır. GUI benchmark'ı kullanıcı veya başka ajan
-  ekranda çalışırken başlatılmaz; o sırada `benchmark.py --headless` aynı GUI senaryolarını gerçek
+  ekranda çalışırken başlatılmaz; o sırada `omniagent-benchmark --headless` aynı GUI senaryolarını gerçek
   ajan döngüsü ve araç mantığıyla görünmez Chromium'da ölçer (`headless_screen.py`; select menüsü
   ve Quartz yakalama yolu orada sınanmaz). UI ve Telegram görevleri `host_lock.py` ile çakışmayı reddeder.
 - UI süreci kodu açılışta yükler; kaynak dosya değişince çalışan süreç kendiliğinden güncellenmez.
@@ -71,7 +71,7 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - **Bağımlılıklar:** `pyproject.toml` + `uv.lock` (`uv sync` ile kurulur).
 
 ## ⚡ Performans Notları
-- **Ölçüm önce gelir:** `benchmark.py` 9 deterministik senaryoyu gerçek modelle koşturur; başarı
+- **Ölçüm önce gelir:** `.venv/bin/omniagent-benchmark` (`dev/benchmark.py`) 9 deterministik senaryoyu gerçek modelle koşturur; başarı
   oranı, medyan/maks süre, tur ve token (önbellek dahil) raporlar, ev dizininde istenmeyen dosya
   oluşursa bildirir. Her değişiklik hız VE doğrulukla birlikte ölçülmelidir.
 - **Araç diyeti:** genel yolda model 19 temel araç ve bir `discover_capabilities` şeması, açık
@@ -126,7 +126,7 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   Pencere görüntüsü Chrome'un önündeki kendi açılır pencerelerini (select menüsü, otomatik
   doldurma) de içerir; başka uygulamaların pencereleri karışmaz. Chrome AX
   ağacı web içeriğini vermediği (`AXManualAccessibility` desteklenmiyor, `AXEnhancedUserInterface`
-  ayarlanamıyor) için AX araçları bu yolda kapalıdır. `benchmark.py --only chrome_ilan
+  ayarlanamıyor) için AX araçları bu yolda kapalıdır. `omniagent-benchmark --only chrome_ilan
   --concurrency 1` (2026-09-23): önce 1/2 başarı, medyan 73 sn, 14-24 tur → sonra 3/3, medyan
   30 sn, 6 tur. Uzun görevlerde model artık her araç turunda kısa `STATE:` çalışma kaydı
   tutmaya yönlendirilir; aynı tam Chrome URL'sinin ikinci ve sonraki başarılı açılışlarında
