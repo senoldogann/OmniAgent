@@ -12,8 +12,9 @@ kaldığı yerden devam etmek için gereken durumu içerir.
 - Tek seferlik geçiş: bu komutları bilmeyen köprü için Mac'te `git pull` ve
   `.venv/bin/omniagent-telegram install-service` (ya da Telegram'dan OmniAgent'a aynı komut). Sonra
   `/doctor` sürümü ve izinleri doğrular.
-- GitHub Actions bu özel depoda iş başlatmıyor (0 faturalı dakika, `runner_id` 0): hesap faturalama
-  sorunu. Testler Linux'ta xvfb ile koşuldu; macOS'ta canlı koşu yapılmadı.
+- GitHub Actions artık iş başlatıyor (önceki PR'larda 0 dakika/`runner_id` 0 ile hiç başlamıyordu).
+  PR #6'da ilk kez gerçek pyobjc'li macOS işi koştu: 417 geçti, 2 atlandı (canlı API ve canlı Chrome
+  testleri); Linux işi de yeşil. Kullanıcının Mac'inde canlı ekran/Telegram denemesi yapılmadı.
 
 ## 25 Eylül (akşam) — src-layout refactor gerilemeleri geri alındı
 - `db972bb` araç katmanını yeniden yazarken ölçülmüş davranışı kaybetmişti. Eski `tools.py`,
