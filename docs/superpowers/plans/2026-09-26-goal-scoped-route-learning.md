@@ -15,14 +15,16 @@
 | Dosya | Sorumluluk |
 | --- | --- |
 | `src/omniagent/memory/experience.py` | URL eşlemesi, salt okunur tarayıcı kanıtı, ders adayları, eşleşme, geri bildirim ve eski kayıt göçü. |
+| `src/omniagent/tools/browser.py` | Sayfa başlığı ve gerçek metin arasına açık `SAYFA METNİ:` sınırı koyar. |
 | `tests/test_experience.py` | Çapraz araç davranışı ve gizlilik; mevcut aynı araç senaryosunun korunması. |
+| `tests/test_tool_regressions.py` | Tarayıcı metin sınırının çıktı sözleşmesi. |
 | `docs/CAPABILITIES.md` | Yeni öğrenme davranışının kısa yetenek açıklaması. |
 
 ## Task 1 — Aday eşlemesi ve gizlilik
 
 - [ ] Failing tests: tam URL aynı ve `actions=[]` olan `browse_url` sonucu `URL: <tam URL>` satırı ile boş olmayan sayfa metni içerdiğinde aday oluşur. Farklı URL, yönlendirme, eylem ve boş sayfa metninde aday oluşmaz.
 - [ ] `.venv/bin/python -m pytest tests/test_experience.py -q` ile yeni testin kırıldığını doğrula.
-- [ ] `pair_route_candidate(failed_arguments, failed_detail, fixed_arguments, fixed_detail)` saf fonksiyonunu ekle. JSON argümanlarını doğrula; HTTP(S) URL'lerini birebir karşılaştır; tarayıcı sonucu `URL`, `Başlık` ve `ÖĞELER` sınırları arasından sayfa metnini ayıkla. Adayda `tool="fetch_raw"`, `fixed_tool="browse_url"`, `target_hash=sha256(url)`, `failed_tokens=[]`, sabit çağrı şablonları olsun. `route_error_key(detail)` tek yardımcı fonksiyon olsun: **kırpılmamış** `normalize_text(detail)` sonucunun SHA-256 özetini `sha256:` önekiyle döndürsün; aday üretimi ve sonraki eşleşme yalnız bu fonksiyonu kullansın. 200 karakterden uzun hata testi ekle.
+- [ ] `pair_route_candidate(failed_arguments, failed_detail, fixed_arguments, fixed_detail)` saf fonksiyonunu ekle. JSON argümanlarını doğrula; HTTP(S) URL'lerini birebir karşılaştır; tarayıcı sonucu `URL`, `Başlık`, `SAYFA METNİ:` ve `ÖĞELER` sınırları arasından gerçek sayfa metnini ayıkla. `browser.py` çıktısına `SAYFA METNİ:` sınırı ekle; çok satırlı başlığı içerik saymayan test yaz. Adayda `tool="fetch_raw"`, `fixed_tool="browse_url"`, `target_hash=sha256(url)`, `failed_tokens=[]`, sabit çağrı şablonları olsun. `route_error_key(detail)` tek yardımcı fonksiyon olsun: **kırpılmamış** `normalize_text(detail)` sonucunun SHA-256 özetini `sha256:` önekiyle döndürsün; aday üretimi ve sonraki eşleşme yalnız bu fonksiyonu kullansın. 200 karakterden uzun hata testi ekle.
 - [ ] Hedefli testleri çalıştır; yalnız `src/omniagent/memory/experience.py` ve `tests/test_experience.py` dosyalarını commit et.
 
 ## Task 2 — Ders yaşam döngüsü
@@ -30,7 +32,7 @@
 - [ ] Failing tests: `observe_result` başarısız `fetch_raw` ardından geçerli `browse_url` adayını toplar; `finish_task(success=False)` saklamaz, `success=True` saklar. Aynı URL ve hata tekrarlandığında hatırlatma çıkar; farklı sorgulu URL'de çıkmaz. Hatırlatma sonrasında başarılı `browse_url` etki sayacını artırır.
 - [ ] Failing tests: eski JSON dersinde `fixed_tool` yoksa eski araç varsayılır; çapraz ders aynı araç dersinin yerini almaz ve sayaçlarını devralmaz.
 - [ ] Testleri kırmızı çalıştır.
-- [ ] `Lesson` ve `LessonCandidate` tiplerine `fixed_tool`, `target_hash` ekle; eski kayıtları `_lesson` içinde göç ettir. `observe_result` başarılı tarayıcı çağrısında bekleyen `fetch_raw` hatalarını tarasın; aday anahtarına düzeltme aracı ve hedef özetini katsın. `match_lesson` çapraz derste `route_error_key(detail)` ve URL özetini birebir karşılaştırsın, eski derste mevcut benzerliği korusun. `merge_candidates` iki ders türünü ayırsın. **Aynı araç dersinin mevcut `lesson_id(tool,key,tokens)` formülü değişmesin**; yalnız çapraz araç dersine ayrı `route_lesson_id(tool,fixed_tool,error_digest,target_hash)` formülü eklensin. Eski dersin yeniden öğrenildiğinde kimliği ve sayaçları korunarak güncellendiğini test et. Geri bildirim için bekleyen dersin `fixed_tool` değerini kullan.
+- [ ] `Lesson` ve `LessonCandidate` tiplerine `fixed_tool`, `target_hash` ekle; eski kayıtları `_lesson` içinde göç ettir. `observe_result` başarılı tarayıcı çağrısında bekleyen `fetch_raw` hatalarını tarasın; aday anahtarına düzeltme aracı ve hedef özetini katsın. `match_lesson` çapraz derste `route_error_key(detail)` ve URL özetini birebir karşılaştırsın, eski derste mevcut benzerliği korusun. `merge_candidates` iki ders türünü ayırsın. **Aynı araç dersinin mevcut `lesson_id(tool,key,tokens)` formülü değişmesin**; yalnız çapraz araç dersine ayrı `route_lesson_id(tool,fixed_tool,error_digest,target_hash)` formülü eklensin. Eski dersin yeniden öğrenildiğinde kimliği ve sayaçları korunarak güncellendiğini test et. Geri bildirim için bekleyen dersin `fixed_tool` değerini kullan; ilk sonraki çağrı yanlış URL veya eylem içeriyorsa hemen başarısız say.
 - [ ] Hedefli testleri yeşil çalıştır; yalnız kendi iki dosyanı commit et.
 
 ## Task 3 — Bütünleme ve ölçüm

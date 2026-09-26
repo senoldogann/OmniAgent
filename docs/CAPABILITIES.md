@@ -130,6 +130,10 @@ araç/hata imzası tekrarlandığında hatırlatılır ve işe yaramayan dersler
 canlı `self_repair` ölçümünde 3/3 başarı: ilk koşu 5 tur/4 araç/4,5 sn; öğrenilmiş iki koşu
 3 tur/2 araç ve 3,6/2,1 sn. Finansal para hareketleri ile kullanıcının istemediği kalıcı
 hafıza mutasyonları `approval.py` host kapısından geçer; onay yoksa araç çalıştırılmaz.
+Alternatif web okuma yolu da öğrenilir: `fetch_raw` hatasından sonra aynı tam URL'yi
+`browse_url(actions=[])` içerikle okur ve görev başarıyla biterse, bir sonraki aynı hatada
+tarayıcı yolu önerilir. Kalıcı derste URL veya hata metni değil özetleri tutulur; farklı
+hedefe ders taşınmaz ve önerinin etkisi aynı hedefteki sonraki çağrıyla ölçülür.
 
 
 24 Eylül ek canlı `self_repair` kontrolünde önce doğru `OZET: 42` komut çıktısı alınmasına rağmen Fast Loop son yanıtı beklemeden başarısız durdu (6 tur/6 araç). Yeni çıktıyı ilerleme sayan düzeltmeden sonra aynı senaryo 1/1 başarıyla 7 tur/6 araçta tamamlandı. Aynı kök altında ardışık iki koşu da başarılıydı; ikinci koşuda deneyim dersi kullanımı araç sayısını 4→2, tur sayısını 5→3 indirdi. Sağlayıcının iki geçici isteği geciktirmesi ikinci koşunun duvar süresini 126,6 saniyeye çıkardı; bu tek başına yerel araç süresinin ölçüsü değildir. Model isteği başına zaman aşımı bunun ardından 60 saniyeden 30 saniyeye indirildi; yeni sınırın canlı sağlayıcı hatasındaki etkisi henüz tekrar ölçülmedi.
