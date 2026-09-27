@@ -1,12 +1,13 @@
 """Tk transkripti için yan etkisiz, komut metinlerini koruyan Markdown dönüşümü."""
 import re
 import unicodedata
-from typing import List, Tuple, TypedDict
+from typing import List, NotRequired, Tuple, TypedDict
 
 
 class Span(TypedDict):
     text: str
     style: str
+    url: NotRequired[str]
 
 
 class Block(TypedDict):
@@ -24,6 +25,12 @@ _INLINE = re.compile(
     r"|(?P<bold>(?<!\w)\*\*(?=\S)(?P<strong>[^\n]*?\S)\*\*(?!\w))"
     r"|(?P<italic>(?<!\S)\*(?=\S)(?P<em>[^*\n]*?\S|[^*\s])\*(?=\s|$|[.,!?;:]))"
 )
+_LATEX_TEXT = re.compile(r"\$\\(?:text|mathrm|mathbf)\{([^{}]*)\}\$")
+
+
+def _plain_text(value: str) -> str:
+    """Modellerin düz metinde ürettiği basit LaTeX yazı komutlarını okunur metne çevirir."""
+    return _LATEX_TEXT.sub(r"\1", value)
 
 
 def _parse_markup(line: str) -> List[Span]:
@@ -32,20 +39,20 @@ def _parse_markup(line: str) -> List[Span]:
     position = 0
     for match in _INLINE.finditer(line):
         if match.start() > position:
-            spans.append({"text": line[position:match.start()], "style": "plain"})
+            spans.append({"text": _plain_text(line[position:match.start()]), "style": "plain"})
         if match.group("code"):
             spans.append({"text": match.group("body"), "style": "code"})
         elif match.group("link"):
-            spans.append({"text": f"{match.group('label')} ({match.group('url')})", "style": "link"})
+            spans.append({"text": match.group("label"), "style": "link", "url": match.group("url")})
         elif match.group("bold"):
             # İçteki kod biçimi yıldızlardan bağımsız korunur.
-            spans.extend({"text": s["text"], "style": "bold" if s["style"] == "plain" else s["style"]}
+            spans.extend({**s, "style": "bold" if s["style"] == "plain" else s["style"]}
                          for s in _parse_markup(match.group("strong")))
         else:
-            spans.append({"text": match.group("em"), "style": "italic"})
+            spans.append({"text": _plain_text(match.group("em")), "style": "italic"})
         position = match.end()
     if position < len(line):
-        spans.append({"text": line[position:], "style": "plain"})
+        spans.append({"text": _plain_text(line[position:]), "style": "plain"})
     return spans
 
 
@@ -68,11 +75,11 @@ def parse_spans(line: str) -> List[Span]:
         position = 0
         for match in token.finditer(span["text"]):
             if match.start() > position:
-                result.append({"text": span["text"][position:match.start()], "style": span["style"]})
+                result.append({**span, "text": span["text"][position:match.start()]})
             result.append({"text": codes[int(match.group(1))], "style": "code"})
             position = match.end()
         if position < len(span["text"]):
-            result.append({"text": span["text"][position:], "style": span["style"]})
+            result.append({**span, "text": span["text"][position:]})
     return result
 
 
@@ -183,23 +190,54 @@ def format_table(rows: List[List[str]]) -> List[str]:
     return result
 
 
-def render_markdown(text: str) -> List[Part]:
-    """Doğrudan UI._insert_parts tarafından tüketilen metin/etiket çiftlerini üretir."""
+def render_markdown(text: str, max_columns: int) -> List[Part]:
+    """
+    Doğrudan UI._insert_parts tarafından tüketilen metin/etiket çiftlerini üretir.
+    max_columns: sütunlu tablonun satır kaydırmadan sığdığı en geniş mono karakter sayısı.
+    """
     parts: List[Part] = []
     for block in parse_blocks(text):
         kind = block["kind"]
         base = ("assistant",)
         if kind == "code":
-            parts.append(("\n".join(block["lines"]) + "\n", base + ("md_codeblock",)))
+            lines = block["lines"] or [""]
+            for index, line in enumerate(lines):
+                # Blok içi satırlar sıkı kalır; iç boşluk yalnız ilk ve son satıra eklenir.
+                edges = (("md_codeblock_first",) if index == 0 else ()) + (
+                    ("md_codeblock_last",) if index == len(lines) - 1 else ())
+                parts.append((line + "\n", base + ("md_codeblock",) + edges))
         elif kind == "table":
-            for index, line in enumerate(format_table(block["rows"])):
-                parts.append((line + "\n", base + (("md_table_head",) if index == 0 else ())))
+            rows = block["rows"]
+            table_lines = format_table(rows)
+            # Yalnız başlıktan oluşan tablonun dikey karta dönüşecek satırı yoktur; sütunlu kalır.
+            if len(rows) == 1 or max(_width(line) for line in table_lines) <= max_columns:
+                for index, line in enumerate(table_lines):
+                    parts.append((line + "\n", base + ("md_table",) + (("md_table_head",) if index == 0 else ())))
+            else:
+                # Geniş hücreler, sabit sütun aralıklarında okunamayacak kadar taşar.
+                headers = rows[0]
+                for row in rows[1:]:
+                    for column, value in enumerate(row):
+                        label = headers[column] if column < len(headers) else f"Sütun {column + 1}"
+                        parts.append((label + "\n", base + ("md_table_label",)))
+                        for span in parse_spans(value):
+                            tags = base + ("md_table_value",)
+                            if span["style"] != "plain":
+                                tags += (f"md_{span['style']}",)
+                            if span.get("url", "").startswith(("https://", "http://")):
+                                tags += (f"md_href:{span['url']}",)
+                            parts.append((span["text"], tags))
+                        parts.append(("\n", base + ("md_table_value",)))
+                    parts.append(("\n", base + ("md_table_gap",)))
         elif kind == "rule":
             parts.append(("─" * 32 + "\n", base + ("md_rule",)))
         else:
             tag = f"md_h{block['level']}" if kind == "heading" else {"list_item": "md_bullet", "quote": "md_quote"}.get(kind)
             tags = base + ((tag,) if tag else ())
             for span in block["spans"]:
-                parts.append((span["text"], tags + ((f"md_{span['style']}",) if span["style"] != "plain" else ())))
+                span_tags = tags + ((f"md_{span['style']}",) if span["style"] != "plain" else ())
+                if span.get("url", "").startswith(("https://", "http://")):
+                    span_tags += (f"md_href:{span['url']}",)
+                parts.append((span["text"], span_tags))
             parts.append(("\n", tags))
     return parts

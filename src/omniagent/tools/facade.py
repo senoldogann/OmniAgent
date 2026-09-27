@@ -158,6 +158,8 @@ class Toolbox:
         self._visual_geometry: Optional[ScreenGeometry] = None
         self._visual_display_id: Optional[int] = None
         self._task_js: Dict[str, str] = {}
+        # Son başarılı capture_photo dosyası; host sohbet kartı için okur, model aracı değildir.
+        self.last_capture_path: Optional[str] = None
 
     @property
     def playwright_instance(self) -> Optional[Playwright]:
@@ -530,6 +532,7 @@ class Toolbox:
         )
 
     def capture_photo(self) -> str:
+        self.last_capture_path = None
         desktop = Path.home() / "Desktop"
         if not desktop.is_dir():
             raise ToolError(f"Masaüstü dizini bulunamadı: {desktop}", "MISSING_DIRECTORY", False)
@@ -574,6 +577,7 @@ class Toolbox:
                 os.link(temporary, target)
             except FileExistsError as error:
                 raise ToolError(f"Fotoğraf hedefi işlem sırasında oluştu: {target}", "FILE_EXISTS", False) from error
+            self.last_capture_path = str(target)
             return f"Fotoğraf kaydedildi ve doğrulandı: {target} ({target.stat().st_size} bayt)."
         finally:
             if temporary is not None:

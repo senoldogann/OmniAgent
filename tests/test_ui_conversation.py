@@ -4,15 +4,20 @@ import os
 from pathlib import Path
 import time
 from concurrent.futures import Future
-from typing import Any, Iterator
+from typing import Any, Iterator, List, Tuple
 
 import pytest
+from PIL import Image
 
 from omniagent.ui import app as ui
 from omniagent.app import agent as main
 from omniagent.config import DEFAULT_BACKEND
 from omniagent.core.conversation import make_exchange
+from omniagent.core.events import AgentEvent, ArtifactReady
 from omniagent.app.agent import ZERO_USAGE
+from omniagent.app.agent import artifact_event_for_call, merge_artifact
+from omniagent.integrations.capabilities import CapabilityService
+from omniagent.tools import filesystem
 
 
 @pytest.fixture
@@ -201,8 +206,145 @@ def test_finished_run_keeps_stats_in_footer(app: ui.OmniUI) -> None:
     app._handle_event({"kind": "run_finished", "success": True, "outcome": "tamam",
                        "reason": "", "metrics": metrics})
     assert "5.1 sn" in app.stats_label.cget("text")
-    assert "toplam 120 token" in app.stats_label.cget("text")
+    assert "toplam 120 token" not in app.stats_label.cget("text")
+    assert "toplam 120 token" in app._text.get("1.0", "end")
     assert "✓ Tamamlandı" in app._text.get("1.0", "end")
+
+
+def test_requested_screenshot_appears_inline_and_clear_removes_card(
+    app: ui.OmniUI, tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "ekran.png"
+    Image.new("RGB", (1400, 900), "#d97757").save(image_path)
+    call = {"id": "shot-1", "name": "take_screenshot",
+            "arguments": json.dumps({"filename": str(image_path)})}
+    event = artifact_event_for_call(call, {"ok": True, "result": "kaydedildi"}, tmp_path, "ekran resmi çek")
+    assert event is not None
+    assert event["tool"] == "take_screenshot"
+    app._handle_event(event)
+    assert len(app._artifact_widgets) == 1
+    assert len(app._artifact_images) == 1
+    assert "ekran.png" in app._text.get("1.0", "end")
+    assert app._text.window_names()
+    app._clear_transcript()
+    assert not app._artifact_widgets
+    assert not app._artifact_images
+    assert "ekran.png" not in app._text.get("1.0", "end")
+
+
+def test_internal_or_failed_screenshot_has_no_chat_artifact(tmp_path: Path) -> None:
+    image_path = tmp_path / "ekran.png"
+    image_path.write_bytes(b"test")
+    call = {"id": "shot-1", "name": "take_screenshot",
+            "arguments": json.dumps({"filename": str(image_path)})}
+    assert artifact_event_for_call(call, {"ok": True}, tmp_path, "sayfayı oku") is None
+    assert artifact_event_for_call(call, {"ok": False}, tmp_path, "ekran resmi çek") is None
+    image_path.unlink()
+    assert artifact_event_for_call(call, {"ok": True}, tmp_path, "ekran resmi çek") is None
+
+
+def test_photo_and_generated_file_get_structured_chat_cards(tmp_path: Path) -> None:
+    photo = tmp_path / "foto.jpg"
+    photo.write_bytes(b"photo")
+    photo_call = {"id": "photo-1", "name": "capture_photo", "arguments": "{}"}
+    photo_event = artifact_event_for_call(
+        photo_call, {"ok": True, "artifact_path": str(photo)}, tmp_path, "fotoğraf çek",
+    )
+    assert photo_event is not None
+    assert photo_event["media_type"] == "image"
+    document = tmp_path / "rapor.md"
+    document.write_text("Rapor", encoding="utf-8")
+    file_call = {"id": "write-1", "name": "write_file",
+                 "arguments": json.dumps({"path": "rapor.md", "content": "Rapor"})}
+    file_event = artifact_event_for_call(file_call, {"ok": True}, tmp_path, "rapor oluştur")
+    assert file_event is not None
+    assert file_event["path"] == str(document)
+    assert file_event["media_type"] == "file"
+
+
+def test_artifact_merge_keeps_latest_screenshot_and_one_card_per_path() -> None:
+    def card(call_id: str, tool: str, path: str) -> ArtifactReady:
+        return {"kind": "artifact_ready", "call_id": call_id, "tool": tool, "path": path,
+                "title": "Çıktı", "media_type": "file"}
+
+    merged: Tuple[ArtifactReady, ...] = ()
+    for item in (card("s1", "take_screenshot", "/a.png"), card("w1", "write_file", "/r.md"),
+                 card("s2", "take_screenshot", "/b.png"), card("w2", "write_file", "/r.md"),
+                 card("p1", "capture_photo", "/f1.jpg"), card("p2", "capture_photo", "/f2.jpg")):
+        merged = merge_artifact(merged, item)
+    assert [item["call_id"] for item in merged] == ["s2", "w2", "p1", "p2"]
+
+
+def test_artifact_card_survives_file_vanishing_during_render(
+    app: ui.OmniUI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_path = tmp_path / "ekran.png"
+    Image.new("RGB", (40, 30), "#d97757").save(image_path)
+    real_stat = Path.stat
+    checks: List[Path] = []
+
+    def vanishing_stat(self: Path, **options: bool) -> os.stat_result:
+        # İlk denetimden sonra dosya silinmiş gibi davranır (çizim sırasındaki yarış).
+        if self == image_path:
+            checks.append(self)
+            if len(checks) > 1:
+                raise FileNotFoundError(str(self))
+        return real_stat(self, **options)
+
+    monkeypatch.setattr(Path, "stat", vanishing_stat)
+    app._render_artifact(str(image_path), "Ekran görüntüsü", "image")
+    assert "ekran.png" in app._text.get("1.0", "end")
+
+
+@pytest.mark.asyncio
+async def test_run_emits_cards_at_finish_for_outputs_that_still_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_file = tmp_path / "rapor.md"
+    scratch_file = tmp_path / "gecici.py"
+    turns: List[List[Tuple[str, Path, str]]] = [
+        [("w1", report_file, "taslak"), ("w2", scratch_file, "print(1)")],
+        [("w3", report_file, "son hâl")],
+    ]
+    calls = 0
+
+    async def fake_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str,
+        backend: str, emit: Any, should_stop: Any,
+    ) -> tuple[dict[str, Any], str]:
+        nonlocal calls
+        calls += 1
+        if calls <= len(turns):
+            return {
+                "content": "", "tool_calls": [
+                    {"id": call_id, "name": "write_file",
+                     "arguments": json.dumps({"path": str(path), "content": content})}
+                    for call_id, path, content in turns[calls - 1]
+                ],
+                "finish_reason": "tool_calls", "usage": ZERO_USAGE,
+            }, backend
+        # Geçici betik görev bitmeden silinir; kalıcı çıktı sayılmaz.
+        scratch_file.unlink(missing_ok=True)
+        return {"content": "Rapor hazır.", "tool_calls": [], "finish_reason": "stop",
+                "usage": ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    monkeypatch.setattr(filesystem, "BACKUP_DIR", tmp_path / "backups")
+    events: List[AgentEvent] = []
+    service = CapabilityService(tmp_path)
+    try:
+        await main.run_agent_with_callback(
+            "rapor.md raporunu hazırla", events.append,
+            {"requested_backend": None, "should_stop": lambda: False,
+             "state_file": str(tmp_path / "memory.json"), "history": [],
+             "integrations": service},
+            {"ollama-cloud": object()},
+        )
+    finally:
+        await service.close()
+    cards = [event for event in events if event["kind"] == "artifact_ready"]
+    assert [(card["tool"], card["path"]) for card in cards] == [("write_file", str(report_file))]
+    assert [event["kind"] for event in events][-2:] == ["artifact_ready", "run_finished"]
 
 
 def test_idle_tick_skips_transcript_redraw(app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch) -> None:
