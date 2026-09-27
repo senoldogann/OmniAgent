@@ -25,10 +25,13 @@ garantisi sunulmayacak. Böyle bir kayıtta UI görünmemesi gerekiyorsa kullan�
   isteği bırakır. Var olan `_tick` döngüsü bunu Tk ana thread'inde uygular.
   Görünürken `NSApplication.hide_`, gizliyken `unhide_` ve etkinleştirme çağrısı
   yapılır. Açık Ayarlar penceresi de uygulamayla birlikte gizlenir.
-- Kullanıcı gizlediğinde geçici menü çubuğu durum öğesi gösterilmez. Görev ve
-  geçmiş verileri bellekte kalır; açıldığında arayüz kaldığı yerden sürer.
+- Kullanıcı gizlediğinde `_sync_menu_status` açık gizli durumunu önce kontrol
+  ederek geçici menü çubuğu durum öğesini kaldırır ve görev sürerken yeniden
+  oluşturmaz. Görev ve geçmiş verileri bellekte kalır; açıldığında arayüz
+  kaldığı yerden sürer.
 - `tools/screen.py` tam ekran Quartz yakalamalarında on-screen pencere listesini
-  alır. `OmniAgent` başlıklı ana pencerelerin PID'lerini bulursa aynı süreçteki
+  alır. Adı `OmniAgent` olan veya `OmniAgent —` ile başlayan ana, Ayarlar ya da
+  girdi pencerelerinin PID'lerini bulursa aynı süreçteki
   pencereleri listeden çıkarıp `CGWindowListCreateImageFromArray` ile görüntüyü
   oluşturur. Böylece kullanıcının gördüğü UI, yalnız OmniAgent'ın kendi
   ekran görüntüsü, OCR ve durulma gözlemlerine girmez. Uygulama penceresi
@@ -39,9 +42,11 @@ garantisi sunulmayacak. Böyle bir kayıtta UI görünmemesi gerekiyorsa kullan�
 
 ## Doğrulama
 
-- Saf seçim testleri yalnız ilgili PID pencerelerini çıkarır; UI yokken eski
+- Saf seçim testleri yalnız ilgili PID pencerelerini çıkarır; ana pencere
+  küçültülüp Ayarlar veya girdi penceresi açıkken de PID'yi bulur; UI yokken eski
   yakalama yolunun kullanıldığını, filtre başarısızsa hata verildiğini ölçer.
-- Gerçek Tk testinde gizle/göster isteği görev ve transkripti korur; hotkey
+- Gerçek Tk testinde gizle/göster isteği görev ve transkripti korur; aktif
+  görev sırasında menü çubuğu durum öğesi tekrar oluşmaz; hotkey
   kaydı/kaldırılması ayrı bir testte doğrulanır.
 - Canlı macOS'ta kayıt durumu, UI görünürlüğü ve kendi yakalama filtresi
   kontrol edilir; üçüncü taraf video görünmezliği başarı ölçütü değildir.
