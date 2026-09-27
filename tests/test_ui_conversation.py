@@ -1,11 +1,15 @@
 """Gerçek Tk bileşenlerinde akış, yeniden deneme ve bağlam temizleme duman testleri."""
+import json
 import os
+from pathlib import Path
+import time
 from concurrent.futures import Future
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 
 from omniagent.ui import app as ui
+from omniagent.app import agent as main
 from omniagent.config import DEFAULT_BACKEND
 from omniagent.core.conversation import make_exchange
 from omniagent.app.agent import ZERO_USAGE
@@ -61,6 +65,49 @@ def test_stream_render_reset_and_long_answer(app: ui.OmniUI) -> None:
     app._handle_event({"kind": "text_delta", "text": "**Yeni** yanıt"})
     _drain(app)
     assert "Yeni yanıt" in app._text.get("1.0", "end")
+
+
+def test_worker_delivers_host_rejection_without_model_success_claim(
+    app: ui.OmniUI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "hedef.txt"
+    target.write_text("koru", encoding="utf-8")
+    other = tmp_path / "not.txt"
+    app._clients = {"ollama-cloud": object()}
+    monkeypatch.setattr(ui, "STATE_FILE", str(tmp_path / "memory.json"))
+    turns = 0
+
+    async def fake_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str,
+        backend: str, emit: Any, should_stop: Any,
+    ) -> tuple[dict[str, Any], str]:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return {
+                "content": "", "tool_calls": [{
+                    "id": "write-1", "name": "write_file",
+                    "arguments": json.dumps({"path": str(other), "content": "alakasız"}),
+                }], "finish_reason": "tool_calls", "usage": main.ZERO_USAGE,
+            }, backend
+        emit({"kind": "text_delta", "text": "Hedef silindi."})
+        return {"content": "Hedef silindi.", "tool_calls": [],
+                "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    app.entry.insert(0, f"sil: `{target}`")
+    app._send_goal()
+    deadline = time.monotonic() + 8
+    while app._agent_future is not None and time.monotonic() < deadline:
+        app.update()
+        time.sleep(0.01)
+    app.update()
+    _drain(app)
+    assert app._agent_future is None
+    visible = app._text.get("1.0", "end")
+    assert "Doğrulanmadı:" in visible
+    assert "Hedef silindi." not in visible
+    assert target.read_text(encoding="utf-8") == "koru"
 
 
 def test_history_delivery_clear_and_pending_completion(app: ui.OmniUI) -> None:

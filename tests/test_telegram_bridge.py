@@ -1,5 +1,6 @@
 """Telegram uzaktan erişim, akış ve tek görev kilidinin regresyon testleri."""
 import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,9 @@ import httpx
 import pytest
 
 from omniagent.integrations import telegram
+from omniagent.app import agent as main
 from omniagent.core.conversation import make_exchange
+from omniagent.integrations.capabilities import CapabilityService
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 
 
@@ -58,6 +61,54 @@ class FakeAPI:
 
     async def close(self) -> None:
         self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_bridge_delivers_host_rejection_without_model_success_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "STATE_FILE", str(tmp_path / "memory.json"))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.clients = {"ollama-cloud": object()}
+    bridge.integrations = CapabilityService(tmp_path)
+    target = tmp_path / "hedef.txt"
+    target.write_text("koru", encoding="utf-8")
+    other = tmp_path / "not.txt"
+    turns = 0
+
+    async def fake_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str,
+        backend: str, emit: Any, should_stop: Any,
+    ) -> tuple[dict[str, Any], str]:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return {
+                "content": "", "tool_calls": [{
+                    "id": "write-1", "name": "write_file",
+                    "arguments": json.dumps({"path": str(other), "content": "alakasız"}),
+                }], "finish_reason": "tool_calls", "usage": main.ZERO_USAGE,
+            }, backend
+        emit({"kind": "text_delta", "text": "Hedef silindi."})
+        return {"content": "Hedef silindi.", "tool_calls": [],
+                "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    try:
+        await bridge.handle({"message": {
+            "chat": {"id": 123, "type": "private"}, "from": {"id": 456},
+            "text": f"sil: `{target}`",
+        }})
+        assert bridge.active is not None
+        await bridge.active
+    finally:
+        await bridge.integrations.close()
+    transcript = "\n".join(api.sent + api.edited + api.html_sent + api.html_edited)
+    assert "Doğrulanmadı:" in transcript
+    assert "Hedef silindi." not in transcript
+    assert target.read_text(encoding="utf-8") == "koru"
 
 
 def test_only_paired_private_sender_is_authorized() -> None:
