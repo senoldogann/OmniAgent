@@ -34,6 +34,23 @@ def test_long_research_expected_selection_is_first_eight_only() -> None:
     assert benchmark.research_statistics(selected) == (145_000, 29_000.0, 3.33)
 
 
+def test_file_scenarios_require_the_requested_final_state(tmp_path: Path) -> None:
+    names = ("file_delete", "file_move", "file_edit")
+    for name in names:
+        directory = tmp_path / name
+        directory.mkdir()
+        scenario = benchmark.build_scenario(name, directory, "abc12345", 8765)
+        assert scenario["check"]("DOSYA: TAMAM")[0] is False
+        if name == "file_delete":
+            (directory / "silinecek.txt").unlink()
+        elif name == "file_move":
+            (directory / "kaynak.txt").rename(directory / "tasindi.txt")
+        else:
+            (directory / "duzenlenecek.txt").write_text("YENI-abc12345\n", encoding="utf-8")
+        assert scenario["check"]("DOSYA: TAMAM")[0] is True
+        assert scenario["check"]("Eksik son yanıt")[0] is False
+
+
 def test_stagnation_scenario_is_expected_bounded_failure(tmp_path: Path) -> None:
     scenario = benchmark.build_scenario("stagnation", tmp_path, "deadbeef", 8123)
     assert scenario["expect_success"] is False

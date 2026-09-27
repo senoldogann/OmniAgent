@@ -25,8 +25,10 @@ aynı son karar ve olay akışını tüketir.
 
 - Saf ayrıştırıcı, yalnız doğrudan emir cümlesindeki tırnaklı/backtick'li,
   mutlak veya açık bağıl (`./`, `../`, `dizin/dosya`, `dosya.ext`) yerel yolları
-  seçer. `http(s)` URL'leri, README içindeki yol referansı ve birden fazla
-  yoruma açık cümleler hedef olmaz. Bağıl yol, görevin başladığı çalışma
+  seçer. `http(s)` URL'leri ve birden fazla yoruma açık cümleler hedef olmaz;
+  README içindeki yol referansı dosya silme hedefi sayılmaz ve değişikliği
+  ayrıca kanıtlanmadıkça desteklenmeyen dosya niyeti olarak bildirilir.
+  Bağıl yol, görevin başladığı çalışma
   dizinine göre `os.path.abspath` ile leksik olarak çözülür; sembolik bağ
   hedefi takip edilmez. Ayrıştırıcı önce
   mevcut `action_execution_expected`/`_action_scope` ayrımını kullanır:

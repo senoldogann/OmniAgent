@@ -19,7 +19,7 @@ def _turn(content: str, calls: list[dict[str, str]] | None = None) -> dict[str, 
 
 
 @pytest.mark.asyncio
-async def test_no_tool_action_claim_gets_one_recovery_then_fails(
+async def test_ambiguous_file_target_fails_without_unproductive_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: list[list[dict[str, Any]]] = []
@@ -43,8 +43,8 @@ async def test_no_tool_action_claim_gets_one_recovery_then_fails(
     finally:
         await service.close()
     assert not report["success"]
-    assert "işlem kanıtı" in report["reason"]
-    assert len(seen) == 2
+    assert "hedefi açıkça belirlenemedi" in report["reason"]
+    assert len(seen) == 1
     assert report["metrics"]["tool_calls"] == 0
 
 
@@ -291,7 +291,7 @@ async def test_git_status_then_false_delete_claim_stays_unverified(
         )
     finally:
         await service.close()
-    assert turns == 3  # İlk sonuçtan sonra kanıtsız final için bir kurtarma turu.
+    assert turns == 2  # Hedef belirsizken ek araç turu başarıyı kanıtlayamaz.
     assert not report["success"]
     assert report["outcome"].startswith("Doğrulanmadı:")
     assert "Dosya silindi." not in str(events)

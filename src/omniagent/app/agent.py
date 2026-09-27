@@ -71,7 +71,6 @@ from omniagent.app.constants import (
     MAX_ITERATIONS,
     MAX_NOVEL_READ_OUTPUTS,
     MAX_NOVEL_SHELL_OUTPUTS,
-    MAX_SOURCE_ACTION_RECOVERIES,
     MAX_UNEXECUTED_TOOL_RECOVERIES,
     MAX_WALL_CLOCK_SECONDS,
     MODEL_IMAGE_QUALITY,
@@ -85,6 +84,9 @@ from omniagent.app.constants import (
     TRIMMED_CONTENT_LIMIT,
     TURKISH_WEEKDAYS,
     ZERO_USAGE,
+)
+from omniagent.app.file_delivery import (
+    FileReceipt, capture_file_contract, file_delivery_gap, receipt_for_call,
 )
 from omniagent.app import model_runtime
 from omniagent.app.progress import (
@@ -652,8 +654,14 @@ async def run_agent_with_callback(
         )
         if not chrome_session or skills_sh_goal(goal):
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
+        file_cwd: Path = Path.cwd()
+        file_contract = capture_file_contract(goal, file_cwd)
+        must_change_source: bool = source_change_expected(goal, options["history"])
+        allow_edit: bool = must_change_source or (
+            file_contract is not None and file_contract["kind"] == "edit"
+        )
         tool_schemas: List[Dict[str, Any]] = route_tool_schemas(
-            goal, source_change_expected(goal, options["history"]), chrome_session, can_send_files, can_schedule,
+            goal, allow_edit, chrome_session, can_send_files, can_schedule,
         )
     except Exception as error:
         if service is not None and "integrations" not in options:
@@ -675,10 +683,9 @@ async def run_agent_with_callback(
     final_length_recoveries: int = 0
     unexecuted_tool_recoveries: int = 0
     awaiting_real_tool_call: bool = False
-    source_action_recoveries: int = 0
-    action_evidence_recoveries: int = 0
-    must_change_source: bool = source_change_expected(goal, options["history"])
-    must_execute_action: bool = action_execution_expected(goal)
+    delivery_recoveries: int = 0
+    file_receipts: Tuple[FileReceipt, ...] = ()
+    must_execute_action: bool = action_execution_expected(goal) or file_contract is not None
     guarded_final_output: bool = (
         must_change_source or must_execute_action or unmet_wait_status(goal, []) is not None
     )
@@ -721,7 +728,7 @@ async def run_agent_with_callback(
                 break
 
             runtime.published = dict(runtime.selected)
-            tool_schemas = route_tool_schemas(goal, must_change_source, chrome_session, can_send_files, can_schedule) + [
+            tool_schemas = route_tool_schemas(goal, allow_edit, chrome_session, can_send_files, can_schedule) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)
@@ -813,8 +820,8 @@ async def run_agent_with_callback(
                 if success and must_change_source and not any(
                     step["tool"] in {"write_file", "edit_file"} and step["ok"] for step in steps
                 ):
-                    if source_action_recoveries < MAX_SOURCE_ACTION_RECOVERIES:
-                        source_action_recoveries += 1
+                    if delivery_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
+                        delivery_recoveries += 1
                         emit({"kind": "notice", "level": "warning",
                               "text": "Kod değişikliği istenmişti; henüz doğrulanmış dosya yazımı yok. Bir kez daha gerçek uygulama isteniyor."})
                         messages.append({
@@ -835,30 +842,45 @@ async def run_agent_with_callback(
                 action_gap: Optional[str] = None
                 action_evidence_missing: bool = False
                 if success and must_execute_action:
-                    action_evidence_missing = not has_action_evidence(goal, steps)
-                    if action_evidence_missing:
-                        action_gap = "eylem istendi fakat başarılı işlem kanıtı yok"
-                    if action_gap is None:
+                    if file_contract is not None and file_contract["kind"] == "unsupported":
+                        action_gap = file_contract["reason"]
+                    else:
+                        action_evidence_missing = not has_action_evidence(goal, steps)
+                        if action_evidence_missing:
+                            action_gap = "eylem istendi fakat başarılı işlem kanıtı yok"
+                        if action_gap is None and file_contract is not None:
+                            action_gap = file_delivery_gap(file_contract, file_receipts)
+                    if action_gap is None and file_contract is None:
                         action_gap = unmet_explicit_deletion(goal)
                 if success and action_gap is not None:
-                    if action_evidence_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
-                        action_evidence_recoveries += 1
+                    recoverable_file_target: bool = (
+                        file_contract is None or file_contract["kind"] != "unsupported"
+                    )
+                    if recoverable_file_target and delivery_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
+                        delivery_recoveries += 1
                         emit({"kind": "notice", "level": "warning",
                               "text": (
                                   "Eylem istendi; başarılı yürütme kanıtı yok. Bir gerçek işlem denemesi isteniyor."
                                   if action_evidence_missing else
                                   f"{action_gap}. Bir gerçek işlem denemesi isteniyor."
                               )})
+                        recovery_instruction = (
+                            "Bu eylem için başarılı bir yürütme aracı sonucu yok. Okuma veya keşif, "
+                            "işlemin tamamlandığını kanıtlamaz. İstenen eylemi gerçek araçla uygula "
+                            "ve sonucu gözlemle; yapamıyorsan somut engeli bildir."
+                            if action_evidence_missing else
+                            f"{action_gap}. Hedef dosyayı gerçekten taşı ve hedefte kaynakla aynı "
+                            "içeriğin bulunduğunu kontrol et; yapamıyorsan somut engeli bildir."
+                            if file_contract is not None and file_contract["kind"] == "move" else
+                            f"{action_gap}. Hedef dosyanın içeriğini gerçekten değiştir ve son "
+                            "durumunu kontrol et; yapamıyorsan somut engeli bildir."
+                            if file_contract is not None and file_contract["kind"] == "edit" else
+                            f"{action_gap}. Başka dosyayı yazma bu hedefin silindiğini kanıtlamaz. "
+                            "Hedefi gerçekten kaldırıp son durumunu kontrol et; yapamıyorsan somut engeli bildir."
+                        )
                         messages.append({
                             "role": "user",
-                            "content": (
-                                "Bu eylem için başarılı bir yürütme aracı sonucu yok. Okuma veya keşif, "
-                                "işlemin tamamlandığını kanıtlamaz. İstenen eylemi gerçek araçla uygula "
-                                "ve sonucu gözlemle; yapamıyorsan somut engeli bildir."
-                                if action_evidence_missing else
-                                f"{action_gap}. Başka dosyayı yazma bu hedefin silindiğini kanıtlamaz. "
-                                "Hedefi gerçekten kaldırıp son durumunu kontrol et; yapamıyorsan somut engeli bildir."
-                            ),
+                            "content": recovery_instruction,
                         })
                         outcome, reason, success = "", "", False
                         finish_guarded_turn()
@@ -944,6 +966,8 @@ async def run_agent_with_callback(
                 ok: bool = bool(result.get("ok"))
                 detail: str = result_text(result)
                 steps.append(sm.make_step_record(call["name"], call["arguments"], ok, detail))
+                if file_contract is not None:
+                    file_receipts += receipt_for_call(call, result, file_cwd)
                 if ok and call["name"] == "take_screenshot":
                     pending_shots.append(call)
                 if not ok:

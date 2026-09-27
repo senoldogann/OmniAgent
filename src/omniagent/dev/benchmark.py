@@ -43,6 +43,7 @@ from omniagent.app.agent import RunOptions, RunReport, close_model_clients, crea
 from omniagent.tools import _require_accessibility, press_key_spec, type_unicode_text
 
 CORE_SCENARIOS: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat")
+FILE_SCENARIOS: Tuple[str, ...] = ("file_delete", "file_move", "file_edit")
 STRESS_SCENARIOS: Tuple[str, ...] = ("long_research", "stagnation", "self_repair")
 # Hatalardan öğrenme ve kullanıcı hafızası ölçümü. `ogrenme` koşuları aynı deneyim deposunu
 # paylaşır (ilk koşu öğrenir, sonrakiler hatırlatmayla hızlanmalı); `ogrenme_bos` aynı görevi her
@@ -56,7 +57,7 @@ SEQUENTIAL_SCENARIOS: Tuple[str, ...] = ("ogrenme", "self_repair")
 GUI_SCENARIOS: Tuple[str, ...] = ("chrome_ilan", "chrome_maas", "chrome_form")
 # Takip ve geçmişsiz negatif kontrol ayrı ölçülür; varsayılan başarı/hız paydasını bozmaz.
 SCENARIO_NAMES: Tuple[str, ...] = (
-    CORE_SCENARIOS + ("takip", "takip_bos") + GUI_SCENARIOS + STRESS_SCENARIOS
+    CORE_SCENARIOS + FILE_SCENARIOS + ("takip", "takip_bos") + GUI_SCENARIOS + STRESS_SCENARIOS
     + LEARNING_SCENARIOS + MEMORY_SCENARIOS
 )
 # Hata mesajı çözümü söylemeyen yerel araç: çözüm ancak --help → kodlar keşfiyle bulunur.
@@ -600,6 +601,40 @@ def build_scenario(name: str, run_dir: Path, run_id: str, port: int) -> Scenario
             return content == f"OMNI-{run_id}" and files == ["not.txt"], f"icerik={content} dosyalar={files}"
         return {"goal": f"{directory}/not.txt dosyasına tam olarak 'OMNI-{run_id}' yaz. Başka dosya oluşturma. Tek satır 'TAMAM' yaz.",
                 "check": check_sadakat}
+    if name == "file_delete":
+        target = run_dir / "silinecek.txt"
+        target.write_text(f"SIL-{run_id}\n", encoding="utf-8")
+        return {
+            "goal": f"sil: `{target}`. Yalnız execute_shell ile dosyayı kaldır. "
+                    "Sonunda tek satır 'DOSYA: TAMAM' yaz.",
+            "check": lambda outcome: (
+                not target.exists() and "DOSYA: TAMAM" in outcome,
+                f"hedef_mevcut={target.exists()}",
+            ),
+        }
+    if name == "file_move":
+        source, destination = run_dir / "kaynak.txt", run_dir / "tasindi.txt"
+        source.write_text(f"TASI-{run_id}\n", encoding="utf-8")
+        return {
+            "goal": f"move `{source}` to `{destination}`. Yalnız execute_shell ile taşı. "
+                    "Sonunda tek satır 'DOSYA: TAMAM' yaz.",
+            "check": lambda outcome: (
+                not source.exists() and _read_stripped(destination) == f"TASI-{run_id}"
+                and "DOSYA: TAMAM" in outcome,
+                f"kaynak_mevcut={source.exists()} hedef={_read_stripped(destination)}",
+            ),
+        }
+    if name == "file_edit":
+        target = run_dir / "duzenlenecek.txt"
+        target.write_text(f"ESKI-{run_id}\n", encoding="utf-8")
+        return {
+            "goal": f"edit `{target}`: 'ESKI-{run_id}' metnini 'YENI-{run_id}' ile değiştir. "
+                    "edit_file kullan. Sonunda tek satır 'DOSYA: TAMAM' yaz.",
+            "check": lambda outcome: (
+                _read_stripped(target) == f"YENI-{run_id}" and "DOSYA: TAMAM" in outcome,
+                f"icerik={_read_stripped(target)}",
+            ),
+        }
     if name == "long_research":
         report_path: Path = run_dir / "github-typescript-research.txt"
         selected: List[ResearchCandidate] = expected_research_selection()

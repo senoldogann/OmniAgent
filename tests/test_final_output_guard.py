@@ -90,7 +90,7 @@ async def test_rejected_action_claim_never_reaches_user_surfaces(
     assert false_claim not in report["outcome"]
     assert report["outcome"].startswith("Doğrulanmadı:")
     assert false_claim not in report["exchange"]["answer"]
-    assert [event["kind"] for event in events].count("model_finished") == 2
+    assert [event["kind"] for event in events].count("model_finished") == 1
     _final_text_precedes_model_finished(events, report["outcome"])
     finished = next(event for event in events if event["kind"] == "run_finished")
     assert finished["outcome"] == report["outcome"]
