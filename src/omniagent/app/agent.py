@@ -697,23 +697,25 @@ async def resolve_goal_report(
                               "error": problem, "code": "GOAL_NOT_PROVEN", "recoverable": True}
     else:
         try:
+            # Tek metin alanı: "evet" onaylar; başka yanıt eksik olanı anlatan nottur (Telegram'da düz metin).
             answer: Dict[str, Any] = await runtime.ask(
                 redact(goal_confirmation_question(summary, evidence_ids, evidence)),
-                {"onay": {"type": "boolean", "label": "Hedef gerçekleşti", "default": False}},
+                {"yanit": {"type": "string", "label": "'evet' ya da eksik olan", "default": ""}},
                 None,
             )
         except IntegrationStopped as error:
             result = {"tool_call_id": call["id"], "ok": False, "error_type": "IntegrationStopped",
                       "error": str(error), "code": "STOPPED", "recoverable": False}
         else:
-            if approval_granted(answer.get("onay")):
+            reply: str = str(answer.get("yanit", "")).strip()
+            if approval_granted(reply):
                 confirmed = summary.strip()
                 result = {"tool_call_id": call["id"], "ok": True,
                           "result": "Kullanıcı hedefin gerçekleştiğini ONAYLADI; görev tamamlandı."}
             else:
                 result = {"tool_call_id": call["id"], "ok": True, "result": (
-                    "Kullanıcı hedefin gerçekleştiğini ONAYLAMADI. Eksik olanı bul, gerekirse "
-                    "ask_user ile sor ve göreve devam et."
+                    f"Kullanıcı hedefin gerçekleştiğini ONAYLAMADI: {reply or '(açıklama yok)'}\n"
+                    "Eksik olanı tamamla, gerekirse ask_user ile sor ve göreve devam et."
                 )}
     emit({"kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
           "text": result_text(result), "seconds": round(time.monotonic() - started, 2)})

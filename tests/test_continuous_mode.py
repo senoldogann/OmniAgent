@@ -90,7 +90,7 @@ async def test_final_answer_continues_until_user_confirms_proven_goal(
         text_turn("İlk sürüm hazır; sırada yayın var."),
         tool_turn(call("g1", "report_goal_met", {"summary": "Ürün yayında, ilk satış alındı.",
                                                  "evidence_call_ids": ["w1"]})),
-    ], [{"onay": True}], 0.0)
+    ], [{"yanit": "evet"}], 0.0)
     report = await session.run(tmp_path, monkeypatch, {})
     assert report["success"]
     assert report["metrics"]["turns"] == 3
@@ -109,13 +109,14 @@ async def test_unproven_or_rejected_goal_keeps_the_run_going(
         tool_turn(call("g1", "report_goal_met", {"summary": "Para kazanıldı.", "evidence_call_ids": ["yok"]})),
         tool_turn(call("w1", "write_file", {"path": str(tmp_path / "plan.md"), "content": "plan"})),
         tool_turn(call("g2", "report_goal_met", {"summary": "Plan hazır.", "evidence_call_ids": ["w1"]})),
-    ], [{"onay": False}], 0.0)
+    ], [{"yanit": "Hayır: satış kanıtı yok"}], 0.0)
     report = await session.run(tmp_path, monkeypatch, {})
     assert not report["success"]
     assert report["reason"] == "durduruldu"
     assert len(session.questions) == 1 and "Plan hazır." in session.questions[0]
     assert "başarılı bir araç çağrısı değil" in tool_messages(session.model_inputs[1])
-    assert "ONAYLAMADI" in tool_messages(session.model_inputs[3])
+    rejection = tool_messages(session.model_inputs[3])
+    assert "ONAYLAMADI" in rejection and "Hayır: satış kanıtı yok" in rejection
 
 
 @pytest.mark.asyncio
