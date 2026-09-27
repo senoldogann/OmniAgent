@@ -40,6 +40,7 @@ from omniagent.dev.headless_screen import HeadlessPage
 from omniagent.dev.headless_screen import install as install_headless_screen
 from omniagent.integrations.runtime import IntegrationMetrics
 from omniagent.app.agent import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
+from omniagent.core.events import AgentEvent
 from omniagent.tools import _require_accessibility, press_key_spec, type_unicode_text
 
 CORE_SCENARIOS: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat")
@@ -54,7 +55,7 @@ SEQUENTIAL_SCENARIOS: Tuple[str, ...] = ("ogrenme", "self_repair")
 # Gerçek ekranı, fareyi ve kullanıcının Chrome'unu kullanan senaryolar: yalnız açıkça seçilince
 # ve eşzamanlılık 1 iken koşar. chrome_maas ve chrome_form kullanıcının canlı görevlerindeki iki
 # hatayı yeniden üretir: kaydırmadan "tüm ilanlara baktım" demek ve eksik formu "gönderdim" saymak.
-GUI_SCENARIOS: Tuple[str, ...] = ("chrome_ilan", "chrome_maas", "chrome_form")
+GUI_SCENARIOS: Tuple[str, ...] = ("chrome_ilan", "chrome_maas", "chrome_form", "chrome_benzer")
 # Takip ve geçmişsiz negatif kontrol ayrı ölçülür; varsayılan başarı/hız paydasını bozmaz.
 SCENARIO_NAMES: Tuple[str, ...] = (
     CORE_SCENARIOS + FILE_SCENARIOS + ("takip", "takip_bos") + GUI_SCENARIOS + STRESS_SCENARIOS
@@ -202,6 +203,16 @@ kentta('lomake').addEventListener('submit', async e => {
 });
 </script></body></html>"""
 FORM_EXPECTED: Dict[str, str] = {"aihe": "Tarjouspyyntö", "nimi": "Senol Dogan", "sposti": "senoldogan@hotmail.com"}
+
+# İki düğmenin görünür metni aynıdır; yalnız kart bağlamı doğru hedefi ayırt eder.
+SIMILAR_BUTTON_PAGE: str = """<!doctype html><html lang="tr"><head><meta charset="utf-8">
+<title>İki teklif</title><style>body{font:18px sans-serif;padding:40px}article{border:1px solid #bbb;
+padding:24px;margin:18px 0;width:480px}button{padding:12px;font-size:18px}</style></head><body data-benchmark-state="initial">
+<h1>Teklifler</h1><article><h2>Eski teklif</h2><button data-benchmark-target="decoy"
+onclick="document.body.dataset.benchmarkState='decoy';document.getElementById('sonuc').textContent='Eski teklif açıldı'">Detayı aç</button></article>
+<article><h2>Güncel teklif</h2><button data-benchmark-target="expected"
+onclick="document.body.dataset.benchmarkState='expected';document.getElementById('sonuc').textContent='Kod: BT-7421'">Detayı aç</button></article>
+<p id="sonuc">Bir teklif seçin.</p></body></html>"""
 
 
 class ResearchCandidate(TypedDict):
@@ -376,6 +387,84 @@ class RunResult(TypedDict):
     backend: str
     integrations: IntegrationMetrics
     experience_hints: int
+    gui_trace: List[Dict[str, object]]
+    gui_actions: List[Dict[str, object]]
+    gui_metrics: Dict[str, object]
+
+
+class GuiTrace:
+    """Olaylardan içerik saklamadan çağrı kimliği ve süreleri çıkarır."""
+
+    def __init__(self, page: Optional[HeadlessPage]) -> None:
+        self.page = page
+        self.rows: List[Dict[str, object]] = []
+        self.active: Dict[str, Dict[str, object]] = {}
+        self.previous: Optional[Tuple[str, str]] = None
+        self.retries = 0
+        self.verification_seconds = 0.0
+        self.observation_seconds = 0.0
+
+    def record(self, event: AgentEvent) -> None:
+        kind = event["kind"]
+        if kind == "tool_started":
+            call_id = event["call_id"]
+            name = event["name"]
+            signature = (name, hashlib.sha256(event["preview"].encode()).hexdigest()[:12])
+            if signature == self.previous:
+                self.retries += 1
+            self.previous = signature
+            row: Dict[str, object] = {"call_id": call_id, "tool": name,
+                                      "path": gui_tool_path(name), "ok": None, "seconds": None,
+                                      "error_type": None,
+                                      "phase": ("verification" if call_id.startswith("dogrulama-") else
+                                                "observation" if call_id.startswith("otomatik-gozlem-") else "action")}
+            self.rows.append(row)
+            self.active[call_id] = row
+            if self.page is not None:
+                self.page.set_call_id(call_id)
+        elif kind == "tool_finished":
+            call_id = event["call_id"]
+            row = self.active.pop(call_id, None)
+            if row is not None:
+                row["ok"] = event["ok"]
+                row["seconds"] = event["seconds"]
+                if not event["ok"]:
+                    match = re.match(r"([A-Za-z][A-Za-z0-9_]{0,40}):", event["text"])
+                    row["error_type"] = match.group(1) if match else "Unknown"
+            if call_id.startswith("dogrulama-"):
+                self.verification_seconds += event["seconds"]
+            elif call_id.startswith("otomatik-gozlem-"):
+                self.observation_seconds += event["seconds"]
+            if self.page is not None:
+                self.page.set_call_id(None)
+
+    def metrics(self) -> Dict[str, object]:
+        actions = self.page.actions() if self.page is not None else []
+        return {
+            "wrong_target_clicks": sum(item.get("target") == "decoy" for item in actions),
+            "marked_clicks": sum(item["action"] == "click" and item["target"] is not None for item in actions),
+            "no_effect_clicks": sum(item["action"] == "click" and item["no_effect"] is True for item in actions),
+            "retries": self.retries,
+            "loading_wait_seconds": round(sum(float(item["seconds"]) for item in actions
+                                              if item["action"] == "settle"), 2),
+            "observation_seconds": round(self.observation_seconds, 2),
+            "verification_seconds": round(self.verification_seconds, 2),
+            "paths": {path: sum(row["path"] == path for row in self.rows)
+                      for path in ("ax", "ocr", "image", "point", "other")},
+        }
+
+
+def gui_tool_path(name: str) -> str:
+    """Görsel hedef seçimi yolunu araç adından sınıflandırır."""
+    if name in ("cua_get_ax_state", "cua_click", "smart_click"):
+        return "ax"
+    if name == "cua_click_text":
+        return "ocr"
+    if name == "take_screenshot":
+        return "image"
+    if name in ("cua_click_point", "cua_fill_field", "cua_submit_text"):
+        return "point"
+    return "other"
 
 
 def job_code(run_id: str, query: str, index: int) -> str:
@@ -452,6 +541,8 @@ class BenchmarkHandler(BaseHTTPRequestHandler):
             }, ensure_ascii=False).encode())
         elif parts[0] == "form" and len(parts) == 2:
             self._send("text/html; charset=utf-8", FORM_PAGE.replace("__RUN__", parts[1]).encode())
+        elif parts[0] == "benzer" and len(parts) == 2:
+            self._send("text/html; charset=utf-8", SIMILAR_BUTTON_PAGE.encode())
         else:
             run_id: str = parts[-1]
             self._send("application/json", json.dumps(
@@ -718,6 +809,11 @@ def build_scenario(name: str, run_dir: Path, run_id: str, port: int) -> Scenario
                          "kutularını işaretle ve formu gönder. Sonunda tek satır 'FORM: GONDERILDI' ya da "
                          "gönderemediysen 'FORM: GONDERILEMEDI' yaz."),
                 "check": lambda outcome: form_check(run_id, outcome)}
+    if name == "chrome_benzer":
+        return {"goal": f"Açık Google Chrome oturumunu kullanarak http://127.0.0.1:{port}/benzer/{run_id} "
+                        "adresini aç. Güncel teklif kartındaki 'Detayı aç' düğmesine tıkla ve çıkan kodu "
+                        "tek satır 'KOD: <kod>' biçiminde yaz.",
+                "check": lambda outcome: ("KOD: BT-7421" in outcome, "beklenen=BT-7421")}
     if name == "self_repair":
         tool = run_dir / "veri-araci"
         tool.write_text(LEARNING_TOOL_SCRIPT, encoding="utf-8")
@@ -775,6 +871,7 @@ class GuiStage(TypedDict):
     """GUI senaryosunun ekran hazırlığı: test sayfasını açma ve test sekmelerini kapatma."""
     open_page: Callable[[str], None]
     close_pages: Callable[[str], None]
+    page: NotRequired[HeadlessPage]
 
 
 # Gerçek ekran: kullanıcının Chrome'unda ayrı test sekmesi açılır ve sonunda yalnız o kapatılır
@@ -783,7 +880,7 @@ CHROME_STAGE: GuiStage = {"open_page": open_chrome_test_tab, "close_pages": clos
 
 def headless_stage(page: HeadlessPage) -> GuiStage:
     """Görünmez ekran: aynı sayfa her koşuda test adresine gider; kapatılacak sekme yoktur. Saf."""
-    return {"open_page": page.goto, "close_pages": lambda origin: None}
+    return {"open_page": page.goto, "close_pages": lambda origin: None, "page": page}
 
 
 async def run_one(
@@ -814,10 +911,14 @@ async def run_one(
         test_origin: str = f"http://127.0.0.1:{port}/"
         if name in GUI_SCENARIOS:
             await asyncio.to_thread(gui_stage["open_page"], test_origin + "hazir")
+        page = gui_stage.get("page") if name in GUI_SCENARIOS else None
+        trace = GuiTrace(page)
+        if page is not None:
+            page.start_run()
         # Takipte yalnızca ikinci mesajın maliyeti ölçülür; ilk mesaj her iki kolda aynıdır.
         started: float = time.monotonic()
         try:
-            report: RunReport = await run_agent_with_callback(scenario["goal"], lambda event: None, options, clients)
+            report: RunReport = await run_agent_with_callback(scenario["goal"], trace.record, options, clients)
             elapsed: float = round(time.monotonic() - started, 2)
         finally:
             if name in GUI_SCENARIOS:
@@ -826,7 +927,11 @@ async def run_one(
         expected_success: bool = scenario.get("expect_success", True)
         expected_reason: Optional[str] = scenario.get("reason_contains")
         reason_ok: bool = expected_reason is None or expected_reason.casefold() in report["reason"].casefold()
+        gui_metrics = trace.metrics()
         ok = ok and report["success"] == expected_success and reason_ok and first_ok
+        if name == "chrome_benzer" and page is not None:
+            ok = ok and gui_metrics["wrong_target_clicks"] == 0 and any(
+                action["target"] == "expected" for action in page.actions() if action["action"] == "click")
         metrics = report["metrics"]
         result: RunResult = {
             "name": name, "ok": ok, "detail": detail, "outcome": report["outcome"][:300],
@@ -845,6 +950,9 @@ async def run_one(
             "backend": metrics["backend"],
             "integrations": metrics.get("integrations", {}),
             "experience_hints": metrics.get("experience_hints", 0),
+            "gui_trace": trace.rows if name in GUI_SCENARIOS else [],
+            "gui_actions": page.actions() if page is not None else [],
+            "gui_metrics": gui_metrics if name in GUI_SCENARIOS else {},
         }
         print(f"{'✓' if ok else '✗'} {name:9s} {result['elapsed_seconds']:5.1f}s tur={result['turns']} "
               f"araç={result['tool_calls']} model={result['model_seconds']:.1f}s araç_süresi={result['tool_seconds']:.1f}s "
@@ -885,6 +993,12 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
         f"{key}={sum(item.get(key, 0) for item in measurements):.3f}"
         for key in ("discovery_seconds", "install_seconds", "network_seconds", "wait_seconds",
                     "user_wait_seconds", "network_requests", "operations_ok", "operations_failed")))
+    gui_rows = [row for row in results if row["name"] in GUI_SCENARIOS]
+    if gui_rows:
+        lines.append("GUI toplamları: " + " · ".join(
+            f"{key}={sum(float(row['gui_metrics'].get(key, 0)) for row in gui_rows):.2f}"
+            for key in ("wrong_target_clicks", "no_effect_clicks", "retries", "loading_wait_seconds",
+                        "observation_seconds", "verification_seconds")))
     return "\n".join(lines)
 
 
