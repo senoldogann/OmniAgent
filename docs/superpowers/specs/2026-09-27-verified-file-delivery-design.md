@@ -27,7 +27,8 @@ aynı son karar ve olay akışını tüketir.
   mutlak veya açık bağıl (`./`, `../`, `dizin/dosya`, `dosya.ext`) yerel yolları
   seçer. `http(s)` URL'leri, README içindeki yol referansı ve birden fazla
   yoruma açık cümleler hedef olmaz. Bağıl yol, görevin başladığı çalışma
-  dizinine göre çözülür; sembolik bağ hedefi takip edilmez. Ayrıştırıcı önce
+  dizinine göre `os.path.abspath` ile leksik olarak çözülür; sembolik bağ
+  hedefi takip edilmez. Ayrıştırıcı önce
   mevcut `action_execution_expected`/`_action_scope` ayrımını kullanır:
   `How can I delete ./a.txt?` bilgi sorusudur, ardından `Please delete it`
   gelirse soru içindeki yol emre bağlanır.
@@ -35,8 +36,9 @@ aynı son karar ve olay akışını tüketir.
   karşılaştırılır. Birden çok hedefte hepsinin yokluğu ve her hedefe yönelik
   başarılı `rm`/`unlink` araç makbuzu gerekir; başka yere `mv` silme makbuzu
   sayılmaz. Başlangıçta zaten olmayan dosya için “silindi” iddiası onaylanmaz.
-- Düzenleme ve taşıma için içerik özeti akışlı okunur; boyut sınırını aşan,
-  okunamayan veya özel dosyalarda (ör. aygıt) bu sözleşme belirsiz sayılır.
+- Düzenleme ve taşıma için içerik özeti akışlı okunur; düzenleme mevcut 8 MiB
+  dosya aracı sınırını, taşıma 64 MiB doğrulama sınırını aşarsa veya dosya
+  okunamaz/özelse (ör. aygıt) bu sözleşme belirsiz sayılır.
   Sembolik bağın kendisi taşınıyorsa bağ hedefi karşılaştırılır; bağlı
   dosyanın içeriği okunmaz. Sembolik bağ üzerinden düzenleme, mevcut
   `write_file` ve `edit_file` farklı nesneleri değiştirebildiği için bu
