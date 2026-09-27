@@ -108,6 +108,7 @@ from omniagent.app.policy import (
     next_quality_backend,
     retry_after_seconds,
     source_change_expected,
+    unmet_explicit_deletion,
     unmet_wait_status,
 )
 from omniagent.app.tool_execution import (
@@ -831,24 +832,39 @@ async def run_agent_with_callback(
                     reason = "kod değişikliği istendi fakat hiçbir dosya başarıyla değiştirilmedi"
                     if guarded_final_output:
                         outcome = f"Doğrulanmadı: {reason}"
-                if success and must_execute_action and not has_action_evidence(goal, steps):
+                action_gap: Optional[str] = None
+                action_evidence_missing: bool = False
+                if success and must_execute_action:
+                    action_evidence_missing = not has_action_evidence(goal, steps)
+                    if action_evidence_missing:
+                        action_gap = "eylem istendi fakat başarılı işlem kanıtı yok"
+                    if action_gap is None:
+                        action_gap = unmet_explicit_deletion(goal)
+                if success and action_gap is not None:
                     if action_evidence_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
                         action_evidence_recoveries += 1
                         emit({"kind": "notice", "level": "warning",
-                              "text": "Eylem istendi; başarılı yürütme kanıtı yok. Bir gerçek işlem denemesi isteniyor."})
+                              "text": (
+                                  "Eylem istendi; başarılı yürütme kanıtı yok. Bir gerçek işlem denemesi isteniyor."
+                                  if action_evidence_missing else
+                                  f"{action_gap}. Bir gerçek işlem denemesi isteniyor."
+                              )})
                         messages.append({
                             "role": "user",
                             "content": (
                                 "Bu eylem için başarılı bir yürütme aracı sonucu yok. Okuma veya keşif, "
                                 "işlemin tamamlandığını kanıtlamaz. İstenen eylemi gerçek araçla uygula "
                                 "ve sonucu gözlemle; yapamıyorsan somut engeli bildir."
+                                if action_evidence_missing else
+                                f"{action_gap}. Başka dosyayı yazma bu hedefin silindiğini kanıtlamaz. "
+                                "Hedefi gerçekten kaldırıp son durumunu kontrol et; yapamıyorsan somut engeli bildir."
                             ),
                         })
                         outcome, reason, success = "", "", False
                         finish_guarded_turn()
                         continue
                     success = False
-                    reason = "eylem istendi fakat başarılı işlem kanıtı yok"
+                    reason = action_gap
                     if guarded_final_output:
                         outcome = f"Doğrulanmadı: {reason}"
                 if success and not gui_verified and gui_verification_needed(steps):

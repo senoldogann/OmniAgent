@@ -158,6 +158,9 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   beklenen bounded-failure, 7 tur ve 5,4 sn medyan verdi (önceki politika 10 turdu).
   Mutasyon hedefinde `git status` salt gözlemdir; başarılı `execute_shell` sonucu olsa da
   tek başına işlem kanıtı sayılmaz. Zincirli yazma komutları ayrıca değerlendirilir.
+  Hedefte silme fiiline bitişik tek açık mutlak yerel yol varsa finalde `lstat` ile
+  yokluğu da doğrulanır; alakasız araç başarısı mevcut hedefin silindiğini kanıtlamaz.
+  Eylem kanıtı ve bu son durum kapısı aynı tek kurtarma hakkını paylaşır.
 - **Zaman sınırları:** model isteği 30sn (bağlantı 5sn) ve SDK içi yeniden deneme kapalıdır
   (SDK varsayılanı 600sn + 2 gizli deneme idi); composer'da Normal 25 tur/10dk,
   Uzun 50 tur/20dk, Otonom 100 tur/45dk bütçeleri sunar. Dört ardışık tamamen başarısız

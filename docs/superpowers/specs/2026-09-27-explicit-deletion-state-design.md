@@ -12,6 +12,9 @@ Kullanıcı `"/tmp/hedef.txt" dosyasını sil` dediğinde ajan başka bir dosyay
   (`sil: /tmp/a`, `sil "/tmp/a"`, `` `/tmp/a` dosyasını sil ``, `delete /tmp/a`)
   son durum kapısı açılır. Birden fazla aday, URL, göreli veya belirsiz ifadede mevcut
   davranış korunur. Böylece başka bir adımın çıktı yolu yanlışlıkla silme hedefi olmaz.
+  Çıplak yolun sonundaki `.` veya `)` dosya adı da cümle noktalaması da olabilir;
+  sondan noktalama karakterleri birer birer kaldırıldığında oluşan her yorum
+  kontrol edilir; biri mevcutsa yolun yokluğu kanıtlanmış sayılmaz.
 - Finalde `lstat` ile yolun veya kırık sembolik bağın hâlâ var olup olmadığı okunur.
   Mevcutsa eylem kanıtı tek başına başarı sayılmaz. Erişim/istatistik hatası da
   "doğrulanamadı" sonucudur. Yoksa bu ek kapı geçilir; mevcut eylem kanıtı şartı
@@ -28,7 +31,8 @@ Kullanıcı `"/tmp/hedef.txt" dosyasını sil` dediğinde ajan başka bir dosyay
 ## Doğrulama
 
 - Eski kodda alakasız dosya yazımı + sahte silme finali başarı vererek kırmızı test
-  üretir. Yeni kodda hedef duruyorsa final ve geçmiş güvenli başarısızlık gösterir.
+  üretir. Yeni kodda hedef duruyorsa final ve geçmiş güvenli başarısızlık gösterir;
+  çıplak yolun `)` veya `.` ile biten doğal cümleleri de aynı uçtan uca testten geçer.
 - Kurtarma turunda hedef gerçekten kaldırılırsa başarıya izin verilir. Belirsiz ve
   çok yollu hedefler için kapı açılmadığı test edilir; kırık sembolik bağ `lstat`
   ile mevcut sayılır. Eylem kanıtı kurtarması önce harcandığında son durumun
