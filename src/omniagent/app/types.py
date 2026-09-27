@@ -24,6 +24,7 @@ class ToolResult(TypedDict, total=False):
     error: str
     code: str
     recoverable: bool
+    artifact_path: str
 
 
 class ToolCallDraft(TypedDict):

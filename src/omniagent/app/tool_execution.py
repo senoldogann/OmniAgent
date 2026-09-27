@@ -181,6 +181,8 @@ async def execute_tool(
             result = await asyncio.to_thread(method, **arguments)
         outcome: ToolResult = {"tool_call_id": call["id"], "ok": True,
                                "result": json.dumps(result, ensure_ascii=False) if dynamic else str(result)}
+        if name == "capture_photo" and toolbox.last_capture_path is not None:
+            outcome["artifact_path"] = toolbox.last_capture_path
     except (IntegrationStopped, InteractionRequired) as error:
         outcome = {"tool_call_id": call["id"], "ok": False, "error_type": type(error).__name__,
                    "error": str(error), "code": "STOPPED" if isinstance(error, IntegrationStopped) else "INPUT_REQUIRED",

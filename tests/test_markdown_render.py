@@ -12,8 +12,14 @@ def test_commands_remain_literal() -> None:
 def test_inline_styles_and_links() -> None:
     spans = parse_spans("**kalın** *italik* [site](https://example.com)")
     assert [s["style"] for s in spans] == ["bold", "plain", "italic", "plain", "link"]
-    assert spans[-1]["text"] == "site (https://example.com)"
+    assert spans[-1] == {"text": "site", "style": "link", "url": "https://example.com"}
     assert parse_spans("a*b*c")[0]["text"] == "a*b*c"
+
+
+def test_link_keeps_click_target_outside_visible_text() -> None:
+    parts = render_markdown("[kaynak](https://example.com/page)", max_columns=64)
+    assert "".join(text for text, _ in parts) == "kaynak\n"
+    assert "md_href:https://example.com/page" in parts[0][1]
 
 
 def test_fences_keep_contents_even_if_unclosed() -> None:
@@ -37,11 +43,21 @@ def test_table_alignment_and_escaped_pipes() -> None:
 
 
 def test_block_tags_and_empty_input() -> None:
-    assert render_markdown("") == []
-    parts = render_markdown("# Başlık\n- madde\n> alıntı\n---\n```\nx * y")
+    assert render_markdown("", max_columns=64) == []
+    parts = render_markdown("# Başlık\n- madde\n> alıntı\n---\n```\nx * y", max_columns=64)
     tags = {tag for _, group in parts for tag in group}
     assert {"md_h1", "md_bullet", "md_quote", "md_rule", "md_codeblock"} <= tags
     assert "x * y\n" in [text for text, _ in parts]
+
+
+def test_code_block_pads_only_its_outer_lines() -> None:
+    assert render_markdown("```\nbir\niki\n```", max_columns=64) == [
+        ("bir\n", ("assistant", "md_codeblock", "md_codeblock_first")),
+        ("iki\n", ("assistant", "md_codeblock", "md_codeblock_last")),
+    ]
+    assert render_markdown("```\ntek\n```", max_columns=64) == [
+        ("tek\n", ("assistant", "md_codeblock", "md_codeblock_first", "md_codeblock_last")),
+    ]
 
 
 def test_code_delimiters_inside_bold_are_protected_first() -> None:
@@ -49,3 +65,28 @@ def test_code_delimiters_inside_bold_are_protected_first() -> None:
     assert spans == [{"text": "önce ", "style": "bold"},
                      {"text": "a**b", "style": "code"},
                      {"text": " sonra", "style": "bold"}]
+
+
+def test_long_table_uses_readable_stacked_rows_and_plain_math_text() -> None:
+    answer = (
+        "| Güçlü Yönler | Geliştirilebilir Alanlar / Riskler |\n"
+        "| --- | --- |\n"
+        "| Uzun bir açıklama ile anlatılan güçlü yön ve ayrıntılı kanıtlar | "
+        "Uzun bir açıklama ile anlatılan risk ve ayrıntılı gerekçeler |\n"
+        "\nKalite: $\\text{Yüksek}$; komut: `$\\text{ham}$`"
+    )
+    parts = render_markdown(answer, max_columns=64)
+    visible = "".join(value for value, _ in parts)
+    assert "Güçlü Yönler\n" in visible
+    assert "Geliştirilebilir Alanlar / Riskler\n" in visible
+    assert "─┼─" not in visible
+    assert "Kalite: Yüksek" in visible
+    assert "$\\text{ham}$" in visible
+    assert any("md_table_label" in tags for _, tags in parts)
+    assert parse_spans("*$\\text{Yüksek}$*") == [{"text": "Yüksek", "style": "italic"}]
+
+
+def test_wide_table_without_rows_keeps_its_header_visible() -> None:
+    header = " | ".join(f"Uzun sütun başlığı {number}" for number in range(1, 5))
+    parts = render_markdown(f"| {header} |\n| --- | --- | --- | --- |", max_columns=64)
+    assert "Uzun sütun başlığı 4" in "".join(value for value, _ in parts)

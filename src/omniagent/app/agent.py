@@ -14,7 +14,7 @@ from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict, NotRequired
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, NotRequired
 from urllib.request import urlopen
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
@@ -25,7 +25,7 @@ from omniagent.config import (
     API_KEY_VARIABLES, BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER,
     SYSTEM_PROMPT, BackendProfile, apply_stored_api_keys, redact,
 )
-from omniagent.core.events import AgentEvent, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
+from omniagent.core.events import AgentEvent, ArtifactReady, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
 from omniagent.core.fast_loop import (
     FastLoopPolicy, FastLoopState, TurnSignal, advance_fast_loop, classify_semantic_progress,
     normalize_progress_signature,
@@ -109,6 +109,7 @@ from omniagent.app.policy import (
     has_action_evidence,
     next_quality_backend,
     retry_after_seconds,
+    screenshot_requested,
     source_change_expected,
     unmet_explicit_deletion,
     unmet_wait_status,
@@ -564,6 +565,59 @@ def is_resume_goal(goal: str) -> bool:
     ))
 
 
+_ARTIFACT_TITLES: Dict[str, str] = {
+    "take_screenshot": "Ekran görüntüsü", "capture_photo": "Fotoğraf",
+    "write_file": "Oluşturulan dosya", "edit_file": "Düzenlenen dosya",
+    "send_file": "Gönderilen dosya",
+}
+_IMAGE_SUFFIXES: frozenset[str] = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+
+
+def artifact_event_for_call(
+    call: ToolCallDraft, result: ToolResult, cwd: Path, goal: str,
+) -> Optional[ArtifactReady]:
+    """
+    Başarılı çıktı aracını var olan yerel dosyanın sohbet kartına çevirir. Hedef ekran
+    görüntüsü istemediyse modelin kendi gözlem görüntüleri kart olmaz. Dosya varlığını okur.
+    """
+    name: str = call["name"]
+    if not result.get("ok") or name not in _ARTIFACT_TITLES:
+        return None
+    if name == "take_screenshot" and not screenshot_requested(goal):
+        return None
+    if name == "capture_photo":
+        raw_path: object = result.get("artifact_path")
+    else:
+        # Başarılı çağrının argümanları execute_tool'da zaten JSON nesnesi olarak çözüldü.
+        arguments: Dict[str, Any] = json.loads(call["arguments"] or "{}")
+        raw_path = arguments.get("filename" if name == "take_screenshot" else "path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    expanded: Path = Path(raw_path).expanduser()
+    path: Path = (expanded if expanded.is_absolute() else cwd / expanded).resolve()
+    if not path.is_file():
+        return None
+    media_type: Literal["image", "file"] = "image" if path.suffix.casefold() in _IMAGE_SUFFIXES else "file"
+    return {"kind": "artifact_ready", "call_id": call["id"], "tool": name, "path": str(path),
+            "title": _ARTIFACT_TITLES[name], "media_type": media_type}
+
+
+def merge_artifact(
+    artifacts: Tuple[ArtifactReady, ...], artifact: ArtifactReady,
+) -> Tuple[ArtifactReady, ...]:
+    """
+    Görev sonu kart listesine yeni çıktıyı ekler. Aynı yolun eski kaydı düşer; yeni kayıt
+    ekran görüntüsüyse Telegram'daki gibi yalnız son istenen görüntü kalır. Saf.
+    """
+    replaces_screenshot: bool = artifact["tool"] == "take_screenshot"
+    kept: Tuple[ArtifactReady, ...] = tuple(
+        item for item in artifacts
+        if item["path"] != artifact["path"]
+        and not (replaces_screenshot and item["tool"] == "take_screenshot")
+    )
+    return kept + (artifact,)
+
+
 async def run_agent_with_callback(
     goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
 ) -> RunReport:
@@ -688,6 +742,7 @@ async def run_agent_with_callback(
     awaiting_real_tool_call: bool = False
     delivery_recoveries: int = 0
     file_receipts: Tuple[FileReceipt, ...] = ()
+    artifacts: Tuple[ArtifactReady, ...] = ()
     must_execute_action: bool = action_execution_expected(goal) or file_contract is not None
     guarded_final_output: bool = (
         must_change_source or must_execute_action or unmet_wait_status(goal, []) is not None
@@ -1002,6 +1057,9 @@ async def run_agent_with_callback(
                     file_receipts += receipt_for_call(call, result, file_cwd)
                 if ok and call["name"] == "take_screenshot":
                     pending_shots.append(call)
+                artifact: Optional[ArtifactReady] = artifact_event_for_call(call, result, file_cwd, goal)
+                if artifact is not None:
+                    artifacts = merge_artifact(artifacts, artifact)
                 if not ok:
                     failures_in_turn += 1
                 if ok and call["name"] not in _ACTION_RECEIPT_TOOLS:
@@ -1271,6 +1329,10 @@ async def run_agent_with_callback(
                 emit({"kind": "notice", "level": "warning", "text": detail})
             except Exception:
                 logging.exception("Temizlik uyarısı yayınlanamadı")
+        # Çıktı kartları görev sonunda bir kez gelir; bu arada silinen geçici dosya teslim sayılmaz.
+        for card in artifacts:
+            if Path(card["path"]).is_file():
+                emit(card)
         emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "reason": reason,
             "metrics": metrics, "exchange": exchange}

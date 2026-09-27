@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 
 import customtkinter as ctk
 from openai import AsyncOpenAI
-from PIL import Image
+from PIL import Image, ImageOps
 
 from omniagent.platform.macos import api_keys
 from omniagent.config import (
@@ -153,6 +153,9 @@ SUMMARY_LINES: int = 4
 COMMAND_LINES: int = 6
 LINE_CLIP: int = 160
 INSERT_MARK: str = "omni_insert"
+# Sütunlu Markdown tablosu en dar pencerede de (560 px) satır kaydırmadan bu kadar mono
+# karaktere sığar; daha geniş tablo etiket/değer satırlarına dönüşür.
+TABLE_MAX_COLUMNS: int = 64
 
 
 class ToolView(TypedDict):
@@ -316,6 +319,8 @@ class OmniUI(ctk.CTk):
         self._turn: Optional[TurnView] = None
         self._tools_by_call: Dict[str, ToolView] = {}
         self._dirty_tools: Dict[str, ToolView] = {}
+        self._artifact_widgets: List[ctk.CTkFrame] = []
+        self._artifact_images: List[ctk.CTkImage] = []
         self._run_started_at: float = 0.0
         self._task_status: str = "idle"
         self._badge_pending: bool = False
@@ -431,6 +436,7 @@ class OmniUI(ctk.CTk):
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
         self._mono: tkfont.Font = tkfont.Font(family=MONO_FAMILY, size=12)
+        self._body: tkfont.Font = tkfont.Font(family=self._ui_family, size=13)
         self._text: tk.Text = tk.Text(
             frame, bg=BG, fg=TEXT, font=self._mono, wrap="word", bd=0, highlightthickness=0,
             padx=16, pady=10, insertwidth=0, cursor="arrow", spacing1=1, spacing3=1,
@@ -456,7 +462,8 @@ class OmniUI(ctk.CTk):
             "goal_prompt": {"foreground": ACCENT, "background": SURFACE_RAISED, "font": mono_bold},
             "gap": {"font": (MONO_FAMILY, 6)},
             "bullet_text": {"foreground": TEXT, "spacing1": 9},
-            "assistant": {"foreground": TEXT, "lmargin1": indent, "lmargin2": indent},
+            "assistant": {"foreground": TEXT, "font": self._body, "lmargin1": indent,
+                          "lmargin2": indent, "spacing2": 3, "rmargin": 20},
             "cursor": {"foreground": ACCENT, "lmargin1": indent, "lmargin2": indent},
             "reasoning_head": {"foreground": TEXT_FAINT, "font": (MONO_FAMILY, 11, "italic"), "spacing1": 9},
             "reasoning": {"foreground": TEXT_FAINT, "font": (MONO_FAMILY, 11, "italic"), "lmargin1": indent, "lmargin2": indent},
@@ -481,17 +488,25 @@ class OmniUI(ctk.CTk):
             "notice_error": {"foreground": ERROR, "font": small, "lmargin1": indent, "lmargin2": indent},
         }
         tags.update({
-            "md_h1": {"font": (MONO_FAMILY, 18, "bold"), "spacing1": 10},
-            "md_h2": {"font": (MONO_FAMILY, 15, "bold"), "spacing1": 8},
-            "md_h3": {"font": (MONO_FAMILY, 13, "bold"), "spacing1": 6},
-            "md_bold": {"font": mono_bold},
-            "md_italic": {"font": (MONO_FAMILY, 12, "italic")},
-            "md_code": {"background": COMMAND_BG, "foreground": TEXT},
-            "md_codeblock": {"background": COMMAND_BG, "spacing1": 4, "spacing3": 4},
+            "md_h1": {"font": (self._ui_family, 20, "bold"), "spacing1": 14, "spacing3": 5},
+            "md_h2": {"font": (self._ui_family, 17, "bold"), "spacing1": 12, "spacing3": 4},
+            "md_h3": {"font": (self._ui_family, 14, "bold"), "spacing1": 9, "spacing3": 3},
+            "md_bold": {"font": (self._ui_family, 13, "bold")},
+            "md_italic": {"font": (self._ui_family, 13, "italic")},
+            "md_code": {"font": (MONO_FAMILY, 12), "background": COMMAND_BG, "foreground": TEXT},
+            "md_codeblock": {"font": (MONO_FAMILY, 12), "background": COMMAND_BG,
+                             "spacing1": 1, "spacing2": 2, "spacing3": 1},
+            "md_codeblock_first": {"spacing1": 8},
+            "md_codeblock_last": {"spacing3": 8},
             "md_bullet": {"lmargin2": indent + 16},
-            "md_quote": {"foreground": TEXT_DIM, "lmargin1": indent + 8, "lmargin2": indent + 8},
+            "md_quote": {"foreground": TEXT_DIM, "lmargin1": indent + 12, "lmargin2": indent + 12},
             "md_rule": {"foreground": BORDER},
-            "md_table_head": {"font": mono_bold},
+            "md_table": {"font": (MONO_FAMILY, 11)},
+            "md_table_head": {"font": (MONO_FAMILY, 11, "bold"), "foreground": TEXT_DIM},
+            "md_table_label": {"font": (self._ui_family, 12, "bold"), "foreground": ACCENT,
+                               "spacing1": 7},
+            "md_table_value": {"lmargin1": indent + 10, "lmargin2": indent + 10},
+            "md_table_gap": {"font": (MONO_FAMILY, 4)},
             "md_link": {"foreground": INFO, "underline": True},
         })
         for name, options in tags.items():
@@ -933,6 +948,12 @@ class OmniUI(ctk.CTk):
         self._text.mark_gravity(INSERT_MARK, "right")
         for content, tags in parts:
             if content:
+                for tag in tags:
+                    if tag.startswith("md_href:") and tag not in self._text.tag_names():
+                        url = tag.removeprefix("md_href:")
+                        self._text.tag_bind(tag, "<Button-1>", lambda _event, target=url: webbrowser.open(target))
+                        self._text.tag_bind(tag, "<Enter>", lambda _event: self._text.configure(cursor="hand2"))
+                        self._text.tag_bind(tag, "<Leave>", lambda _event: self._text.configure(cursor="arrow"))
                 self._text.insert(INSERT_MARK, content, tags + (region,))
 
     def _new_region(self, parts: List[Tuple[str, Tuple[str, ...]]]) -> str:
@@ -975,7 +996,7 @@ class OmniUI(ctk.CTk):
         if bounds is not None and self._streaming_regions.get(region):
             self._text.delete(f"{bounds[1]} - 2 chars", f"{bounds[1]} - 1 chars")
         if self._streaming_regions.get(region) and region in self._raw_text:
-            self._replace_region(region, [("⏺ ", ("bullet_text",))] + render_markdown(self._raw_text[region]))
+            self._replace_region(region, [("⏺ ", ("bullet_text",))] + render_markdown(self._raw_text[region], max_columns=TABLE_MAX_COLUMNS))
             self._text.see("end")
         self._streaming_regions[region] = False
 
@@ -1103,6 +1124,8 @@ class OmniUI(ctk.CTk):
             self._mark_dirty(view)
             if all(v["status"] in ("ok", "error") for v in self._tools_by_call.values()):
                 self._activity_verb = "Düşünüyor"
+        elif event["kind"] == "artifact_ready":
+            self._render_artifact(event["path"], event["title"], event["media_type"])
         elif event["kind"] == "backend_changed":
             self.model_label.configure(text=self._model_text(event["backend"]))
             self._new_region([(f"↻ {event['backend']} modeline geçildi ({event['reason']})\n", ("notice_info",))])
@@ -1111,9 +1134,82 @@ class OmniUI(ctk.CTk):
         elif event["kind"] == "run_finished":
             self._render_summary(event["success"], event["reason"], event["metrics"])
             status: str = "✓" if event["success"] else "■" if event["reason"] == "durduruldu" else "✗"
-            self.stats_label.configure(text=status + " " + "\n".join(format_run_stats(event["metrics"])))
+            metrics = event["metrics"]
+            self.stats_label.configure(text=(
+                f"{status} {metrics['elapsed_seconds']:.1f} sn · "
+                f"{metrics['turns']} tur · {metrics['tool_calls']} araç"
+            ))
 
     # --- Çizim ---
+
+    def _render_artifact(self, path_text: str, title: str, media_type: str) -> None:
+        """Doğrulanmış yerel çıktıyı sohbetin içinde açılabilir kart olarak göster."""
+        path = Path(path_text)
+        # Dosya tek kez okunur: denetim ile boyut okuması arasında silinirse _tick döngüsü ölmez.
+        try:
+            size: int = path.stat().st_size
+        except OSError as error:
+            self._new_region([(f"⚠ {title}: dosya artık okunamıyor ({type(error).__name__}): {path}\n",
+                               ("notice_warning",))])
+            return
+        viewport = self._text.winfo_width()
+        card_width = max(320, min(620, (viewport if viewport > 100 else 700) - 74))
+        card = ctk.CTkFrame(
+            self._text, width=card_width, fg_color=SURFACE, border_width=1,
+            border_color=BORDER, corner_radius=12,
+        )
+        card.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            card, text=title.upper(), text_color=ACCENT, anchor="w",
+            font=self._ui_font(11, "bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 2))
+        ctk.CTkLabel(
+            card, text=path.name, text_color=TEXT, anchor="w",
+            font=self._ui_font(13, "bold"), wraplength=card_width - 28,
+        ).grid(row=1, column=0, sticky="ew", padx=14)
+        row = 2
+        if media_type == "image" and size <= 40 * 1024 * 1024:
+            try:
+                with Image.open(path) as source:
+                    preview = ImageOps.exif_transpose(source)
+                    preview.thumbnail((card_width - 28, 320), Image.Resampling.LANCZOS)
+                    preview = preview.copy()
+                picture = ctk.CTkImage(light_image=preview, dark_image=preview, size=preview.size)
+                self._artifact_images.append(picture)
+                ctk.CTkLabel(card, text="", image=picture).grid(
+                    row=row, column=0, padx=14, pady=(10, 4), sticky="w",
+                )
+                row += 1
+            except (OSError, ValueError, Image.DecompressionBombError):
+                ctk.CTkLabel(
+                    card, text="Görsel önizlemesi açılamadı", text_color=WARNING,
+                    font=self._ui_font(11, "normal"), anchor="w",
+                ).grid(row=row, column=0, sticky="ew", padx=14, pady=(8, 0))
+                row += 1
+        size_label =f"{size / (1024 * 1024):.1f} MB" if size >= 1024 * 1024 else f"{max(1, size // 1024)} KB"
+        bottom = ctk.CTkFrame(card, fg_color="transparent")
+        bottom.grid(row=row, column=0, sticky="ew", padx=14, pady=(8, 12))
+        bottom.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            bottom, text=size_label, text_color=TEXT_FAINT,
+            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(
+            bottom, text="Yolu kopyala", width=88, height=28, fg_color="transparent",
+            hover_color=SURFACE_RAISED, text_color=TEXT_DIM, corner_radius=7,
+            font=self._ui_font(11, "normal"), cursor="hand2",
+            command=lambda: (self.clipboard_clear(), self.clipboard_append(str(path))),
+        ).grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ctk.CTkButton(
+            bottom, text="Aç ↗", width=72, height=28, fg_color=SURFACE_RAISED,
+            hover_color=BORDER, text_color=TEXT, corner_radius=7,
+            font=self._ui_font(11, "bold"), cursor="hand2",
+            command=lambda: webbrowser.open(path.as_uri()),
+        ).grid(row=0, column=2, sticky="e")
+        self._artifact_widgets.append(card)
+        self._text.insert("end-1c", f"\n▣ {title} · {path.name}\n", ("summary_meta",))
+        self._text.window_create("end-1c", window=card, padx=22, pady=4)
+        self._text.insert("end-1c", "\n", ("gap",))
 
     def _render_tool(self, view: ToolView) -> None:
         bullet_tag: str = {"streaming": "bullet_streaming", "running": "bullet_running",
@@ -1660,6 +1756,10 @@ class OmniUI(ctk.CTk):
             return
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
+        for card in self._artifact_widgets:
+            card.destroy()
+        self._artifact_widgets = []
+        self._artifact_images = []
         self._pending_text = {}
         self._raw_text = {}
         self._history = []

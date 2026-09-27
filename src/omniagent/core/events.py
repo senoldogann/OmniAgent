@@ -95,6 +95,16 @@ class ToolFinished(TypedDict):
     seconds: float
 
 
+class ArtifactReady(TypedDict):
+    """Görev sonunda hâlâ var olan, başarısı doğrulanmış yerel çıktının sohbet kartı."""
+    kind: Literal["artifact_ready"]
+    call_id: str
+    tool: str
+    path: str
+    title: str
+    media_type: Literal["image", "file"]
+
+
 class BackendChanged(TypedDict):
     kind: Literal["backend_changed"]
     backend: str
@@ -133,7 +143,7 @@ class UserInputRequired(TypedDict):
 
 AgentEvent = Union[
     RunStarted, TurnStarted, TextDelta, ReasoningDelta, ToolCallPreview, StreamReset,
-    ModelFinished, ToolStarted, ToolOutput, ToolFinished, BackendChanged, Notice, RunFinished, IntegrationStatus, UserInputRequired,
+    ModelFinished, ToolStarted, ToolOutput, ToolFinished, ArtifactReady, BackendChanged, Notice, RunFinished, IntegrationStatus, UserInputRequired,
 ]
 # Olayları tüketen hedef; araç çıktısı işçi thread'lerinden de çağrılır (thread-safe olmalı).
 EventSink = Callable[[AgentEvent], None]

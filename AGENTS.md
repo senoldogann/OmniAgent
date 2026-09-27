@@ -202,9 +202,17 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - Yalnızca `events.py` olaylarını tüketir; log metni ayrıştırılmaz. Olaylar ajan thread'lerinden
   kuyruğa gelir, tüm çizim Tk thread'inde tek `_tick` döngüsünde yapılır. Metin akarken
   16 ms, boşta 100 ms kullanılır; boş karede büyük transkript yeniden çizilmez.
-- Tasarım dili Claude Code + Codex: nötr koyu yüzeyler, Menlo mono transkript, Claude turuncusu
+- Tasarım dili Claude Code + Codex: nötr koyu yüzeyler, okunur sistem yazı tipiyle Markdown yanıtları,
+  komut/kod/araçlarda Menlo mono ve Claude turuncusu
   (`#D97757`) vurgu; araçlar `⏺ Ad(önizleme)` blokları, komutlar `$` satırları, çıktılar `⎿`
   altında (çalışırken canlı son 6 satır, bitince ilk 4 satır + "… +N satır").
+- En dar pencereye sığmayan (`TABLE_MAX_COLUMNS`) Markdown tablosu etiket/değer satırlarına
+  dönüşür; bağlantılar tıklanır. Başarılı `capture_photo`, `write_file`/`edit_file`/`send_file`
+  ve hedef istediyse `take_screenshot` çıktıları görev sonunda `artifact_ready` olayıyla sohbette
+  açılabilir kart olur: yol başına tek kart, ekran görüntüsünden Telegram'daki gibi yalnız
+  sonuncusu; o ana dek silinen geçici dosya ve otomatik ekran gözlemleri kart olmaz. Kart dosyayı
+  tek `stat` ile okur; dosya kaybolursa uyarı verir, çizim döngüsü durmaz. Tam istatistik
+  transkriptte bir kez görünür.
 - Animasyonlar: daktilo akışı, yanıp sönen imleç ve çalışan araç işareti, yıldız spinner'lı ve
   parıltılı durum satırı (süre, token, "esc ile durdur").
 - Görev başlarken üst sağda süreli durum etiketi, arka planda geçici macOS menü çubuğu
