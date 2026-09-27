@@ -20,6 +20,23 @@ dokunmayan Tk açılış denetimini çalıştırır. `~/Applications/OmniAgent.a
 klasöründen ve Spotlight'tan açılır; Dock'a sürüklenerek sabitlenebilir. `/Applications` hedefi için
 aynı `ditto` komutunda hedef yolu değiştirin; bu yolun yazılabilir olması gerekir.
 
+Önceki kurulum `com.omniagent.ui` adlı Python LaunchAgent ile oturum açılışında arayüzü
+başlatıyorsa, aynı anda iki pencere ve ⌘X kısayolu çakışması olmaması için o kaydı yeni
+uygulamaya yönlendirin. Aşağıdaki örnek `~/Applications` hedefi içindir; `/Applications`
+kullandıysanız JSON içindeki yolu da değiştirin:
+
+```sh
+plist="$HOME/Library/LaunchAgents/com.omniagent.ui.plist"
+launchctl bootout "gui/$(id -u)/com.omniagent.ui" 2>/dev/null || true
+cp -p "$plist" "$plist.python-backup"
+plutil -replace ProgramArguments -json "[\"/usr/bin/open\",\"-a\",\"$HOME/Applications/OmniAgent.app\"]" "$plist"
+plutil -remove WorkingDirectory "$plist" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$plist"
+```
+
+Bu geçiş yalnız eski LaunchAgent dosyası varsa gerekir. Yedek `*.python-backup` adıyla kalır;
+Telegram LaunchAgent'ına dokunulmaz.
+
 Uygulama ilk kez farklı bir imzayla açıldığında macOS mevcut Keychain anahtarlarına erişim isteyebilir.
 İsteği kullanıcı değerlendirir; eski anahtarlar aktarılmasa bile ayarlardan yeniden kaydedilebilir.
 Ekran Kaydı, Erişilebilirlik, Mikrofon, Konuşma Tanıma ve Chrome otomasyonu izinleri yeni uygulama
