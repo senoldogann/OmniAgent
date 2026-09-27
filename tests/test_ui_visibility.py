@@ -97,3 +97,25 @@ def test_display_capture_filters_ui_and_does_not_fallback_to_raw_image(
 
     monkeypatch.setattr(screen.Quartz, "CGWindowListCopyWindowInfo", lambda *_: windows[1:])
     assert screen._display_image(1, 0) is raw.return_value
+
+
+def test_chrome_capture_skips_tiny_helper_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    def chrome_window(number: int, width: int, height: int) -> dict[str, object]:
+        return {
+            screen.Quartz.kCGWindowOwnerName: "Google Chrome",
+            screen.Quartz.kCGWindowOwnerPID: 50,
+            screen.Quartz.kCGWindowNumber: number,
+            screen.Quartz.kCGWindowLayer: 0,
+            screen.Quartz.kCGWindowBounds: {"X": 0, "Y": 0, "Width": width, "Height": height},
+        }
+
+    windows = [chrome_window(10, 189, 22), chrome_window(11, 1710, 988)]
+    monkeypatch.setattr(screen, "_require_screen_capture", lambda: None)
+    monkeypatch.setattr(screen.Quartz, "CGWindowListCopyWindowInfo", lambda *_: windows)
+    capture = Mock(return_value=object())
+    monkeypatch.setattr(screen.Quartz, "CGWindowListCreateImageFromArray", capture)
+    image, geometry = screen._front_app_window_image("Google Chrome", 0)
+    assert image is capture.return_value
+    assert geometry["point_width"] == 1710
+    assert geometry["point_height"] == 988
+    assert capture.call_args.args[1] == [11]

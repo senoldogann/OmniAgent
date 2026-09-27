@@ -136,7 +136,9 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   eksikse bitişte bir düzeltme turu açılır, hâlâ eksikse görev başarı sayılmaz. Kaydırma
   sırasında ekran ölçüsü değişirse `SCREEN_GEOMETRY_CHANGED` açık hatası verilir; farklı
   boyutlu görüntülerin karşılaştırma hatası modelin yanıtını kesmez. Model içeriği
-  okuyamadığını söylüyorsa görev tamamlandı olarak işaretlenmez. Ara/gönder tek
+  okuyamadığını söylüyorsa görev tamamlandı olarak işaretlenmez. Chrome'un ana penceresinin
+  önüne düşebilen 189×22 yardımcı pencere görüntü kapsamı olarak seçilmez; gerçek tarayıcı
+  penceresi kullanılır. Ara/gönder tek
   `cua_submit_text`, çok alanlı form `cua_fill_field` (Enter'a basmaz)
   çağrısıdır. Takip mesajı ("devam et", "formda eksik alan var") 'chrome' kelimesi geçmese de
   önceki görev bu yolda yürüdüyse ve yerel dosya/kabuk işine geçilmiyorsa aynı yolda sürer.

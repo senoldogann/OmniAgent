@@ -279,6 +279,7 @@ def _front_app_window_image(app_name: str, image_option: int) -> Tuple[object, S
     windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
     wanted = app_name.casefold()
     entries = list(windows) if windows else []
+    candidates: List[Tuple[int, Dict[str, object], Dict[str, object], float, float, float, float]] = []
     for pos, window in enumerate(entries):
         if int(window.get(Quartz.kCGWindowLayer) or 0) != 0: continue
         if str(window.get(Quartz.kCGWindowOwnerName) or "").casefold() != wanted: continue
@@ -286,12 +287,19 @@ def _front_app_window_image(app_name: str, image_option: int) -> Tuple[object, S
         if not bounds: continue
         b = dict(bounds)
         left, top, width, height = float(b.get("X", 0.0)), float(b.get("Y", 0.0)), float(b.get("Width", 0.0)), float(b.get("Height", 0.0))
-        if width < 2 or height < 2: continue
+        if width < 200 or height < 120: continue
+        candidates.append((pos, window, b, left, top, width, height))
+    # Chrome'un 189×22 piksellik görünmez/alt kenar yardımcı penceresi bazen ana
+    # pencerenin önüne geçer. Önce gerçek tarayıcı boyutundaki en öndeki adayı seç.
+    preferred = [item for item in candidates if item[5] >= 320 and item[6] >= 240]
+    for pos, window, b, left, top, width, height in preferred or candidates:
         window_id = int(window.get(Quartz.kCGWindowNumber) or 0)
         if window_id <= 0: continue
         owner_pid = int(window.get(Quartz.kCGWindowOwnerPID) or 0)
         popups = [int(other.get(Quartz.kCGWindowNumber) or 0) for other in entries[:pos]
-                  if int(other.get(Quartz.kCGWindowOwnerPID) or 0) == owner_pid and _bounds_intersect(dict(other.get(Quartz.kCGWindowBounds) or {}), b)]
+                  if int(other.get(Quartz.kCGWindowOwnerPID) or 0) == owner_pid
+                  and float(dict(other.get(Quartz.kCGWindowBounds) or {}).get("Height", 0)) >= 80
+                  and _bounds_intersect(dict(other.get(Quartz.kCGWindowBounds) or {}), b)]
         image = Quartz.CGWindowListCreateImageFromArray(Quartz.CGRectMake(left, top, width, height), popups + [window_id], image_option)
         if image is None: continue
         return image, {"point_width": round(width), "point_height": round(height), "model_width": MODEL_SCREEN_SIZE, "model_height": MODEL_SCREEN_SIZE, "origin_x": round(left), "origin_y": round(top)}
