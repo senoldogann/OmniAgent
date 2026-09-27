@@ -106,7 +106,7 @@ def goal_confirmation_question(summary: str, evidence_ids: Sequence[str], eviden
     proof: str = "\n".join(f"• {evidence[item]}" for item in evidence_ids)
     return (
         f"Ajan hedefe ulaşıldığını bildiriyor:\n{summary.strip()}\n\nKanıt:\n{proof}\n\n"
-        "Hedef gerçekten gerçekleşti mi? Onaylamazsan görev sürer."
+        "Hedef gerçekten gerçekleştiyse yalnız 'evet' yaz; değilse neyin eksik olduğunu yaz, görev sürer."
     )
 
 

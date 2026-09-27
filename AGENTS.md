@@ -186,8 +186,9 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   sayılmaz) veya kullanıcı hedefi onaylayana kadar sürer; etkileşimli kanal (masaüstü/Telegram)
   ister. Araçsız son yanıt ilerleme raporudur: o dönemin çıktı kartları gelir, host "sıradaki
   adım" istemiyle döngüyü sürdürür. Tek başarı yolu host aracı `report_goal_met`: kanıt id'leri
-  görevin başarılı araç çağrılarıyla eşleşmezse reddedilir, eşleşirse kullanıcıya onaylatılır;
-  "hayır" görevi sürdürür. `ask_user` bu modda süresiz bekler; metin sorusunda API anahtarı,
+  görevin başarılı araç çağrılarıyla eşleşmezse reddedilir, eşleşirse kullanıcıya tek metin
+  alanıyla sorulur: yalnız "evet" görevi kapatır, başka yanıt eksikleri anlatan not olarak modele
+  gider ve görev sürer. `ask_user` bu modda süresiz bekler; metin sorusunda API anahtarı,
   parola veya token istemi her modda `SECRET_IN_CHAT` ile reddedilir (Ayarlar'a yönlendirilir).
   Hızlı döngü durması, dört başarısız tur veya üç araçsız rapor görevi bitirmez; kullanıcıya
   yön sorulur, yanıtla sayaçlar sıfırlanır. Bağlam 40 turu aşınca en yeni 20 tur kalacak
