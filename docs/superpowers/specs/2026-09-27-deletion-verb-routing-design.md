@@ -15,9 +15,15 @@ kontrolü `remove` için yolu çıkarabilse bile `must_execute_action=False` old
 - Açık yol silme ayrıştırıcısı `kaldır` fiilini de `sil/delete/remove` ile aynı
   dar bitişiklik kurallarıyla tanır. Yolun son durum kontrolü ve ortak tek kurtarma
   turu değiştirilmez.
-- İngilizce yöntem sorusu (`How to ...?`, `How do/can I ...?`) eylem emri
-  değildir; bilgi önekine yalnız bu dar kalıplar eklenir. `How about you
-  remove ...?` gibi kibar eylem isteği kanıt kapısını açmaya devam eder.
+- Türkçe bilgi sorusu öneki korunur. `How to ...?` ve `How can/do I ...?`
+  biçimindeki İngilizce yöntem sorusu tek başına eylem sayılmaz. Soru sonrası
+  `Please remove it`, `Could you remove it` veya `Please do it` gibi açık emir
+  varsa eylem sayılır. Mutasyon ve açık yol kontrolü de bu emrin kapsamında
+  kalır: `How to remove /tmp/a? Please open the terminal` dosya silme isteği
+  değildir. Soru ve emirde tekrarlanan aynı yol tek hedef sayılır; sonraki emir
+  “öteki dosya” derse sorudaki yol ona bağlanmaz. `remove /tmp/a from README`
+  dosyanın kendisini silme sayılmaz; `remove the file at /tmp/a` sayılır.
+  `How about you remove ...?` doğrudan uygulama isteğidir.
 - Kaynak kodu silme yönlendirmesi bu tasarımın dışında tutulur: mevcut kaynak
   kapısı yalnız başarılı `write_file`/`edit_file` yazımını kanıt sayar; tüm dosya
   kaldırma için ayrı araç kanıtı sözleşmesi gerekir.
@@ -28,5 +34,5 @@ Sahte modelin `remove` ve `kaldır` hedeflerinde araçsız “silindi” demesi 
 kodda başarı, yeni kodda güvenli başarısızlık vermelidir. `git status` gözlemi
 silme kanıtı olmamalı; gerçek hedef kaldırıldığında mevcut yol kapısı başarıya
 izin vermelidir. Türkçe/İngilizce bilgi soruları canlı metin akışını korumalıdır.
-`How about you remove ...?` ile `How to delete ...?` karşıt testleri de
-çalıştırılır. Tam test ve görünmez canlı hız/doğruluk ölçümü yapılır.
+Kibar uygulama isteği ve gerçek dosya yolu için karşıt testler çalıştırılır.
+Tam test ve görünmez canlı hız/doğruluk ölçümü yapılır.

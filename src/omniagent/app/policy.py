@@ -128,15 +128,22 @@ def source_change_expected(goal: str, history: List[Exchange]) -> bool:
 
 
 _ACTION_VERBS: re.Pattern[str] = re.compile(
-    r"\b(?:sil|silebilir|siler|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
+    r"\b(?:sil|silebilir|siler|kaldır|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
     r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|"
     r"kapat|aç|açabilir|git|tıkla|uygula|çek|tamamla|iyileştir|hızlandır|"
     r"gider|onar|düzenle|optimize|listele|"
-    r"delete|move|save|send|install|start|run|open|click|edit|update|create|deploy)\b",
+    r"delete|remove|move|save|send|install|start|run|open|click|edit|update|create|deploy)\b",
     re.IGNORECASE,
 )
 _INFORMATIONAL_PREFIX: re.Pattern[str] = re.compile(
     r"^\s*(?:nasıl|neden|niçin|sence|hangi|ne kadar|mümkün mü)\b", re.IGNORECASE,
+)
+_ENGLISH_METHOD_PREFIX: re.Pattern[str] = re.compile(
+    r"^\s*how\s+(?:to\b|(?:do|can|could|should|would)\s+i\b)", re.IGNORECASE,
+)
+_POLITE_ACTION_PREFIX: re.Pattern[str] = re.compile(
+    r"^\s*(?:(?:please|also|then|now|and)\b[\s,]*|"
+    r"(?:can|could|would|will)\s+you\s+)*", re.IGNORECASE,
 )
 _ACTION_EVIDENCE_TOOLS: frozenset[str] = _SIDE_EFFECT_TOOLS - frozenset({
     "take_screenshot", "ask_user", "user_memory",
@@ -160,10 +167,10 @@ def screenshot_requested(goal: str) -> bool:
 
 
 _MUTATION_VERBS: re.Pattern[str] = re.compile(
-    r"\b(?:sil|silebilir|siler|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
+    r"\b(?:sil|silebilir|siler|kaldır|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
     r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|uygula|"
     r"tamamla|iyileştir|hızlandır|gider|onar|düzenle|optimize|"
-    r"delete|move|save|send|install|start|run|edit|update|create|deploy)\b",
+    r"delete|remove|move|save|send|install|start|run|edit|update|create|deploy)\b",
     re.IGNORECASE,
 )
 
@@ -205,20 +212,42 @@ _FETCH_PHRASES: re.Pattern[str] = re.compile(
 )
 
 
+def _english_method_command(goal: str) -> Optional[str]:
+    """Yöntem sorusunu izleyen emri döndür; yöntem sorusu yoksa None."""
+    if not _ENGLISH_METHOD_PREFIX.search(goal):
+        return None
+    question_end = goal.find("?")
+    if question_end < 0:
+        return ""
+    return _POLITE_ACTION_PREFIX.sub("", goal[question_end + 1:]).strip()
+
+
+def _action_scope(goal: str) -> str:
+    """İngilizce yöntem sorusundan sonraki açık uygulama emrini ayır."""
+    if _INFORMATIONAL_PREFIX.search(goal):
+        return ""
+    command = _english_method_command(goal)
+    if command is None:
+        return goal
+    if re.match(r"^do\s+it\b", command, re.IGNORECASE):
+        return goal
+    return command if _ACTION_VERBS.match(command) else ""
+
+
 def action_execution_expected(goal: str) -> bool:
     """
     Açık uygulama/dosya/hizmet eyleminde gerçek yürütme kanıtı ister. Okuma isteğindeki 'çek'
     sayılmaz: "fetch_raw ile adresini çek, değeri yaz" eylem sanılınca başarılı okuma kanıt
     sayılmıyor, host modele gerçek işlem dayatıyor ve doğru cevap bozuluyordu.
     """
-    cleaned: str = _FETCH_PHRASES.sub(" ", goal)
-    return not _INFORMATIONAL_PREFIX.search(cleaned) and bool(_ACTION_VERBS.search(cleaned))
+    cleaned: str = _FETCH_PHRASES.sub(" ", _action_scope(goal))
+    return bool(_ACTION_VERBS.search(cleaned))
 
 
 def has_action_evidence(goal: str, steps: List[sm.StepRecord]) -> bool:
     """Başarılı okuma/keşfi eylem teslimiyle karıştırmaz."""
     runtime = CURRENT_RUNTIME.get()
-    mutation = bool(_MUTATION_VERBS.search(goal))
+    mutation = bool(_MUTATION_VERBS.search(_action_scope(goal)))
     for step in steps:
         if not step["ok"]:
             continue
@@ -256,21 +285,56 @@ _ABSOLUTE_GOAL_PATH: re.Pattern[str] = re.compile(
     r"""'(?P<single>/[^'\r\n]+)'|(?<![:/\w'"`])(?P<bare>/(?!/)[^\s,;!?`'"<>]+)""",
 )
 _DELETION_BEFORE_PATH: re.Pattern[str] = re.compile(
-    r"\b(?:sil|delete|remove)\s*:?\s*[\(\[\{]?\s*$", re.IGNORECASE,
+    r"\b(?:sil|kaldır|delete|remove)\s*:?\s*"
+    r"(?:(?:the\s+)?file\s+at\s+)?[\(\[\{]?\s*$", re.IGNORECASE,
 )
 _DELETION_AFTER_PATH: re.Pattern[str] = re.compile(
-    r"^\s*(?:(?:dosyasını|dosyayı|file)\s+)?(?:sil|delete|remove)\b", re.IGNORECASE,
+    r"^\s*(?:(?:dosyasını|dosyayı|file)\s+)?(?:sil|kaldır|delete|remove)\b", re.IGNORECASE,
 )
 
 
 def _explicit_deletion_paths(goal: str) -> Optional[Tuple[Path, ...]]:
     """Tek açık yolun noktalama dahil olası yazımlarını konservatif olarak çıkar."""
+    command = _english_method_command(goal)
+    if command is not None:
+        if not re.match(r"^(?:sil|kaldır|delete|remove|do\s+it)\b", command, re.IGNORECASE):
+            return None
     matches = list(_ABSOLUTE_GOAL_PATH.finditer(goal))
-    if len(matches) != 1:
+    if not matches:
         return None
-    match = matches[0]
+    if command is None:
+        if len(matches) != 1:
+            return None
+        match = matches[0]
+    else:
+        # Soru ve emirde aynı yol tekrar edebilir; farklı yollar belirsizdir.
+        comparable = {
+            next((part for part in item.groups() if part is not None), "").rstrip(".)]}:")
+            for item in matches
+        }
+        if len(comparable) != 1:
+            return None
+        question_end = goal.find("?")
+        in_command = [item for item in matches if item.start() > question_end]
+        if in_command:
+            match = in_command[0]
+        elif re.fullmatch(
+            r"(?:do\s+it|(?:sil|kaldır|delete|remove)\s+it)"
+            r"(?:\s+(?:for\s+me|now))*[.!?]?", command, re.IGNORECASE,
+        ):
+            match = matches[0]
+        else:
+            return None
     raw = next((part for part in match.groups() if part is not None), "")
     if not raw:
+        return None
+    # "Yolu README'den kaldır" belge düzenlemesidir; "diskten kaldır" dosya silmedir.
+    after_path = goal[match.end():]
+    if re.match(r"^[\s,]*from\b", after_path, re.IGNORECASE) and not re.match(
+        r"^[\s,]*from\s+(?:(?:the|my|this|local)\s+)?"
+        r"(?:disk|filesystem|computer|machine|mac|hard\s+drive)\b",
+        after_path, re.IGNORECASE,
+    ):
         return None
     if not (
         _DELETION_BEFORE_PATH.search(goal[:match.start()])
