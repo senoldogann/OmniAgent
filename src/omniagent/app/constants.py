@@ -26,6 +26,13 @@ RUN_MODE_PROFILES: Dict[str, RunModeProfile] = {
         "max_iterations": 100,
         "max_wall_clock_seconds": 2700.0,
     },
+    # Kullanıcı durdurana, sınır dolana veya hedefi onaylayana kadar sürer; gerçek süre ve token
+    # sınırı Ayarlar'daki continuous_limits.json'dan gelir (bkz. app/continuous.py).
+    "continuous": {
+        "label": "Sürekli",
+        "max_iterations": 100_000,
+        "max_wall_clock_seconds": 28_800.0,
+    },
 }
 
 NO_PROGRESS_LIMIT: int = 4

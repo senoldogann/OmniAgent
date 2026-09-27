@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar, TypedDict
 
+from omniagent.approval import APPROVAL_TIMEOUT_SECONDS
 from omniagent.core.events import EventSink
 from omniagent.paths import data_root
 
@@ -80,6 +81,8 @@ class IntegrationRuntime:
         self.published: Dict[str, Any] = {}
         self.selected: Dict[str, Any] = {}
         self.allowed_tools: Optional[frozenset[str]] = None
+        # ask_user'ın yanıt bekleme sınırı; sürekli görevde None: kullanıcı yanıtlayana dek bekler.
+        self.user_input_timeout: Optional[float] = APPROVAL_TIMEOUT_SECONDS
 
     def check(self) -> None:
         if self.should_stop():

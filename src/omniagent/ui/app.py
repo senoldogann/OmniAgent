@@ -37,6 +37,10 @@ from omniagent.app.agent import (
     RUN_MODE_PROFILES, STATE_FILE, RunOptions, RunReport, close_model_clients,
     create_model_clients, run_agent_with_callback,
 )
+from omniagent.app.continuous import (
+    ContinuousLimits, continuous_limits_path, load_continuous_limits, parse_continuous_limits,
+    save_continuous_limits,
+)
 from omniagent.core.state import EpisodeMetrics
 from omniagent.ui.markdown import render_markdown
 from omniagent.core.conversation import Exchange, make_exchange, trim_history
@@ -638,6 +642,20 @@ class OmniUI(ctk.CTk):
             self._pending_model_choices.update(changed)
         return list(changed)
 
+    def _apply_continuous_limits(self, hours_text: str, tokens_text: str) -> bool:
+        """Sürekli mod sınırlarını doğrular, değiştiyse kaydeder; sonraki sürekli görevde geçerlidir."""
+        limits: ContinuousLimits = parse_continuous_limits(hours_text, tokens_text)
+        path: Path = continuous_limits_path()
+        try:
+            unchanged: bool = load_continuous_limits(path) == limits
+        except (OSError, ValueError):
+            # Bozuk kayıt, kullanıcının girdiği geçerli değerle bilerek üzerine yazılır.
+            unchanged = False
+        if unchanged:
+            return False
+        save_continuous_limits(path, limits)
+        return True
+
 
     def _rebuild_clients(self) -> None:
         """Model istemcilerini yeni anahtarlarla kurar; görev sürüyorsa görev bitince uygular."""
@@ -775,6 +793,47 @@ class OmniUI(ctk.CTk):
             note.pack(anchor="w", padx=14, pady=(0, 9))
             model_notes[name] = note
 
+        ctk.CTkLabel(
+            panel, text="SÜREKLİ MOD", text_color=TEXT_FAINT, anchor="w",
+            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        ).pack(anchor="w", padx=12, pady=(14, 2))
+        ctk.CTkLabel(
+            panel, text=(
+                "Sürekli görev sen durdurana, sınır dolana veya hedefi onaylayana kadar çalışır; "
+                "yanıtını beklediği süre sınıra sayılmaz."
+            ),
+            text_color=TEXT_DIM, wraplength=560, justify="left", anchor="w",
+            font=self._ui_font(11, "normal"),
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+        limits_card: ctk.CTkFrame = ctk.CTkFrame(
+            panel, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
+        )
+        limits_card.pack(fill="x", padx=12, pady=5)
+        limits_problem: str = ""
+        try:
+            stored_limits: Optional[ContinuousLimits] = load_continuous_limits(continuous_limits_path())
+        except (OSError, ValueError) as error:
+            stored_limits = None
+            limits_problem = f"Kayıtlı sınır okunamadı; geçerli değer girip kaydedin: {error}"
+        limit_fields: Dict[str, ctk.CTkEntry] = {}
+        for key, label in (("max_hours", "En uzun süre (saat)"),
+                           ("max_total_tokens", "Token sınırı (giriş + çıkış)")):
+            ctk.CTkLabel(
+                limits_card, text=label, text_color=TEXT, anchor="w", font=self._ui_font(12, "bold"),
+            ).pack(anchor="w", padx=14, pady=(10, 2))
+            field = ctk.CTkEntry(
+                limits_card, height=30, fg_color=SURFACE_RAISED, border_color=BORDER, text_color=TEXT,
+                font=ctk.CTkFont(family=MONO_FAMILY, size=11),
+            )
+            field.pack(fill="x", padx=14, pady=(0, 4))
+            if stored_limits is not None:
+                field.insert(0, f"{stored_limits[key]:g}" if key == "max_hours" else str(stored_limits[key]))
+            limit_fields[key] = field
+        ctk.CTkLabel(
+            limits_card, text=limits_problem, text_color=WARNING, anchor="w", wraplength=540,
+            justify="left", font=ctk.CTkFont(family=MONO_FAMILY, size=9),
+        ).pack(anchor="w", padx=14, pady=(0, 9))
+
         generation = [0]
         active_model_requests: List[Future[Tuple[str, ...]]] = []
 
@@ -879,6 +938,14 @@ class OmniUI(ctk.CTk):
             except (OSError, ValueError) as error:
                 model_changed = []
                 model_error = str(error)
+            try:
+                limits_changed: bool = self._apply_continuous_limits(
+                    limit_fields["max_hours"].get(), limit_fields["max_total_tokens"].get(),
+                )
+                limits_error = ""
+            except (OSError, ValueError) as error:
+                limits_changed = False
+                limits_error = str(error)
             for variable, field in entries.items():
                 field.delete(0, "end")
                 field.insert(0, load_api_key(variable) or "")
@@ -902,19 +969,22 @@ class OmniUI(ctk.CTk):
                                    ("notice_info",))])
                 self._text.see("end")
                 self._text.configure(state="disabled")
-            if failed or model_error:
+            if failed or model_error or limits_error:
                 problems = []
                 if failed:
                     problems.append("API anahtarı: " + ", ".join(failed))
                 if model_error:
                     problems.append("Model: " + model_error)
+                if limits_error:
+                    problems.append("Sürekli mod: " + limits_error)
                 status.configure(text="Kaydedilemedi: " + " · ".join(problems), text_color=ERROR)
                 return
-            if not changed and not model_changed:
+            if not changed and not model_changed and not limits_changed:
                 status.configure(text="Değişiklik yok.", text_color=TEXT_FAINT)
                 return
+            limits_note: str = " · sürekli mod sınırları" if limits_changed else ""
             status.configure(
-                text=f"Kaydedildi · {len(model_changed)} model · hazır profiller: {ready}{suffix}",
+                text=f"Kaydedildi · {len(model_changed)} model{limits_note} · hazır profiller: {ready}{suffix}",
                 text_color=WARNING if self._clients_stale or shell_left else SUCCESS,
             )
 

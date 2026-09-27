@@ -181,6 +181,18 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   (SDK varsayılanı 600sn + 2 gizli deneme idi); composer'da Normal 25 tur/10dk,
   Uzun 50 tur/20dk, Otonom 100 tur/45dk bütçeleri sunar. Dört ardışık tamamen başarısız
   araç turu ilerleme yok sayılır.
+- **Sürekli mod (`app/continuous.py`):** görev kullanıcı durdurana, süre/token sınırı dolana
+  (Ayarlar'da `continuous_limits.json`, varsayılan 8 saat / 20 milyon token; yanıt bekleme
+  sayılmaz) veya kullanıcı hedefi onaylayana kadar sürer; etkileşimli kanal (masaüstü/Telegram)
+  ister. Araçsız son yanıt ilerleme raporudur: o dönemin çıktı kartları gelir, host "sıradaki
+  adım" istemiyle döngüyü sürdürür. Tek başarı yolu host aracı `report_goal_met`: kanıt id'leri
+  görevin başarılı araç çağrılarıyla eşleşmezse reddedilir, eşleşirse kullanıcıya onaylatılır;
+  "hayır" görevi sürdürür. `ask_user` bu modda süresiz bekler; metin sorusunda API anahtarı,
+  parola veya token istemi her modda `SECRET_IN_CHAT` ile reddedilir (Ayarlar'a yönlendirilir).
+  Hızlı döngü durması, dört başarısız tur veya üç araçsız rapor görevi bitirmez; kullanıcıya
+  yön sorulur, yanıtla sayaçlar sıfırlanır. Bağlam 40 turu aşınca en yeni 20 tur kalacak
+  biçimde tur sınırında kırpılır; kalıcı bilgi TASK SCRATCHPAD'dedir. Para hareketi ve yayın
+  onayı kuralları değişmez.
 - **Akış:** model yanıtı `stream=True` ile alınır. Metin, düşünme metni, araç çağrısı
   önizlemesi (komut model yazarken harf harf) ve komut çıktısı (`run_streaming_process`,
   satır satır) `events.py`'deki tipli olaylarla yayınlanır; yarıda kesilen akış yeniden
@@ -290,7 +302,8 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   yalnız hedef istediyse (`policy.screenshot_requested`: "ekran görüntüsü/resmi gönder", "ekranı
   göster", "ss at") görev sonunda tek kez gider; ayrıntılı görünüm hepsini anında gönderir. Köprü
   süreci proje kökünde çalışır: launchd `/` (salt okunur) dizininde başlatır ve göreli yollar
-  "Read-only file system" ile düşüyordu. `/stop`, `/status`, `/model` ve `/mode` desteklenir.
+  "Read-only file system" ile düşüyordu. `/stop`, `/status`, `/model` ve `/mode`
+  (`normal|long|autonomous|surekli`) desteklenir.
   Bot tokenı Keychain'de, sohbet ve kullanıcı kimliği özel izinli yerel dosyadadır.
   Kurulum: [TELEGRAM.md](docs/TELEGRAM.md).
 - Uzaktan bakım (`integrations/maintenance.py`): `/update` `git pull --ff-only` (yerel değişikliğe dokunmaz),
