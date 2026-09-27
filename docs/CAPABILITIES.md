@@ -70,7 +70,7 @@ Varsayılan profil `ollama-cloud` (`gemma4:cloud`, yerel Ollama API'si); bu maki
 varsayılan `gemma4:cloud` korunur. `qwen3.5:cloud` denendi fakat bu hesapta 402 ile
 "ücretsiz kullanıma dahil değil" yanıtı verdi; bu yüzden hazır profil yapılmadı.
 
-Fast Loop semantik ilerlemeyi host seviyesinde izler. Yeni ve başarılı komut çıktısı en fazla sekiz farklı sonuç için ilerleme sayılır; aynı veya boş çıktı sayılmaz. Eylem isteklerinde yalnız keşif, okuma veya gezinme sonucu başarı kanıtı değildir: host gerçek bir işlem denemesi ister, ardından kanıt yoksa görevi başarısız işaretler. `git status` mutasyon hedefinde yalnız gözlem sayılır; zincirde başka bir komut varsa bütün çağrı ayrıca değerlendirilir. Görsel olmayan turlarda iki anlamsız tur
+Fast Loop semantik ilerlemeyi host seviyesinde izler. Yeni ve başarılı komut çıktısı en fazla sekiz farklı sonuç için ilerleme sayılır; aynı veya boş çıktı sayılmaz. Eylem isteklerinde yalnız keşif, okuma veya gezinme sonucu başarı kanıtı değildir: host gerçek bir işlem denemesi ister, ardından kanıt yoksa görevi başarısız işaretler. `git status` mutasyon hedefinde yalnız gözlem sayılır; zincirde başka bir komut varsa bütün çağrı ayrıca değerlendirilir. Silme fiiline bitişik tek açık mutlak yerel yol verilmişse finalde `lstat` ile yolun yokluğu da kontrol edilir; başka dosyanın yazılması mevcut hedefi silmiş sayılmaz. Eylem kanıtı ve yol kontrolü aynı tek kurtarma hakkını kullanır. Görsel olmayan turlarda iki anlamsız tur
 sonra replan, görsel otomatik gözlem taşıyan turlarda üç tur tolerans, delivery aşamasında iki
 anlamsız tur sonra bounded-stop uygulanır. 24 Eylül'deki üçer stress koşusunda
 `long_research` 3/3 başarı, 6 tur/13 araç ve 8,5 saniye medyan; `stagnation` 3/3 beklenen

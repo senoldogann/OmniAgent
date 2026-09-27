@@ -251,6 +251,67 @@ def has_action_evidence(goal: str, steps: List[sm.StepRecord]) -> bool:
     return False
 
 
+_ABSOLUTE_GOAL_PATH: re.Pattern[str] = re.compile(
+    r"""`(?P<backtick>/[^`\r\n]+)`|"(?P<double>/[^"\r\n]+)"|"""
+    r"""'(?P<single>/[^'\r\n]+)'|(?<![:/\w'"`])(?P<bare>/(?!/)[^\s,;!?`'"<>]+)""",
+)
+_DELETION_BEFORE_PATH: re.Pattern[str] = re.compile(
+    r"\b(?:sil|delete|remove)\s*:?\s*[\(\[\{]?\s*$", re.IGNORECASE,
+)
+_DELETION_AFTER_PATH: re.Pattern[str] = re.compile(
+    r"^\s*(?:(?:dosyasını|dosyayı|file)\s+)?(?:sil|delete|remove)\b", re.IGNORECASE,
+)
+
+
+def _explicit_deletion_paths(goal: str) -> Optional[Tuple[Path, ...]]:
+    """Tek açık yolun noktalama dahil olası yazımlarını konservatif olarak çıkar."""
+    matches = list(_ABSOLUTE_GOAL_PATH.finditer(goal))
+    if len(matches) != 1:
+        return None
+    match = matches[0]
+    raw = next((part for part in match.groups() if part is not None), "")
+    if not raw:
+        return None
+    if not (
+        _DELETION_BEFORE_PATH.search(goal[:match.start()])
+        or _DELETION_AFTER_PATH.match(goal[match.end():])
+    ):
+        return None
+    # Çıplak cümle sonundaki ')' veya '.' dosya adının parçası da olabilir.
+    # Her olası son ek mevcut dosyaya işaret edebilir; ara biçimleri atlama.
+    candidates = [Path(raw)]
+    if match.group("bare") is not None:
+        shortened = raw
+        while shortened and shortened[-1] in ".)]}:":
+            shortened = shortened[:-1]
+            if not shortened:
+                return None
+            candidates.append(Path(shortened))
+    return tuple(dict.fromkeys(candidates))
+
+
+def explicit_deletion_target(goal: str) -> Optional[Path]:
+    """Yalnız silme fiiline bitişik tek açık mutlak yerel yolu seç; belirsizi atla."""
+    paths = _explicit_deletion_paths(goal)
+    return paths[-1] if paths is not None else None
+
+
+def unmet_explicit_deletion(goal: str) -> Optional[str]:
+    """Açık hedef yol lstat ile hâlâ varsa silme başarısını reddet."""
+    paths = _explicit_deletion_paths(goal)
+    if paths is None:
+        return None
+    for target in paths:
+        try:
+            target.lstat()  # Kırık sembolik bağ da mevcut hedef sayılır.
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return "açık hedef yolun silindiği doğrulanamadı"
+        return "açık hedef yol hâlâ mevcut"
+    return None
+
+
 def unmet_wait_status(goal: str, steps: List[sm.StepRecord]) -> Optional[str]:
     """'status X olana kadar bekle' hedefini son başarılı JSON gözlemiyle karşılaştırır."""
     match = re.search(
