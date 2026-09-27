@@ -13,6 +13,7 @@ class FakeUI:
         self._spinner_index = 1
         self.task_status_label = FakeLabel()
         self._task_status = "idle"
+        self._visibility_hidden = False
 
 def test_status_pill_shows_elapsed_and_completion() -> None:
     app = FakeUI()
@@ -35,6 +36,21 @@ def test_stopped_background_task_removes_menu_spinner(monkeypatch) -> None:
         "hide": lambda self: hidden.append(True),
     })()
     monkeypatch.setattr(ui, "app_is_active", lambda: False)
+    ui.OmniUI._sync_menu_status(app)
+    assert not shown
+    assert hidden == [True]
+
+
+def test_private_visibility_suppresses_running_menu_status() -> None:
+    shown = []
+    hidden = []
+    app = FakeUI()
+    app._visibility_hidden = True
+    app._task_status = "running"
+    app._menu_status = type("FakeMenu", (), {
+        "show": lambda self, *args: shown.append(args),
+        "hide": lambda self: hidden.append(True),
+    })()
     ui.OmniUI._sync_menu_status(app)
     assert not shown
     assert hidden == [True]

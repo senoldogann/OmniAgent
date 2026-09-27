@@ -407,14 +407,61 @@ def test_chrome_active_tab_reuses_front_tab(monkeypatch: pytest.MonkeyPatch) -> 
     result = toolbox.chrome_active_tab("https://outlook.live.com/mail/0/deleteditems")
     assert "Görünür Chrome" in result and "Poistetut" in result and "hâlâ yükleniyor" in result
     assert calls[0][0] == "osascript"
-    assert calls[0][-3:] == [
-        "https://outlook.live.com/mail/0/deleteditems", "https://outlook.live.com/", str(tools.CHROME_LOAD_CHECKS),
+    assert calls[0][-4:] == [
+        "https://outlook.live.com/mail/0/deleteditems", "https://outlook.live.com/", str(tools.CHROME_LOAD_CHECKS), "false",
     ]
     assert "tab id tabId of targetWindow" in calls[0][2]
     assert toolbox.browser is None
     with pytest.raises(ToolError) as error:
         toolbox.chrome_active_tab("javascript:alert(1)")
     assert error.value.code == "INVALID_URL"
+
+
+def test_chrome_active_tab_creates_requested_new_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return tools.subprocess.CompletedProcess(
+            args, 0, "https://www.linkedin.com/feed/\nFeed | LinkedIn\nfalse\n", "",
+        )
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: False)
+    result = Toolbox().chrome_active_tab("https://www.linkedin.com/feed/", new_tab=True)
+    assert "Yeni Chrome sekmesi" in result
+    assert calls[0][-1] == "true"
+    assert "make new tab at end of tabs of front window" in calls[0][2]
+
+
+def test_explicit_chrome_destination_requires_new_tab_and_feed() -> None:
+    from omniagent.app.verification import requested_chrome_navigation_gap
+
+    goal = "Açık Google Chrome'da yeni bir tab aç ve LinkedIn anasayfa akışımı raporla."
+    assert "yeni Chrome sekmesi" in (requested_chrome_navigation_gap(goal, []) or "")
+    reused = [make_step_record("chrome_active_tab", json.dumps({"url": "https://www.linkedin.com/"}), True, "ok")]
+    assert "yeni Chrome sekmesi" in (requested_chrome_navigation_gap(goal, reused) or "")
+    wrong_page = [make_step_record("chrome_active_tab", json.dumps({"url": "https://www.linkedin.com/in/me/", "new_tab": True}), True, "ok")]
+    assert "/feed/" in (requested_chrome_navigation_gap(goal, wrong_page) or "")
+    correct = [make_step_record("chrome_active_tab", json.dumps({"url": "https://www.linkedin.com/feed/", "new_tab": True}), True, "ok")]
+    assert requested_chrome_navigation_gap(goal, correct) is None
+
+
+def test_chrome_new_tab_fallback_uses_new_tab_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    keys: List[str] = []
+
+    def fake_run(args, **kwargs):
+        if args[0] == "osascript":
+            raise tools.subprocess.TimeoutExpired(args, timeout=20)
+        return tools.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
+    monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    monkeypatch.setattr(tools, "press_key_spec", keys.append)
+    monkeypatch.setattr(tools, "type_unicode_text", lambda text: None)
+    Toolbox().chrome_active_tab("https://www.linkedin.com/feed/", new_tab=True)
+    assert keys == ["cmd+t", "cmd+l", "enter"]
 
 
 def test_chrome_active_tab_falls_back_to_visible_ui_and_circuit_breaks(

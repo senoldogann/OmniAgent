@@ -681,8 +681,8 @@ class Toolbox:
         return fetch_raw_content(url)
 
     @_screen_input
-    def chrome_active_tab(self, url: Optional[str]) -> str:
-        result, available = run_chrome_active_tab(url, self._chrome_applescript_available)
+    def chrome_active_tab(self, url: Optional[str], new_tab: bool = False) -> str:
+        result, available = run_chrome_active_tab(url, self._chrome_applescript_available, new_tab)
         self._chrome_applescript_available = available
         self._screen_scope_app = "Google Chrome"
         self._visual_display_id = None

@@ -20,11 +20,44 @@ def app(monkeypatch: pytest.MonkeyPatch) -> Iterator[ui.OmniUI]:
     if os.environ.get("OMNI_UI_TEST") != "1":
         pytest.skip("Gerçek Tk testi OMNI_UI_TEST=1 ile etkinleştirilir.")
     monkeypatch.setattr(ui, "create_model_clients", lambda: {})
+    class FakeHotkey:
+        def __init__(self, callback: Any) -> None:
+            self.callback = callback
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(ui, "GlobalVisibilityHotkey", FakeHotkey)
     window = ui.OmniUI()
     window.withdraw()
     window._text.configure(state="normal")
     yield window
     window._on_close()
+
+
+def test_global_visibility_toggle_keeps_task_state(app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch) -> None:
+    applied: list[bool] = []
+    monkeypatch.setattr(ui, "set_application_hidden", lambda hidden, window: applied.append(hidden))
+    transcript = app._text.get("1.0", "end")
+    future: Future[Any] = Future()
+    app._agent_future = future
+    app._task_status = "running"
+    hotkey = app._visibility_hotkey
+    assert hotkey is not None
+    hotkey.callback()
+    app._tick()
+    assert applied == [True]
+    assert app._visibility_hidden
+    assert app._agent_future is future
+    assert app._text.get("1.0", "end") == transcript
+    hotkey.callback()
+    app._tick()
+    assert applied == [True, False]
+    assert not app._visibility_hidden
+    assert app._agent_future is future
+    assert app._text.get("1.0", "end") == transcript
+    future.cancel()
 
 
 def _start(app: ui.OmniUI) -> None:

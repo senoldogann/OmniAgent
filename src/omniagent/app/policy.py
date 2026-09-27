@@ -81,6 +81,12 @@ def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str
         content, re.IGNORECASE,
     ):
         return False, "model işlemin başarısız olduğunu bildirdi"
+    if re.search(
+        r"\b(?:okuyamıyorum|okuyamadım|erişemiyorum|erişemedim|göremiyorum|göremedim|"
+        r"raporlayamıyorum|raporlayamadım)\b",
+        content, re.IGNORECASE,
+    ):
+        return False, "model gerekli içeriğe erişemediğini bildirdi"
     return True, ""
 
 

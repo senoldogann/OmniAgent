@@ -56,11 +56,15 @@ _CHROME_TAB_APPLESCRIPT: str = """on run argv
 set targetUrl to item 1 of argv
 set targetOrigin to item 2 of argv
 set loadChecks to (item 3 of argv) as integer
+set createNewTab to item 4 of argv is "true"
 tell application "Google Chrome"
     if (count of windows) is 0 then make new window
     set windowId to id of front window
     set tabId to id of active tab of front window
-    if targetUrl is not "" then
+    if createNewTab then
+        set newTab to make new tab at end of tabs of front window with properties {URL:targetUrl}
+        set tabId to id of newTab
+    else if targetUrl is not "" then
         repeat with windowItem in windows
             set matchingIds to id of (every tab of windowItem whose URL starts with targetOrigin)
             if matchingIds is not {} then
@@ -143,10 +147,14 @@ def fetch_raw_content(url: str) -> str:
         return _clip(stdout, SHELL_STDOUT_LIMIT)
     return clean_html(stdout)
 
-def run_chrome_active_tab(url: Optional[str], applescript_available: Optional[bool]) -> Tuple[str, bool]:
+def run_chrome_active_tab(
+    url: Optional[str], applescript_available: Optional[bool], new_tab: bool = False,
+) -> Tuple[str, bool]:
     parsed = urlsplit(url) if url else None
     if parsed and (parsed.scheme not in ("https", "http") or not parsed.netloc):
         raise ToolError("Chrome sekmesi için http(s) adresi ver.", "INVALID_URL", False)
+    if new_tab and not url:
+        raise ToolError("Yeni Chrome sekmesi için http(s) adresi ver.", "INVALID_URL", False)
     origin = f"{parsed.scheme}://{parsed.netloc}/" if parsed else ""
     
     fallback_reason = "önceki AppleScript hatası" if applescript_available is False else None
@@ -155,7 +163,7 @@ def run_chrome_active_tab(url: Optional[str], applescript_available: Optional[bo
 
     if applescript_available is not False:
         try:
-            result = subprocess.run(["osascript", "-e", _CHROME_TAB_APPLESCRIPT, url or "", origin, str(CHROME_LOAD_CHECKS)],
+            result = subprocess.run(["osascript", "-e", _CHROME_TAB_APPLESCRIPT, url or "", origin, str(CHROME_LOAD_CHECKS), str(new_tab).lower()],
                                     env=child_environment(), capture_output=True, text=True, timeout=CHROME_SCRIPT_TIMEOUT_SECONDS, check=False)
             if result.returncode != 0:
                 new_as_available, fallback_reason = False, result.stderr.strip() or f"çıkış={result.returncode}"
@@ -177,15 +185,19 @@ def run_chrome_active_tab(url: Optional[str], applescript_available: Optional[bo
                 "CHROME_SESSION_FAILED", True,
             )
         if url:
+            if new_tab:
+                press_key_spec("cmd+t")
             press_key_spec("cmd+l"); type_unicode_text(url); press_key_spec("enter")
-            return f"Görünür Chrome sekmesi: {url}\nBaşlık: görünür UI fallback ({fallback_reason}); yükleme otomatik gözlemle doğrulanacak.", new_as_available
+            kind = "Yeni Chrome sekmesi" if new_tab else "Görünür Chrome sekmesi"
+            return f"{kind}: {url}\nBaşlık: görünür UI fallback ({fallback_reason}); yükleme otomatik gözlemle doğrulanacak.", new_as_available
         return f"Görünür Chrome öne getirildi.\nBaşlık: görünür UI fallback ({fallback_reason}); etkin URL AppleScript olmadan okunamadı.", new_as_available
 
     if result is None: raise ToolError("Açık Chrome sekmesine erişilemedi.", "CHROME_SESSION_FAILED", True)
     lines = result.stdout.rstrip("\n").split("\n")
     if len(lines) < 3: raise ToolError(f"Chrome sekme yanıtı beklenmeyen biçimde: {result.stdout!r}", "CHROME_SESSION_FAILED", True)
     loading = "\nSayfa hâlâ yükleniyor." if lines[-1] == "true" else ""
-    return f"Görünür Chrome sekmesi: {lines[0]}\nBaşlık: {' '.join(lines[1:-1])}{loading}", new_as_available
+    kind = "Yeni Chrome sekmesi" if new_tab else "Görünür Chrome sekmesi"
+    return f"{kind}: {lines[0]}\nBaşlık: {' '.join(lines[1:-1])}{loading}", new_as_available
 
 class HeadlessBrowserSession:
     def __init__(self) -> None:

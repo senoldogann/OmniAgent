@@ -205,6 +205,15 @@ def test_recovered_failure_sentence_is_not_misread_as_final_failure() -> None:
     assert success and not reason
 
 
+def test_unread_feed_is_never_marked_complete() -> None:
+    success, reason = main.final_verdict(
+        "LinkedIn sayfasına eriştim ancak akışınızdaki içerikleri okuyamıyorum. "
+        "Sayfayı yenilemeyi deneyim mi?", "stop",
+    )
+    assert not success
+    assert "erişemediğini" in reason
+
+
 def test_polite_action_and_project_repair_open_the_right_tools() -> None:
     assert main.action_execution_expected("Outlook çöp kutusunu boşaltır mısın?")
     assert main.action_execution_expected("Tüm kodu kontrol et eksik varsa tamamla")

@@ -27,6 +27,7 @@ from omniagent.config import (
 from omniagent.core.events import AgentEvent, compact_count, tool_label
 from omniagent.platform.macos.desktop_status import MenuBarTaskStatus, app_is_active, is_backgrounded, notify_finished, set_dock_badge
 from omniagent.platform.macos.host_lock import host_task_lock
+from omniagent.platform.macos.visibility import GlobalVisibilityHotkey, VisibilityHotkeyError, set_application_hidden
 from omniagent.model_catalog import (
     ModelCatalogError, cached_models, list_provider_models, load_model_preferences,
     save_model_preferences, valid_model_id,
@@ -286,6 +287,9 @@ class OmniUI(ctk.CTk):
         self._build_footer()
 
         self._inbox: "Queue[UiItem]" = Queue()
+        self._visibility_requests: "Queue[bool]" = Queue()
+        self._visibility_hidden: bool = False
+        self._visibility_hotkey: Optional[GlobalVisibilityHotkey] = None
         self._stop_event: threading.Event = threading.Event()
         self._agent_future: Optional["Future[RunReport]"] = None
         self._history: List[Exchange] = []
@@ -346,6 +350,14 @@ class OmniUI(ctk.CTk):
         self._render_welcome()
         self._text.configure(state="disabled")
         self._set_activity_idle()
+        if sys.platform == "darwin":
+            try:
+                self._visibility_hotkey = GlobalVisibilityHotkey(
+                    lambda: self._visibility_requests.put(True)
+                )
+            except (VisibilityHotkeyError, OSError) as error:
+                self._post({"kind": "notice", "level": "warning",
+                            "text": f"Genel ⌘X kullanılamıyor: {error}"})
         self.after(FRAME_MS, self._tick)
         self.after(120, self.entry.focus_set)
         self.after(120, self._style_native_titlebar)
@@ -1212,6 +1224,9 @@ class OmniUI(ctk.CTk):
 
     def _sync_menu_status(self) -> None:
         """Arka planda görev sürerken menü çubuğu göstergesini canlı tutar."""
+        if self._visibility_hidden:
+            self._menu_status.hide()
+            return
         background = is_backgrounded(
             self.state(), self.focus_displayof() is not None, app_is_active())
         if not background:
@@ -1224,6 +1239,18 @@ class OmniUI(ctk.CTk):
             self._menu_status.show(f"✻ {symbol}", "OmniAgent görevi tamamlandı")
         else:
             self._menu_status.hide()
+
+    def _toggle_visibility(self) -> None:
+        """Genel kısayol isteğini yalnız Tk thread'inde uygular."""
+        target = not self._visibility_hidden
+        try:
+            set_application_hidden(target, self)
+        except Exception as error:
+            self._post({"kind": "notice", "level": "warning",
+                        "text": f"OmniAgent görünürlüğü değiştirilemedi: {error}"})
+            return
+        self._visibility_hidden = target
+        self._sync_menu_status()
 
     def _on_focus_return(self, _event: object = None) -> None:
         """Pencere yeniden görünür olunca tamamlanma rozetini temizler."""
@@ -1257,6 +1284,12 @@ class OmniUI(ctk.CTk):
 
     def _tick(self) -> None:
         """~60 fps kare döngüsü: olayları işle, daktiloyu ilerlet, kirli blokları çiz, animasyonları oynat."""
+        while True:
+            try:
+                self._visibility_requests.get_nowait()
+            except Empty:
+                break
+            self._toggle_visibility()
         now: float = time.monotonic()
         running: bool = self._agent_future is not None and not self._agent_future.done()
         refresh_due: bool = (
@@ -1642,6 +1675,8 @@ class OmniUI(ctk.CTk):
 
     def _on_close(self) -> None:
         """Pencere kapanırken ses/istemci kaynaklarını kapatıp event loop'u durdurur."""
+        if self._visibility_hotkey is not None:
+            self._visibility_hotkey.close()
         self._voice.cancel()
         self._stop_event.set()
         set_dock_badge(None)

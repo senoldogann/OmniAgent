@@ -222,9 +222,47 @@ def _require_screen_capture() -> None:
         raise ToolError(screen_capture_help(), "SCREEN_CAPTURE_PERMISSION", False)
     require_unlocked_screen()
 
+
+def _capture_window_ids(windows: List[Dict[str, object]]) -> Optional[Tuple[int, ...]]:
+    """OmniAgent UI sürecini başlıklı herhangi bir penceresinden tanıyıp ayıkla."""
+    private_pids = {
+        int(window.get("kCGWindowOwnerPID") or 0)
+        for window in windows
+        if str(window.get("kCGWindowName") or "") == "OmniAgent"
+        or str(window.get("kCGWindowName") or "").startswith("OmniAgent — ")
+    }
+    private_pids.discard(0)
+    if not private_pids:
+        return None
+    return tuple(
+        int(window.get("kCGWindowNumber") or 0)
+        for window in windows
+        if int(window.get("kCGWindowNumber") or 0) > 0
+        and int(window.get("kCGWindowOwnerPID") or 0) not in private_pids
+    )
+
+
 def _display_image(display_id: int, resolution: int) -> object:
-    image = Quartz.CGWindowListCreateImage(Quartz.CGDisplayBounds(display_id), Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID, resolution)
-    if image is None: raise ToolError(f"Ekran görüntüsü alınamadı: id={display_id}.", "SCREEN_CAPTURE_FAILED", True)
+    windows = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID,
+    )
+    if windows is None:
+        raise ToolError("Ekran pencereleri okunamadı; görüntü doğrulanamadı.", "SCREEN_WINDOW_LIST_FAILED", True)
+    allowed_ids = _capture_window_ids(list(windows))
+    bounds = Quartz.CGDisplayBounds(display_id)
+    if allowed_ids is None:
+        image = Quartz.CGWindowListCreateImage(
+            bounds, Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID, resolution,
+        )
+    else:
+        image = Quartz.CGWindowListCreateImageFromArray(bounds, list(allowed_ids), resolution)
+    if image is None and allowed_ids is not None:
+        raise ToolError(
+            "OmniAgent penceresi hariç tutularak ekran görüntüsü alınamadı.",
+            "SCREEN_CAPTURE_FILTER_FAILED", True,
+        )
+    if image is None:
+        raise ToolError(f"Ekran görüntüsü alınamadı: id={display_id}.", "SCREEN_CAPTURE_FAILED", True)
     return image
 
 def _main_display_image(resolution: int) -> object:
@@ -241,6 +279,7 @@ def _front_app_window_image(app_name: str, image_option: int) -> Tuple[object, S
     windows = Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
     wanted = app_name.casefold()
     entries = list(windows) if windows else []
+    candidates: List[Tuple[int, Dict[str, object], Dict[str, object], float, float, float, float]] = []
     for pos, window in enumerate(entries):
         if int(window.get(Quartz.kCGWindowLayer) or 0) != 0: continue
         if str(window.get(Quartz.kCGWindowOwnerName) or "").casefold() != wanted: continue
@@ -248,12 +287,19 @@ def _front_app_window_image(app_name: str, image_option: int) -> Tuple[object, S
         if not bounds: continue
         b = dict(bounds)
         left, top, width, height = float(b.get("X", 0.0)), float(b.get("Y", 0.0)), float(b.get("Width", 0.0)), float(b.get("Height", 0.0))
-        if width < 2 or height < 2: continue
+        if width < 200 or height < 120: continue
+        candidates.append((pos, window, b, left, top, width, height))
+    # Chrome'un 189×22 piksellik görünmez/alt kenar yardımcı penceresi bazen ana
+    # pencerenin önüne geçer. Önce gerçek tarayıcı boyutundaki en öndeki adayı seç.
+    preferred = [item for item in candidates if item[5] >= 320 and item[6] >= 240]
+    for pos, window, b, left, top, width, height in preferred or candidates:
         window_id = int(window.get(Quartz.kCGWindowNumber) or 0)
         if window_id <= 0: continue
         owner_pid = int(window.get(Quartz.kCGWindowOwnerPID) or 0)
         popups = [int(other.get(Quartz.kCGWindowNumber) or 0) for other in entries[:pos]
-                  if int(other.get(Quartz.kCGWindowOwnerPID) or 0) == owner_pid and _bounds_intersect(dict(other.get(Quartz.kCGWindowBounds) or {}), b)]
+                  if int(other.get(Quartz.kCGWindowOwnerPID) or 0) == owner_pid
+                  and float(dict(other.get(Quartz.kCGWindowBounds) or {}).get("Height", 0)) >= 80
+                  and _bounds_intersect(dict(other.get(Quartz.kCGWindowBounds) or {}), b)]
         image = Quartz.CGWindowListCreateImageFromArray(Quartz.CGRectMake(left, top, width, height), popups + [window_id], image_option)
         if image is None: continue
         return image, {"point_width": round(width), "point_height": round(height), "model_width": MODEL_SCREEN_SIZE, "model_height": MODEL_SCREEN_SIZE, "origin_x": round(left), "origin_y": round(top)}
@@ -422,6 +468,12 @@ def post_scroll(dx: float, dy: float) -> None:
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
 def changed_region(before: np.ndarray, after: np.ndarray, anchor: Tuple[int, int], min_share: float) -> Optional[Tuple[int, int, int, int]]:
+    if before.shape != after.shape:
+        raise ToolError(
+            f"Ekran ölçüsü kaydırma sırasında değişti ({before.shape} → {after.shape}); "
+            "güncel ekranı alıp işlemi yeniden dene.",
+            "SCREEN_GEOMETRY_CHANGED", True,
+        )
     changed = (np.abs(after.astype(np.int16) - before.astype(np.int16)) > SETTLE_PIXEL_DELTA).astype(np.uint8)
     if not changed.any(): return None
     grown = cv2.dilate(changed, np.ones((9, 9), np.uint8))
