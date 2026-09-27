@@ -22,7 +22,7 @@ from openai.types import CompletionUsage
 from PIL import Image, ImageOps
 
 from omniagent.config import (
-    API_KEY_VARIABLES, BACKENDS, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER,
+    API_KEY_VARIABLES, BACKENDS, CONTINUOUS_GUIDANCE, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER,
     SYSTEM_PROMPT, BackendProfile, apply_stored_api_keys, redact,
 )
 from omniagent.core.events import AgentEvent, ArtifactReady, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
@@ -31,8 +31,16 @@ from omniagent.core.fast_loop import (
     normalize_progress_signature,
 )
 from omniagent.tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, ToolRuntime, Toolbox, ToolError, shell_command_words
+from omniagent.app.continuous import (
+    CONTEXT_KEEP_TURNS, CONTEXT_MAX_TURNS, CONTINUE_PROMPT, CONTINUOUS_MODE, MAX_IDLE_REPORTS,
+    continuous_limits_path, direction_prompt, goal_confirmation_question, goal_report_problem,
+    load_continuous_limits, window_messages,
+)
+from omniagent.approval import approval_granted
 from omniagent.app.tool_schema import (
     AUTO_OBSERVATION_PREVIEW,
+    GOAL_REPORT_SCHEMA,
+    GOAL_REPORT_TOOL,
     POINT_SCHEMA,
     TOOL_NAMES,
     VERIFICATION_OBSERVATION_PREVIEW,
@@ -618,6 +626,100 @@ def merge_artifact(
     return kept + (artifact,)
 
 
+def emit_existing_artifacts(cards: Tuple[ArtifactReady, ...], emit: EventSink) -> None:
+    """Birikmiş çıktı kartlarını yayınlar; bu arada silinen geçici dosya teslim sayılmaz."""
+    for card in cards:
+        if Path(card["path"]).is_file():
+            emit(card)
+
+
+def record_goal_evidence(
+    evidence: Dict[str, str], calls: List[ToolCallDraft], results: List[ToolResult],
+) -> Dict[str, str]:
+    """Başarılı araç çağrılarını report_goal_met kanıtı olarak id → kısa özetle ekler. Saf."""
+    return {**evidence, **{
+        call["id"]: f"{call['name']}: {result_text(result)[:160]}"
+        for call, result in zip(calls, results, strict=True) if result.get("ok")
+    }}
+
+
+def merge_call_results(
+    hosted_mask: List[bool], regular: List[ToolResult], hosted: List[ToolResult],
+) -> List[ToolResult]:
+    """Araç ve host sonuçlarını modelin çağrı sırasına geri dizer (tool mesajları sırayla gider). Saf."""
+    regular_results = iter(regular)
+    hosted_results = iter(hosted)
+    return [next(hosted_results) if is_hosted else next(regular_results) for is_hosted in hosted_mask]
+
+
+async def ask_for_direction(runtime: IntegrationRuntime, stall: str) -> Optional[str]:
+    """
+    Sürekli görev takılınca durmak yerine kullanıcıdan yön ister; yanıt süresi bütçeye sayılmaz.
+    Kullanıcı durdurursa None döner. Boş yanıt da geçerlidir: model farklı bir yol seçer.
+    """
+    try:
+        answer: Dict[str, Any] = await runtime.ask(
+            f"Sürekli görev takıldı: {stall}\nNasıl devam edeyim? (Durdurmak için Esc veya /stop)",
+            {"yanit": {"type": "string", "label": "Yönlendirme", "default": ""}},
+            None,
+        )
+    except IntegrationStopped:
+        return None
+    return str(answer.get("yanit", "")).strip()
+
+
+async def resolve_goal_report(
+    call: ToolCallDraft, index: int, evidence: Dict[str, str], runtime: IntegrationRuntime, emit: EventSink,
+) -> Tuple[ToolResult, Optional[str]]:
+    """
+    report_goal_met çağrısını host'ta işler: kanıt id'lerini görevin başarılı çağrılarıyla
+    karşılaştırır, geçerliyse kullanıcıya onaylatır. Onaylanan özeti, aksi hâlde None döner.
+    """
+    started: float = time.monotonic()
+    emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
+          "preview": preview_arguments(call["name"], call["arguments"])})
+    confirmed: Optional[str] = None
+    try:
+        arguments: object = json.loads(call["arguments"] or "{}")
+    except json.JSONDecodeError as error:
+        arguments = f"Argümanlar çözümlenemedi: {error}"
+    if not isinstance(arguments, dict):
+        problem: Optional[str] = str(arguments) if isinstance(arguments, str) else "Argümanlar JSON nesnesi olmalı."
+        summary: str = ""
+        evidence_ids: List[str] = []
+    else:
+        summary = str(arguments.get("summary", ""))
+        raw_ids: object = arguments.get("evidence_call_ids")
+        problem = goal_report_problem(summary, raw_ids, evidence)
+        evidence_ids = [item for item in raw_ids if isinstance(item, str)] if isinstance(raw_ids, list) else []
+    if problem is not None:
+        result: ToolResult = {"tool_call_id": call["id"], "ok": False, "error_type": "GoalNotProven",
+                              "error": problem, "code": "GOAL_NOT_PROVEN", "recoverable": True}
+    else:
+        try:
+            answer: Dict[str, Any] = await runtime.ask(
+                redact(goal_confirmation_question(summary, evidence_ids, evidence)),
+                {"onay": {"type": "boolean", "label": "Hedef gerçekleşti", "default": False}},
+                None,
+            )
+        except IntegrationStopped as error:
+            result = {"tool_call_id": call["id"], "ok": False, "error_type": "IntegrationStopped",
+                      "error": str(error), "code": "STOPPED", "recoverable": False}
+        else:
+            if approval_granted(answer.get("onay")):
+                confirmed = summary.strip()
+                result = {"tool_call_id": call["id"], "ok": True,
+                          "result": "Kullanıcı hedefin gerçekleştiğini ONAYLADI; görev tamamlandı."}
+            else:
+                result = {"tool_call_id": call["id"], "ok": True, "result": (
+                    "Kullanıcı hedefin gerçekleştiğini ONAYLAMADI. Eksik olanı bul, gerekirse "
+                    "ask_user ile sor ve göreve devam et."
+                )}
+    emit({"kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
+          "text": result_text(result), "seconds": round(time.monotonic() - started, 2)})
+    return result, confirmed
+
+
 async def run_agent_with_callback(
     goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
 ) -> RunReport:
@@ -642,9 +744,20 @@ async def run_agent_with_callback(
                 "metrics": initial_metrics, "exchange": make_exchange(goal, failure, [])}
 
     try:
+        if options.get("run_mode") == CONTINUOUS_MODE:
+            # Ayarlar'daki kullanıcı sınırları varsayılandır; çağıranın açık değerleri önceliklidir.
+            limits = load_continuous_limits(continuous_limits_path())
+            options = {"max_wall_clock_seconds": limits["max_hours"] * 3600,
+                       "max_total_tokens": limits["max_total_tokens"], **options}
         run_mode, max_iterations, max_wall_clock = resolve_run_limits(options)
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         return startup_failure(error, DEFAULT_BACKEND)
+    continuous: bool = run_mode == CONTINUOUS_MODE
+    max_total_tokens: Optional[int] = options.get("max_total_tokens")
+    if continuous and options.get("answer") is None:
+        return startup_failure(ValueError(
+            "Sürekli mod, soru sorup yanıt bekleyebileceği bir kanal ister (masaüstü uygulaması veya Telegram)."
+        ), DEFAULT_BACKEND)
     if not clients:
         return startup_failure(RuntimeError(
             "Kullanılabilir model yok: Ollama Cloud modeli veya bir API anahtarı "
@@ -698,12 +811,16 @@ async def run_agent_with_callback(
             user_message_with_images, user_content, options.get("images", []),
         )
         messages: List[Dict[str, Any]] = (
-            [{"role": "system", "content": route_system_prompt(date.today(), goal, memory_block, chrome_session)}]
+            [{"role": "system", "content": route_system_prompt(date.today(), goal, memory_block, chrome_session)
+              + (CONTINUOUS_GUIDANCE if continuous else "")}]
             + to_messages(options["history"])
             + [first_message]
         )
         service = options.get("integrations") or CapabilityService()
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"), options.get("deliver"))
+        if continuous:
+            # Sürekli görev kullanıcının yanıtını süresiz bekler; bekleme bütçeye sayılmaz.
+            runtime.user_input_timeout = None
         can_send_files: bool = runtime.deliver is not None
         # Planı Telegram köprüsü çalıştırır; zamanlanmış görevin kendisi yeniden plan kuramaz
         can_schedule: bool = (
@@ -743,8 +860,13 @@ async def run_agent_with_callback(
     delivery_recoveries: int = 0
     file_receipts: Tuple[FileReceipt, ...] = ()
     artifacts: Tuple[ArtifactReady, ...] = ()
+    head_len: int = len(messages)
+    dropped_turns: int = 0
+    idle_reports: int = 0
+    goal_evidence: Dict[str, str] = {}
     must_execute_action: bool = action_execution_expected(goal) or file_contract is not None
-    guarded_final_output: bool = (
+    # Sürekli modda son yanıt "bitti" beyanı değil ilerleme raporudur; metin canlı akar.
+    guarded_final_output: bool = not continuous and (
         must_change_source or must_execute_action or unmet_wait_status(goal, []) is not None
     )
     gui_verified: bool = False
@@ -776,20 +898,44 @@ async def run_agent_with_callback(
     experience_hints: int = 0
     metrics: sm.EpisodeMetrics
 
+    async def continue_with_direction(stall: str) -> bool:
+        """
+        Sürekli görev takılınca kullanıcının yönünü bağlama ekler ve takılma sayaçlarını sıfırlar;
+        aynı takılma hemen ikinci soruyu üretmez. Kullanıcı durdurduysa False döner.
+        """
+        nonlocal no_progress_turns, fast_loop_state, idle_reports
+        direction: Optional[str] = await ask_for_direction(runtime, stall)
+        if direction is None:
+            return False
+        messages.append({"role": "user", "content": direction_prompt(direction)})
+        no_progress_turns, fast_loop_state, idle_reports = 0, FastLoopState(), 0
+        return True
+
     try:
         for iteration in range(1, max_iterations + 1):
             if options["should_stop"]():
                 outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                 break
             if time.monotonic() - start_time - runtime.metrics["user_wait_seconds"] > max_wall_clock:
-                outcome, reason = "", f"zaman bütçesi ({max_wall_clock:.0f}sn) aşıldı"
+                outcome, reason = "", (
+                    f"sınır doldu: süre ({max_wall_clock / 3600:g} saat)" if continuous
+                    else f"zaman bütçesi ({max_wall_clock:.0f}sn) aşıldı"
+                )
+                break
+            if max_total_tokens is not None and usage["prompt_tokens"] + usage["completion_tokens"] >= max_total_tokens:
+                outcome, reason = "", f"sınır doldu: token ({max_total_tokens} giriş + çıkış)"
                 break
 
             runtime.published = dict(runtime.selected)
             tool_schemas = route_tool_schemas(goal, allow_edit, chrome_session, can_send_files, can_schedule) + [
-                entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"]
+                entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"
+            ] + ([GOAL_REPORT_SCHEMA] if continuous else [])
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)
+            if continuous:
+                messages, dropped_turns = window_messages(
+                    messages, head_len, CONTEXT_MAX_TURNS, CONTEXT_KEEP_TURNS, dropped_turns,
+                )
             messages_for_model = inject_task_ledger_into_messages(messages, host_task_ledger)
             emit({"kind": "turn_started", "turn": iteration, "max_turns": max_iterations,
                   "backend": current_backend, "model": BACKENDS[current_backend]["model"]})
@@ -868,6 +1014,18 @@ async def run_agent_with_callback(
                     outcome = f"Doğrulanmadı: {reason}" if guarded_final_output else turn["content"]
                     finish_guarded_turn(outcome)
                     break
+                if continuous:
+                    # Son yanıt ilerleme raporudur: görev sürer, bu dönemin çıktı kartları şimdi gelir.
+                    emit_existing_artifacts(artifacts, emit)
+                    artifacts = ()
+                    idle_reports += 1
+                    if idle_reports < MAX_IDLE_REPORTS:
+                        messages.append({"role": "user", "content": CONTINUE_PROMPT})
+                        continue
+                    if not await continue_with_direction(f"{idle_reports} ardışık yanıtta hiçbir araç çalışmadı"):
+                        outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
+                        break
+                    continue
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
                 navigation_gap = requested_chrome_navigation_gap(goal, steps) if success else None
@@ -1033,15 +1191,38 @@ async def run_agent_with_callback(
 
             finish_guarded_turn()
             awaiting_real_tool_call = False
+            idle_reports = 0
             if turn["finish_reason"] == "length":
                 emit({"kind": "notice", "level": "warning",
                       "text": "Yanıt max_tokens sınırında kesildi; araç argümanları eksik olabilir."})
             tool_call_count += len(turn["tool_calls"])
             tools_started: float = time.monotonic()
+            # report_goal_met host'a aittir: kanıtı görev kaydıyla denetler ve kullanıcıya onaylatır.
+            hosted_mask: List[bool] = [
+                continuous and call["name"] == GOAL_REPORT_TOOL for call in turn["tool_calls"]
+            ]
+            regular_calls: List[ToolCallDraft] = [
+                call for call, hosted in zip(turn["tool_calls"], hosted_mask, strict=True) if not hosted
+            ]
+            confirmed_goal: Optional[str] = None
             try:
-                results: List[ToolResult] = await _execute_tool_calls(
-                    turn["tool_calls"], toolbox, tool_cache, emit, options["should_stop"],
-                )
+                regular_results: List[ToolResult] = await _execute_tool_calls(
+                    regular_calls, toolbox, tool_cache, emit, options["should_stop"],
+                ) if regular_calls else []
+                goal_evidence = record_goal_evidence(goal_evidence, regular_calls, regular_results)
+                hosted_results: List[ToolResult] = []
+                for index, (call, hosted) in enumerate(zip(turn["tool_calls"], hosted_mask, strict=True)):
+                    if hosted and confirmed_goal is not None:
+                        # Aynı turdaki ikinci bildirim kullanıcıya ikinci kez sorulmaz.
+                        hosted_results.append({"tool_call_id": call["id"], "ok": True,
+                                               "result": "Hedef bu turda zaten onaylandı."})
+                    elif hosted:
+                        hosted_result, confirmed = await resolve_goal_report(
+                            call, index, goal_evidence, runtime, emit,
+                        )
+                        hosted_results.append(hosted_result)
+                        confirmed_goal = confirmed
+                results: List[ToolResult] = merge_call_results(hosted_mask, regular_results, hosted_results)
             finally:
                 tool_seconds += time.monotonic() - tools_started
 
@@ -1081,6 +1262,12 @@ async def run_agent_with_callback(
                 if duplicate_note is not None:
                     duplicate_navigation_notes.append(duplicate_note)
                     duplicate_navigation_count += 1
+
+            if confirmed_goal is not None:
+                # Sürekli görevin tek başarı yolu: kanıtlı hedefi kullanıcı onayladı.
+                outcome, reason, success = confirmed_goal, "", True
+                emit({"kind": "text_delta", "text": confirmed_goal})
+                break
 
             # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: tool sonuçları assistant
             # tool_calls'ı kesintisiz izlemeli; araya user mesajı 400'e yol açar.
@@ -1224,8 +1411,12 @@ async def run_agent_with_callback(
                     ),
                 })
             if decision.stop_reason is not None:
-                reason = decision.stop_reason
-                break
+                if not continuous:
+                    reason = decision.stop_reason
+                    break
+                if not await continue_with_direction(decision.stop_reason):
+                    outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
+                    break
 
             # Her tur sonunda oturum kontrol noktası atomik olarak saklanır
             try:
@@ -1244,9 +1435,14 @@ async def run_agent_with_callback(
             # model/API çağrısının kendi hata yolunda (_call_model_with_retries) yapılır.
             no_progress_turns = no_progress_turns + 1 if all_failed else 0
             if no_progress_turns >= NO_PROGRESS_LIMIT:
-                reason = f"ilerleme yok: {NO_PROGRESS_LIMIT} ardışık tamamen başarısız araç turu"
-                emit({"kind": "notice", "level": "warning", "text": reason})
-                break
+                stall: str = f"ilerleme yok: {NO_PROGRESS_LIMIT} ardışık tamamen başarısız araç turu"
+                emit({"kind": "notice", "level": "warning", "text": stall})
+                if not continuous:
+                    reason = stall
+                    break
+                if not await continue_with_direction(stall):
+                    outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
+                    break
         else:
             success = False
             reason = f"maksimum iterasyon sayısına ({max_iterations}) ulaşıldı"
@@ -1329,10 +1525,8 @@ async def run_agent_with_callback(
                 emit({"kind": "notice", "level": "warning", "text": detail})
             except Exception:
                 logging.exception("Temizlik uyarısı yayınlanamadı")
-        # Çıktı kartları görev sonunda bir kez gelir; bu arada silinen geçici dosya teslim sayılmaz.
-        for card in artifacts:
-            if Path(card["path"]).is_file():
-                emit(card)
+        # Çıktı kartları görev sonunda (sürekli modda her ilerleme raporunda) bir kez gelir.
+        emit_existing_artifacts(artifacts, emit)
         emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "reason": reason,
             "metrics": metrics, "exchange": exchange}

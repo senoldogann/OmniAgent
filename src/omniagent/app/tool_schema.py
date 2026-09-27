@@ -73,6 +73,23 @@ def _function_schema(
     }}
 
 
+# Sürekli görevin tek başarı yolu; host kanıtı denetleyip kullanıcıya onaylatır (bkz. agent.py).
+GOAL_REPORT_TOOL: str = "report_goal_met"
+GOAL_REPORT_SCHEMA: Dict[str, Any] = _function_schema(
+    GOAL_REPORT_TOOL,
+    "Sürekli görevde hedefe ulaşıldığını bildirir. Yalnız önceki başarılı araç çağrılarının "
+    "id'leriyle kanıtlanabiliyorsa çağır; host kanıtı denetler ve kullanıcıya onaylatır, "
+    "onaylanmazsa görev sürer.",
+    {
+        "summary": {"type": "string", "description": "Ulaşılan somut sonuç (tutar, hesap, bağlantı dahil)."},
+        "evidence_call_ids": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Sonucu kanıtlayan önceki başarılı araç çağrılarının id'leri.",
+        },
+    },
+)
+
+
 def camera_photo_goal(goal: str) -> bool:
     """Tek kare kamera çekimi hedeflerinde özel aracı açar; diğer görevleri sade tutar."""
     lowered: str = goal.casefold()

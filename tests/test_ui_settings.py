@@ -41,6 +41,11 @@ def _of_kind(root: object, kind: type) -> List[object]:
     return [widget for widget in _descendants(root) if isinstance(widget, kind)]
 
 
+def _key_entries(window: object) -> List[object]:
+    """API anahtarı alanları maskeli açılır; sürekli mod sınır alanları sır değildir."""
+    return [entry for entry in _of_kind(window, ctk.CTkEntry) if entry.cget("show") == "•"]
+
+
 def _save_buttons(window: object) -> List[object]:
     return [button for button in _of_kind(window, ctk.CTkButton) if button.cget("text") == "Kaydet"]
 
@@ -123,7 +128,7 @@ def test_settings_page_saves_key_without_touching_environment(
     assert window is not None and window.winfo_exists()
     assert window.title() == "OmniAgent — Ayarlar"
     assert window.cget("fg_color") == ui.BG
-    entries: List[object] = _of_kind(window, ctk.CTkEntry)
+    entries: List[object] = _key_entries(window)
     assert len(entries) == len(api_keys.KEY_VARIABLES)
     assert len(_save_buttons(window)) == 1
 
@@ -161,7 +166,7 @@ def test_partial_save_still_rebuilds_clients(
     app._open_settings()
     window = app._settings_window
     assert window is not None
-    entries: List[object] = _of_kind(window, ctk.CTkEntry)
+    entries: List[object] = _key_entries(window)
     _fill(entries[0], "kaydedilen")
     _fill(entries[1], "reddedilen")
     _save_buttons(window)[0].invoke()
@@ -176,7 +181,7 @@ def test_settings_page_reveals_keys_on_request(app: ui.OmniUI, keychain: FakeKey
     app._open_settings()
     window = app._settings_window
     assert window is not None
-    entries: List[object] = _of_kind(window, ctk.CTkEntry)
+    entries: List[object] = _key_entries(window)
     checks: List[object] = _of_kind(window, ctk.CTkCheckBox)
     assert entries and checks
     assert all(entry.cget("show") == "•" for entry in entries)

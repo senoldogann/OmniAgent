@@ -38,7 +38,7 @@ from omniagent.config import redact
 from omniagent.core import schedule, state as sm
 from omniagent.paths import schedules_file
 from omniagent.integrations.runtime import CURRENT_RUNTIME, DeliveryFailed
-from omniagent.approval import APPROVAL_TIMEOUT_SECONDS, approval_granted
+from omniagent.approval import approval_granted
 
 from . import browser, filesystem, gui_input, screen, system, types as tool_types
 
@@ -126,6 +126,12 @@ from .browser import (
 from playwright.async_api import Browser, BrowserContext, Page, Playwright
 
 _P = ParamSpec("_P")
+# Metin yanıtı isteyen soruda sır istemi: yanıt modele, transkripte ve Telegram'a düşerdi.
+_SECRET_REQUEST: re.Pattern[str] = re.compile(
+    r"api[\s_-]?(?:key|anahtar)|secret|token|şifre|parola|password|private[\s_-]?key"
+    r"|gizli\s+anahtar|erişim\s+anahtar|access[\s_-]?key",
+    re.IGNORECASE,
+)
 
 def _screen_input(method: Callable[Concatenate["Toolbox", _P], str]) -> Callable[Concatenate["Toolbox", _P], str]:
     from functools import wraps
@@ -302,6 +308,13 @@ class Toolbox:
         text = " ".join(str(question).split())
         if not text:
             raise ToolError("Soru boş olamaz.", "INVALID_QUESTION", False)
+        if kind == "text" and _SECRET_REQUEST.search(text):
+            raise ToolError(
+                "Sırlar (API anahtarı, parola, token) sohbetle istenmez; yanıt modele ve kayda düşerdi. "
+                "Kullanıcıdan ⚙ Ayarlar'a girmesini iste ve kind=confirm ile girdiğini doğrulat.",
+                "SECRET_IN_CHAT",
+                True,
+            )
         if kind == "confirm":
             fields: Dict[str, object] = {
                 "onay": {"type": "boolean", "label": "Onaylıyorum", "default": False}
@@ -312,11 +325,12 @@ class Toolbox:
             raise ToolError(
                 f"kind confirm veya text olmalı; alınan: {kind!r}", "INVALID_QUESTION", False
             )
+        timeout: Optional[float] = runtime.user_input_timeout
         try:
-            answer = await runtime.ask(redact(_clip(text, 1500)), fields, APPROVAL_TIMEOUT_SECONDS)
+            answer = await runtime.ask(redact(_clip(text, 1500)), fields, timeout)
         except TimeoutError as error:
             raise ToolError(
-                f"Kullanıcı {APPROVAL_TIMEOUT_SECONDS / 60:.0f} dakika içinde yanıt vermedi; "
+                f"Kullanıcı {(timeout or 0) / 60:.0f} dakika içinde yanıt vermedi; "
                 "bekleyen soruyu final yanıtında bildir.",
                 "INPUT_TIMEOUT",
                 False,

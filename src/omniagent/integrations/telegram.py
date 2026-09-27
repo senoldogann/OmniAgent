@@ -1119,7 +1119,8 @@ class TelegramBridge:
                 chat_id,
                 "Hedefinizi yazın. /stop durdurur, /status durumu gösterir. "
                 "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
-                "/model <profil> ve /mode <normal|long|autonomous> sonraki görevi ayarlar. "
+                "/model <profil> ve /mode <normal|long|autonomous|surekli> sonraki görevi ayarlar; "
+                "surekli, siz durdurana veya hedefi onaylayana kadar çalışır ve gerekince size sorar. "
                 "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
                 "ajan istediğiniz dosyaları size buradan geri gönderebilir. "
                 "\"Her sabah 9'da …\" gibi görevler planlanır; /schedules listeler, /unschedule <kimlik> siler. "
@@ -1144,10 +1145,11 @@ class TelegramBridge:
             return
         if text.startswith("/mode "):
             selected = text.split(None, 1)[1].strip()
-            if selected not in ("normal", "long", "extended", "autonomous"):
-                await self.api.send(chat_id, "Mod: normal, long veya autonomous.")
+            aliases = {"long": "extended", "surekli": "continuous", "sürekli": "continuous"}
+            if selected not in ("normal", "long", "extended", "autonomous", "surekli", "sürekli", "continuous"):
+                await self.api.send(chat_id, "Mod: normal, long, autonomous veya surekli.")
                 return
-            self.run_mode = "extended" if selected == "long" else selected
+            self.run_mode = aliases.get(selected, selected)
             await self.api.send(chat_id, f"Sonraki görev modu: {selected}.")
             return
         if self.active is not None:

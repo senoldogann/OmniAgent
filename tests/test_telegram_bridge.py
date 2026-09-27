@@ -216,6 +216,10 @@ async def test_bridge_streams_real_event_contract_and_stop(monkeypatch: pytest.M
         "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "2+2 hesapla",
     }}
     await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "/mode surekli",
+    }})
+    assert bridge.run_mode == "continuous"
+    await bridge.handle({"message": {
         "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "/mode long",
     }})
     assert bridge.run_mode == "extended"

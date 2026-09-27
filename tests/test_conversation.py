@@ -17,6 +17,7 @@ def test_run_mode_budgets_are_bounded_and_overridable() -> None:
     assert main.resolve_run_limits(base) == ("normal", main.MAX_ITERATIONS, main.MAX_WALL_CLOCK_SECONDS)
     assert main.resolve_run_limits({**base, "run_mode": "extended"}) == ("extended", 50, 1200.0)
     assert main.resolve_run_limits({**base, "run_mode": "autonomous"}) == ("autonomous", 100, 2700.0)
+    assert main.resolve_run_limits({**base, "run_mode": "continuous"}) == ("continuous", 100_000, 28_800.0)
     assert main.resolve_run_limits({**base, "run_mode": "extended", "max_iterations": 7}) == ("extended", 7, 1200.0)
 
 

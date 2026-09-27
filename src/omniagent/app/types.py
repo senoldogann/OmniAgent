@@ -59,6 +59,7 @@ class RunOptions(TypedDict):
     run_mode: NotRequired[str]
     max_iterations: NotRequired[int]
     max_wall_clock_seconds: NotRequired[float]
+    max_total_tokens: NotRequired[int]
 
 
 class RunReport(TypedDict):
