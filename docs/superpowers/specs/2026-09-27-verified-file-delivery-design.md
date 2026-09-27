@@ -27,29 +27,55 @@ aynı son karar ve olay akışını tüketir.
   mutlak veya açık bağıl (`./`, `../`, `dizin/dosya`, `dosya.ext`) yerel yolları
   seçer. `http(s)` URL'leri, README içindeki yol referansı ve birden fazla
   yoruma açık cümleler hedef olmaz. Bağıl yol, görevin başladığı çalışma
-  dizinine göre çözülür; sembolik bağ hedefi takip edilmez.
+  dizinine göre çözülür; sembolik bağ hedefi takip edilmez. Ayrıştırıcı önce
+  mevcut `action_execution_expected`/`_action_scope` ayrımını kullanır:
+  `How can I delete ./a.txt?` bilgi sorusudur, ardından `Please delete it`
+  gelirse soru içindeki yol emre bağlanır.
 - Silmede her seçilen hedef için başlangıçtaki `lstat` ve bitişteki `lstat`
-  karşılaştırılır. Birden çok hedefte hepsinin yokluğu gerekir. Başlangıçta
-  zaten olmayan dosya için “silindi” iddiası onaylanmaz.
+  karşılaştırılır. Birden çok hedefte hepsinin yokluğu ve her hedefe yönelik
+  başarılı `rm`/`unlink` araç makbuzu gerekir; başka yere `mv` silme makbuzu
+  sayılmaz. Başlangıçta zaten olmayan dosya için “silindi” iddiası onaylanmaz.
+- Düzenleme ve taşıma için içerik özeti akışlı okunur; boyut sınırını aşan,
+  okunamayan veya özel dosyalarda (ör. aygıt) bu sözleşme belirsiz sayılır.
+  Sembolik bağın kendisi taşınıyorsa bağ hedefi karşılaştırılır; bağlı
+  dosyanın içeriği okunmaz. Sembolik bağ üzerinden düzenleme, mevcut
+  `write_file` ve `edit_file` farklı nesneleri değiştirebildiği için bu
+  dilimde doğrulanmış düzenleme sözleşmesine alınmaz.
 - Taşımada açık kaynak ve hedef yolu varsa başlangıçta kaynak mevcut,
-  bitişte kaynak yok ve hedef mevcut olmalıdır. Düzenlemede açık hedefin
-  başlangıç/bitiş içerik özeti farklı olmalı veya hedefe yapılan doğrulanmış
-  `write_file`/`edit_file` çağrısı son içerikle eşleşmelidir. Aynı içeriği
-  yeniden yazma isteği açıkça verilmişse araç kanıtı yeterlidir.
+  bitişte kaynak yok ve hedef mevcut, bitişteki içerik/bağ kimliği de ilk
+  kaynakla eşleşmiş olmalıdır. Hedef bir dizinse etkin hedef
+  `hedef_dizin/kaynak_adı` olur. Etkin hedef başlangıçta mevcutsa bu ilk
+  sürüm sözleşme kurmaz; yalnız kaynağın yokluğu yanlış başarı üretemez.
+  Düzenlemede açık hedefin başlangıç ve bitiş içerik özeti farklı olmalıdır;
+  `edit_file` aynı metni geri döndürdüğünde başarı sayılmaz.
 - Hedefte açık yol bulunmasa da “dosyayı sil” gibi dosya işlemi istekleri
   alakasız `write_file` ile kanıtlanmaz. İşlemle uyumlu araç kanıtı ve mümkünse
   araç argümanından çıkarılan yerel hedefin son durumu aranır; doğru hedef
   bağlanamıyorsa sonuç `Doğrulanmadı` olur.
+- Açık `.txt`/`.md` gibi dosya düzenleme hedeflerinde `edit_file` şeması da
+  göreve açılır; yalnız “kaynak kodu” heuristiğine bağlı kalmaz.
+- Yeni dosya sözleşmesi görev başındaki `guarded_final_output` kararına
+  katılır; doğrulanmamış canlı final metni Telegram ve UI'ye akmaz. Aynı
+  içeriğin yeniden yazılmasını isteyen hedefler, bu ilk dilimdeki düzenleme
+  sözleşmesinin dışında kalır.
 - Host, görev başında alınan küçük dosya durumunu görev içinde tutar; model
-  geçmişine ve kalıcı belleğe enjekte etmez. Son doğrulama, mevcut tek kurtarma
+  geçmişine ve kalıcı belleğe enjekte etmez. Araçla hedef eşleştirmesi için
+  `StepRecord` kullanılmaz: bu kayıt argümanı 300 karakterde kırpar. Gerçek
+  `ToolCallDraft` ile sonucundan doğrulanmış işlem türü (`delete`, `move`,
+  `edit`), normalleştirilmiş kaynak/hedef yollar ve gerekli içerik özeti
+  görev içinde yapılandırılmış makbuz olarak tutulur. Kabukta yalnız tam
+  ayrıştırılabilen doğrudan `rm`/`unlink`/`mv` çağrıları bu makbuzu üretir;
+  gizli içerik/komut kalıcı kayda eklenmez. Son doğrulama, mevcut tek kurtarma
   turunu kullanır. Başarısız final metni kullanıcıya doğrulanmış başarı olarak
-  akmaz.
+  akmaz. Kaynak yazımı ve eylem kanıtı aynı dosya teslimi için ayrı ayrı
+  kurtarma hakkı vermez; tek ortak teslim kurtarma sayacı kullanılır.
 
 ## Değerlendirme ve kabul
 
 - Karşıt testlerde başka dosyaya yazma, salt gözlem, var olmayan dosyada
-  `rm -f`, hedeflerden yalnız birini silme, yanlış yere taşıma ve aynı
-  içerikte kalan düzenleme yanlış başarı üretmemelidir.
+  `rm -f`, hedeflerden yalnız birini silme, yanlış yere taşıma, önceden
+  mevcut hedefe karşı yalnız kaynağı silme ve aynı içerikte kalan düzenleme
+  yanlış başarı üretmemelidir.
 - Gerçek silme, taşıma ve düzenleme; yöntem sorusu ve README referansı
   karşıtlarında doğru sonuç korunmalıdır.
 - Tam test paketi ve macOS/Linux CI geçmeli. Görünmez canlı çekirdek ve
