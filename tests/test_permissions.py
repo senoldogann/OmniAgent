@@ -98,6 +98,17 @@ def test_help_points_to_python_when_no_app_identity(
     assert sys.executable in text
 
 
+def test_frozen_app_help_points_to_app_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Paketli kurulumda izin yönergesi Python yerine Finder uygulamasını gösterir."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", "/Applications/OmniAgent.app/Contents/MacOS/OmniAgent")
+    monkeypatch.setenv("__CFBundleIdentifier", "com.omniagent.desktop")
+    text = tools.screen_capture_help()
+    assert "'OmniAgent' (com.omniagent.desktop)" in text
+    assert "/Applications/OmniAgent.app" in text
+    assert "python ikilisini" not in text
+
+
 def test_tool_error_carries_actionable_help(monkeypatch: pytest.MonkeyPatch, terminal_owner: None) -> None:
     """Ekran kaydı gerektiren araç, izinsizken çıplak 'izin yok' yerine tam yönerge verir."""
     monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: False)

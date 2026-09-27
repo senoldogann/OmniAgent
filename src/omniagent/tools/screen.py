@@ -50,6 +50,7 @@ BUNDLE_APP_NAMES: Dict[str, str] = {
     "com.github.wez.wezterm": "WezTerm",
     "co.zeit.hyper": "Hyper",
     "com.freebuff.desktop": "Freebuff",
+    "com.omniagent.desktop": "OmniAgent",
 }
 
 _SCREEN_CAPTURE_REQUESTED: List[bool] = [False]
@@ -121,8 +122,14 @@ def _permission_help(title: str, settings_url: str, pane: str, requested: bool) 
         f'1) Ayarlar sayfasını açın: open "{settings_url}"',
         f"   (Sistem Ayarları > Gizlilik ve Güvenlik > {pane})",
         f"2) Listede '{app}'{identity} varsa anahtarını açın.",
-        f"   Yoksa '+' ile şu python ikilisini ekleyin (⌘⇧G ile yolu yapıştırın): {owner['python']}",
-        "3) İzni verdikten sonra Terminal'i/arayüzü tamamen kapatıp yeniden açın; macOS izni",
+    ]
+    if getattr(sys, "frozen", False):
+        bundle_path = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+        lines.append(f"   Yoksa '+' ile şu uygulamayı ekleyin (⌘⇧G ile yolu yapıştırın): {bundle_path}")
+    else:
+        lines.append(f"   Yoksa '+' ile şu python ikilisini ekleyin (⌘⇧G ile yolu yapıştırın): {owner['python']}")
+    lines += [
+        "3) İzni verdikten sonra uygulamayı tamamen kapatıp yeniden açın; macOS izni",
         "   çalışan sürece hemen uygulamaz.",
     ]
     if requested:

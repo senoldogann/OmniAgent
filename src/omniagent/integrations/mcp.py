@@ -50,6 +50,17 @@ async def run_install(command: List[str], runtime: IntegrationRuntime, timeout: 
                     await process.wait()
 
 
+def _install_python() -> str:
+    """Paketlenmiş .app ikilisini Python yorumlayıcısı sanmadan uygun sürümü bulur."""
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    python = next((found for minor in range(11, 15)
+                   if (found := shutil.which(f"python3.{minor}"))), None)
+    if not python:
+        raise RuntimeError("Python entegrasyonu için Python 3.11 veya uv kurulmalı.")
+    return python
+
+
 async def install_package(root: Path, entry: Capability, runtime: IntegrationRuntime) -> List[str]:
     package = entry.get("package", {})
     if not entry.get("trusted") or not entry.get("source") or not package:
@@ -88,14 +99,20 @@ async def install_package(root: Path, entry: Capability, runtime: IntegrationRun
     try:
         if ecosystem == "python":
             uv = shutil.which("uv")
+            if not uv:
+                for candidate in (Path.home() / ".local/bin/uv", Path("/opt/homebrew/bin/uv")):
+                    if candidate.is_file() and os.access(candidate, os.X_OK):
+                        uv = str(candidate)
+                        break
             if uv:
-                await run_install([uv, "venv", "--python", sys.executable, str(destination / "venv")],
+                python = "3.11" if getattr(sys, "frozen", False) else sys.executable
+                await run_install([uv, "venv", "--python", python, str(destination / "venv")],
                                   runtime, 60 - (time.monotonic() - start))
                 await run_install([uv, "pip", "install", "--python", str(executable),
                                    "--index-url", "https://pypi.org/simple", name + "==" + version],
                                   runtime, 60 - (time.monotonic() - start))
             else:
-                await run_install([sys.executable, "-m", "venv", str(destination / "venv")],
+                await run_install([_install_python(), "-m", "venv", str(destination / "venv")],
                                   runtime, 60 - (time.monotonic() - start))
                 await run_install([str(executable), "-m", "pip", "install",
                                    "--index-url", "https://pypi.org/simple", name + "==" + version],
@@ -285,4 +302,3 @@ async def load_skill(entry: Capability, http: httpx.AsyncClient, runtime: Integr
             raise ValueError("Skill dosyası 64 KB sınırını aşıyor.")
         text = response.text
     return text[:12000]
-
