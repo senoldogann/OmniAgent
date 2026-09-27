@@ -12,6 +12,8 @@ uv sync
 Komut satırı: `.venv/bin/omniagent "<hedef>"`. Telegram köprüsü (`.venv/bin/omniagent-telegram`) için
 [kurulum kılavuzuna](docs/TELEGRAM.md) bakın. İzin tanısı: `.venv/bin/omniagent-permissions`.
 
+Finder ve Dock'tan açılan yerel macOS uygulaması için [kurulum kılavuzuna](docs/MACOS_APP.md) bakın.
+
 ## Dizinler
 
 | Yol | İçerik |

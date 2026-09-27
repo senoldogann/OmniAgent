@@ -102,6 +102,27 @@ async def test_install_pin_reuse_and_failure_not_repeated(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
+async def test_frozen_app_uses_python_version_for_plugin_install(tmp_path: Path, monkeypatch):
+    """.app ikilisi uv'ye Python yorumlayıcısı olarak verilmez."""
+    calls = []
+
+    async def install(command, task, timeout):
+        calls.append(command)
+        if "install" in command:
+            executable = Path(command[command.index("--python") + 1])
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.touch()
+
+    monkeypatch.setattr(mcp_bridge, "run_install", install)
+    monkeypatch.setattr(mcp_bridge.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mcp_bridge.shutil, "which", lambda name: "/usr/bin/uv" if name == "uv" else None)
+    configured = dict(entry(), package={"ecosystem": "python", "name": "demo",
+                                      "version": "1.0.0", "module": "demo"})
+    await install_package(tmp_path, configured, runtime())
+    assert calls[0][calls[0].index("--python") + 1] == "3.11"
+
+
+@pytest.mark.asyncio
 async def test_install_timeout_and_skill_only_data(tmp_path: Path):
     with pytest.raises(TimeoutError):
         await run_install([sys.executable, "-c", "import time; time.sleep(10)"], runtime(), 0.03)

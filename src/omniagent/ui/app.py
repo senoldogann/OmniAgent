@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 import uuid
 import webbrowser
@@ -1700,9 +1701,25 @@ class OmniUI(ctk.CTk):
 
 def main() -> None:
     """OmniAgent masaüstü arayüzünü başlatır."""
-    # Finder'dan başlatıldığında ortam değişkenleri miras alınmaz: kayıtlı anahtarları uygula.
-    apply_stored_api_keys()
+    if sys.argv[1:] == ["--bundle-check"]:
+        # Paket açılışını Keychain izni istemeden doğrula.
+        probe = tk.Tk()
+        probe.withdraw()
+        probe.update_idletasks()
+        probe.destroy()
+        return
+
+    if getattr(sys, "frozen", False) and Path.cwd() == Path("/"):
+        # Finder'ın / çalışma dizini araçların çıktı yazmasını engeller.
+        os.chdir(Path.home())
     app = OmniUI()
+
+    def load_keys() -> None:
+        # Yeni .app kimliği için Keychain izin istemi çıkabilir; önce pencereyi göster.
+        apply_stored_api_keys()
+        app._rebuild_clients()
+
+    app.after(200, load_keys)
     app.mainloop()
 
 
