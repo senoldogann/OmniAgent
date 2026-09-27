@@ -132,6 +132,7 @@ from omniagent.app.verification import (
     gui_evidence_summary,
     gui_verification_needed,
     needs_action_observation,
+    requested_chrome_navigation_gap,
     should_reuse_observation,
     unchanged_screen_note,
     verification_message,
@@ -302,7 +303,9 @@ def route_system_prompt(today: date, goal: Optional[str], memory_block: str, chr
         "\n### USER'S OPEN CHROME SESSION\n"
         "- Use chrome_active_tab and the visible Chrome GUI. Never use browse_url, "
         "API/MCP discovery, shell, Node or CDP for this goal.\n"
-        "- chrome_active_tab opens the URL in the matching open tab and waits for it to load.\n"
+        "- If the user asks for a new tab, call chrome_active_tab with new_tab=true and the target URL; "
+        "otherwise it reuses a matching open tab. For a LinkedIn home feed, use "
+        "https://www.linkedin.com/feed/ and verify the visible page before reporting its contents.\n"
         "- Click any target that shows text (link, button, tab, job/list title, menu item, dropdown "
         "option, checkbox label) with cua_click_text: OCR finds its exact spot. Use cua_click_point "
         "only for targets without text (icons, empty fields) and aim at the element's CENTER, not "
@@ -812,6 +815,35 @@ async def run_agent_with_callback(
                     break
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
+                navigation_gap = requested_chrome_navigation_gap(goal, steps) if success else None
+                if navigation_gap is not None:
+                    if delivery_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
+                        delivery_recoveries += 1
+                        emit({"kind": "notice", "level": "warning", "text": navigation_gap})
+                        feed_goal = "linkedin" in goal.casefold() and (
+                            "akış" in goal.casefold() or "feed" in goal.casefold()
+                        )
+                        destination = (
+                            "https://www.linkedin.com/feed/"
+                            if feed_goal else "kullanıcının istediği URL"
+                        )
+                        new_tab_arg = (
+                            "new_tab=true ve "
+                            if "yeni Chrome sekmesi" in navigation_gap or "yeni sekmede" in navigation_gap
+                            else ""
+                        )
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"HOST: {navigation_gap}. chrome_active_tab aracını {new_tab_arg}"
+                                f"hedef URL olarak {destination} ile çağır. Güncel sayfayı okuyup "
+                                "doğrula; tamamlanmadan bitirme."
+                            ),
+                        })
+                        outcome, reason, success = "", "", False
+                        finish_guarded_turn()
+                        continue
+                    success, reason = False, navigation_gap
                 status_gap = unmet_wait_status(goal, steps)
                 if success and status_gap is not None:
                     success, reason = False, status_gap

@@ -33,12 +33,12 @@
 
 ## Görev 3: OmniAgent yakalamalarından UI çıkarma
 
-- [ ] `screen.py` için UI PID'si bulunduğunda tüm o süreç pencerelerinin listeden çıktığını, ana pencere küçültülüp Ayarlar veya girdi penceresi açıkken de PID'nin bulunduğunu, UI yokken eski hızlı yolun çalıştığını, filtreli görüntü oluşturulamazsa açık hata verdiğini test et.
-- [ ] `_display_image` içinde pencere listesini al; adı `OmniAgent` veya `OmniAgent —` ile başlayan pencere PID'lerini çıkar; `CGWindowListCreateImageFromArray` ile kalan on-screen pencereleri aynı ekran sınırlarında birleştir. Yalnız tam ekran yolu değişsin; Chrome pencere kapsamı kalsın.
-- [ ] Hedefli testleri ve canlı Quartz penceresi listesini doğrula; filtreli yakalamanın mevcut UI sürecini seçmediğini ölç.
+- [ ] `screen.py` için `kCGWindowOwnerName="Python"` ve `kCGWindowName="OmniAgent"` penceresinin PID'sinin bulunduğunu, tüm o süreç pencerelerinin listeden çıktığını, ana pencere küçültülüp Ayarlar veya girdi penceresi açıkken de PID'nin bulunduğunu, UI yokken eski hızlı yolun çalıştığını, filtreli görüntü oluşturulamazsa açık hata verdiğini test et.
+- [ ] `_display_image` içinde pencere listesini al; `kCGWindowName` değeri `OmniAgent` veya `OmniAgent —` ile başlayan pencere PID'lerini çıkar; `CGWindowListCreateImageFromArray` ile kalan on-screen pencereleri aynı ekran sınırlarında birleştir. Yalnız tam ekran yolu değişsin; Chrome pencere kapsamı kalsın.
+- [ ] Hedefli testleri çalıştır. Canlı UI öne alınıp filtreli ve filtrelenmemiş yakalamanın UI bölgesindeki piksel farkı ölçülsün; testi bitirince önceki uygulama öne getirilsin.
 
 ## Görev 4: Doğrulama ve teslim
 
 - [ ] Belgelerde global `⌘X` Kes çakışmasını, kendi yakalama filtresini ve üçüncü taraf kayıt sınırını açık yaz.
-- [ ] `compileall`, `git diff --check`, normal ve `OMNI_UI_TEST=1` tam test paketlerini çalıştır. Varsa somut performans farkını ölç; ham pencere yokken eski yolun korunduğunu doğrula.
+- [ ] `compileall`, `git diff --check`, normal ve `OMNI_UI_TEST=1` tam test paketlerini çalıştır. Görünür UI ile `⌘X` gönderildiğinde pencerenin kaybolduğunu ve ikinci `⌘X` ile geri geldiğini kontrollü, boş girdili oturumda doğrula; başarısız hotkey'in başka uygulamada Kes yapma riskini önle. Varsa somut performans farkını ölç; ham pencere yokken eski yolun korunduğunu doğrula.
 - [ ] PR aç ve bağla, macOS/Linux CI sonrası birleştir; canlı checkout'u ileri sar. Görev kilidi boşken UI ve gerekiyorsa Telegram hizmetlerini yeniden başlat; PID, pencere, bridge kilidi ve sürümü kontrol et.

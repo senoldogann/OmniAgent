@@ -131,7 +131,13 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
   gönderim onayı, listenin sonu) kanıtla eşleşmeden bitmez. Canlı kayıtta model formun yarısını
   doldurup "gönderdim", paneli kaydırmadan "tüm ilanlara baktım" demişti.
 - **Açık Chrome yolu:** `chrome_active_tab` aynı kökenli sekmeyi kimlikle bulup yüklenmesini
-  bekler; ara/gönder tek `cua_submit_text`, çok alanlı form `cua_fill_field` (Enter'a basmaz)
+  bekler; kullanıcı yeni sekme isterse `new_tab=true` ile yeni sekme açar. LinkedIn ana akışı
+  isteğinde `/feed/` hedefine gidilmesi ve yeni sekme isteği araç kayıtlarıyla doğrulanır;
+  eksikse bitişte bir düzeltme turu açılır, hâlâ eksikse görev başarı sayılmaz. Kaydırma
+  sırasında ekran ölçüsü değişirse `SCREEN_GEOMETRY_CHANGED` açık hatası verilir; farklı
+  boyutlu görüntülerin karşılaştırma hatası modelin yanıtını kesmez. Model içeriği
+  okuyamadığını söylüyorsa görev tamamlandı olarak işaretlenmez. Ara/gönder tek
+  `cua_submit_text`, çok alanlı form `cua_fill_field` (Enter'a basmaz)
   çağrısıdır. Takip mesajı ("devam et", "formda eksik alan var") 'chrome' kelimesi geçmese de
   önceki görev bu yolda yürüdüyse ve yerel dosya/kabuk işine geçilmiyorsa aynı yolda sürer.
   Pencere görüntüsü Chrome'un önündeki kendi açılır pencerelerini (select menüsü, otomatik
@@ -214,7 +220,11 @@ Bu dosya, OmniAgent projesinin geliştirilme sürecinde uyulacak katı kurallar�
 - İzin tanısı: `.venv/bin/omniagent-permissions` ekran kaydı ve erişilebilirlik durumunu, izni alacak uygulamayı
   (bundle kimliğiyle) ve eklenecek python ikilisini yazar; `--request` sistem istemini gösterir.
 - Görevler kalıcı bir event loop'ta paylaşımlı model istemcileriyle çalışır; `Esc` durdurur,
-  `⌘K` temizler. Composer'da Normal/Uzun/Otonom bütçe profili ve macOS yerel mikrofon
+  `⌘K` temizler. Genel `⌘X`, tüm OmniAgent pencerelerini gizleyip tekrar gösterir; macOS'ta
+  Kes kısayoluyla çakışır. Gizliyken görev durumu ve transkript korunur, menü çubuğu göstergesi
+  kaldırılır. OmniAgent'ın kendi tam ekran yakalamaları UI sürecinin pencerelerini çıkarır;
+  üçüncü taraf ekran görüntüsü ve videolarda görünür pencereyi gizleme garantisi yoktur.
+  Composer'da Normal/Uzun/Otonom bütçe profili ve macOS yerel mikrofon
   düğmesi bulunur; mikrofon SVG ikonludur, `AVAudioEngine` buffer'ları konuşma sırasında
   partial metni composer'a akıtır ve stop sonrası final sonucu otomatik gönderilmez. Header'daki
   SVG kopyala düğmesi görünen transcript'in tamamını panoya alır.

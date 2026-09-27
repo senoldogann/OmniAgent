@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from omniagent.app.tool_schema import _GUI_VERIFICATION_TOOLS, _SCREEN_ACTION_TOOLS
 from omniagent.app.types import ToolCallDraft, ToolResult
@@ -99,6 +101,31 @@ def _step_arguments(step: sm.StepRecord) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def requested_chrome_navigation_gap(goal: str, steps: List[sm.StepRecord]) -> Optional[str]:
+    """Açıkça istenen yeni sekme ve LinkedIn akışı için araç kanıtını denetler."""
+    lowered = goal.casefold()
+    chrome_goal = bool(re.search(r"\b(?:chrome|google chrome)\b", lowered))
+    if not chrome_goal:
+        return None
+    wants_new_tab = bool(re.search(r"\b(?:yeni\s+(?:bir\s+)?(?:chrome\s+)?(?:tab|sekme)|new\s+tab)\b", lowered))
+    wants_feed = "linkedin" in lowered and bool(re.search(r"(?:anasayfa\s+akış|\bfeed\b)", lowered))
+    navigations = [
+        _step_arguments(step)
+        for step in steps
+        if step["ok"] and step["tool"] == "chrome_active_tab"
+    ]
+    if wants_new_tab and not any(args.get("new_tab") is True for args in navigations):
+        return "yeni Chrome sekmesi istendi fakat yeni sekme açıldığına dair araç kanıtı yok"
+    if wants_feed and not any(
+        (urlsplit(str(args.get("url") or "")).hostname or "").casefold() in {"linkedin.com", "www.linkedin.com"}
+        and urlsplit(str(args.get("url") or "")).path.rstrip("/") == "/feed"
+        and (not wants_new_tab or args.get("new_tab") is True)
+        for args in navigations
+    ):
+        return "LinkedIn ana akışı istendi fakat yeni sekmede /feed/ adresine gidildiğine dair araç kanıtı yok" if wants_new_tab else "LinkedIn ana akışı istendi fakat /feed/ adresine gidildiğine dair araç kanıtı yok"
+    return None
 
 
 def gui_evidence_summary(steps: List[sm.StepRecord]) -> str:

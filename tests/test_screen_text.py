@@ -168,3 +168,13 @@ def test_read_scrollable_returns_whole_pane_once_and_stops_at_end(monkeypatch: p
     pane.offset = 0
     limited = Toolbox().cua_read_scrollable([750, 500], 1)
     assert "SONA ULAŞILMADI" in limited
+
+
+def test_changed_region_reports_transient_screen_resize() -> None:
+    with pytest.raises(tools.ToolError) as error:
+        tools.changed_region(
+            tools.np.zeros((24, 480), dtype=tools.np.uint8),
+            tools.np.zeros((277, 480), dtype=tools.np.uint8),
+            (240, 12), 0.01,
+        )
+    assert error.value.code == "SCREEN_GEOMETRY_CHANGED"

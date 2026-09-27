@@ -378,9 +378,11 @@ def route_tool_schemas(
         schemas.append(_function_schema(
             "chrome_active_tab",
             "Kullanıcının açık Google Chrome penceresini kullanır. URL verilirse aynı sitedeki "
-            "mevcut sekmeyi bulur ve görünür kılar; yoksa etkin sekmeye gider; sayfanın yüklenmesini bekler. "
+            "mevcut sekmeyi bulur ve görünür kılar; yoksa etkin sekmeye gider. "
+            "new_tab=true ise mutlaka YENİ sekme açar ve URL'ye gider; sayfanın yüklenmesini bekler. "
             "Null ise etkin sekmeyi okur. Giriş yapılmış Chrome profilini korur, ayrı tarayıcı açmaz.",
-            {"url": {"type": ["string", "null"], "description": "Gidilecek http(s) adresi; mevcut sekmeyi okumak için null."}},
+            {"url": {"type": ["string", "null"], "description": "Gidilecek http(s) adresi; mevcut sekmeyi okumak için null."},
+             "new_tab": {"type": "boolean", "description": "Kullanıcı yeni sekme istediğinde true; mevcut sekme için false."}},
         ))
         schemas.extend([
             _function_schema("cua_click_point", "Son ekran görüntüsündeki noktaya sol tıklar.", {
