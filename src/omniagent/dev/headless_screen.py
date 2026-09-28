@@ -7,6 +7,7 @@ Chromium sayfasına bağlanır. Böylece GUI senaryoları kullanıcı ekrandayke
 Quartz yakalama, pencere kapsamı ve gerçek kaydırma olayı yolu burada sınanmaz.
 """
 import io
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Tuple, TypeVar
@@ -57,7 +58,14 @@ class HeadlessPage:
 
     def _start(self) -> None:
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
+        # Varsayılan: playwright'ın kendi indirdiği Chromium. Bazı ortamlarda (ör. bu depo pip
+        # paketiyle uyumsuz, önceden kurulu tek bir Chromium sürümü sunan konteynerler) sürüm
+        # uyuşmazlığı yüzünden "Executable doesn't exist" ile düşer; bu değişken ayarlıysa o
+        # ikiliye açıkça yönlendirir. Üretimde/macOS'ta kullanılmaz (değişken tanımlı değildir).
+        executable_path: Optional[str] = os.environ.get("OMNI_HEADLESS_CHROMIUM_PATH")
+        self._browser = self._playwright.chromium.launch(
+            headless=True, executable_path=executable_path or None,
+        )
         self._page = self._browser.new_page(
             viewport={"width": VIEW_WIDTH, "height": VIEW_HEIGHT}, device_scale_factor=2,
         )

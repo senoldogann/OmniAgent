@@ -12,6 +12,8 @@ Kullanım:
   .venv/bin/omniagent-benchmark --runs 2 --concurrency 1 --only chrome_maas,chrome_form --headless  # görünmez Chromium
   .venv/bin/omniagent-benchmark --runs 4 --concurrency 1 --only ogrenme,ogrenme_bos,hafiza
 """
+from __future__ import annotations
+
 import argparse
 import asyncio
 import hashlib
@@ -31,20 +33,25 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Callable, Dict, List, NotRequired, Optional, Sequence, Tuple, TypedDict
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, NotRequired, Optional, Sequence, Tuple, TypedDict
 from urllib.parse import parse_qs, urlsplit
 
 from openai import AsyncOpenAI
 
 from omniagent.memory import user as user_memory
 from omniagent.config import apply_stored_api_keys
-from omniagent.dev.headless_screen import HeadlessPage
-from omniagent.dev.headless_screen import install as install_headless_screen
 from omniagent.integrations.runtime import IntegrationMetrics
 from omniagent.app.agent import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 from omniagent.app.tool_schema import AUTO_OBSERVATION_PREVIEW, VERIFICATION_OBSERVATION_PREVIEW
 from omniagent.core.events import AgentEvent
 from omniagent.tools import _require_accessibility, press_key_spec, type_unicode_text
+
+if TYPE_CHECKING:
+    # Yalnız tip denetimi için: gerçek import (bkz. main()) --headless bayrağı seçilince
+    # yapılır. headless_screen modülü gerçek Quartz'ı çeker; CORE_SCENARIOS gibi GUI
+    # gerektirmeyen senaryoları pyobjc kurulu olmayan (Linux) bir makinede koşturmak bu
+    # importu tetiklememeli.
+    from omniagent.dev.headless_screen import HeadlessPage
 
 CORE_SCENARIOS: Tuple[str, ...] = ("gun", "satir", "js", "satis", "paralel", "siralama", "json", "ceviri", "sadakat")
 FILE_SCENARIOS: Tuple[str, ...] = ("file_delete", "file_move", "file_edit")
@@ -1240,6 +1247,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         asyncio.run(run_benchmark(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json,
                                   CHROME_STAGE, arguments.seed))
     else:
+        # Gerçek Quartz'ı çeken import yalnız burada, --headless gerçekten istenince yapılır.
+        from omniagent.dev.headless_screen import HeadlessPage
+        from omniagent.dev.headless_screen import install as install_headless_screen
+
         headless_page: HeadlessPage = HeadlessPage()
         try:
             install_headless_screen(headless_page)
