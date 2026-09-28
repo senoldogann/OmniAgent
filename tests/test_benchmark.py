@@ -2,7 +2,7 @@
 import subprocess
 from pathlib import Path
 
-from omniagent.dev import benchmark
+from omniagent.dev import benchmark, headless_screen
 from omniagent.memory import user as user_memory
 
 
@@ -216,8 +216,11 @@ def test_command_line_entry_point_validates_and_runs_selected_scenarios(monkeypa
         def close(self) -> None:
             closed.append(True)
 
-    monkeypatch.setattr(benchmark, "HeadlessPage", FakePage)
-    monkeypatch.setattr(benchmark, "install_headless_screen", lambda page: None)
+    # HeadlessPage/install artık yalnız --headless dalında, çalışma zamanında import edilir
+    # (bkz. dev/benchmark.py main()): CORE_SCENARIOS'u gerçek Quartz gerektirmeden koşturabilmek
+    # için. Bu yüzden sahtelerini gerçek tanımlandıkları modülde (headless_screen) yamıyoruz.
+    monkeypatch.setattr(headless_screen, "HeadlessPage", FakePage)
+    monkeypatch.setattr(headless_screen, "install", lambda page: None)
     monkeypatch.setattr(benchmark, "headless_stage", lambda page: "görünmez sahne")
     benchmark.main(["--runs", "1", "--concurrency", "1", "--only", "chrome_maas", "--headless"])
     assert runs[-1][-2:] == ("görünmez sahne", None) and closed == [True]
