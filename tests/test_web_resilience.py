@@ -9,7 +9,7 @@ import pytest
 
 from omniagent.app import agent as main
 from omniagent import tools
-from omniagent.tools import Toolbox
+from omniagent.tools import Toolbox, web
 from omniagent.tools.browser import fetch_raw_content
 from omniagent.tools.types import ToolError
 
@@ -84,6 +84,53 @@ def test_web_search_falls_back_to_text_when_news_is_empty(monkeypatch: pytest.Mo
 
     assert [call[0] for call in EmptyNews.calls] == ["news", "text"]
     assert payload[0]["url"] == "https://example.com/text"
+
+
+def test_web_search_retries_transient_failures_before_succeeding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+    attempts: list[int] = []
+
+    class FlakyThenOk:
+        def __enter__(self) -> "FlakyThenOk":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def text(self, query: str, **kwargs: Any) -> list[dict[str, str]]:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise RuntimeError("No results found.")
+            return [{"title": "OK", "body": "body", "href": "https://example.com/ok"}]
+
+    result = json.loads(web.search_web("test query", client_factory=FlakyThenOk))
+
+    assert len(attempts) == 3
+    assert result[0]["url"] == "https://example.com/ok"
+
+
+def test_web_search_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+    attempts: list[int] = []
+
+    class AlwaysFails:
+        def __enter__(self) -> "AlwaysFails":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def text(self, query: str, **kwargs: Any) -> list[dict[str, str]]:
+            attempts.append(1)
+            raise RuntimeError("No results found.")
+
+    with pytest.raises(ToolError) as exc_info:
+        web.search_web("test query", client_factory=AlwaysFails)
+
+    assert len(attempts) == 3
+    assert exc_info.value.code == "WEB_SEARCH_FAILED"
 
 
 def test_fetch_raw_decodes_non_utf8_body_without_crashing(monkeypatch: pytest.MonkeyPatch) -> None:
