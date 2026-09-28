@@ -1274,8 +1274,12 @@ class Toolbox:
                 command = ["node", "--require", str(preload_path), str(temp_path), str(input_path)]
             try:
                 returncode, stdout, stderr = run_streaming_process(command, False, JS_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired as error:
-                raise ToolError(f"JS {JS_TIMEOUT_SECONDS:.0f} saniyede tamamlanmadı.", "JS_TIMEOUT", True) from error
+            except ToolError as error:
+                if error.code != "SHELL_TIMEOUT":
+                    raise
+                raise ToolError(
+                    f"JS {JS_TIMEOUT_SECONDS:.0f} saniyede tamamlanmadı.", "JS_TIMEOUT", True,
+                ) from error
             if returncode != 0:
                 raise ToolError(
                     f"JS çalıştırma başarısız: çıkış={returncode}, stderr={_clip(stderr.strip(), 1000)}",

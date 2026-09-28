@@ -11,11 +11,16 @@ APP_NAME = "OmniAgent"
 
 
 def data_root() -> Path:
-    """Kalıcı kullanıcı verisinin canonical kökünü döndürür."""
+    """
+    Kalıcı kullanıcı verisinin canonical kökünü döndürür; ilk çağrıda dizini 0700 izinle
+    oluşturur. Kök 0700 olduğu için altındaki her alt dizin/dosya kendi izin biti ne olursa
+    olsun aynı makinedeki başka kullanıcıya kapalıdır (üst dizine erişim gerekir).
+    """
     configured = os.environ.get("OMNI_DATA_DIR", "").strip()
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / "Library" / "Application Support" / APP_NAME
+    root = Path(configured).expanduser() if configured else Path.home() / "Library" / "Application Support" / APP_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
 
 
 def state_file() -> Path:

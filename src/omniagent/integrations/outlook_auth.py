@@ -12,9 +12,14 @@ from urllib.parse import parse_qs, urlparse
 import msal
 import requests
 
+from omniagent.config import register_secret
+
 from .runtime import IntegrationRuntime, InteractionRequired, read_json, save_json
 
 SCOPES = ["Mail.ReadWrite"]
+# Kullanıcı tarayıcıdaki girişi bu süre içinde tamamlamazsa akış InteractionRequired ile
+# durur; süresiz bekleme görevi kilitlemesin (bkz. approval.APPROVAL_TIMEOUT_SECONDS).
+OAUTH_CALLBACK_TIMEOUT_SECONDS: float = 300.0
 
 
 class MSALTransport:
@@ -118,7 +123,13 @@ class OutlookAuth:
             opened = await runtime.wait(asyncio.to_thread(webbrowser.open, flow["auth_uri"]))
             if not opened:
                 raise InteractionRequired("Microsoft giriş sayfası açılamadı; varsayılan tarayıcıyı kontrol edin.")
-            response = await runtime.wait(callback)
+            try:
+                response = await runtime.wait(callback, timeout=OAUTH_CALLBACK_TIMEOUT_SECONDS)
+            except TimeoutError as error:
+                raise InteractionRequired(
+                    f"Microsoft girişi {OAUTH_CALLBACK_TIMEOUT_SECONDS:.0f} saniye içinde "
+                    "tamamlanmadı; Outlook bağlantısını yeniden başlatın."
+                ) from error
             return await runtime.wait(asyncio.to_thread(
                 self.app.acquire_token_by_auth_code_flow, flow, response))
         finally:
@@ -161,6 +172,7 @@ class OutlookAuth:
                 await runtime.wait(asyncio.to_thread(
                     self.keyring.set_password, "OmniAgent.Outlook", self.config["client_id"], self.cache.serialize()))
             self.ready = True
+            register_secret("outlook_access_token", result["access_token"])
             return result["access_token"]
 
     async def close(self) -> None:

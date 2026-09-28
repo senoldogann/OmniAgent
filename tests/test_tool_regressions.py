@@ -93,6 +93,25 @@ def test_write_verification_failure_does_not_create_destination(tmp_path: Path) 
     assert not target.exists()
 
 
+def test_write_file_concurrent_delete_between_stat_and_backup_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    stat() ile yedekleme arasındaki dar TOCTOU aralığında dosya silinirse (başka işlem),
+    sessizce 'yeni dosya' sanıp üzerine yazmak yerine açık bir hata verir.
+    """
+    target: Path = tmp_path / "yaris.txt"
+    target.write_text("eski içerik", encoding="utf-8")
+
+    def vanished(path: Path) -> Path:
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(filesystem, "_backup_file", vanished)
+    with pytest.raises(ToolError) as error:
+        filesystem.write_file_content(str(target), "yeni içerik")
+    assert error.value.code == "WRITE_CONCURRENT_CHANGE"
+
+
 def test_write_file_relative_path_resolves_against_default_base(tmp_path: Path) -> None:
     """default_base verilince göreli yol oraya bağlanır; mutlak yol her zaman kendi haline yazılır."""
     base = tmp_path / "workspace"

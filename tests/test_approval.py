@@ -1,5 +1,6 @@
 """Para hareketi ve istenmemiş hafıza değişikliği için host onay kapısı, ask_user ve denetim kaydı."""
 import asyncio
+import base64
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -49,6 +50,16 @@ def _audit(tmp_path: Path) -> List[Dict[str, str]]:
     ("node -e \"fetch('https://api.stripe.com/v1/payment_intents',{method:'POST'})\"", True),
     ("python3 -c \"print('https://api.stripe.com/v1/balance')\"", True),
     ("ls -la ~/Desktop", False),
+    # Hedef adresi değişken/komut ikamesinden geliyor: literal eşleşme yok ama veri gönderiliyor.
+    ("curl -X POST $PAYMENT_URL -d amount=500", True),
+    ("curl \"$(cat url.txt)\" -d amount=500", True),
+    ("curl $SOME_URL", False),  # değişken var ama veri gönderimi yok, tetiklenmemeli
+    (
+        "bash -c \"$(echo "
+        + base64.b64encode(b"curl -X POST https://api.stripe.com/v1/charges -d amount=100").decode()
+        + " | base64 -d)\"",
+        True,
+    ),
 ])
 def test_shell_financial_classification(command: str, financial: bool) -> None:
     assert (approval.shell_financial_reason(shell_command_words(command), command) is not None) is financial

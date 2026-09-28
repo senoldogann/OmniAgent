@@ -8,6 +8,7 @@ kanal (arayüz/Telegram) yoksa çağrı reddedilir. Sınıflandırma en iyi çab
 güvenlik sınırı değildir: bilinen finansal CLI, API adresi, RPC yöntemi ve araç adı kalıplarını
 yakalar. Grafik arayüzdeki ödeme adımları sistem istemindeki `ask_user` kuralıyla korunur.
 """
+import base64
 import json
 import os
 import re
@@ -109,6 +110,37 @@ def _mentions_financial_endpoint(text: str) -> Optional[str]:
     return None
 
 
+def _has_shell_expansion(words: List[str]) -> bool:
+    """
+    Argümanlardan biri değişken/komut ikamesi mi (ör. $PAYMENT_URL, `cmd`). Böyle bir argümana
+    veri gönderiliyorsa gerçek hedef bu metinden doğrulanamaz; literal eşleşme arayan
+    _mentions_financial_endpoint bunu asla yakalayamaz. Saf.
+    """
+    return any("$" in word or "`" in word for word in words)
+
+
+# echo/printf ile üretilip base64 -d/--decode'a borulanan gövdeyi yakalar: opaque yorumlayıcıya
+# ("bash -c "$(echo <b64> | base64 -d)"" veya "echo <b64> | base64 -d | bash") gizlenmiş finansal
+# içerik böyle çözülüp yeniden taranır.
+_BASE64_DECODE_PIPE: re.Pattern[str] = re.compile(
+    r"(?:echo|printf)\s+(?:-[a-zA-Z]+\s+)?['\"]?([A-Za-z0-9+/=]{8,})['\"]?\s*\|\s*base64\s+(?:-d|--decode)\b",
+)
+
+
+def _decoded_financial_reason(command: str) -> Optional[str]:
+    """Komuttaki base64-çöz borularının içeriğini çözüp finansal içerik arar. Saf."""
+    for match in _BASE64_DECODE_PIPE.finditer(command):
+        try:
+            padded = match.group(1) + "=" * (-len(match.group(1)) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        except (ValueError, base64.binascii.Error):
+            continue
+        endpoint = _mentions_financial_endpoint(decoded)
+        if endpoint is not None:
+            return f"base64 ile çözülen içerikte {endpoint} bulundu"
+    return None
+
+
 def _sends_data(words: List[str]) -> bool:
     """HTTP istemci sözcükleri veri gönderen/yazan bir istek mi? (-d, --data*, -X POST, -XPOST…) Saf."""
     for word in words:
@@ -144,6 +176,10 @@ def shell_financial_reason(words_by_segment: List[List[str]], command: str) -> O
     if endpoint_in_command is not None and _command_sends_data(command):
         return f"{endpoint_in_command} adresine veri gönderimi"
 
+    decoded_reason: Optional[str] = _decoded_financial_reason(command)
+    if decoded_reason is not None:
+        return decoded_reason
+
     for words in words_by_segment:
         if not words:
             continue
@@ -158,9 +194,12 @@ def shell_financial_reason(words_by_segment: List[List[str]], command: str) -> O
             if arguments & subcommands:
                 return f"{program} para hareketi komutu"
         if program in ("curl", "wget", "http", "https", "xh"):
+            sends_data: bool = _sends_data(words[1:])
             endpoint: Optional[str] = _mentions_financial_endpoint(" ".join(words))
-            if endpoint is not None and _sends_data(words[1:]):
+            if endpoint is not None and sends_data:
                 return f"{endpoint} adresine veri gönderimi"
+            if sends_data and _has_shell_expansion(words[1:]):
+                return f"{program} değişken/komut ikamesiyle doğrulanamayan bir adrese veri gönderiyor"
     method: Optional[str] = next(
         (name for name in _FINANCIAL_RPC_METHODS if name in command.casefold()), None,
     )

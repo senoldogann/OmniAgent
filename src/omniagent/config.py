@@ -43,6 +43,15 @@ def set_api_key(variable: str, value: Optional[str]) -> None:
             _RUNTIME_KEYS.pop(variable, None)
 
 
+def register_secret(label: str, value: Optional[str]) -> None:
+    """
+    Model API anahtarı olmayan ama redact()/secret_values() kapsamına girmesi gereken bir sırrı
+    (Telegram bot token'ı, Outlook/MCP erişim belirteci gibi) süreç-içi depoya kaydeder. Aynı
+    kilitli depoyu (_RUNTIME_KEYS) kullanır; boş değer kaydı siler, ortam değişkenine dokunmaz.
+    """
+    set_api_key(label, value)
+
+
 def load_api_key(variable: str) -> Optional[str]:
     """
     Profilin API anahtarını okur: önce süreç-içi depo (Ayarlar sayfası / Keychain), sonra
@@ -148,6 +157,10 @@ _OPENAI_BASE_URL: str = "https://api.openai.com/v1"
 _OPENCODE_BASE_URL: str = "https://opencode.ai/zen/go/v1"
 _OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
+# UI iş parçacığı Ayarlar'dan model/anahtar yazarken ajan iş parçacığı BACKENDS'i okuyabilir;
+# _RUNTIME_KEYS_LOCK ile aynı gerekçeyle mutasyon kilitlidir.
+_BACKENDS_LOCK: threading.Lock = threading.Lock()
+
 BACKENDS: Dict[str, BackendProfile] = {
     "ollama-cloud": {
         "provider": "ollama-cloud",
@@ -211,11 +224,12 @@ def set_backend_model(name: str, model: str) -> None:
     from omniagent.model_catalog import valid_model_id
     if name not in BACKENDS or not valid_model_id(model):
         raise ValueError("Geçersiz profil veya model adı.")
-    BACKENDS[name]["model"] = model
-    if name == "openai":
-        BACKENDS[name]["extra_body"] = (
-            {"reasoning_effort": "none"} if model in ("gpt-6-luna", "gpt-6-sol") else {}
-        )
+    with _BACKENDS_LOCK:
+        BACKENDS[name]["model"] = model
+        if name == "openai":
+            BACKENDS[name]["extra_body"] = (
+                {"reasoning_effort": "none"} if model in ("gpt-6-luna", "gpt-6-sol") else {}
+            )
 
 
 def apply_model_preferences() -> Tuple[str, ...]:
@@ -235,11 +249,12 @@ def refresh_api_keys() -> Tuple[str, ...]:
     yeniden başlatmadan kullanılabilir olur. Tek girdi os.environ'dur. Saf fonksiyon değildir:
     yalnız profil anahtarlarını tazeler.
     """
-    for name, profile in BACKENDS.items():
-        variable: Optional[str] = API_KEY_VARIABLES.get(name)
-        if variable is not None:
-            profile["api_key"] = load_api_key(variable)
-    return tuple(name for name, profile in BACKENDS.items() if profile["api_key"])
+    with _BACKENDS_LOCK:
+        for name, profile in BACKENDS.items():
+            variable: Optional[str] = API_KEY_VARIABLES.get(name)
+            if variable is not None:
+                profile["api_key"] = load_api_key(variable)
+        return tuple(name for name, profile in BACKENDS.items() if profile["api_key"])
 
 
 def apply_stored_api_keys() -> Tuple[str, ...]:

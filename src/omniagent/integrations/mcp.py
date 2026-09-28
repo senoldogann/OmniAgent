@@ -22,7 +22,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from omniagent.approval import financial_tool_name
 from .capabilities import Capability, ToolEntry
-from omniagent.config import API_KEY_VARIABLES
+from omniagent.config import API_KEY_VARIABLES, register_secret
 from .runtime import IntegrationRuntime, InteractionRequired, read_json, save_json
 
 
@@ -237,6 +237,7 @@ class MCPBridge:
                         Keyring().get_password, "OmniAgent.MCP", entry["token_key"]))
                     if not token:
                         raise InteractionRequired("MCP bağlantısının Keychain erişim anahtarı eksik.")
+                    register_secret(f"mcp_token:{entry['token_key']}", token)
                     headers["Authorization"] = "Bearer " + token
             connection = MCPConnection(entry, command, headers)
             self.connections[key] = connection

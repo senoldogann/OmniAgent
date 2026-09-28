@@ -113,9 +113,22 @@ def write_file_content(
     created_directory: Optional[Path] = None if destination.parent.exists() else destination.parent
     destination.parent.mkdir(parents=True, exist_ok=True)
     existing_mode: Optional[int] = None
-    if destination.exists():
+    try:
         existing_mode = stat.S_IMODE(destination.stat().st_mode)
-        _backup_file(destination)
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            _backup_file(destination)
+        except FileNotFoundError as error:
+            # stat() ile yedekleme arasındaki dar aralıkta başka bir işlem dosyayı sildi/taşıdı;
+            # sessizce "yeni dosya" sanıp üzerine yazmak yerine açıkça durup yeniden okumayı iste.
+            raise ToolError(
+                f"Dosya yedeklenirken kayboldu; başka bir işlem sildi/taşıdı olabilir: {destination}. "
+                "Güncel durumu yeniden oku ve tekrar dene.",
+                "WRITE_CONCURRENT_CHANGE",
+                True,
+            ) from error
 
     temp_path = None
     try:

@@ -25,7 +25,10 @@ from openai import AsyncOpenAI
 
 from omniagent.approval import approval_granted
 from .capabilities import CapabilityService
-from omniagent.config import API_KEY_VARIABLES, BACKENDS, apply_model_preferences, apply_stored_api_keys, load_api_key
+from omniagent.config import (
+    API_KEY_VARIABLES, BACKENDS, apply_model_preferences, apply_stored_api_keys, load_api_key,
+    register_secret,
+)
 from omniagent.core import schedule
 from omniagent.core.conversation import Exchange, trim_history
 from omniagent.core.events import AgentEvent, tool_label
@@ -52,6 +55,9 @@ SCHEDULER_TICK_SECONDS = 30
 DOWNLOAD_LIMIT_BYTES = 20 * 1024 * 1024
 UPLOAD_TIMEOUT = httpx.Timeout(300.0, connect=5.0)
 DOWNLOAD_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+# Telegram getFile'ı zaten 20 MB üstü dosyalar için file_path vermiyor; bu, sunucunun
+# bildirdiği boyuta güvenmeden aynı sınırı yerelde de zorlayan bağımsız bir ikinci kapıdır.
+DOWNLOAD_MAX_BYTES: int = 20 * 1024 * 1024
 # Görsel olarak modele verilecek belge türleri (svg/heic Pillow'da güvenilir açılmaz)
 _IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp"})
 # Mesaj alanı -> kullanıcıya/modele gösterilen ek türü
@@ -160,10 +166,11 @@ def load_settings() -> TelegramSettings:
 
 
 def load_token() -> str:
-    """Bot tokenını yalnız macOS Keychain'den alır."""
+    """Bot tokenını yalnız macOS Keychain'den alır; redact() kapsamına girmesi için kaydeder."""
     token = Keyring().get_password(TOKEN_SERVICE, TOKEN_ACCOUNT)
     if not token:
         raise TelegramError("Telegram bot tokenı Keychain'de yok; setup komutunu çalıştırın.")
+    register_secret("telegram_bot_token", token)
     return token
 
 
@@ -355,26 +362,39 @@ class TelegramAPI:
     async def download(self, file_id: str, directory: Path, preferred_name: Optional[str]) -> Path:
         """
         getFile ile sohbet ekini indirir ve yalnız kullanıcıya açık dosya olarak kaydeder. Ad,
-        zaman damgası önekiyle çakışmasız yapılır; token hata metnine taşınmaz.
+        zaman damgası önekiyle çakışmasız yapılır; token hata metnine taşınmaz. Gövde parça
+        parça okunup DOWNLOAD_MAX_BYTES ile sınırlanır; sunucunun bildirdiği boyuta güvenilmez,
+        indirme sırasında bellek/diskte sınırsız birikme engellenir.
         """
         info = await self.call("getFile", {"file_id": file_id})
         remote = info.get("file_path") if isinstance(info, dict) else None
         if not isinstance(remote, str) or not remote:
             raise TelegramError("getFile: dosya yolu yok (dosya 20 MB sınırını aşmış olabilir).")
-        try:
-            response = await self.client.get(
-                f"https://api.telegram.org/file/bot{self.token}/{remote}", timeout=DOWNLOAD_TIMEOUT,
-            )
-        except httpx.HTTPError as error:
-            raise TelegramError(f"dosya indirme: {type(error).__name__}.") from None
-        if response.status_code != 200:
-            raise TelegramError(f"dosya indirme: HTTP {response.status_code}.", response.status_code)
         directory.mkdir(parents=True, exist_ok=True)
         name = safe_file_name(preferred_name or Path(remote).name)
         target = directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}-{name}"
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as sink:
-            sink.write(response.content)
+        written = 0
+        try:
+            async with self.client.stream(
+                "GET", f"https://api.telegram.org/file/bot{self.token}/{remote}", timeout=DOWNLOAD_TIMEOUT,
+            ) as response:
+                if response.status_code != 200:
+                    raise TelegramError(f"dosya indirme: HTTP {response.status_code}.", response.status_code)
+                descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as sink:
+                    async for chunk in response.aiter_bytes():
+                        written += len(chunk)
+                        if written > DOWNLOAD_MAX_BYTES:
+                            raise TelegramError(
+                                f"dosya indirme: {DOWNLOAD_MAX_BYTES // (1024 * 1024)} MB sınırını aştı."
+                            )
+                        sink.write(chunk)
+        except httpx.HTTPError as error:
+            target.unlink(missing_ok=True)
+            raise TelegramError(f"dosya indirme: {type(error).__name__}.") from None
+        except TelegramError:
+            target.unlink(missing_ok=True)
+            raise
         return target
 
 

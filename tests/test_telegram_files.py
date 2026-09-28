@@ -87,6 +87,26 @@ async def test_download_saves_private_file_without_leaking_token(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_download_enforces_local_size_cap_and_leaves_no_partial_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sunucunun bildirdiği/susup büyük gövde göndermesi yerelde de durdurulur; yarım dosya kalmaz."""
+    monkeypatch.setattr(telegram, "DOWNLOAD_MAX_BYTES", 10)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/getFile"):
+            return httpx.Response(200, json={"ok": True, "result": {"file_path": "documents/buyuk.bin"}})
+        return httpx.Response(200, content=b"x" * 4096)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        api = telegram.TelegramAPI("secret-token", client)
+        with pytest.raises(telegram.TelegramError) as error:
+            await api.download("abc", tmp_path / "inbox", "buyuk.bin")
+    assert "MB" in str(error.value)
+    assert list((tmp_path / "inbox").glob("*buyuk.bin")) == []
+
+
+@pytest.mark.asyncio
 async def test_send_document_uploads_file_with_caption(tmp_path: Path) -> None:
     captured: List[bytes] = []
 
