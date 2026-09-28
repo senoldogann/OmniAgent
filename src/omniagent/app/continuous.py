@@ -19,10 +19,12 @@ MIN_TOTAL_TOKENS: int = 10_000
 # biçimde toplu kırpılır. Her tur kırpmak sağlayıcı önek önbelleğini her turda bozardı.
 CONTEXT_MAX_TURNS: int = 40
 CONTEXT_KEEP_TURNS: int = 20
-# Araç çalıştırmadan üst üste bu kadar rapor yazan model takılmış sayılır; kullanıcıya yön sorulur.
+# Araç çalıştırmadan üst üste bu kadar rapor yazan modele yeni yol denemesi söylenir.
 MAX_IDLE_REPORTS: int = 3
+# Bir görevde kullanıcıya sorulacak hedef bildirimi sayısı. Sınırsızken ajan reddedildikten
+# sonra da "goal" bildirmeyi sürdürüyor ve kullanıcıyı boşa meşgul ediyordu.
+MAX_GOAL_REPORTS: int = 5
 WINDOW_MARKER: str = "HOST — BAĞLAM PENCERESİ:"
-DIRECTION_PREFIX: str = "KULLANICI YÖNLENDİRMESİ:"
 CONTINUE_PROMPT: str = (
     "HOST — SÜREKLİ MOD: Görev bitmedi; son yanıtın kullanıcıya ilerleme raporu olarak gösterildi.\n"
     "- Kullanıcıdan bilgi, hesap, seçim veya onay gerekiyorsa şimdi ask_user çağır ve yanıtı bekle. "
@@ -101,6 +103,21 @@ def goal_report_problem(summary: str, evidence_ids: object, evidence: Mapping[st
     return None
 
 
+def goal_report_repeat_problem(evidence_ids: Sequence[str], seen: frozenset[str]) -> Optional[str]:
+    """
+    Aynı kanıt id'leriyle yinelenen hedef bildirimini kullanıcıya sormadan reddeder: her
+    bildirim yeni bir kanıt getirmeli. Canlı kayıtta ajan reddedildikten sonra aynı kanıtlarla
+    bildirimi tekrarlayıp kullanıcıyı boşa meşgul etti. Saf.
+    """
+    if evidence_ids and all(item in seen for item in evidence_ids):
+        return (
+            "Bu kanıt id'leri önceki bir hedef bildiriminde zaten değerlendirildi; aynı kanıtla "
+            "yeniden bildirme. Önce eksik işi gerçekten tamamla (yeni başarılı araç çağrıları "
+            "üret), sonra bildirimi yalnız o yeni çağrıların id'leriyle yap."
+        )
+    return None
+
+
 def goal_confirmation_question(summary: str, evidence_ids: Sequence[str], evidence: Mapping[str, str]) -> str:
     """Kullanıcıya hedefin gerçekten gerçekleşip gerçekleşmediğini soran onay metni. Saf."""
     proof: str = "\n".join(f"• {evidence[item]}" for item in evidence_ids)
@@ -108,11 +125,6 @@ def goal_confirmation_question(summary: str, evidence_ids: Sequence[str], eviden
         f"Ajan hedefe ulaşıldığını bildiriyor:\n{summary.strip()}\n\nKanıt:\n{proof}\n\n"
         "Hedef gerçekten gerçekleştiyse yalnız 'evet' yaz; değilse neyin eksik olduğunu yaz, görev sürer."
     )
-
-
-def direction_prompt(reply: str) -> str:
-    """Takılan göreve kullanıcının verdiği yönü modele iletir; boş yanıt farklı yol ister. Saf."""
-    return f"{DIRECTION_PREFIX} {reply}" if reply else f"{DIRECTION_PREFIX} (boş) — farklı bir yaklaşım seç."
 
 
 def window_messages(

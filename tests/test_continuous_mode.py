@@ -120,18 +120,134 @@ async def test_unproven_or_rejected_goal_keeps_the_run_going(
 
 
 @pytest.mark.asyncio
-async def test_stalled_run_asks_user_for_direction_instead_of_stopping(
+async def test_repeated_goal_report_with_same_evidence_is_not_asked_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Aynı kanıtla yinelenen bildirim kullanıcıya ikinci kez sorulmaz (canlı kayıtta soruluyordu)."""
+    product = tmp_path / "urun.md"
+    session = ContinuousRun([
+        tool_turn(call("w1", "write_file", {"path": str(product), "content": "ürün"})),
+        tool_turn(call("g1", "report_goal_met", {"summary": "Ürün yayında.",
+                                                 "evidence_call_ids": ["w1"]})),
+        tool_turn(call("g2", "report_goal_met", {"summary": "Ürün gerçekten yayında.",
+                                                 "evidence_call_ids": ["w1"]})),
+    ], [{"yanit": "hayır, satış kanıtı yok"}], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {})
+
+    assert not report["success"]
+    assert len(session.questions) == 1
+    assert "zaten değerlendirildi" in tool_messages(session.model_inputs[3])
+
+
+@pytest.mark.asyncio
+async def test_goal_report_with_new_evidence_is_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Yeni başarılı çağrı içeren bildirim yine değerlendirilir; yalnız tekrar reddedilir."""
+    session = ContinuousRun([
+        tool_turn(call("w1", "write_file", {"path": str(tmp_path / "a.md"), "content": "a"})),
+        tool_turn(call("g1", "report_goal_met", {"summary": "İlk iddia.",
+                                                 "evidence_call_ids": ["w1"]})),
+        tool_turn(call("w2", "write_file", {"path": str(tmp_path / "b.md"), "content": "b"})),
+        tool_turn(call("g2", "report_goal_met", {"summary": "İkinci iddia.",
+                                                 "evidence_call_ids": ["w2"]})),
+    ], [{"yanit": "hayır"}, {"yanit": "evet"}], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {})
+
+    assert report["success"]
+    assert len(session.questions) == 2 and "İkinci iddia." in session.questions[1]
+
+
+@pytest.mark.asyncio
+async def test_stalled_run_recovers_without_asking_user(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     missing = call("r1", "read_file", {"path": str(tmp_path / "yok.txt")})
-    session = ContinuousRun([tool_turn(missing)] * 6, [{"yanit": "Başka bir yol dene"}], 0.0)
+    session = ContinuousRun([tool_turn(missing)] * 6, [], 0.0)
     report = await session.run(tmp_path, monkeypatch, {})
     assert report["reason"] == "durduruldu"
-    assert len(session.questions) == 1 and "takıldı" in session.questions[0]
-    after_question = session.model_inputs[-1]
+    assert session.questions == []
+    after_recovery = session.model_inputs[-1]
     assert any(message["role"] == "user"
-               and str(message["content"]).startswith("KULLANICI YÖNLENDİRMESİ: Başka bir yol dene")
-               for message in after_question)
+               and "Aynı başarısız çağrıyı" in str(message["content"])
+               for message in after_recovery)
+
+
+@pytest.mark.asyncio
+async def test_first_failed_call_immediately_requests_an_alternative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "yok.txt"
+    available = tmp_path / "var.txt"
+    available.write_text("ok", encoding="utf-8")
+    session = ContinuousRun([
+        tool_turn(call("r1", "read_file", {"path": str(missing)})),
+        tool_turn(call("r2", "read_file", {"path": str(available)})),
+    ], [], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {})
+    assert report["reason"] == "durduruldu"
+    assert session.questions == []
+    next_turn = "\n".join(str(message.get("content", "")) for message in session.model_inputs[1])
+    assert "HOST — ARAÇ HATASI" in next_turn
+    assert "read_file:" in next_turn
+    assert "farklı bir araç/yöntem seç" in next_turn
+    assert sum(message.get("role") == "user" and str(message.get("content", "")).startswith("HOST — ARAÇ HATASI")
+               for message in session.model_inputs[2]) == 1
+
+
+@pytest.mark.asyncio
+async def test_identical_failed_call_is_blocked_until_another_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "yok.txt"
+    available = tmp_path / "var.txt"
+    available.write_text("ok", encoding="utf-8")
+    session = ContinuousRun([
+        tool_turn(call("r1", "read_file", {"path": str(missing)})),
+        tool_turn(call("r2", "read_file", {"path": str(missing)})),
+        tool_turn(call("r3", "read_file", {"path": str(available)})),
+        tool_turn(call("r4", "read_file", {"path": str(missing)})),
+    ], [], 0.0)
+    await session.run(tmp_path, monkeypatch, {})
+    blocked = tool_messages(session.model_inputs[2])
+    assert "REPEATED_FAILED_CALL" in blocked or "RepeatedFailedCall" in blocked
+    final = tool_messages(session.model_inputs[4])
+    assert final.count("RepeatedFailedCall") == 1
+    assert session.questions == []
+
+
+@pytest.mark.asyncio
+async def test_idle_reports_recover_without_asking_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ContinuousRun([text_turn("İlerleme raporu")] * 3, [], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {})
+    assert report["reason"] == "durduruldu"
+    assert session.questions == []
+    assert any(message["role"] == "user" and "3 ardışık yanıtta hiçbir araç çalışmadı" in str(message["content"])
+               for message in session.model_inputs[-1])
+
+
+@pytest.mark.asyncio
+async def test_repeated_successful_reads_do_not_trigger_budget_or_delivery_question(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "probe.txt"
+    probe.write_text("ok", encoding="utf-8")
+    high_usage = {"prompt_tokens": 70_000, "cached_tokens": 0, "completion_tokens": 1_000}
+    script = [
+        {**tool_turn(call(f"r{index}", "read_file", {"path": str(probe)})), "usage": high_usage}
+        for index in range(26)
+    ]
+    session = ContinuousRun(script, [], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {})
+    assert report["reason"] == "durduruldu"
+    assert report["metrics"]["turns"] == 27
+    assert session.questions == []
+    assert not any("HOST FAST LOOP" in str(message.get("content", ""))
+                   for turn in session.model_inputs for message in turn)
+    assert not any(event["kind"] == "notice" and "bütçesi baskısı" in event["text"].lower()
+                   for event in session.events)
 
 
 @pytest.mark.asyncio

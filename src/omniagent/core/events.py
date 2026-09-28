@@ -4,8 +4,11 @@ bunları gösterirken kullanılan saf yardımcılar. Arayüz log metnini ayrış
 bu tipli olayları tüketir.
 """
 import json
+import hashlib
+import hmac
+import os
 import re
-from typing import Callable, Dict, Literal, NotRequired, Optional, TypedDict, Union
+from typing import Callable, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 from .state import EpisodeMetrics
 
@@ -13,6 +16,7 @@ from .state import EpisodeMetrics
 # her parçada tüm metni taramak O(n²) olur; önizlenen alan hep baştadır.
 PREVIEW_SCAN_LIMIT: int = 800
 PREVIEW_LIMIT: int = 400
+_ARGUMENT_TAG_KEY: bytes = os.urandom(32)
 
 
 class TokenUsage(TypedDict):
@@ -70,6 +74,9 @@ class ModelFinished(TypedDict):
     turn: int
     seconds: float
     usage: TokenUsage
+    finish_reason: NotRequired[Optional[str]]
+    tool_call_count: NotRequired[int]
+    empty_content: NotRequired[bool]
 
 
 class ToolStarted(TypedDict):
@@ -78,6 +85,8 @@ class ToolStarted(TypedDict):
     index: int
     name: str
     preview: str
+    argument_tag: NotRequired[str]
+    point: NotRequired[Optional[List[int]]]
 
 
 class ToolOutput(TypedDict):
@@ -93,6 +102,7 @@ class ToolFinished(TypedDict):
     ok: bool
     text: str
     seconds: float
+    code: NotRequired[str]
 
 
 class ArtifactReady(TypedDict):
@@ -219,6 +229,33 @@ def preview_arguments(name: str, arguments: str) -> str:
     if value is None:
         return ""
     return value if len(value) <= PREVIEW_LIMIT else value[:PREVIEW_LIMIT] + "…"
+
+
+def argument_tag(name: str, arguments: str) -> str:
+    """Aynı tam argümanı oturum içinde eşler; gizli değeri olay kaydına taşımaz."""
+    try:
+        parsed = json.loads(arguments)
+        stable = json.dumps(parsed, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        stable = arguments
+    return hmac.new(_ARGUMENT_TAG_KEY, f"{name}\0{stable}".encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def argument_point(name: str, arguments: str) -> Optional[List[int]]:
+    """GUI hedefinin yalnız sayısal koordinatını olay kaydına çıkarır."""
+    if name not in {"cua_click_text", "cua_click_point", "cua_scroll", "cua_read_scrollable"}:
+        return None
+    try:
+        parsed = json.loads(arguments)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get("near") if name == "cua_click_text" else parsed.get("point")
+    if (isinstance(value, list) and len(value) == 2
+            and all(type(item) is int and 0 <= item < 1000 for item in value)):
+        return value
+    return None
 
 
 def compact_count(value: int) -> str:
