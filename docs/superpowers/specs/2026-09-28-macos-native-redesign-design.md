@@ -42,8 +42,7 @@ Mevcut palet (`ui/app.py:78-95`) korunur ve genişletilir, yeniden icat edilmez:
 | `ACCENT` `#D97757` ailesi | var | değişmiyor — marka kimliği |
 | `MONO_FAMILY` `"Menlo"` | var | değişmiyor — kod/komut bloklarında kalır |
 | Gövde fontu (`self._ui_family`) | `tkfont.nametofont("TkDefaultFont").actual("family")` → bu makinede doğrulandı: zaten `.AppleSystemUIFont` | **İş yok** — zaten native. |
-| `RADIUS_SM/MD/LG` (yeni) | CustomTkinter varsayılanları (widget başına dağınık) | 6 / 10 / 14 piksel olarak tek yerden standardize edilir |
-| `SPACE_UNIT` (yeni) | yok (elle seçilmiş boşluklar) | 8px taban birim; bileşenler `SPACE_UNIT * n` kullanır |
+| `RADIUS_SM/MD/LG`, `SPACE_UNIT` (yeni) | yok (widget başına dağınık değerler) | Bu sub-project'te **tanımlanmaz** — YAGNI: henüz tüketicisi yok. İlk gerçek tüketicisi olan Alt proje 2 (kenar çubuğu) tarafından, o iş başladığında tanıtılacak. |
 
 ## Native köprü modülü: `ui/native_macos.py`
 
@@ -60,7 +59,7 @@ Bu iki fonksiyon da **çağrıldıkları an başarısız olabileceklerini varsay
 
 Her biri kendi worktree/dalında, kendi PR'ında, bir öncekini bozmadan teslim edilir:
 
-1. **Temel (bu spec'in ilk uygulama dilimi):** `native_macos.py` (vibrancy + native menü çubuğu), `RADIUS_*`/`SPACE_UNIT` jetonları. Görünür etki: pencere arka planı bulanık/vibrant olur, standart bir uygulama menüsü belirir — kenar çubuğu/transkript içeriği henüz yeniden tasarlanmaz.
+1. **Temel (bu spec'in ilk uygulama dilimi):** yalnızca `native_macos.py` (vibrancy + native menü çubuğu). Görünür etki: pencere arka planı bulanık/vibrant olur, standart bir uygulama menüsü belirir — kenar çubuğu/transkript içeriği henüz yeniden tasarlanmaz, jetonlar henüz tanımlanmaz.
 2. Kenar çubuğu (`chats.py` mantığı korunur) — native liste satırı/seçim/hover.
 3. Transkript + composer — asıl sohbet deneyimi.
 4. Ayarlar sayfası — gruplu liste stiline geçiş.
