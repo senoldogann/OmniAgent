@@ -51,6 +51,8 @@ class HeadlessPage:
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
+        self._actions: List[Dict[str, object]] = []
+        self._call_id: Optional[str] = None
         self._pool.submit(self._start).result()
 
     def _start(self) -> None:
@@ -79,7 +81,17 @@ class HeadlessPage:
         return self._run(lambda page: page.screenshot())
 
     def click(self, x: float, y: float, button: str) -> None:
-        self._run(lambda page: page.mouse.click(x, y, button=button))
+        def action(page: Page) -> None:
+            target = page.evaluate("""([x, y]) => {
+              const node = document.elementFromPoint(x, y);
+              return node?.closest('[data-benchmark-target]')?.getAttribute('data-benchmark-target') || null;
+            }""", [x, y])
+            before = page.locator("body").get_attribute("data-benchmark-state")
+            page.mouse.click(x, y, button=button)
+            after = page.locator("body").get_attribute("data-benchmark-state")
+            self._actions.append({"call_id": self._call_id, "action": "click", "target": target,
+                                  "no_effect": before == after if before is not None else None})
+        self._run(action)
 
     def move(self, x: float, y: float) -> None:
         self._run(lambda page: page.mouse.move(x, y))
@@ -101,6 +113,17 @@ class HeadlessPage:
                 self._playwright.stop()
         self._pool.submit(stop).result()
         self._pool.shutdown()
+
+    def start_run(self) -> None:
+        """Yeni koşunun yalnız güvenli hedef işaretlerini ve çağrı kimliklerini tutar."""
+        self._actions = []
+        self._call_id = None
+
+    def set_call_id(self, call_id: Optional[str]) -> None:
+        self._call_id = call_id
+
+    def actions(self) -> List[Dict[str, object]]:
+        return list(self._actions)
 
 
 def to_page_point(x: int, y: int) -> Tuple[float, float]:
@@ -171,6 +194,7 @@ def install(page: HeadlessPage) -> None:
                     self._pending_input["baseline"], self._pending_input["at"], self._settle_frame,
                 )
                 self._pending_input = None
+                page._actions.append({"call_id": page._call_id, "action": "settle", "seconds": round(waited, 2)})
                 note = f" Son eylemden sonra ekranın durulması {waited:.1f}sn beklendi."
             frame: Image.Image = Image.open(io.BytesIO(page.png())).convert("RGB").resize(
                 (VIEW_WIDTH, VIEW_HEIGHT), Image.Resampling.LANCZOS,
@@ -181,7 +205,7 @@ def install(page: HeadlessPage) -> None:
                     "en-boy oranı). Sana 1000×1000 kare olarak gösterilir; o görüntüdeki koordinatlar tıklama "
                     "araçlarıyla aynı uzaydadır." + note)
 
-        def chrome_active_tab(self, url: Optional[str]) -> str:
+        def chrome_active_tab(self, url: Optional[str], new_tab: bool = False) -> str:
             if url is not None:
                 page.goto(url)
             title, current = page.title_and_url()

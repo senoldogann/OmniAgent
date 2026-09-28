@@ -6,6 +6,45 @@ from omniagent.dev import benchmark
 from omniagent.memory import user as user_memory
 
 
+def test_gui_trace_keeps_call_ids_and_excludes_visible_text() -> None:
+    trace = benchmark.GuiTrace(None)
+    trace.record({"kind": "tool_started", "call_id": "c1", "index": 0,
+                  "name": "cua_click_text", "preview": "Gizli parola 123"})
+    trace.record({"kind": "tool_finished", "call_id": "c1", "ok": False,
+                  "text": "Gizli parola 123", "seconds": 1.25})
+    trace.record({"kind": "tool_started", "call_id": "dogrulama-1-2", "index": 0,
+                  "name": "take_screenshot", "preview": "ekran"})
+    trace.record({"kind": "tool_finished", "call_id": "dogrulama-1-2", "ok": True,
+                  "text": "ekran", "seconds": 0.5})
+
+    assert trace.rows[0] == {"call_id": "c1", "tool": "cua_click_text", "path": "ocr",
+                             "ok": False, "seconds": 1.25, "error_type": "Unknown", "phase": "action"}
+    assert trace.rows[1]["phase"] == "verification"
+    assert trace.metrics()["verification_seconds"] == 0.5
+    assert "Gizli" not in str(trace.rows)
+
+
+def test_similar_button_scenario_has_distinct_safe_target_markers(tmp_path: Path) -> None:
+    scenario = benchmark.build_scenario("chrome_benzer", tmp_path, "abc12345", 8765)
+    assert "Güncel teklif" in scenario["goal"]
+    assert 'data-benchmark-target="decoy"' in benchmark.SIMILAR_BUTTON_PAGE
+    assert 'data-benchmark-target="expected"' in benchmark.SIMILAR_BUTTON_PAGE
+    assert scenario["check"]("KOD: BT-7421")[0] is True
+    assert scenario["check"]("KOD: yanlış")[0] is False
+
+
+def test_gui_metrics_separate_clicks_from_settle_records() -> None:
+    class FakePage:
+        def actions(self) -> list[dict[str, object]]:
+            return [{"call_id": "c1", "action": "click", "target": "decoy", "no_effect": False},
+                    {"call_id": "c2", "action": "settle", "seconds": 0.7}]
+
+    metrics = benchmark.GuiTrace(FakePage()).metrics()
+    assert metrics["wrong_target_clicks"] == 1
+    assert metrics["marked_clicks"] == 1
+    assert metrics["loading_wait_seconds"] == 0.7
+
+
 def test_long_research_scenario_requires_full_delivery_contract(tmp_path: Path) -> None:
     run_id = "abc12345"
     scenario = benchmark.build_scenario("long_research", tmp_path, run_id, 8765)

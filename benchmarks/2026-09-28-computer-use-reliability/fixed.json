@@ -1,0 +1,1214 @@
+[
+ {
+  "name": "chrome_ilan",
+  "ok": false,
+  "detail": "beklenen=IL-5A7A7A,IL-67CE92,IL-9744CE",
+  "outcome": "",
+  "elapsed_seconds": 46.46,
+  "turns": 13,
+  "tool_calls": 15,
+  "prompt_tokens": 95125,
+  "cached_tokens": 84416,
+  "completion_tokens": 454,
+  "model_seconds": 14.63,
+  "tool_seconds": 31.77,
+  "uncached_prompt_tokens": 10709,
+  "observations": 13,
+  "observations_reused": 0,
+  "duplicate_navigation": 0,
+  "semantic_progress_events": 5,
+  "fast_loop_stagnation_events": 8,
+  "fast_loop_replans": 1,
+  "fast_loop_delivery_entries": 1,
+  "backend": "ollama-cloud",
+  "integrations": {
+   "discovery_seconds": 0.0,
+   "install_seconds": 0.0,
+   "network_seconds": 0.0,
+   "wait_seconds": 0.0,
+   "user_wait_seconds": 0.0,
+   "network_requests": 0,
+   "operations_ok": 0,
+   "operations_failed": 0
+  },
+  "experience_hints": 0,
+  "gui_trace": [
+   {
+    "call_id": "call_njqm2ab4",
+    "tool": "chrome_active_tab",
+    "path": "other",
+    "ok": true,
+    "seconds": 0.06,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-1",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.71,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_lyjgrbmz",
+    "tool": "cua_submit_text",
+    "path": "point",
+    "ok": true,
+    "seconds": 0.16,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-2",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.42,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_fjctnm1c",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.64,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_bbry2vcg",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.48,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_tei6nwf9",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 1.69,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-3",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.96,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_07bxhmdn",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.44,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-4",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.63,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_pkjln8iv",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.83,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-5",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 2.19,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_93j1us4l",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.71,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-6",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 2.06,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_4535sct9",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.88,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-7",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.72,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_agsje4uu",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.43,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-8",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 2.01,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_nsjoe1nk",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.55,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-9",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.98,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_ztt7ygdp",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.84,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-10",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.76,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_ilsmrw5s",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.44,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-11",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.64,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_il1lv0v3",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.36,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-12",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.76,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_csi6crma",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.37,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-13",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.56,
+    "error_type": null,
+    "phase": "observation"
+   }
+  ],
+  "gui_actions": [
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-1",
+    "action": "settle",
+    "seconds": 0.61
+   },
+   {
+    "call_id": "call_lyjgrbmz",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-2",
+    "action": "settle",
+    "seconds": 1.29
+   },
+   {
+    "call_id": "call_fjctnm1c",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "call_bbry2vcg",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "call_tei6nwf9",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-3",
+    "action": "settle",
+    "seconds": 1.66
+   },
+   {
+    "call_id": "call_07bxhmdn",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-4",
+    "action": "settle",
+    "seconds": 1.43
+   },
+   {
+    "call_id": "call_pkjln8iv",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-5",
+    "action": "settle",
+    "seconds": 1.67
+   },
+   {
+    "call_id": "call_93j1us4l",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-6",
+    "action": "settle",
+    "seconds": 1.76
+   },
+   {
+    "call_id": "call_4535sct9",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-7",
+    "action": "settle",
+    "seconds": 1.51
+   },
+   {
+    "call_id": "call_agsje4uu",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-8",
+    "action": "settle",
+    "seconds": 1.65
+   },
+   {
+    "call_id": "call_nsjoe1nk",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-9",
+    "action": "settle",
+    "seconds": 1.44
+   },
+   {
+    "call_id": "call_ztt7ygdp",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-10",
+    "action": "settle",
+    "seconds": 1.52
+   },
+   {
+    "call_id": "call_ilsmrw5s",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-11",
+    "action": "settle",
+    "seconds": 1.45
+   },
+   {
+    "call_id": "call_il1lv0v3",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-12",
+    "action": "settle",
+    "seconds": 1.53
+   },
+   {
+    "call_id": "call_csi6crma",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-a1c84db3-13",
+    "action": "settle",
+    "seconds": 1.39
+   }
+  ],
+  "gui_metrics": {
+   "wrong_target_clicks": 0,
+   "marked_clicks": 0,
+   "no_effect_clicks": 0,
+   "retries": 0,
+   "loading_wait_seconds": 18.91,
+   "observation_seconds": 22.4,
+   "verification_seconds": 0.0,
+   "paths": {
+    "ax": 0,
+    "ocr": 13,
+    "image": 13,
+    "point": 1,
+    "other": 1
+   }
+  }
+ },
+ {
+  "name": "chrome_ilan",
+  "ok": true,
+  "detail": "beklenen=IL-6DF26D,IL-F1706C,IL-2BF229",
+  "outcome": "KODLAR: IL-6DF26D,IL-F1706C,IL-2BF229",
+  "elapsed_seconds": 22.84,
+  "turns": 5,
+  "tool_calls": 8,
+  "prompt_tokens": 33850,
+  "cached_tokens": 28864,
+  "completion_tokens": 301,
+  "model_seconds": 5.16,
+  "tool_seconds": 17.64,
+  "uncached_prompt_tokens": 4986,
+  "observations": 4,
+  "observations_reused": 0,
+  "duplicate_navigation": 0,
+  "semantic_progress_events": 3,
+  "fast_loop_stagnation_events": 0,
+  "fast_loop_replans": 0,
+  "fast_loop_delivery_entries": 0,
+  "backend": "ollama-cloud",
+  "integrations": {
+   "discovery_seconds": 0.0,
+   "install_seconds": 0.0,
+   "network_seconds": 0.0,
+   "wait_seconds": 0.0,
+   "user_wait_seconds": 0.0,
+   "network_requests": 0,
+   "operations_ok": 0,
+   "operations_failed": 0
+  },
+  "experience_hints": 0,
+  "gui_trace": [
+   {
+    "call_id": "call_jek6u7xf",
+    "tool": "chrome_active_tab",
+    "path": "other",
+    "ok": true,
+    "seconds": 0.05,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-53363cc2-1",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.69,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_kj25e2np",
+    "tool": "cua_submit_text",
+    "path": "point",
+    "ok": true,
+    "seconds": 0.13,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-53363cc2-2",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.46,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_hm716khu",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.45,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_8yfselbm",
+    "tool": "cua_read_scrollable",
+    "path": "other",
+    "ok": true,
+    "seconds": 4.6,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_hqodcbum",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.53,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_ytz9o0ux",
+    "tool": "cua_read_scrollable",
+    "path": "other",
+    "ok": true,
+    "seconds": 3.6,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_ll5jht39",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.32,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "call_jy4kve4i",
+    "tool": "cua_read_scrollable",
+    "path": "other",
+    "ok": true,
+    "seconds": 4.67,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-53363cc2-3",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.86,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "dogrulama-53363cc2-4",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.18,
+    "error_type": null,
+    "phase": "verification"
+   }
+  ],
+  "gui_actions": [
+   {
+    "call_id": "otomatik-gozlem-53363cc2-1",
+    "action": "settle",
+    "seconds": 0.56
+   },
+   {
+    "call_id": "call_kj25e2np",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-53363cc2-2",
+    "action": "settle",
+    "seconds": 1.31
+   },
+   {
+    "call_id": "call_hm716khu",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "call_hqodcbum",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "call_ll5jht39",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-53363cc2-3",
+    "action": "settle",
+    "seconds": 0.67
+   }
+  ],
+  "gui_metrics": {
+   "wrong_target_clicks": 0,
+   "marked_clicks": 0,
+   "no_effect_clicks": 0,
+   "retries": 0,
+   "loading_wait_seconds": 2.54,
+   "observation_seconds": 3.01,
+   "verification_seconds": 0.18,
+   "paths": {
+    "ax": 0,
+    "ocr": 3,
+    "image": 4,
+    "point": 1,
+    "other": 4
+   }
+  }
+ },
+ {
+  "name": "chrome_ilan",
+  "ok": false,
+  "detail": "beklenen=IL-5B68F9,IL-DF220E,IL-26D826",
+  "outcome": "KODLAR: IL-11405,IL-DF220E,IL-26D826",
+  "elapsed_seconds": 17.56,
+  "turns": 8,
+  "tool_calls": 6,
+  "prompt_tokens": 52871,
+  "cached_tokens": 47488,
+  "completion_tokens": 480,
+  "model_seconds": 8.34,
+  "tool_seconds": 9.16,
+  "uncached_prompt_tokens": 5383,
+  "observations": 6,
+  "observations_reused": 0,
+  "duplicate_navigation": 0,
+  "semantic_progress_events": 5,
+  "fast_loop_stagnation_events": 1,
+  "fast_loop_replans": 0,
+  "fast_loop_delivery_entries": 0,
+  "backend": "ollama-cloud",
+  "integrations": {
+   "discovery_seconds": 0.0,
+   "install_seconds": 0.0,
+   "network_seconds": 0.0,
+   "wait_seconds": 0.0,
+   "user_wait_seconds": 0.0,
+   "network_requests": 0,
+   "operations_ok": 0,
+   "operations_failed": 0
+  },
+  "experience_hints": 0,
+  "gui_trace": [
+   {
+    "call_id": "call_c5pqmujt",
+    "tool": "chrome_active_tab",
+    "path": "other",
+    "ok": true,
+    "seconds": 0.03,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-1",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.79,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_5ba0k9qb",
+    "tool": "cua_submit_text",
+    "path": "point",
+    "ok": true,
+    "seconds": 0.12,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-2",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.41,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_m26ckuil",
+    "tool": "run_action_sequence",
+    "path": "other",
+    "ok": false,
+    "seconds": 0.0,
+    "error_type": "ToolUnavailable",
+    "phase": "action"
+   },
+   {
+    "call_id": "call_priy6tby",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.39,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-4",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.46,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_dley7a95",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.34,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-5",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 1.68,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_387au9wo",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.59,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-6",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 2.0,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "dogrulama-9cc3e5ed-7",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.16,
+    "error_type": null,
+    "phase": "verification"
+   }
+  ],
+  "gui_actions": [
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-1",
+    "action": "settle",
+    "seconds": 0.6
+   },
+   {
+    "call_id": "call_5ba0k9qb",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-2",
+    "action": "settle",
+    "seconds": 1.22
+   },
+   {
+    "call_id": "call_priy6tby",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-4",
+    "action": "settle",
+    "seconds": 1.31
+   },
+   {
+    "call_id": "call_dley7a95",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-5",
+    "action": "settle",
+    "seconds": 1.48
+   },
+   {
+    "call_id": "call_387au9wo",
+    "action": "click",
+    "target": null,
+    "no_effect": null
+   },
+   {
+    "call_id": "otomatik-gozlem-9cc3e5ed-6",
+    "action": "settle",
+    "seconds": 1.52
+   }
+  ],
+  "gui_metrics": {
+   "wrong_target_clicks": 0,
+   "marked_clicks": 0,
+   "no_effect_clicks": 0,
+   "retries": 0,
+   "loading_wait_seconds": 6.13,
+   "observation_seconds": 7.34,
+   "verification_seconds": 0.16,
+   "paths": {
+    "ax": 0,
+    "ocr": 3,
+    "image": 6,
+    "point": 1,
+    "other": 2
+   }
+  }
+ },
+ {
+  "name": "chrome_benzer",
+  "ok": true,
+  "detail": "beklenen=BT-7421",
+  "outcome": "KOD: BT-7421",
+  "elapsed_seconds": 5.79,
+  "turns": 4,
+  "tool_calls": 2,
+  "prompt_tokens": 24782,
+  "cached_tokens": 22784,
+  "completion_tokens": 98,
+  "model_seconds": 3.51,
+  "tool_seconds": 2.23,
+  "uncached_prompt_tokens": 1998,
+  "observations": 3,
+  "observations_reused": 0,
+  "duplicate_navigation": 0,
+  "semantic_progress_events": 2,
+  "fast_loop_stagnation_events": 0,
+  "fast_loop_replans": 0,
+  "fast_loop_delivery_entries": 0,
+  "backend": "ollama-cloud",
+  "integrations": {
+   "discovery_seconds": 0.0,
+   "install_seconds": 0.0,
+   "network_seconds": 0.0,
+   "wait_seconds": 0.0,
+   "user_wait_seconds": 0.0,
+   "network_requests": 0,
+   "operations_ok": 0,
+   "operations_failed": 0
+  },
+  "experience_hints": 0,
+  "gui_trace": [
+   {
+    "call_id": "call_royoc46v",
+    "tool": "chrome_active_tab",
+    "path": "other",
+    "ok": true,
+    "seconds": 0.02,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-6d8ed824-1",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.71,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_xk1lfjlm",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.42,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-6d8ed824-2",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.84,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "dogrulama-6d8ed824-3",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.17,
+    "error_type": null,
+    "phase": "verification"
+   }
+  ],
+  "gui_actions": [
+   {
+    "call_id": "otomatik-gozlem-6d8ed824-1",
+    "action": "settle",
+    "seconds": 0.59
+   },
+   {
+    "call_id": "call_xk1lfjlm",
+    "action": "click",
+    "target": "expected",
+    "no_effect": false
+   },
+   {
+    "call_id": "otomatik-gozlem-6d8ed824-2",
+    "action": "settle",
+    "seconds": 0.7
+   }
+  ],
+  "gui_metrics": {
+   "wrong_target_clicks": 0,
+   "marked_clicks": 1,
+   "no_effect_clicks": 0,
+   "retries": 0,
+   "loading_wait_seconds": 1.29,
+   "observation_seconds": 1.55,
+   "verification_seconds": 0.17,
+   "paths": {
+    "ax": 0,
+    "ocr": 1,
+    "image": 3,
+    "point": 0,
+    "other": 1
+   }
+  }
+ },
+ {
+  "name": "chrome_benzer",
+  "ok": true,
+  "detail": "beklenen=BT-7421",
+  "outcome": "KOD: BT-7421",
+  "elapsed_seconds": 5.71,
+  "turns": 4,
+  "tool_calls": 2,
+  "prompt_tokens": 24804,
+  "cached_tokens": 22816,
+  "completion_tokens": 99,
+  "model_seconds": 3.17,
+  "tool_seconds": 2.5,
+  "uncached_prompt_tokens": 1988,
+  "observations": 3,
+  "observations_reused": 0,
+  "duplicate_navigation": 0,
+  "semantic_progress_events": 2,
+  "fast_loop_stagnation_events": 0,
+  "fast_loop_replans": 0,
+  "fast_loop_delivery_entries": 0,
+  "backend": "ollama-cloud",
+  "integrations": {
+   "discovery_seconds": 0.0,
+   "install_seconds": 0.0,
+   "network_seconds": 0.0,
+   "wait_seconds": 0.0,
+   "user_wait_seconds": 0.0,
+   "network_requests": 0,
+   "operations_ok": 0,
+   "operations_failed": 0
+  },
+  "experience_hints": 0,
+  "gui_trace": [
+   {
+    "call_id": "call_6mi81qrs",
+    "tool": "chrome_active_tab",
+    "path": "other",
+    "ok": true,
+    "seconds": 0.02,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-b3ce8ddb-1",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.8,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_1r7ktvsz",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.5,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-b3ce8ddb-2",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.94,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "dogrulama-b3ce8ddb-3",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.16,
+    "error_type": null,
+    "phase": "verification"
+   }
+  ],
+  "gui_actions": [
+   {
+    "call_id": "otomatik-gozlem-b3ce8ddb-1",
+    "action": "settle",
+    "seconds": 0.66
+   },
+   {
+    "call_id": "call_1r7ktvsz",
+    "action": "click",
+    "target": "expected",
+    "no_effect": false
+   },
+   {
+    "call_id": "otomatik-gozlem-b3ce8ddb-2",
+    "action": "settle",
+    "seconds": 0.77
+   }
+  ],
+  "gui_metrics": {
+   "wrong_target_clicks": 0,
+   "marked_clicks": 1,
+   "no_effect_clicks": 0,
+   "retries": 0,
+   "loading_wait_seconds": 1.43,
+   "observation_seconds": 1.74,
+   "verification_seconds": 0.16,
+   "paths": {
+    "ax": 0,
+    "ocr": 1,
+    "image": 3,
+    "point": 0,
+    "other": 1
+   }
+  }
+ },
+ {
+  "name": "chrome_benzer",
+  "ok": true,
+  "detail": "beklenen=BT-7421",
+  "outcome": "Zorunlu maddeler ve kanıtları  \n1. ​Sayfa “http://127.0.0.1:55558/benzer/ba734ab6” açıldı → Chrome başlığı ve ekran görüntüsünde “Teklifler” listesi görünüyor.  \n2. ​“Güncel teklif” kartındaki “Detayı aç” düğmesine tıklandı → HOST KANIT ÖZETİ’nde metne tıklama “Detayı aç”; ardından ekranda “Kod: BT-",
+  "elapsed_seconds": 17.89,
+  "turns": 4,
+  "tool_calls": 2,
+  "prompt_tokens": 24457,
+  "cached_tokens": 15616,
+  "completion_tokens": 1046,
+  "model_seconds": 16.05,
+  "tool_seconds": 1.81,
+  "uncached_prompt_tokens": 8841,
+  "observations": 3,
+  "observations_reused": 0,
+  "duplicate_navigation": 0,
+  "semantic_progress_events": 2,
+  "fast_loop_stagnation_events": 0,
+  "fast_loop_replans": 0,
+  "fast_loop_delivery_entries": 0,
+  "backend": "openai",
+  "integrations": {
+   "discovery_seconds": 0.0,
+   "install_seconds": 0.0,
+   "network_seconds": 0.0,
+   "wait_seconds": 0.0,
+   "user_wait_seconds": 0.0,
+   "network_requests": 0,
+   "operations_ok": 0,
+   "operations_failed": 0
+  },
+  "experience_hints": 0,
+  "gui_trace": [
+   {
+    "call_id": "call_am8gwmx2",
+    "tool": "chrome_active_tab",
+    "path": "other",
+    "ok": true,
+    "seconds": 0.02,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-348f21ad-1",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.67,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "call_qYQ4JujHRC4BmBFx0de8ohOJ",
+    "tool": "cua_click_text",
+    "path": "ocr",
+    "ok": true,
+    "seconds": 0.27,
+    "error_type": null,
+    "phase": "action"
+   },
+   {
+    "call_id": "otomatik-gozlem-348f21ad-2",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.69,
+    "error_type": null,
+    "phase": "observation"
+   },
+   {
+    "call_id": "dogrulama-348f21ad-3",
+    "tool": "take_screenshot",
+    "path": "image",
+    "ok": true,
+    "seconds": 0.11,
+    "error_type": null,
+    "phase": "verification"
+   }
+  ],
+  "gui_actions": [
+   {
+    "call_id": "otomatik-gozlem-348f21ad-1",
+    "action": "settle",
+    "seconds": 0.57
+   },
+   {
+    "call_id": "call_qYQ4JujHRC4BmBFx0de8ohOJ",
+    "action": "click",
+    "target": "expected",
+    "no_effect": false
+   },
+   {
+    "call_id": "otomatik-gozlem-348f21ad-2",
+    "action": "settle",
+    "seconds": 0.6
+   }
+  ],
+  "gui_metrics": {
+   "wrong_target_clicks": 0,
+   "marked_clicks": 1,
+   "no_effect_clicks": 0,
+   "retries": 0,
+   "loading_wait_seconds": 1.17,
+   "observation_seconds": 1.36,
+   "verification_seconds": 0.11,
+   "paths": {
+    "ax": 0,
+    "ocr": 1,
+    "image": 3,
+    "point": 0,
+    "other": 1
+   }
+  }
+ }
+]
