@@ -83,8 +83,10 @@ def _listed_ids(provider: str, payload: Any) -> tuple[str, ...]:
         candidate: Any = entry.get("name" if provider == "ollama-cloud" else "id")
         if not isinstance(candidate, str) or not valid_model_id(candidate):
             continue
-        if provider == "ollama-cloud" and not candidate.endswith(":cloud"):
-            continue
+        if provider == "ollama-cloud":
+            tag: str = candidate.rsplit(":", 1)[-1]
+            if tag != "cloud" and not tag.endswith("-cloud"):
+                continue
         if provider == "openai":
             # Modeller API'si ses, görsel ve gömme modellerini de listeler.
             if not (candidate.startswith("gpt-") or candidate.startswith(("o3", "o4"))):
