@@ -184,6 +184,22 @@ def _boolean_field(spec: object) -> bool:
     return isinstance(spec, dict) and spec.get("type") == "boolean"
 
 
+_INTEGRATION_STATUS_OVERRIDES: Dict[str, str] = {"waiting_user": "Yanıtınız bekleniyor"}
+
+
+def integration_status_label(stage: str, text: str, completed: int, total: int) -> str:
+    """
+    İç durum kodunu (`stage`) kullanıcıya okunur etikete çevirir; arayüz zaten yalnız `text`
+    gösterir ve doğru çalışır, Telegram eskiden ham `stage` kodunu ("waiting_user" gibi)
+    basıyordu. Çoğu aşamada `text` kendi başına açıklayıcıdır. Yalnız 'waiting_user' özel:
+    oradaki `text` sorunun kendisidir ve ask_user akışıyla zaten ayrıca gösterilir, geçici
+    "düşünüyor" balonunda tekrarlanmaz. Saf.
+    """
+    base = _INTEGRATION_STATUS_OVERRIDES.get(stage, text)
+    progress = f" {completed}/{total}" if total else ""
+    return base + progress
+
+
 def event_text(event: AgentEvent) -> str:
     """Tipli ajan olayunu kısa, okunur Telegram metnine dönüştürür."""
     kind = event["kind"]
@@ -205,8 +221,10 @@ def event_text(event: AgentEvent) -> str:
     if kind == "notice":
         return f"\n! {event['text'][:500]}\n"
     if kind == "integration_status":
-        progress = f" {event['completed']}/{event['total']}" if event["total"] else ""
-        return f"\n◦ {event['stage']}{progress}: {event['text'][:300]}\n"
+        label = integration_status_label(
+            event["stage"], event["text"][:300], event["completed"], event["total"]
+        )
+        return f"\n◦ {label}\n"
     if kind == "stream_reset":
         return f"\n↺ Akış sıfırlandı: {event['reason'][:200]}\n"
     if kind == "run_finished":
@@ -242,6 +260,11 @@ class TelegramAPI:
             try:
                 response = await self.client.post(url, json=payload)
                 body = response.json()
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                if attempt == 0:
+                    await asyncio.sleep(0.25)
+                    continue
+                raise TelegramError(f"{method}: ağ veya yanıt hatası ({type(error).__name__}).") from None
             except (httpx.HTTPError, ValueError) as error:
                 raise TelegramError(f"{method}: ağ veya yanıt hatası ({type(error).__name__}).") from None
             if not isinstance(body, dict):
@@ -502,6 +525,7 @@ class TelegramDraftStream:
         self.rich_message: Dict[str, str] = {"html": "<tg-thinking>Düşünüyor…</tg-thinking>"}
         self.sent = ""
         self.last_draft = 0.0
+        self.last_draft_error_log = 0.0
 
     async def show(
         self, text: str, *, rich_message: Optional[Dict[str, str]] = None,
@@ -541,6 +565,15 @@ class TelegramDraftStream:
                     self.sent = self.visible
                     self.last_draft = time.monotonic()
                     return
+            if error.status is None or error.status == 429 or (
+                error.status is not None and error.status >= 500
+            ):
+                # Geçici taslak hatası gerçek ajan işini iptal etmez; sonraki tick yeniden dener.
+                self.last_draft = time.monotonic()
+                if self.last_draft - self.last_draft_error_log >= 30.0:
+                    logging.warning("Telegram taslak akışı geçici olarak erişilemiyor: %s", error)
+                    self.last_draft_error_log = self.last_draft
+                return
             if error.status not in (400, 404):
                 raise error
             self.native = False
@@ -605,6 +638,7 @@ class CompactPresenter:
         self.hide_turn = False
         self.finished = False
         self.active_tool: Optional[tuple[str, str, str, str]] = None
+        self.last_status_stage: Optional[str] = None
 
     async def event(self, event: AgentEvent) -> None:
         kind = event["kind"]
@@ -653,12 +687,20 @@ class CompactPresenter:
                     rich_message={"html": "<tg-thinking>" + label + "</tg-thinking>"},
                 )
         elif kind == "integration_status":
-            progress = f" {event['completed']}/{event['total']}" if event["total"] else ""
-            label = event["stage"] + progress
+            stage = event["stage"]
+            label = integration_status_label(
+                stage, event["text"], event["completed"], event["total"]
+            )
+            # Aşama gerçekten değiştiyse (ör. waiting_user -> resumed) hemen gösterilir; aksi
+            # halde art arda gelen aynı aşamalı ilerleme güncellemeleri (ör. "3/10 ileti
+            # taşındı") normal düzenleme aralığıyla kısılır. Hızlı ardışık geçişte "resumed"
+            # eskiden bu kısıtlamaya takılıp taslakta hâlâ önceki aşama görünüyordu.
             await self.stream.show(
                 "⏳ " + label,
                 rich_message={"html": "<tg-thinking>" + html.escape(label) + "</tg-thinking>"},
+                immediate=stage != self.last_status_stage,
             )
+            self.last_status_stage = stage
         elif kind == "run_finished":
             self.finished = True
             answer = str(event["outcome"]).strip() or str(event["reason"]).strip() or "Yanıt yok."

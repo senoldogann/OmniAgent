@@ -332,6 +332,41 @@ async def test_compact_tool_turn_hides_state_and_keeps_one_status(
 
 
 @pytest.mark.asyncio
+async def test_waiting_user_status_is_readable_and_reply_resumes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    live = telegram.TelegramDraftStream(api, 123, telegram.TelegramStream(api, 123))
+    presenter = telegram.CompactPresenter(live)
+    waiting: dict[str, Any] = {
+        "kind": "integration_status", "stage": "waiting_user",
+        "text": "Hangi yöntemi seçiyorsunuz?", "completed": 0, "total": 0,
+    }
+    await presenter.event(waiting)
+    assert "Yanıtınız bekleniyor" in api.drafts[-1][1]["html"]
+    assert "waiting_user" not in str(api.drafts[-1][1])
+    assert "waiting_user" not in telegram.event_text(waiting)
+
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.pending_answer = asyncio.get_running_loop().create_future()
+    bridge.pending_fields = {"yanit": {"type": "string", "label": "Yanıtınız"}}
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456},
+        "text": "Mikro-SaaS",
+    }})
+    assert bridge.pending_answer.result() == {"yanit": "Mikro-SaaS"}
+    assert api.sent[-1] == "Yanıt alındı; görev sürüyor."
+
+    resumed: dict[str, Any] = {
+        "kind": "integration_status", "stage": "resumed",
+        "text": "Göreve devam ediliyor", "completed": 0, "total": 0,
+    }
+    await presenter.event(resumed)
+    assert "Göreve devam ediliyor" in api.drafts[-1][1]["html"]
+
+
+@pytest.mark.asyncio
 async def test_native_draft_animates_tools_and_preserves_markdown() -> None:
     api = FakeAPI()
     fallback = telegram.TelegramStream(api, 123)
@@ -357,6 +392,35 @@ async def test_native_draft_animates_tools_and_preserves_markdown() -> None:
     assert api.html_sent == ['<b>Kalın</b> <a href="https://example.com">kaynak</a>']
     assert api.sent == []
     assert len({draft_id for draft_id, _ in api.drafts}) == 1
+
+
+@pytest.mark.asyncio
+async def test_draft_connection_error_does_not_abort_task() -> None:
+    api = FakeAPI()
+    fallback = telegram.TelegramStream(api, 123)
+    live = telegram.TelegramDraftStream(api, 123, fallback)
+    attempts = 0
+    original = api.send_draft
+
+    async def flaky_draft(
+        chat_id: int, draft_id: int, rich_message: dict[str, str],
+    ) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise telegram.TelegramError("sendRichMessageDraft: ağ veya yanıt hatası (ConnectError).")
+        await original(chat_id, draft_id, rich_message)
+
+    api.send_draft = flaky_draft
+    await live.show("⏳ Düşünüyor…")
+    assert live.native
+    assert live.last_draft > 0
+    assert api.sent == []
+    live.last_draft = time.monotonic() - 2
+    await live.tick()
+    assert api.drafts[-1][1] == {"markdown": "⏳ Düşünüyor…"}
+    await live.finish("Yanıt")
+    assert api.html_sent == ["Yanıt"]
 
 
 @pytest.mark.asyncio
@@ -420,6 +484,26 @@ async def test_bot_api_rich_payload_contract() -> None:
         ("editMessageText", {"chat_id": 123, "message_id": 9,
                              "text": "<b>Düzenle</b>", "parse_mode": "HTML"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_bot_api_retries_connection_establishment_once() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("temporary connection failure", request=request)
+        return httpx.Response(200, json={"ok": True, "result": {"id": 1}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    api = telegram.TelegramAPI("secret-token", client)
+    try:
+        assert await api.call("getMe", {}) == {"id": 1}
+    finally:
+        await client.aclose()
+    assert attempts == 2
 
 
 @pytest.mark.asyncio
