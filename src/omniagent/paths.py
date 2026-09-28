@@ -53,6 +53,16 @@ def backups_dir() -> Path:
     return data_root() / "backups"
 
 
+def workspace_dir() -> Path:
+    """
+    Görev kaynak deposunu açıkça hedeflemediğinde write_file/take_screenshot'ın vardığı
+    varsayılan çıktı dizini. Model bir yol vermeden salt dosya adı verdiğinde (ör. "leads.md")
+    bu göreli ad artık süreç çalışma dizinine (köprüde proje kökü) değil buraya çözülür;
+    kaynak deposu görev dışı üretilen dosyalarla kirlenmez.
+    """
+    return data_root() / "workspace"
+
+
 def project_root() -> Path:
     """Kaynak deposunun kökü (düzenlenebilir kurulumda git çalışma ağacı)."""
     return Path(__file__).resolve().parents[2]

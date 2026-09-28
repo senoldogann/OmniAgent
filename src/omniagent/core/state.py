@@ -31,6 +31,7 @@ class StepRecord(TypedDict):
     ok: bool
     # Başarıda araç sonucu, hatada "hata_tipi: mesaj" (kırpılmış)
     detail: str
+    partial_steps: NotRequired[int]
 
 
 class EpisodeMetrics(TypedDict):
@@ -120,14 +121,19 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + " …"
 
 
-def make_step_record(tool: str, args: str, ok: bool, detail: str) -> StepRecord:
+def make_step_record(
+    tool: str, args: str, ok: bool, detail: str, partial_steps: int = 0,
+) -> StepRecord:
     """Araç çağrısını kırpılmış epizot adımına çevirir. Saf fonksiyon."""
-    return {
+    record: StepRecord = {
         "tool": tool,
         "args": _clip(args, STEP_ARGS_LIMIT),
         "ok": ok,
         "detail": _clip(detail, STEP_DETAIL_LIMIT),
     }
+    if partial_steps > 0:
+        record["partial_steps"] = partial_steps
+    return record
 
 
 def record_episode(

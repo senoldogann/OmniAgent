@@ -15,7 +15,6 @@ from threading import Thread
 from typing import Callable, Dict, IO, List, Optional, Tuple, Union
 
 from omniagent.config import API_KEY_VARIABLES, redact
-from .filesystem import _is_sensitive_path, _logical_path
 from .types import (
     PROCESS_POLL_SECONDS, SHELL_MAX_TIMEOUT_SECONDS, SHELL_TIMEOUT_SECONDS,
     STREAM_EMIT_INTERVAL_SECONDS, STREAM_READ_CHARS, STREAM_STDERR_MAX_BYTES, STREAM_STDOUT_MAX_BYTES,
@@ -28,9 +27,33 @@ def _call_approved() -> bool:
     runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
     return bool(runtime is not None and runtime.get("approved", False))
 
+# Paketlenmiş uygulama Finder/launchd ile açıldığında PATH yalnız /usr/bin:/bin:/usr/sbin:/sbin
+# olur; Homebrew ve kullanıcı araç dizinleri görünmez. Canlı kayıtta execute_js "FileNotFoundError:
+# 'node'" ile, brew kurulumu "command not found" ile düşüyordu. Çocuk ortamına bu dizinleri ekle.
+_TOOL_PATH_DIRECTORIES: Tuple[str, ...] = (
+    "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin",
+)
+
+
+def extended_path(current: str) -> str:
+    """PATH'e eksik olan mevcut standart araç dizinlerini (Homebrew, ~/.local/bin) ekler. Saf."""
+    parts: List[str] = [part for part in current.split(os.pathsep) if part]
+    known: set[str] = set(parts)
+    for directory in (*_TOOL_PATH_DIRECTORIES, str(Path.home() / ".local" / "bin")):
+        if directory not in known and Path(directory).is_dir():
+            parts.append(directory)
+            known.add(directory)
+    return os.pathsep.join(parts)
+
+
 def child_environment() -> Dict[str, str]:
+    """Alt süreç ortamı: API anahtarları çıkarılır, PATH eksik araç dizinleriyle genişletilir."""
     blocked: frozenset[str] = frozenset(API_KEY_VARIABLES.values())
-    return {name: value for name, value in os.environ.items() if name not in blocked}
+    environment: Dict[str, str] = {
+        name: value for name, value in os.environ.items() if name not in blocked
+    }
+    environment["PATH"] = extended_path(environment.get("PATH", ""))
+    return environment
 
 def _pump_lines(
     stream: IO[str], lines: List[str], sink: Optional[Callable[[str], None]],
@@ -217,14 +240,6 @@ def _shell_segments(tokens: List[str]) -> List[List[str]]:
             segments[-1].append(token)
     return [s for s in segments if s]
 
-def _shell_path(raw: str) -> Optional[Path]:
-    if not raw or raw == "-": return None
-    for prefix in ("${HOME}", "$HOME"):
-        if raw.startswith(prefix):
-            raw = str(Path.home()) + raw[len(prefix):]
-            break
-    return Path(raw).expanduser()
-
 def _command_words(segment: List[str]) -> List[str]:
     words = list(segment)
     # Değer alan seçenekler: değerleri komut adı sanılmasın (finansal onay sınıflandırması buna dayanır)
@@ -275,20 +290,6 @@ def _nested_shell_commands(words: List[str]) -> List[str]:
             return [args[i + 1]]
     return []
 
-def _has_shell_expansion(raw: str) -> bool:
-    return "$" in raw or "`" in raw
-
-def _dangerous_rm_target(raw: str) -> bool:
-    if _has_shell_expansion(raw): return True
-    target = _shell_path(raw)
-    if target is None: return False
-    resolved = _logical_path(target)
-    home = _logical_path(Path.home())
-    if resolved in (Path("/"), Path("/Users"), home) or _is_sensitive_path(target): return True
-    if resolved.parts[:2] == ("/", "Users") and len(resolved.parts) == 3: return True
-    if "*" in raw and resolved.parent in (Path("/"), Path("/Users"), home): return True
-    return False
-
 def shell_command_words(command: str) -> List[List[str]]:
     words_by_segment = []
     for segment in _shell_segments(_shell_tokens(command)):
@@ -320,6 +321,3 @@ def parent_process_name() -> str:
         return res.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-
-def _is_catastrophic_command(command: str) -> bool: return False
-def _shell_writes_to_sensitive_path(command: str) -> bool: return False

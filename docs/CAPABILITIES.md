@@ -6,7 +6,7 @@ Bu belge, 27 Eylül 2026 itibarıyla kodda bulunan yetenekleri ve bu makinedeki 
 
 Kullanıcı hedefi arayüzden, CLI'den veya eşleştirilmiş özel Telegram sohbetinden alınır. Ajan, varsayılan `ollama-cloud` modeliyle kısa bir araç çağırma döngüsü çalıştırır; araç sonucunu görüp gerektiğinde sonraki tura geçer. Bir turda bağımsız okumalar paralel, yan etkili işlemler sırayla çalışır. Composer'daki Normal profil 25 tur/10 dakika, Uzun profil 50 tur/20 dakika, Otonom profil 100 tur/45 dakika bütçe sunar; kullanıcı cevabı bekleme süresi bu bütçeden düşülür. Model yanıtı ve kabuk çıktısı arayüze canlı akar. `Esc` çalışan görevi durdurur.
 
-Arayüzde model seçimi, sohbet geçmişi, komut/araç önizlemeleri, canlı çıktı, hata ve bağlantı durumları bulunur. Görev sürerken üst sağda süreli bir durum göstergesi görünür; pencere arka plandaysa macOS menü çubuğunda geçici animasyon ve Dock rozeti gösterilir. Arka planda tamamlanan görev macOS bildirimi verir; bildirim görev içeriğini taşımaz. Görev bitince alt bölümde toplam süre, model/araç süresi, tur ve araç sayısı, kesin giriş/önbellek/yeni giriş/çıkış/toplam token sayısı görünür. Entegrasyon kullanıldıysa ağ isteği, keşif, kurulum ve bekleme ölçüleri de gösterilir. `⌘K` transkripti ve sohbet bağlamını temizler. Genel `⌘X` tüm OmniAgent pencerelerini gizleyip yeniden gösterir; macOS'taki Kes kısayoluyla çakışır. Gizleme görev durumunu korur ve menü çubuğu göstergesini kaldırır. OmniAgent kendi tam ekran yakalamalarından UI pencerelerini çıkarır; üçüncü taraf ekran görüntüsü veya videosunda görünür pencereyi gizleme garantisi yoktur.
+Arayüzde model seçimi, kalıcı sohbet geçmişi, komut/araç önizlemeleri, canlı çıktı, hata ve bağlantı durumları bulunur. Soldaki listeden eski sohbet açılır; **Yeni sohbet** düğmesi ve `⌘K` yeni, boş bir sohbet başlatır. Eski sohbetler silinmez. Masaüstü sohbetleri `~/Library/Application Support/OmniAgent/desktop_chats/` altında sohbet başına ayrı JSON dosyasında saklanır; son açık sohbet uygulama yeniden başlayınca yüklenir. Görev sürerken üst sağda süreli bir durum göstergesi görünür; pencere arka plandaysa macOS menü çubuğunda geçici animasyon ve Dock rozeti gösterilir. Arka planda tamamlanan görev macOS bildirimi verir; bildirim görev içeriğini taşımaz. Görev bitince alt bölümde toplam süre, model/araç süresi, tur ve araç sayısı, kesin giriş/önbellek/yeni giriş/çıkış/toplam token sayısı görünür. Entegrasyon kullanıldıysa ağ isteği, keşif, kurulum ve bekleme ölçüleri de gösterilir. Genel `⌘X` tüm OmniAgent pencerelerini gizleyip yeniden gösterir; macOS'taki Kes kısayoluyla çakışır. Gizleme görev durumunu korur ve menü çubuğu göstergesini kaldırır. OmniAgent kendi tam ekran yakalamalarından UI pencerelerini çıkarır; üçüncü taraf ekran görüntüsü veya videosunda görünür pencereyi gizleme garantisi yoktur.
 
 ## Yerleşik araçlar
 
@@ -71,8 +71,13 @@ varsayılan `gemma4:cloud` korunur. `qwen3.5:cloud` denendi fakat bu hesapta 402
 "ücretsiz kullanıma dahil değil" yanıtı verdi; bu yüzden hazır profil yapılmadı.
 
 Fast Loop semantik ilerlemeyi host seviyesinde izler. Yeni ve başarılı komut çıktısı en fazla sekiz farklı sonuç için ilerleme sayılır; aynı veya boş çıktı sayılmaz. Eylem isteklerinde yalnız keşif, okuma veya gezinme sonucu başarı kanıtı değildir: host gerçek bir işlem denemesi ister, ardından kanıt yoksa görevi başarısız işaretler. `git status` mutasyon hedefinde yalnız gözlem sayılır; zincirde başka bir komut varsa bütün çağrı ayrıca değerlendirilir. `remove` ve `kaldır` da silme eylemi sayılır. İngilizce `How to ...?`/`How can I ...?` yöntem soruları tek başına eylem sayılmaz; soru sonrası açık emir kendi eylem türüyle doğrulanır. Açık yerel dosya silme hedeflerinde tüm yolların başlangıçta mevcut, bitişte yok olması ve her birine yönelik başarılı silme komutu gerekir. Taşıma için kaynak/hedef ve içerik özeti veya sembolik bağ hedefi; düzenleme için ilk/son içerik özeti ile hedefli dosya aracı eşleştirilir. Bağıl yollar görev başındaki çalışma dizinine göre yorumlanır. Belirsiz hedef, README içindeki yol referansı, okunamayan veya boyut sınırını aşan dosya doğrulanmış teslim sayılmaz; sonuç `Doğrulanmadı` olur. Dosya sözleşmesi yalnız açık ve dar yerel yol biçimlerini kapsar. Eylem kanıtı ve son durum kontrolü aynı tek kurtarma hakkını kullanır. Görsel olmayan turlarda iki anlamsız tur
-sonra replan, görsel otomatik gözlem taşıyan turlarda üç tur tolerans, delivery aşamasında iki
-anlamsız tur sonra bounded-stop uygulanır. 24 Eylül'deki üçer stress koşusunda
+sonra yeniden planlama, görsel otomatik gözlem taşıyan turlarda üç tur tolerans, teslim aşamasında iki
+anlamsız tur sonra kontrollü durma uygulanır. Bu erken durma yalnız Normal, Uzun ve Otonom modlarındadır.
+Sürekli mod ayarlanan süre ve toplam token sınırlarına kadar çalışır. Başarısız araç çağrısının
+hemen ardından hatayı özetleyip alternatif adım ister; önceki turdaki aynı başarısız çağrı aynı
+argümanlarla yinelenirse çalıştırmaz. Farklı bir adımın ardından yeniden deneme mümkündür.
+Tekrarlanan başarısızlıkları ve araçsız raporları kullanıcıya otomatik yön sorusu açmadan yeniden planlar.
+Önbelleksiz token veya araç çağrısı sayısı opsiyonel keşfi daraltmaz. 24 Eylül'deki üçer stress koşusunda
 `long_research` 3/3 başarı, 6 tur/13 araç ve 8,5 saniye medyan; `stagnation` 3/3 beklenen
 bounded-failure, 7 tur ve 5,4 saniye medyan verdi. Önceki stagnation politikası 10 tur
 harcıyordu. Koşularda ev dizininde istenmeyen dosya oluşmadı.
@@ -101,6 +106,11 @@ olayları akmaya devam eder. Başarısız görev geçmişine modelin doğrulanma
 alınmaz; yalnız araç çıktılarından çıkarılmış host gerçekleri korunur. Bu kapı mevcut eylem,
 kaynak yazımı ve durum kanıtını uygular; hedefteki bütün alt maddeler için genel bir doğrulama
 garantisi vermez.
+
+Uzun görevlerde model her turda son gerçek araç çağrılarının kimliğini, başarı durumunu ve kısa
+sonucunu çalışma kaydında görür. Modelin kendi `STATE` notu açıkça doğrulanmamış olarak etiketlenir
+ve tek başına ilerleme sayılmaz. Kontrol noktası, araç çıktılarından çıkarılmış değerleri düz metin
+olarak saklar; görev yeniden açıldığında bu değerler sözlük gösterimine dönüşmez.
 
 23 Eylül'deki önceki genel benchmark 9 senaryoda üçer koşuyla 27/27 başarı ve 4,95 saniye
 medyan süre verdi. Aynı koşularda sürenin toplam %99,4'ü model çağrılarında geçti; yerel

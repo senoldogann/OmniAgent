@@ -202,7 +202,7 @@ def test_command_line_entry_point_validates_and_runs_selected_scenarios(monkeypa
     monkeypatch.setattr(benchmark, "run_benchmark", fake_run)
     monkeypatch.setattr(benchmark, "apply_stored_api_keys", lambda: applied.append(True))
     benchmark.main(["--runs", "2", "--concurrency", "3", "--only", "gun,json"])
-    assert runs == [(2, 3, None, ["gun", "json"], None, benchmark.CHROME_STAGE)] and applied == [True]
+    assert runs == [(2, 3, None, ["gun", "json"], None, benchmark.CHROME_STAGE, None)] and applied == [True]
 
     for invalid in (["--runs", "1", "--concurrency", "2", "--only", "chrome_ilan"],
                     ["--runs", "1", "--concurrency", "1", "--only", "yok"]):
@@ -220,4 +220,4 @@ def test_command_line_entry_point_validates_and_runs_selected_scenarios(monkeypa
     monkeypatch.setattr(benchmark, "install_headless_screen", lambda page: None)
     monkeypatch.setattr(benchmark, "headless_stage", lambda page: "görünmez sahne")
     benchmark.main(["--runs", "1", "--concurrency", "1", "--only", "chrome_maas", "--headless"])
-    assert runs[-1][-1] == "görünmez sahne" and closed == [True]
+    assert runs[-1][-2:] == ("görünmez sahne", None) and closed == [True]

@@ -11,11 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from omniagent.paths import backups_dir
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Optional
 
 from bs4 import BeautifulSoup
 
-from functools import lru_cache
 from .types import (
     BACKUP_KEEP_PER_FILE, FILE_READ_LIMIT, FILE_READ_MAX_BYTES,
     PAGE_TEXT_LIMIT, ToolError, clip_text,
@@ -30,14 +29,6 @@ def _logical_path(path: Path) -> Path:
     if posix == marker: return Path("/")
     if posix.startswith(marker + "/"): return Path(posix[len(marker):])
     return resolved
-
-@lru_cache(maxsize=4)
-def _sensitive_prefixes(prefixes: Tuple[Path, ...]) -> Tuple[Path, ...]:
-    return tuple(_logical_path(raw.expanduser()) for raw in prefixes)
-
-def _is_sensitive_path(path: Path) -> bool: return False
-def _sensitive_read_allowed() -> bool: return True
-def _sensitive_write_allowed() -> bool: return True
 
 def _backup_namespace(path: Path) -> str:
     """Aynı ada sahip farklı kaynakların yedeklerini birbirinden ayırır."""
@@ -76,8 +67,6 @@ def clean_html(html: str) -> str:
 
 def read_full_file(path: str) -> str:
     source_path = Path(path).expanduser()
-    if _is_sensitive_path(source_path) and not _sensitive_read_allowed():
-        raise ToolError(f"Korunan yol erişimi engellendi: {source_path}.", "SENSITIVE_PATH_BLOCKED", False)
     try:
         # stat() önce: olmayan yol FileNotFoundError ile "en yakın dizin" ipucuna düşer
         # (is_file() False döndüğü için eksik dosya "düzenli dosya değil" sanılıyordu)
@@ -103,11 +92,18 @@ def read_file_content(path: str, reader: Optional[Callable[[str], str]] = None) 
     read_fn = reader or read_full_file
     return clip_text(read_fn(path), FILE_READ_LIMIT)
 
-def write_file_content(path: str, content: str, reader: Optional[Callable[[str], str]] = None) -> str:
+def write_file_content(
+    path: str, content: str, reader: Optional[Callable[[str], str]] = None,
+    default_base: Optional[Path] = None,
+) -> str:
     read_fn = reader or read_full_file
-    destination = Path(path).expanduser()
-    if _is_sensitive_path(destination) and not _sensitive_write_allowed():
-        raise ToolError(f"Korunan yola yazma engellendi: {destination}.", "SENSITIVE_PATH_BLOCKED", False)
+    raw_destination = Path(path).expanduser()
+    # Göreli yol + default_base: çağıran (Toolbox) görev kaynak deposunu hedeflemiyorsa
+    # burayı iş alanı dizinine bağlar; mutlak yol her zaman olduğu gibi kullanılır.
+    destination = (
+        raw_destination if raw_destination.is_absolute() or default_base is None
+        else default_base / raw_destination
+    )
     if len(content.encode("utf-8")) > FILE_READ_MAX_BYTES:
         raise ToolError(f"Dosya {FILE_READ_MAX_BYTES} bayt sınırını aşıyor.", "FILE_TOO_LARGE", False)
     if destination.suffix == ".py":
@@ -133,17 +129,20 @@ def write_file_content(path: str, content: str, reader: Optional[Callable[[str],
         if existing_mode is not None:
             temp_path.chmod(existing_mode)
 
-        # Atomik taşıma (rename)
-        temp_path.replace(destination)
-        
-        # Yazılanı doğrula
-        actual = read_fn(str(destination))
+        # Doğrulama atomik taşımadan ÖNCE, geçici kopyada yapılır: eşleşmezse hedef dosya
+        # hiç değiştirilmemiş olur. Eskiden önce replace yapılıyor, sonra doğrulanıyordu;
+        # başarısız doğrulamada WRITE_VERIFICATION_FAILED gerçek disk durumunu yansıtmıyordu.
+        actual = read_fn(str(temp_path))
         if actual != content:
             raise ToolError(
-                f"Doğrulama başarısız: {destination} içeriği beklenenle eşleşmiyor.",
+                f"Doğrulama başarısız: {destination} yazılmadı; geçici kopya beklenen "
+                "içerikle eşleşmiyor.",
                 "WRITE_VERIFICATION_FAILED",
                 True,
             )
+
+        # Atomik taşıma (rename)
+        temp_path.replace(destination)
 
         note = f" Yeni dizin oluşturuldu: {created_directory}." if created_directory is not None else ""
         return f"Dosya yazıldı ve içeriği doğrulandı: {destination} ({len(content)} karakter).{note}"

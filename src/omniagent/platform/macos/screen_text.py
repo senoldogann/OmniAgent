@@ -10,10 +10,12 @@ görüntüyle 48 hedefin 20'sinde isabet etti. Tüm kutular yakalanan kapsamın 
 0-1000 normalize uzayındadır; tıklama araçlarının kullandığı uzayla aynıdır.
 """
 import math
+import re
 import unicodedata
 from difflib import SequenceMatcher
 from typing import List, Optional, Tuple, TypedDict
 
+import Quartz
 import Vision
 from Foundation import NSMakeRange
 
@@ -36,6 +38,7 @@ SAME_TEXT_MIN_RATIO: float = 0.93
 _CHARACTER_MAP: dict[int, str] = str.maketrans({
     "’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-", " ": " ", "ı": "i",
 })
+_CODE_TOKEN: re.Pattern[str] = re.compile(r"\b[A-Za-z0-9]{2,8}-[A-Za-z0-9]{5,}\b")
 _WORD_EDGE_PUNCTUATION: str = ".,:;!?\"'()[]{}<>«»…*•·|"
 
 
@@ -102,6 +105,82 @@ def _word_boxes(candidate: object, text: str) -> List[TextWord]:
     return words
 
 
+def choose_focused_code(original: str, focused_text: str) -> str:
+    """Odaklı OCR yalnız O/0 ayrımında uzlaşıyorsa kod sözcüğünü düzeltir. Saf."""
+    if (
+        _CODE_TOKEN.fullmatch(original) is None
+        or not any(char.isdigit() for char in original)
+        or not any(char in "Oo0" for char in original)
+    ):
+        return original
+    prefix, suffix = original.split("-", 1)
+    matches: List[str] = [
+        token for token in _CODE_TOKEN.findall(focused_text)
+        if len(token) == len(original)
+        and token.split("-", 1)[0].casefold() == prefix.casefold()
+        and token.split("-", 1)[1].upper().replace("O", "0")
+        == suffix.upper().replace("O", "0")
+    ]
+    return matches[0] if len(set(matches)) == 1 else original
+
+
+def _focused_code_text(image: object, box: TextBox, padding_px: int) -> Optional[str]:
+    """Kod sözcüğünü çevresiyle kırpıp ayrı Vision isteğiyle yeniden okur."""
+    width = int(Quartz.CGImageGetWidth(image))
+    height = int(Quartz.CGImageGetHeight(image))
+    left = max(0, round(box["left"] * width / NORMALIZED_SPACE) - padding_px)
+    top = max(0, round(box["top"] * height / NORMALIZED_SPACE) - padding_px)
+    right = min(width, round((box["left"] + box["width"]) * width / NORMALIZED_SPACE) + padding_px)
+    bottom = min(height, round((box["top"] + box["height"]) * height / NORMALIZED_SPACE) + padding_px)
+    if right <= left or bottom <= top:
+        return None
+    crop = Quartz.CGImageCreateWithImageInRect(
+        image, Quartz.CGRectMake(left, top, right - left, bottom - top),
+    )
+    if crop is None:
+        return None
+    request = Vision.VNRecognizeTextRequest.alloc().init()
+    request.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
+    request.setUsesLanguageCorrection_(False)
+    handler = Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(crop, None)
+    succeeded, _error = handler.performRequests_error_([request], None)
+    if not succeeded:
+        return None
+    candidates = [
+        str(candidate.string())
+        for observation in request.results() or []
+        for candidate in observation.topCandidates_(1)
+    ]
+    return " ".join(candidates) if candidates else None
+
+
+def _refine_code_words(image: object, text: str, words: List[TextWord]) -> Tuple[str, List[TextWord]]:
+    """Tam ekran OCR'ın O/0 karışıklığını yalnız kod kırpımında teyitle düzeltir."""
+    refined_text = text
+    refined_words: List[TextWord] = []
+    for word in words:
+        original = word["text"]
+        suspicious = (
+            _CODE_TOKEN.fullmatch(original) is not None
+            and any(char.isdigit() for char in original)
+            and any(char in "Oo0" for char in original)
+        )
+        if suspicious:
+            first = choose_focused_code(
+                original, _focused_code_text(image, word["box"], 20) or "",
+            )
+            second = choose_focused_code(
+                original, _focused_code_text(image, word["box"], 30) or "",
+            )
+            chosen = first if first == second else original
+        else:
+            chosen = original
+        if chosen != original:
+            refined_text = refined_text.replace(original, chosen, 1)
+        refined_words.append({**word, "text": chosen})
+    return refined_text, refined_words
+
+
 def _vertical_center(line: TextLine) -> float:
     return line["box"]["top"] + line["box"]["height"] / 2
 
@@ -147,11 +226,12 @@ def recognize_text(image: object) -> List[TextLine]:
         text: str = str(candidate.string())
         if not text.strip():
             continue
+        refined_text, words = _refine_code_words(image, text, _word_boxes(candidate, text))
         lines.append({
-            "text": text,
+            "text": refined_text,
             "confidence": float(candidate.confidence()),
             "box": _vision_box(observation.boundingBox()),
-            "words": _word_boxes(candidate, text),
+            "words": words,
         })
     return reading_order(lines)
 

@@ -1,4 +1,7 @@
 """Fast Loop phase controller and semantic-progress tests."""
+import json
+
+from omniagent.app.progress import novel_read_output_progress
 from omniagent.core.fast_loop import (
     FastLoopPolicy,
     FastLoopState,
@@ -14,8 +17,6 @@ def _signal(
     *,
     semantic_progress: bool = False,
     unresolved: int = 3,
-    uncached: int = 0,
-    tool_calls: int = 0,
     delivery_ready: bool = False,
     visual_turn: bool = False,
 ) -> TurnSignal:
@@ -23,8 +24,6 @@ def _signal(
         signature=signature,
         semantic_progress=semantic_progress,
         unresolved_deliverables=unresolved,
-        uncached_prompt_tokens=uncached,
-        tool_calls=tool_calls,
         delivery_ready=delivery_ready,
         visual_turn=visual_turn,
     )
@@ -103,19 +102,14 @@ def test_delivery_stagnation_eventually_requests_bounded_stop() -> None:
     assert "ilerleme" in two.stop_reason
 
 
-def test_pressure_threshold_enters_conserve_without_aborting() -> None:
-    policy = FastLoopPolicy(
-        stagnation_window=3,
-        delivery_stagnation_limit=2,
-        soft_uncached_prompt_tokens=100,
-        soft_tool_calls=4,
-    )
+def test_meaningful_progress_stays_in_fast_phase() -> None:
+    policy = FastLoopPolicy(stagnation_window=3, delivery_stagnation_limit=2)
     decision = advance_fast_loop(
         FastLoopState(),
-        _signal("fresh", semantic_progress=True, uncached=100, tool_calls=2),
+        _signal("fresh", semantic_progress=True),
         policy,
     )
-    assert decision.state.phase == "conserve"
+    assert decision.state.phase == "fast"
     assert decision.stop_reason is None
 
 
@@ -208,3 +202,26 @@ def test_deterministic_delivery_progress_counts_without_ledger_delta() -> None:
         signature="after",
         all_failed=False,
     ) is True
+
+
+def test_sequence_read_progress_uses_new_content_including_partial_result() -> None:
+    """Çok adımlı okuma, ekran aynı yere dönse bile yeni veri geldiyse ilerlemedir."""
+    call = {
+        "id": "r1", "name": "run_action_sequence",
+        "arguments": json.dumps({"steps": [
+            {"action": "click_text", "text": "İlan A"},
+            {"action": "read_scrollable", "point": [600, 500]},
+            {"action": "click_text", "text": "İlan B"},
+        ]}),
+    }
+    partial = {"tool_call_id": "r1", "ok": False, "completed_steps": 2,
+               "error": "Tamamlanan adımlar: İlan A; Aylık maaş: 5200 €"}
+    seen, progressed = novel_read_output_progress([call], [partial], frozenset())
+    assert progressed
+    assert seen
+    same_seen, repeated = novel_read_output_progress([call], [partial], seen)
+    assert same_seen == seen
+    assert not repeated
+
+    click_only = {**partial, "completed_steps": 1}
+    assert not novel_read_output_progress([call], [click_only], frozenset())[1]

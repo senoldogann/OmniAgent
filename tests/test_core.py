@@ -21,7 +21,7 @@ from PIL import Image
 from omniagent.core.events import AgentEvent, preview_arguments
 from omniagent.app.agent import ToolCallDraft, _trim_old_turns, encode_image, execute_tool, merge_tool_call_delta
 from omniagent.core.state import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
-from omniagent.tools import ScreenGeometry, ToolError, Toolbox, _is_sensitive_path, model_to_points, points_to_model
+from omniagent.tools import ScreenGeometry, ToolError, Toolbox, model_to_points, points_to_model
 
 
 @pytest.mark.asyncio
@@ -54,6 +54,10 @@ def test_shell_execution() -> None:
     with pytest.raises(ToolError) as failure:
         toolbox.execute_shell("exit 7", False, None)
     assert failure.value.code == "SHELL_EXIT"
+    with pytest.raises(ToolError) as partial:
+        toolbox.execute_shell("printf RESET_APPLIED; exit 7", False, None)
+    assert "RESET_APPLIED" in str(partial.value)
+    assert "aynı çok adımlı komutu baştan çalıştırmadan önce" in str(partial.value)
 
 
 def test_file_ops(tmp_path: Path) -> None:
@@ -173,6 +177,31 @@ async def test_readonly_tool_calls_are_cached(tmp_path: Path) -> None:
     assert cache == {}
 
 
+@pytest.mark.asyncio
+async def test_parallel_identical_reads_run_once(tmp_path: Path) -> None:
+    """Aynı turda paralel iki eşdeğer read_file çağrısı gerçekte tek kez yürütülür."""
+    from omniagent.app.tool_execution import _execute_tool_calls
+
+    target: Path = tmp_path / "paralel.txt"
+    target.write_text("icerik", encoding="utf-8")
+    toolbox: Toolbox = Toolbox()
+    calls: List[ToolCallDraft] = [
+        {"id": f"c{index}", "name": "read_file", "arguments": json.dumps({"path": str(target)})}
+        for index in range(2)
+    ]
+    runs: List[str] = []
+    original = toolbox.read_file
+
+    def counting(path: str) -> str:
+        runs.append(path)
+        return original(path)
+
+    toolbox.read_file = counting  # type: ignore[method-assign]
+    results = await _execute_tool_calls(calls, toolbox, {}, lambda event: None, lambda: False)
+    assert [result["ok"] for result in results] == [True, True]
+    assert len(runs) == 1
+
+
 def test_streaming_tool_call_assembly_and_preview() -> None:
     """Akış parçalarından araç çağrısının birleştirildiğini ve yarım JSON'dan komut önizlemesi çıktığını sınar."""
     drafts: List[ToolCallDraft] = []
@@ -184,6 +213,23 @@ def test_streaming_tool_call_assembly_and_preview() -> None:
     assert preview_arguments("write_file", '{"path": "/tmp/ç.txt", "content": "uzun') == "/tmp/ç.txt"
     assert preview_arguments("cua_click_point", '{"point": [196, 17') == ""
     assert preview_arguments("cua_click_point", '{"point": [196, 175]}') == "196, 175"
+
+
+def test_ollama_reused_index_keeps_distinct_tool_calls() -> None:
+    """Ollama farklı kimlikli iki tam çağrıyı aynı index=0 ile akıtabiliyor."""
+    drafts: List[ToolCallDraft] = []
+    drafts = merge_tool_call_delta(drafts, 0, "first", "read_file", '{"path":"README.md"}')
+    drafts = merge_tool_call_delta(drafts, 0, "second", "read_file", '{"path":"Makefile"}')
+    assert drafts == [
+        {"id": "first", "name": "read_file", "arguments": '{"path":"README.md"}'},
+        {"id": "second", "name": "read_file", "arguments": '{"path":"Makefile"}'},
+    ]
+
+
+def test_tool_call_gap_does_not_create_ghost_drafts() -> None:
+    """Index atlarsa adı boş "hayalet" taslak üretilmez; yalnız gerçek çağrı kalır."""
+    drafts = merge_tool_call_delta([], 2, None, "read_file", "{}")
+    assert drafts == [{"id": "", "name": "read_file", "arguments": "{}"}]
 
 
 def test_trim_never_cuts_latest_turn() -> None:
@@ -242,12 +288,7 @@ def test_trim_keeps_head_and_tail_of_old_read_result() -> None:
     assert "SON" not in trimmed[4]["content"]
 
 
-def test_budget_pressure_and_duplicate_chrome_visit_are_explicit() -> None:
-    """Soft budget ve tekrar ziyaret guard'ları zorunlu işi kesmeden modele görünür not üretir."""
-    usage = {"prompt_tokens": 70_000, "cached_tokens": 5_000, "completion_tokens": 1_000}
-    note = main.budget_pressure_message(usage, main.SOFT_TOOL_CALL_BUDGET)
-    assert note is not None and "opsiyonel keşfi" in note and "STATE" in note
-
+def test_duplicate_chrome_visit_is_explicit() -> None:
     call: ToolCallDraft = {
         "id": "c1", "name": "chrome_active_tab",
         "arguments": '{"url":"https://github.com/angular/angular"}',
@@ -266,15 +307,6 @@ def test_model_space_roundtrip() -> None:
     geometry: ScreenGeometry = {"point_width": 1710, "point_height": 1112, "model_width": 1280, "model_height": 832}
     assert model_to_points(1279, 831, geometry) == (1709, 1111)
     assert points_to_model(855, 556, geometry) == (640, 416)
-
-
-def test_sensitive_path_macos_firmlink_false_positive() -> None:
-    """Güvenlik rayları kaldırıldı: tüm yollar serbesttir ve False döner."""
-    assert not _is_sensitive_path(Path("/tmp/omni_yazilabilir.txt"))
-    assert not _is_sensitive_path(Path("/home/kullanici/notlar.txt"))
-    assert not _is_sensitive_path(Path("/System/Library/CoreServices/test.txt"))
-    assert not _is_sensitive_path(Path("/etc/hosts"))
-    assert not _is_sensitive_path(Path.home() / ".ssh" / "id_rsa")
 
 
 def test_camera_tool_only_appears_for_photo_capture_goal() -> None:
@@ -344,10 +376,11 @@ def test_explicit_chrome_session_excludes_hidden_browser_and_discovery() -> None
     assert main.active_chrome_session_goal(goal)
     assert "chrome_active_tab" in names
     assert "take_screenshot" in names
-    assert {"cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text"} <= names
+    assert {"cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
+            "run_action_sequence"} <= names
     assert not names.intersection({
         "browse_url", "discover_capabilities", "fetch_raw", "execute_shell", "execute_js",
-        "run_action_sequence", "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
+        "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
     })
     prompt = main.build_system_prompt(date.today(), goal, "")
     assert "USER'S OPEN CHROME SESSION" in prompt
@@ -671,7 +704,7 @@ async def test_chrome_action_turns_end_with_automatic_observation(tmp_path: Path
     """Açık Chrome yolunda eylem turu otomatik gözlemle biter; model ayrı ekran turu harcamaz."""
     shots: List[str] = []
 
-    def fake_screenshot(self: Toolbox, filename: str) -> str:
+    def fake_screenshot(self: Toolbox, filename: str, detail: bool = True) -> str:
         shots.append(filename)
         Image.new("RGB", (8, 8), "white").save(filename)
         return "kaydedildi"
@@ -954,7 +987,7 @@ async def test_successful_but_useless_turns_are_bounded_after_delivery(
 
 
 @pytest.mark.asyncio
-async def test_semantic_state_change_resets_stagnation(
+async def test_unverified_model_state_does_not_hide_stagnation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = tmp_path / "probe.txt"
@@ -997,9 +1030,9 @@ async def test_semantic_state_change_resets_stagnation(
         await service.close()
 
     assert report["success"]
-    assert report["metrics"]["fast_loop_replans"] == 0
+    assert report["metrics"]["fast_loop_replans"] >= 1
     assert report["metrics"]["fast_loop_delivery_entries"] == 0
-    assert report["metrics"]["semantic_progress_events"] >= 2
+    assert report["metrics"]["semantic_progress_events"] == 1
 
 
 def test_openrouter_session_overrides_are_request_local() -> None:
@@ -1045,7 +1078,7 @@ def test_recent_duplicate_observation_reuses_only_inside_visual_context_window()
 async def test_duplicate_auto_observation_is_not_reinjected_while_recent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_screenshot(self: Toolbox, filename: str) -> str:
+    def fake_screenshot(self: Toolbox, filename: str, detail: bool = True) -> str:
         Image.new("RGB", (8, 8), "white").save(filename)
         return "kaydedildi"
 

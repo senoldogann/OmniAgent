@@ -1,5 +1,8 @@
 import os
-from typing import Dict, List, Optional, Tuple, TypedDict, Union
+import re
+import threading
+from functools import lru_cache
+from typing import Dict, List, Optional, Pattern, Tuple, TypedDict, Union
 
 # Maskelemede kullanılacak eşik ve yer tutucu: çok kısa sırlar metni bozmasın.
 SECRET_MIN_LENGTH: int = 8
@@ -26,15 +29,18 @@ class BackendProfile(TypedDict):
 # anahtarlar BİLEREK os.environ'a konmaz: ajanın çalıştırdığı her alt süreç ortamı miras
 # aldığı için (execute_shell, MCP sunucuları, tarayıcı) sır süreç ağacına yayılmamalıdır.
 _RUNTIME_KEYS: Dict[str, str] = {}
+# Arayüz iş parçacığı anahtar yazarken ajan iş parçacıkları okur; erişim kilitlidir.
+_RUNTIME_KEYS_LOCK: threading.Lock = threading.Lock()
 
 
 def set_api_key(variable: str, value: Optional[str]) -> None:
     """Anahtarı süreç-içi depoya yazar; boş değer kaydı siler. Ortam değişkenine dokunmaz."""
     cleaned: str = (value or "").strip()
-    if cleaned:
-        _RUNTIME_KEYS[variable] = cleaned
-    else:
-        _RUNTIME_KEYS.pop(variable, None)
+    with _RUNTIME_KEYS_LOCK:
+        if cleaned:
+            _RUNTIME_KEYS[variable] = cleaned
+        else:
+            _RUNTIME_KEYS.pop(variable, None)
 
 
 def load_api_key(variable: str) -> Optional[str]:
@@ -44,7 +50,8 @@ def load_api_key(variable: str) -> Optional[str]:
     kılar; böylece arayüzden girilen anahtar sessizce yok sayılmaz. Boş/whitespace değer
     tanımlı sayılmaz. Anahtar dosyaları okunmaz (bkz. AGENTS.md güvenlik rayları).
     """
-    stored: str = _RUNTIME_KEYS.get(variable, "").strip()
+    with _RUNTIME_KEYS_LOCK:
+        stored: str = _RUNTIME_KEYS.get(variable, "").strip()
     if stored:
         return stored
     environment: str = os.environ.get(variable, "").strip()
@@ -57,7 +64,9 @@ def api_key_source(variable: str) -> str:
     veya Keychain), 'ortam' (kabuk değişkeni) ya da 'yok'. Arayüzdeki rozet bunu gösterir;
     iki kaynak birlikte varsa 'ayarlar' kazanır (bkz. load_api_key). Saf fonksiyon.
     """
-    if _RUNTIME_KEYS.get(variable, "").strip():
+    with _RUNTIME_KEYS_LOCK:
+        stored: bool = bool(_RUNTIME_KEYS.get(variable, "").strip())
+    if stored:
         return "ayarlar"
     if os.environ.get(variable, "").strip():
         return "ortam"
@@ -70,7 +79,8 @@ def secret_values() -> Tuple[str, ...]:
     çok kısa değerler (ör. '1') metni bozmasın diye maskelenmez. Saf fonksiyon değildir:
     süreç-içi depo ve ortamdan okur.
     """
-    values: List[str] = [value for value in _RUNTIME_KEYS.values() if len(value) >= SECRET_MIN_LENGTH]
+    with _RUNTIME_KEYS_LOCK:
+        values: List[str] = [value for value in _RUNTIME_KEYS.values() if len(value) >= SECRET_MIN_LENGTH]
     for variable in API_KEY_VARIABLES.values():
         environment: str = os.environ.get(variable, "").strip()
         if len(environment) >= SECRET_MIN_LENGTH:
@@ -78,14 +88,26 @@ def secret_values() -> Tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
+@lru_cache(maxsize=8)
+def _secret_pattern(secrets: Tuple[str, ...]) -> Optional[Pattern[str]]:
+    """
+    Sır listesini tek geçişli arama kalıbına çevirir. Değer kümesi değiştikçe yeni bir anahtar
+    oluşur; en çok 8 farklı küme önbellekte kalır. Saf fonksiyon.
+    """
+    if not secrets:
+        return None
+    return re.compile("|".join(re.escape(secret) for secret in secrets))
+
+
 def redact(text: str) -> str:
-    """Bilinen sır değerlerini metinden çıkarır. Araç çıktısı modele/transcripte gitmeden önce
-    uygulanır: model 'printenv' benzeri bir komutla anahtarı okursa sır yayılmaz. Saf fonksiyon."""
-    cleaned: str = text
-    for secret in secret_values():
-        if secret in cleaned:
-            cleaned = cleaned.replace(secret, SECRET_PLACEHOLDER)
-    return cleaned
+    """
+    Bilinen sır değerlerini metinden çıkarır. Araç çıktısı modele/transcripte gitmeden önce
+    uygulanır: model 'printenv' benzeri bir komutla anahtarı okursa sır yayılmaz. Sır başına ayrı
+    `str.replace` turu (O(sır × çıktı)) yerine tek geçişli, önbellekli bir kalıp kullanılır. Saf
+    fonksiyon değildir: sır deposunu okur.
+    """
+    pattern: Optional[Pattern[str]] = _secret_pattern(secret_values())
+    return text if pattern is None else pattern.sub(SECRET_PLACEHOLDER, text)
 
 
 # --- Çoklu model backend'i (hız + doğruluk yönlendirmesi) ---
@@ -299,18 +321,35 @@ judgment: no destructive action beyond what the goal requires.
   with execute_js before writing. For highest/lowest use max/min, never min/max. Combine
   related arithmetic in one call and preserve requested decimal formatting.
 
+### STRUCTURED API TASKS
+- Before an HTTP mutation, inspect that exact endpoint schema for body fields, query fields and
+  identity headers. Never guess field names from the goal or a different endpoint. Use curl -fsS
+  for requests whose success is required; HTTP 4xx/5xx or an error body is a failed step.
+- If the goal names an account, tenant or resource ID, pass its exact value through the documented
+  field or header on EVERY relevant request. Compare the returned owner/ID with the goal before
+  another mutation. A different or absent owner is not success; inspect and correct the request.
+- Chain dependent read/write requests only after validating the earlier response. At the end,
+  verify the requested counts and values from the authoritative state, not from an attempted
+  command or a similarly named metric.
+- If a multi-step command or script fails after a mutation, earlier steps may already be applied.
+  Never rerun it from the reset/start step: inspect current state and perform only missing work.
+  Repeating a reset can close a live position and repeating an order can duplicate it.
+
 ### ENVIRONMENT (macOS, BSD userland: GNU-only flags fail)
 - Weekday of a date: date -j -f '%Y-%m-%d' YYYY-MM-DD '+%A'   (never date -d)
 - Date math: date -v+1d '+%F' | in-place edit: sed -i '' 's/a/b/' FILE | size: stat -f %z FILE
 - Not installed: GNU timeout, gdate, gsed, grep -P, readlink -f. Use rg, grep -E, realpath.
 - write_file creates missing parent directories: no mkdir needed.
-- execute_shell stops after 60 s. For installs, builds or downloads pass timeout_seconds (max 900).
+- execute_shell stops after 60 s. For installs, builds or downloads pass timeout_seconds (max 3600).
 
 ### GUI
 - Prefer cua_get_ax_state + cua_click (accessibility, text only, fast) over take_screenshot.
 - Click any visible text (link, button, tab, list item, menu item, checkbox label) with
   cua_click_text: OCR finds its exact spot. Click a point only for targets without text.
-- Screenshots are 1000×1000 (not the screen's aspect ratio). The accessibility list, OCR results and
+- A screenshot has a 1000×1000 coordinate image. Explicit take_screenshot includes an aspect-preserved
+  detail image unless detail=false; automatic post-action observations use one image for speed. Read
+  fine visual detail in the second image when present; click coordinates come ONLY from the first image.
+  For small or uncertain text, call cua_read_visible_text before repeating it to the user. The accessibility list, OCR results and
   every click/move point share that ONE 0-1000 space: pass points as [x, y] and use the numbers as they are.
 - For another monitor, call take_screenshot with display_index=2 (or its 1-based number).
   The tool keeps that display selected for later screenshots and maps clicks using its real
@@ -318,6 +357,9 @@ judgment: no destructive action beyond what the goal requires.
 - Chain clicks, typing, keys and short waits in ONE run_action_sequence call. Keys accept
   combos such as cmd+c or cmd+shift+t; typing supports any Unicode text. Use click with clicks=2
   to open Finder items or select a word, and drag for drag-and-drop, sliders and range selection.
+- Clicking visible text inside an editable field only places the caret; typing then inserts text.
+  To REPLACE a value, use cua_fill_field where available or press cmd+a after focusing the field
+  and before typing. Confirm the resulting field or account identity before using its data.
 - Content outside the visible area does not exist for you until you scroll: use cua_scroll, or read
   a long pane completely with ONE cua_read_scrollable call.
 
@@ -353,6 +395,18 @@ judgment: no destructive action beyond what the goal requires.
 ### FINAL ANSWER
 - Give the requested result and state any failed, skipped or still-blocked items plainly.
   Be concise, but never report an attempted action as a verified success.
+
+### CLAIMS, EVIDENCE AND PUBLICATION
+- A filled field, an open composer, a clicked button or a drafted text is NOT a sent message,
+  a published post or a completed submission. Confirm the confirmation state of the screen
+  (closing composer, "sent/published" notice, new item in the list) before reporting it as done.
+- Never leave a page, tab, dialog or form while an action you started is unfinished: unsent
+  drafts are discarded on navigation. Finish or explicitly cancel the pending action first.
+- Publicly published or documented material is not a leak and not a vulnerability: vendor docs,
+  open-source repositories, released prompts, public configuration and release notes are public
+  by design. Do not present such material as a security finding or build an exploit narrative on it;
+  if the goal assumes a leak, say plainly that the material is public, then offer a real finding or
+  another concrete step.
 
 ### USER MEMORY
 - "### USER MEMORY (saved by the user)" at the end of this prompt lists the user's saved preferences,
@@ -407,5 +461,8 @@ CONTINUOUS_GUIDANCE: str = """
   passwords or tokens in chat; ask the user to enter them in ⚙ Settings and confirm with kind=confirm.
 - When earlier successful tool results prove the goal is met, call report_goal_met with the ids of
   those tool calls. The host checks the ids and asks the user; without confirmation the task continues.
+- Report the goal ONCE per genuinely new result. After a rejection do not send another report with the
+  same evidence: first complete the missing work so new successful calls exist, then report those ids.
+  Repeating a report does not close the goal and only interrupts the user.
 - Money moves, payments, publishing and outreach still need ask_user kind=confirm first.
 """

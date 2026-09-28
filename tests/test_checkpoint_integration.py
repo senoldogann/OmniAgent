@@ -55,11 +55,39 @@ async def test_checkpoint_saved_on_turn_and_cleared_on_success(tmp_path: Path, m
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_keeps_observed_fact_value_as_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Uzun görevde yeniden açılan kontrol noktası araç verisini sözlük gösterimine dönüştürmez."""
+    runs_dir = tmp_path / "runs"
+    source = tmp_path / "status.txt"
+    source.write_text("Status: Active\n", encoding="utf-8")
+    monkeypatch.setattr(main, "save_checkpoint", lambda **kwargs: save_checkpoint(runs_dir=runs_dir, **kwargs))
+    turns = iter([
+        {"content": "", "tool_calls": [{"id": "r1", "name": "read_file",
+                                        "arguments": json.dumps({"path": str(source)})}],
+         "finish_reason": "tool_calls", "usage": main.ZERO_USAGE},
+        {"content": "", "tool_calls": [], "finish_reason": "stopped", "usage": main.ZERO_USAGE},
+    ])
+
+    async def fake_model(clients, messages, schemas, session_id, backend, emit, should_stop):
+        return next(turns), backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    await main.run_agent_with_callback(
+        "Durumu oku", lambda event: None,
+        {"requested_backend": None, "should_stop": lambda: False,
+         "state_file": str(tmp_path / "memory.json"), "history": []},
+        {"opencode": object()},
+    )
+    checkpoint = find_latest_checkpoint(runs_dir=runs_dir)
+    assert checkpoint is not None
+    assert checkpoint["facts"]["status"] == "Active"
+
+
+@pytest.mark.asyncio
 async def test_resume_goal_loads_latest_checkpoint(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Kullanıcı 'devam et' dediğinde son kontrol noktasından veriler devralınır."""
     runs_dir: Path = tmp_path / "runs"
     monkeypatch.setattr("omniagent.core.checkpoint.RUNS_DIR", runs_dir)
-    monkeypatch.setattr(main, "find_latest_checkpoint", lambda: find_latest_checkpoint(runs_dir=runs_dir))
 
     # Önce yarım kalmış bir checkpoint simüle et
     old_session_id = "test-session-prev-123"

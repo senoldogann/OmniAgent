@@ -370,7 +370,10 @@ def _raise_if_stopped() -> None:
     if runtime is not None and runtime["should_stop"]():
         raise ToolError("Kullanıcı tarafından durduruldu.", "STOPPED", False)
 
-def wait_for_screen_settle(baseline: np.ndarray, input_at: float, frame_source: Optional[Callable[[], np.ndarray]] = None) -> float:
+def wait_for_screen_settle(
+    baseline: np.ndarray, input_at: float, frame_source: Optional[Callable[[], np.ndarray]] = None,
+    minimum_elapsed_seconds: float = 0.0,
+) -> float:
     started = time.monotonic()
     reference = baseline
     reacted = False
@@ -382,7 +385,10 @@ def wait_for_screen_settle(baseline: np.ndarray, input_at: float, frame_source: 
         now = time.monotonic()
         if frame_change_ratio(reference, frame, SETTLE_PIXEL_DELTA) > SETTLE_CHANGED_RATIO:
             reacted, last_change, reference = True, now, frame
-        if (reacted and now - last_change >= SETTLE_QUIET_SECONDS) or (not reacted and now >= input_at + SETTLE_REACTION_SECONDS) or now >= input_at + SETTLE_MAX_SECONDS:
+        quiet = (reacted and now - last_change >= SETTLE_QUIET_SECONDS) or (
+            not reacted and now >= input_at + SETTLE_REACTION_SECONDS
+        )
+        if (quiet and now >= input_at + minimum_elapsed_seconds) or now >= input_at + SETTLE_MAX_SECONDS:
             return time.monotonic() - started
         time.sleep(SETTLE_POLL_SECONDS)
 
@@ -493,6 +499,8 @@ def changed_region(before: np.ndarray, after: np.ndarray, anchor: Tuple[int, int
     if not components: return None
     ax, ay = anchor
     around_anchor = [item for item in components if item[0] <= ax < item[0] + item[2] and item[1] <= ay < item[1] + item[3]]
-    chosen = max(around_anchor or components, key=lambda item: item[4])[5]
+    if not around_anchor:
+        return None
+    chosen = max(around_anchor, key=lambda item: item[4])[5]
     rows, cols = np.nonzero(changed & (labels == chosen))
     return (int(cols.min()), int(rows.min()), int(cols.max()) + 1, int(rows.max()) + 1)

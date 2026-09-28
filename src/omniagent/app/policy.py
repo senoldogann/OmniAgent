@@ -62,6 +62,30 @@ def retry_after_seconds(error: APIStatusError) -> float:
             return 1.0
 
 
+# Modelin gerekli içeriğe erişemediğini bildiren ifadeler ve tamamlanmış teslim iddiaları.
+# Erişim bildirimi ancak yanıtta tamamlanmış bir teslim iddiası (kaydedildi, tamamlandı…) yoksa
+# başarısızlıktır (bkz. final_verdict). Sabitler modül düzeyinde bir kez derlenir.
+_INACCESSIBLE_CONTENT: re.Pattern[str] = re.compile(
+    r"\b(?:okuyamıyorum|okuyamadım|erişemiyorum|erişemedim|göremiyorum|göremedim|"
+    r"raporlayamıyorum|raporlayamadım)\b",
+    re.IGNORECASE,
+)
+_COMPLETION_CLAIM: re.Pattern[str] = re.compile(
+    r"\b(?:kaydedildi|kaydettim|tamamlandı|tamamladım|oluşturuldu|oluşturdum|"
+    r"yazıldı|yazdım|gönderildi|gönderdim|hazırlandı|hazırladım|başarıyla|"
+    r"saved|created|written|sent|completed|successfully)\b",
+    re.IGNORECASE,
+)
+_UNFINISHED_DELIVERY: re.Pattern[str] = re.compile(
+    r"\b(?:gerçekleşmedi|gerçekleşmemiş|geçilemedi|geçilememiş|"
+    r"raporlanamadı|raporlanamamış|doğrulanamadı|doğrulanamamış|"
+    r"tamamlanamadı|tamamlanamamış|yapılamadı|yapılamamış|"
+    r"gönderilemedi|gönderilememiş|oluşturulamadı|oluşturulamamış|"
+    r"kaydedilemedi|kaydedilememiş)\w*\b",
+    re.IGNORECASE,
+)
+
+
 def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str]:
     """
     Araç çağrısız son yanıtın gerçekten tamamlanmış bir cevap olup olmadığına karar verir:
@@ -81,11 +105,16 @@ def final_verdict(content: str, finish_reason: Optional[str]) -> Tuple[bool, str
         content, re.IGNORECASE,
     ):
         return False, "model işlemin başarısız olduğunu bildirdi"
-    if re.search(
-        r"\b(?:okuyamıyorum|okuyamadım|erişemiyorum|erişemedim|göremiyorum|göremedim|"
-        r"raporlayamıyorum|raporlayamadım)\b",
-        content, re.IGNORECASE,
-    ):
+    # Sonradan tamamlanmış bir denemenin önceki hatası başarıyı düşürmez; son açık
+    # teslim beyanı hâlâ yapılmadıysa tek bir yan işlemin başarısı görevi kapatmaz.
+    unfinished = list(_UNFINISHED_DELIVERY.finditer(content))
+    completed = list(_COMPLETION_CLAIM.finditer(content))
+    if unfinished and (not completed or unfinished[-1].start() > completed[-1].start()):
+        return False, "model zorunlu teslimin tamamlanmadığını bildirdi"
+    # "Rapor kaydedildi: … Not: 3. sayfayı okuyamadım, PDF bozuktu." bir kapsam notudur; teslim
+    # gerçekleştiği için başarıyı düşürmemeli. Teslim iddiası olmayan "içerikleri okuyamıyorum"
+    # gibi bildirim ise doğrudan başarısızlıktır.
+    if _INACCESSIBLE_CONTENT.search(content) and not _COMPLETION_CLAIM.search(content):
         return False, "model gerekli içeriğe erişemediğini bildirdi"
     return True, ""
 

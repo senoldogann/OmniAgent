@@ -15,7 +15,9 @@ Kullanım:
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
+import os
 import random
 import re
 import stat
@@ -40,6 +42,7 @@ from omniagent.dev.headless_screen import HeadlessPage
 from omniagent.dev.headless_screen import install as install_headless_screen
 from omniagent.integrations.runtime import IntegrationMetrics
 from omniagent.app.agent import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
+from omniagent.app.tool_schema import AUTO_OBSERVATION_PREVIEW, VERIFICATION_OBSERVATION_PREVIEW
 from omniagent.core.events import AgentEvent
 from omniagent.tools import _require_accessibility, press_key_spec, type_unicode_text
 
@@ -365,9 +368,12 @@ class Scenario(TypedDict):
 
 class RunResult(TypedDict):
     name: str
+    case_id: str
     ok: bool
     detail: str
     outcome: str
+    outcome_digest: NotRequired[str]
+    reason: str
     elapsed_seconds: float
     turns: int
     tool_calls: int
@@ -390,6 +396,8 @@ class RunResult(TypedDict):
     gui_trace: List[Dict[str, object]]
     gui_actions: List[Dict[str, object]]
     gui_metrics: Dict[str, object]
+    trace: NotRequired[List[Dict[str, Any]]]
+    trace_summary: NotRequired[Dict[str, Any]]
 
 
 class GuiTrace:
@@ -467,10 +475,142 @@ def gui_tool_path(name: str) -> str:
     return "other"
 
 
+def gui_tool_route(name: str) -> str:
+    """Hassas hedef metnini kaydetmeden GUI aracının gözlem/eylem yolunu sınıflandırır."""
+    if name in {"cua_get_ax_state", "cua_click"}:
+        return "ax"
+    if name in {"cua_read_visible_text", "cua_click_text", "cua_read_scrollable"}:
+        return "ocr"
+    if name == "take_screenshot":
+        return "image"
+    if name in {"cua_click_point", "cua_scroll", "run_action_sequence", "smart_click"}:
+        return "point"
+    if name == "chrome_active_tab":
+        return "browser"
+    return "other"
+
+
+def failure_reason_category(reason: str) -> str:
+    """Serbest hata metnini gizli ekran içeriği taşımayan teşhis sınıfına indirger."""
+    value = reason.casefold()
+    if not value:
+        return "completed"
+    if "model boş yanıt" in value:
+        return "empty_model_answer"
+    if "max_tokens" in value or "token sınır" in value:
+        return "token_limit"
+    if "content_filter" in value or "içerik filtres" in value:
+        return "content_filter"
+    if "maksimum iterasyon" in value:
+        return "iteration_limit"
+    if "ilerleme yok" in value or "fast loop" in value:
+        return "stagnation"
+    if "zaman sınır" in value or "timeout" in value:
+        return "time_limit"
+    # "Kritik hata: … doğrulanmadı" ifadesi önce eşleşmeli; eskiden doğrulan/kanıt kontrolü
+    # kritik hata kontrolünden önce geldiği için yanlış sınıflanıyordu.
+    if "kritik hata" in value:
+        return "critical_error"
+    if "doğrulan" in value or "kanıt" in value:
+        return "verification_gap"
+    return "other_failure"
+
+
+def gui_trace_recorder() -> Tuple[List[Dict[str, Any]], Callable[[AgentEvent], None]]:
+    """GUI olaylarını hassas ekran metni tutmadan çağrı kimliğiyle eşleştirir."""
+    trace: List[Dict[str, Any]] = []
+    trace_calls: Dict[str, Dict[str, Any]] = {}
+    trace_lock = Lock()
+    trace_key = os.urandom(32)
+    previous_targets: Dict[Tuple[str, str], str] = {}
+    active_turn = 0
+
+    def record_event(event: AgentEvent) -> None:
+        nonlocal active_turn
+        with trace_lock:
+            if event["kind"] == "turn_started":
+                active_turn = event["turn"]
+                trace.append({
+                    "kind": "turn", "turn": active_turn, "backend": event["backend"],
+                    "max_turns": event.get("max_turns"),
+                })
+            elif event["kind"] == "model_finished":
+                trace.append({
+                    "kind": "model", "turn": event["turn"], "seconds": event["seconds"],
+                    "finish_reason": event.get("finish_reason"),
+                    "tool_call_count": event.get("tool_call_count", 0),
+                    "empty_content": event.get("empty_content", False),
+                })
+            elif event["kind"] == "tool_started":
+                observation = (
+                    event["preview"] == AUTO_OBSERVATION_PREVIEW
+                    or event["preview"] == VERIFICATION_OBSERVATION_PREVIEW
+                )
+                row: Dict[str, Any] = {
+                    "kind": "tool", "turn": active_turn, "call_id": event["call_id"],
+                    "tool": event["name"], "route": gui_tool_route(event["name"]),
+                    "observation": observation,
+                }
+                if not observation:
+                    target_tag = event.get("argument_tag") or hmac.new(
+                        trace_key, event["preview"].encode("utf-8"), hashlib.sha256,
+                    ).hexdigest()[:16]
+                    target_key = (event["name"], target_tag)
+                    row["target_tag"] = target_tag
+                    if event.get("point") is not None:
+                        row["point"] = event["point"]
+                    if target_key in previous_targets:
+                        row["repeat_of"] = previous_targets[target_key]
+                    previous_targets[target_key] = event["call_id"]
+                trace.append(row)
+                trace_calls[event["call_id"]] = row
+            elif event["kind"] == "tool_finished":
+                row = trace_calls.get(event["call_id"])
+                if row is not None:
+                    row.update({"ok": event["ok"], "seconds": event["seconds"]})
+                    if event.get("code"):
+                        row["code"] = event["code"]
+
+    return trace, record_event
+
+
+def gui_trace_summary(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Hata nedenini (model/araç/döngü sınırı) ayıran toplamları gizli metin taşımadan çıkarır."""
+    tools = [row for row in trace if row["kind"] == "tool"]
+    models = [row for row in trace if row["kind"] == "model"]
+    turns = [row for row in trace if row["kind"] == "turn"]
+    routes = sorted({row["route"] for row in tools})
+    finish_reasons: Dict[str, int] = {}
+    for row in models:
+        key: str = row.get("finish_reason") or "unspecified"
+        finish_reasons[key] = finish_reasons.get(key, 0) + 1
+    return {
+        "turns": len(turns),
+        "max_turns": turns[-1].get("max_turns") if turns else None,
+        "empty_model_answers": sum(bool(row.get("empty_content")) for row in models),
+        "finish_reasons": finish_reasons,
+        "actions": sum(not row["observation"] for row in tools),
+        "observations": sum(row["observation"] for row in tools),
+        "failed_calls": sum(row.get("ok") is False for row in tools),
+        "repeated_targets": sum("repeat_of" in row for row in tools),
+        "route_seconds": {
+            route: round(sum(row.get("seconds", 0.0) for row in tools if row["route"] == route), 3)
+            for route in routes
+        },
+    }
+
+
 def job_code(run_id: str, query: str, index: int) -> str:
     """İlan kodu çalıştırma kimliği ve yazılan aramadan türetilir: yanlış arama yanlış kod verir. Saf."""
     normalized: str = " ".join(query.casefold().split())
     return "IL-" + hashlib.sha256(f"{run_id}|{normalized}|{index}".encode()).hexdigest()[:6].upper()
+
+
+def benchmark_run_id(name: str, run_index: int, seed: Optional[str]) -> str:
+    """Aynı tohum ve koşu sıra numarası için karşılaştırılabilir test kimliği üretir."""
+    if seed is None:
+        return uuid.uuid4().hex[:8]
+    return hashlib.sha256(f"{seed}|{name}|{run_index}".encode("utf-8")).hexdigest()[:8]
 
 
 class BenchmarkHandler(BaseHTTPRequestHandler):
@@ -886,10 +1026,11 @@ def headless_stage(page: HeadlessPage) -> GuiStage:
 async def run_one(
     name: str, root: Path, port: int, backend: Optional[str],
     clients: Dict[str, AsyncOpenAI], semaphore: asyncio.Semaphore, gui_stage: GuiStage,
+    run_index: int = 0, seed: Optional[str] = None,
 ) -> RunResult:
     """Bir senaryoyu tek kez koşturur ve sonucu denetler."""
     async with semaphore:
-        run_id: str = uuid.uuid4().hex[:8]
+        run_id: str = benchmark_run_id(name, run_index, seed)
         run_dir: Path = root / f"{name}-{run_id}"
         run_dir.mkdir(parents=True)
         _clear_request_counts(run_id)
@@ -912,13 +1053,24 @@ async def run_one(
         if name in GUI_SCENARIOS:
             await asyncio.to_thread(gui_stage["open_page"], test_origin + "hazir")
         page = gui_stage.get("page") if name in GUI_SCENARIOS else None
-        trace = GuiTrace(page)
+        # İki bağımsız izleyici birlikte çalışır: gui_trace_obj hedef/decoy tıklama doğruluğunu
+        # (chrome_benzer'ın asıl geçme koşulu), gui_trace_recorder() ise tur/model/araç düzeyinde
+        # arıza teşhisini (trace_summary) besler. combined_sink ikisine de aynı olayı iletir.
+        gui_trace_obj = GuiTrace(page)
         if page is not None:
             page.start_run()
-        # Takipte yalnızca ikinci mesajın maliyeti ölçülür; ilk mesaj her iki kolda aynıdır.
+        trace, record_event = gui_trace_recorder()
+
+        def combined_sink(event: AgentEvent) -> None:
+            gui_trace_obj.record(event)
+            record_event(event)
+
         started: float = time.monotonic()
         try:
-            report: RunReport = await run_agent_with_callback(scenario["goal"], trace.record, options, clients)
+            report: RunReport = await run_agent_with_callback(
+                scenario["goal"], combined_sink if name in GUI_SCENARIOS else lambda event: None,
+                options, clients,
+            )
             elapsed: float = round(time.monotonic() - started, 2)
         finally:
             if name in GUI_SCENARIOS:
@@ -927,14 +1079,17 @@ async def run_one(
         expected_success: bool = scenario.get("expect_success", True)
         expected_reason: Optional[str] = scenario.get("reason_contains")
         reason_ok: bool = expected_reason is None or expected_reason.casefold() in report["reason"].casefold()
-        gui_metrics = trace.metrics()
+        gui_metrics = gui_trace_obj.metrics()
         ok = ok and report["success"] == expected_success and reason_ok and first_ok
         if name == "chrome_benzer" and page is not None:
             ok = ok and gui_metrics["wrong_target_clicks"] == 0 and any(
                 action["target"] == "expected" for action in page.actions() if action["action"] == "click")
         metrics = report["metrics"]
+        gui_run = name in GUI_SCENARIOS
+        safe_outcome = ("<nonempty>" if report["outcome"].strip() else "") if gui_run else report["outcome"][:300]
         result: RunResult = {
-            "name": name, "ok": ok, "detail": detail, "outcome": report["outcome"][:300],
+            "name": name, "case_id": run_id, "ok": ok, "detail": detail, "outcome": safe_outcome,
+            "reason": failure_reason_category(report["reason"]) if gui_run else report["reason"],
             "elapsed_seconds": elapsed, "turns": metrics["turns"],
             "tool_calls": metrics["tool_calls"], "prompt_tokens": metrics["prompt_tokens"],
             "cached_tokens": metrics["cached_tokens"], "completion_tokens": metrics["completion_tokens"],
@@ -950,13 +1105,18 @@ async def run_one(
             "backend": metrics["backend"],
             "integrations": metrics.get("integrations", {}),
             "experience_hints": metrics.get("experience_hints", 0),
-            "gui_trace": trace.rows if name in GUI_SCENARIOS else [],
+            "gui_trace": gui_trace_obj.rows if name in GUI_SCENARIOS else [],
             "gui_actions": page.actions() if page is not None else [],
             "gui_metrics": gui_metrics if name in GUI_SCENARIOS else {},
         }
+        if gui_run:
+            result["trace"] = trace
+            result["trace_summary"] = gui_trace_summary(trace)
+            result["outcome_digest"] = hashlib.sha256(report["outcome"].encode("utf-8")).hexdigest()[:16]
         print(f"{'✓' if ok else '✗'} {name:9s} {result['elapsed_seconds']:5.1f}s tur={result['turns']} "
               f"araç={result['tool_calls']} model={result['model_seconds']:.1f}s araç_süresi={result['tool_seconds']:.1f}s "
-              f"ders={result['experience_hints']} backend={result['backend']} | {report['outcome'][:70]!r} {detail[:80]}",
+              f"ders={result['experience_hints']} backend={result['backend']} "
+              f"neden={result['reason'][:70]!r} | {safe_outcome[:70]!r} {detail[:80]}",
               flush=True)
         return result
 
@@ -988,6 +1148,21 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
         f"replan={sum(r['fast_loop_replans'] for r in results)} delivery={sum(r['fast_loop_delivery_entries'] for r in results)} "
         f"dupnav={sum(r['duplicate_navigation'] for r in results)}"
     )
+    traces: List[Dict[str, Any]] = [row.get("trace_summary") or {} for row in results]
+    if any(traces):
+        route_seconds: Dict[str, float] = {}
+        for summary in traces:
+            for route, seconds in summary.get("route_seconds", {}).items():
+                route_seconds[route] = route_seconds.get(route, 0.0) + seconds
+        lines.append(
+            "GUI izleme toplamları: "
+            f"eylem={sum(item.get('actions', 0) for item in traces)} "
+            f"gözlem={sum(item.get('observations', 0) for item in traces)} "
+            f"başarısız={sum(item.get('failed_calls', 0) for item in traces)} "
+            f"tekrar={sum(item.get('repeated_targets', 0) for item in traces)} "
+            f"boş_yanıt={sum(item.get('empty_model_answers', 0) for item in traces)} "
+            + " · ".join(f"{route}={seconds:.2f}s" for route, seconds in sorted(route_seconds.items()))
+        )
     measurements = [row.get("integrations", {}) for row in results]
     lines.append("Entegrasyon toplamları: " + " · ".join(
         f"{key}={sum(item.get(key, 0) for item in measurements):.3f}"
@@ -1004,7 +1179,7 @@ def summarize(results: List[RunResult], names: List[str]) -> str:
 
 async def run_benchmark(
     runs: int, concurrency: int, backend: Optional[str], names: List[str], json_path: Optional[str],
-    gui_stage: GuiStage,
+    gui_stage: GuiStage, seed: Optional[str] = None,
 ) -> None:
     server: ThreadingHTTPServer = ThreadingHTTPServer(("127.0.0.1", 0), BenchmarkHandler)
     Thread(target=server.serve_forever, daemon=True).start()
@@ -1016,10 +1191,18 @@ async def run_benchmark(
     clients: Dict[str, AsyncOpenAI] = create_model_clients()
     semaphore: asyncio.Semaphore = asyncio.Semaphore(concurrency)
     try:
-        results: List[RunResult] = list(await asyncio.gather(*(
-            run_one(name, root, server.server_port, backend, clients, semaphore, gui_stage)
-            for name in names for _ in range(runs)
-        )))
+        pending = [asyncio.create_task(run_one(
+            name, root, server.server_port, backend, clients, semaphore, gui_stage, index, seed,
+        )) for name in names for index in range(runs)]
+        results: List[RunResult] = []
+        for completed in asyncio.as_completed(pending):
+            results.append(await completed)
+            if json_path:
+                # Uzun GUI koşularında ara sonuç kaybolmasın; her biten koşu atomik kaydedilir.
+                destination = Path(json_path)
+                temporary = destination.with_name(destination.name + ".tmp")
+                temporary.write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
+                temporary.replace(destination)
     finally:
         await close_model_clients(clients)
         server.shutdown()
@@ -1029,8 +1212,6 @@ async def run_benchmark(
         if entry.name not in home_before and not entry.name.startswith(".")
     )
     print(f"İstenmeyen yan etki (ev dizininde yeni dosya): {unexpected or 'yok'}")
-    if json_path:
-        Path(json_path).write_text(json.dumps(results, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -1041,6 +1222,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--backend", default=None, help="Başlangıç backend'i (varsayılan: config.DEFAULT_BACKEND)")
     parser.add_argument("--only", default=",".join(CORE_SCENARIOS), help="Virgülle ayrılmış senaryo adları")
     parser.add_argument("--json", default=None, help="Ham sonuçların yazılacağı JSON dosyası")
+    parser.add_argument("--seed", default=None, help="Karşılaştırma için aynı senaryo kimliklerini üretir")
     parser.add_argument("--headless", action="store_true",
                         help="GUI senaryolarını kullanıcının ekranı yerine görünmez Chromium'da koş (headless_screen.py)")
     arguments: argparse.Namespace = parser.parse_args(argv)
@@ -1056,13 +1238,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     apply_stored_api_keys()
     if not arguments.headless:
         asyncio.run(run_benchmark(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json,
-                                  CHROME_STAGE))
+                                  CHROME_STAGE, arguments.seed))
     else:
         headless_page: HeadlessPage = HeadlessPage()
         try:
             install_headless_screen(headless_page)
             asyncio.run(run_benchmark(arguments.runs, arguments.concurrency, arguments.backend, selected,
-                                      arguments.json, headless_stage(headless_page)))
+                                      arguments.json, headless_stage(headless_page), arguments.seed))
         finally:
             headless_page.close()
 

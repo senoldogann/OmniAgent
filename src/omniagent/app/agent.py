@@ -25,16 +25,22 @@ from omniagent.config import (
     API_KEY_VARIABLES, BACKENDS, CONTINUOUS_GUIDANCE, DEFAULT_BACKEND, ESCALATION_BACKEND, QUALITY_LADDER,
     SYSTEM_PROMPT, BackendProfile, apply_stored_api_keys, redact,
 )
-from omniagent.core.events import AgentEvent, ArtifactReady, EventSink, TokenUsage, compact_count, preview_arguments, tool_label
+from omniagent.core.events import (
+    AgentEvent, ArtifactReady, EventSink, TokenUsage, argument_point, argument_tag,
+    compact_count, preview_arguments, tool_label,
+)
 from omniagent.core.fast_loop import (
     FastLoopPolicy, FastLoopState, TurnSignal, advance_fast_loop, classify_semantic_progress,
     normalize_progress_signature,
 )
-from omniagent.tools import MODEL_SCREEN_SIZE, TOOL_RUNTIME, ToolRuntime, Toolbox, ToolError, shell_command_words
+from omniagent.tools import (
+    MODEL_SCREEN_SIZE, SCREENSHOT_MAX_EDGE, TOOL_RUNTIME, ToolRuntime, Toolbox, ToolError,
+    shell_command_words,
+)
 from omniagent.app.continuous import (
-    CONTEXT_KEEP_TURNS, CONTEXT_MAX_TURNS, CONTINUE_PROMPT, CONTINUOUS_MODE, MAX_IDLE_REPORTS,
-    continuous_limits_path, direction_prompt, goal_confirmation_question, goal_report_problem,
-    load_continuous_limits, window_messages,
+    CONTEXT_KEEP_TURNS, CONTEXT_MAX_TURNS, CONTINUE_PROMPT, CONTINUOUS_MODE, MAX_GOAL_REPORTS,
+    MAX_IDLE_REPORTS, continuous_limits_path, goal_confirmation_question,
+    goal_report_problem, goal_report_repeat_problem, load_continuous_limits, window_messages,
 )
 from omniagent.approval import approval_granted
 from omniagent.app.tool_schema import (
@@ -75,6 +81,7 @@ from omniagent.app.constants import (
     ENGLISH_WEEKDAYS,
     FULL_DETAIL_TURNS,
     MAX_ACTION_EVIDENCE_RECOVERIES,
+    MAX_EMPTY_ANSWER_RECOVERIES,
     MAX_FINAL_LENGTH_RECOVERIES,
     MAX_ITERATIONS,
     MAX_NOVEL_READ_OUTPUTS,
@@ -85,8 +92,6 @@ from omniagent.app.constants import (
     NO_PROGRESS_LIMIT,
     READ_TRIMMED_TAIL_LIMIT,
     RUN_MODE_PROFILES,
-    SOFT_TOOL_CALL_BUDGET,
-    SOFT_UNCACHED_PROMPT_TOKEN_BUDGET,
     TASK_LEDGER_LIMIT,
     TRIMMED_ARGS_LIMIT,
     TRIMMED_CONTENT_LIMIT,
@@ -101,8 +106,8 @@ from omniagent.app.progress import (
     _fast_loop_prompt,
     _ledger_delivery_ready,
     add_usage,
-    budget_pressure_message,
     extract_task_ledger,
+    failed_tool_recovery_message,
     host_turn_progress,
     novel_read_output_progress,
     novel_shell_output_progress,
@@ -131,18 +136,26 @@ from omniagent.app.tool_execution import (
     _tool_result_to_message,
     approval_request_for_call,
     execute_tool,
+    failed_call_key,
     require_approval,
     result_text,
     update_chrome_visits,
 )
 from omniagent.app.verification import (
-    FULL_DETAIL_TURNS,
+    COMMIT_UNVERIFIED_MESSAGE,
     GUI_VERIFICATION_PROMPT,
+    REPEATED_NO_EFFECT_ACTION_MESSAGE,
+    commit_action_call,
+    commit_navigation_call,
+    commit_then_navigation_in_sequence,
+    executed_call_prefix,
     gui_evidence_summary,
     gui_verification_needed,
     needs_action_observation,
+    no_effect_action_key,
     requested_chrome_navigation_gap,
     should_reuse_observation,
+    text_entry_call,
     unchanged_screen_note,
     verification_message,
     with_observation_note,
@@ -153,11 +166,11 @@ from omniagent.core import state as sm
 from omniagent.memory import user as user_memory
 from omniagent.core.conversation import Exchange, make_exchange, to_messages
 from omniagent.core.task_ledger import (
-    TaskLedger, empty_task_ledger, record_tool_result,
+    TaskLedger, empty_task_ledger, record_tool_receipt, record_tool_result,
     format_ledger_prompt, record_model_state, inject_task_ledger_into_messages,
 )
 from omniagent.core.checkpoint import (
-    clear_checkpoint, find_latest_checkpoint, find_resume_checkpoint,
+    clear_checkpoint, find_resume_checkpoint,
     format_checkpoint_scratchpad, save_checkpoint,
 )
 from omniagent.integrations.capabilities import CapabilityService, ToolEntry, discovery_entry, validate_arguments
@@ -168,6 +181,14 @@ from omniagent.integrations.runtime import (
 )
 
 STATE_FILE: str = str(state_file())
+
+# Aynı (araç + argüman) çağrısı bir tur önce başarısız olduysa yürütülmez.
+REPEATED_FAILED_CALL_MESSAGE: str = (
+    "Aynı başarısız araç çağrısı aynı argümanlarla tekrarlandı; farklı bir adım dene."
+)
+# Gönderim koruması bu kadar tur sürer: yazılı taslak gönderildikten sonra ilk turda sayfadan
+# ayrılma engellenir, ajan ekrana bakıp gönderimi doğrular ya da gönder düğmesine yeniden basar.
+COMMIT_GUARD_TURNS: int = 3
 
 
 
@@ -185,6 +206,27 @@ def encode_image(path: str) -> str:
     buffer: BytesIO = BytesIO()
     square.save(buffer, format="JPEG", quality=MODEL_IMAGE_QUALITY, subsampling=0)
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def encode_screen_observation(path: str, detail_requested: bool = True) -> Tuple[str, Optional[str], Tuple[int, int]]:
+    """Tıklama haritasını ve gerekirse oranı korunmuş ayrıntı görüntüsünü hazırlar."""
+    with Image.open(path) as source:
+        frame: Image.Image = source.convert("RGB")
+    width, height = frame.size
+    square = frame.resize((MODEL_SCREEN_SIZE, MODEL_SCREEN_SIZE), Image.Resampling.LANCZOS)
+    square_buffer = BytesIO()
+    square.save(square_buffer, format="JPEG", quality=MODEL_IMAGE_QUALITY, subsampling=0)
+    coordinate_image = base64.b64encode(square_buffer.getvalue()).decode("ascii")
+
+    if not detail_requested or (width == height and width <= MODEL_SCREEN_SIZE):
+        return coordinate_image, None, (width, height)
+
+    detail = frame.copy()
+    detail.thumbnail((SCREENSHOT_MAX_EDGE, SCREENSHOT_MAX_EDGE), Image.Resampling.LANCZOS)
+    detail_buffer = BytesIO()
+    detail.save(detail_buffer, format="JPEG", quality=MODEL_IMAGE_QUALITY, subsampling=0)
+    reference_image = base64.b64encode(detail_buffer.getvalue()).decode("ascii")
+    return coordinate_image, reference_image, (width, height)
 
 
 def encode_attachment_image(path: str) -> str:
@@ -319,6 +361,9 @@ def route_system_prompt(today: date, goal: Optional[str], memory_block: str, chr
         "option, checkbox label) with cua_click_text: OCR finds its exact spot. Use cua_click_point "
         "only for targets without text (icons, empty fields) and aim at the element's CENTER, not "
         "empty whitespace.\n"
+        "- Editable text inside an input is not a button: click_text then type only inserts at the "
+        "caret. For a replacement, use cua_fill_field(point,text), which selects the old value first; "
+        "check the resulting field/account before reading or changing its data.\n"
         "- Search box: ONE cua_submit_text call. Multi-field form: fill each field with cua_fill_field "
         "(no Enter; Enter inside a form submits it half-filled), open a dropdown with a click and pick "
         "the option with cua_click_text (if no option list appears, type the option text with "
@@ -328,11 +373,15 @@ def route_system_prompt(today: date, goal: Optional[str], memory_block: str, chr
         "- Content outside the visible area does not exist for you until you scroll. Scroll the pane "
         "you need (list or detail) with cua_scroll; read a long description, article or list completely "
         "with ONE cua_read_scrollable call instead of scrolling screenshot by screenshot.\n"
-        "- Only a cua_scroll result 'KAYMADI' or a cua_read_scrollable result 'sona ulaşıldı' proves the "
-        "end of a list/page. Never claim you checked all items or the whole page without that proof.\n"
-        "- In a list/detail layout open each item from the list pane. To inspect several items, return "
-        "cua_click_text + cua_read_scrollable (or + take_screenshot) pairs for all of them in ONE turn; "
-        "calls run in order and each waits for its page to settle.\n"
+        "- A lone cua_scroll 'KAYMADI' can mean either the end or a non-scrollable/wrong target. "
+        "For complete coverage use cua_read_scrollable and require 'sona ulaşıldı' without a "
+        "truncation warning. Never claim you checked all items without that evidence.\n"
+        "- In a list/detail layout open each item from the list pane. Once you know their labels, "
+        "use run_action_sequence with 2-3 click_text/read_scrollable pairs per call: "
+        "{action:click_text,text:<label>,near:[x,y]} then "
+        "{action:read_scrollable,point:[detail_x,detail_y],max_pages:15}. "
+        "The steps run in order and each detail is read after its click. Keep measured values and "
+        "inspected labels in STATE; do not wait for separate screenshots between items.\n"
         "- After a turn with actions you automatically receive a screenshot taken once the screen "
         "settles. Do not call take_screenshot after actions and never wait.\n"
         "- If the automatic screenshot is unchanged after an action (the host reports it), the action "
@@ -508,17 +557,34 @@ async def _screenshot_observation_with_digest(
 ) -> Tuple[Dict[str, Any], str]:
     """Görsel gözlem mesajını ve tekrar tespiti için ucuz içerik digest'ini döner."""
     arguments: Dict[str, Any] = json.loads(call["arguments"] or "{}")
-    image_b64: str = await asyncio.to_thread(encode_image, str(Path(arguments["filename"]).expanduser()))
-    digest: str = hashlib.sha256(image_b64.encode("ascii")).hexdigest()
+    coordinate_image, reference_image, (width, height) = await asyncio.to_thread(
+        encode_screen_observation, str(Path(arguments["filename"]).expanduser()),
+        arguments.get("detail", True),
+    )
+    digest: str = hashlib.sha256(
+        (coordinate_image + (reference_image or "")).encode("ascii")
+    ).hexdigest()
+    reference_note = (
+        f"İkinci görüntü aynı ekranın oranı korunmuş {width}×{height} görünümüdür; "
+        "küçük metin ve görsel ayrıntıları oradan incele. İkinci görüntüdeki piksel sayılarını "
+        "doğrudan tıklama noktası olarak kullanma. "
+        if reference_image is not None else ""
+    )
     message: Dict[str, Any] = {
         "role": "user",
         "content": [
-            {"type": "text", "text": "Gözlem: az önce alınan ekran görüntüsü (koordinatlar tıklama araçlarıyla aynı uzayda). "
+            {"type": "text", "text": "Gözlem: ilk görüntü 1000×1000 tıklama koordinat haritasıdır. "
+                                     + reference_note
+                                     + "Emin olunmayan yazıyı OCR ile doğrula; görünmeyen içeriği görmek için kaydır. "
                                      f"Görüntü {FULL_DETAIL_TURNS} tur sonra bağlamdan silinir: gereken değerleri "
                                      "(kod, ad, sayı) bu turdaki yanıt metnine yaz."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{coordinate_image}"}},
         ],
     }
+    if reference_image is not None:
+        message["content"].append(
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{reference_image}"}}
+        )
     return message, digest
 
 
@@ -538,7 +604,11 @@ async def _observe_after_actions(
     Başarısız gözlem modele açık metinle bildirilir. preview arayüzdeki çağrı etiketidir.
     """
     path: Path = Path(tempfile.gettempdir()) / f"omni-{call_id}.png"
-    call: ToolCallDraft = {"id": call_id, "name": "take_screenshot", "arguments": json.dumps({"filename": str(path)})}
+    call: ToolCallDraft = {
+        "id": call_id,
+        "name": "take_screenshot",
+        "arguments": json.dumps({"filename": str(path), "detail": False}),
+    }
     result: ToolResult = await _run_tool_with_events(
         index, call, preview, toolbox, cache, emit, should_stop)
     step: sm.StepRecord = sm.make_step_record(call["name"], call["arguments"], bool(result.get("ok")), result_text(result))
@@ -652,32 +722,20 @@ def merge_call_results(
     return [next(hosted_results) if is_hosted else next(regular_results) for is_hosted in hosted_mask]
 
 
-async def ask_for_direction(runtime: IntegrationRuntime, stall: str) -> Optional[str]:
-    """
-    Sürekli görev takılınca durmak yerine kullanıcıdan yön ister; yanıt süresi bütçeye sayılmaz.
-    Kullanıcı durdurursa None döner. Boş yanıt da geçerlidir: model farklı bir yol seçer.
-    """
-    try:
-        answer: Dict[str, Any] = await runtime.ask(
-            f"Sürekli görev takıldı: {stall}\nNasıl devam edeyim? (Durdurmak için Esc veya /stop)",
-            {"yanit": {"type": "string", "label": "Yönlendirme", "default": ""}},
-            None,
-        )
-    except IntegrationStopped:
-        return None
-    return str(answer.get("yanit", "")).strip()
-
-
 async def resolve_goal_report(
     call: ToolCallDraft, index: int, evidence: Dict[str, str], runtime: IntegrationRuntime, emit: EventSink,
-) -> Tuple[ToolResult, Optional[str]]:
+    seen_evidence: frozenset[str], report_count: int, pending_commit: bool = False,
+) -> Tuple[ToolResult, Optional[str], frozenset[str], bool]:
     """
     report_goal_met çağrısını host'ta işler: kanıt id'lerini görevin başarılı çağrılarıyla
-    karşılaştırır, geçerliyse kullanıcıya onaylatır. Onaylanan özeti, aksi hâlde None döner.
+    karşılaştırır, aynı kanıtla yinelenen bildirimi ve bildirim tavanını reddeder, geçerliyse
+    kullanıcıya onaylatır. Onaylanan özeti ve o ana dek değerlendirilmiş kanıt id'lerini döner.
     """
     started: float = time.monotonic()
     emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
-          "preview": preview_arguments(call["name"], call["arguments"])})
+          "preview": preview_arguments(call["name"], call["arguments"]),
+          "argument_tag": argument_tag(call["name"], call["arguments"]),
+          "point": argument_point(call["name"], call["arguments"])})
     confirmed: Optional[str] = None
     try:
         arguments: object = json.loads(call["arguments"] or "{}")
@@ -692,10 +750,32 @@ async def resolve_goal_report(
         raw_ids: object = arguments.get("evidence_call_ids")
         problem = goal_report_problem(summary, raw_ids, evidence)
         evidence_ids = [item for item in raw_ids if isinstance(item, str)] if isinstance(raw_ids, list) else []
+        if problem is None and pending_commit:
+            # Gönderim koruması aktifken hedef kapandı denemez: canlı kayıtta ajan gönderiyi
+            # yayınlamadan "başarıyla paylaşıldı" diye bildiriyordu.
+            problem = (
+                "Son gönder/paylaş eyleminin tamamlandığı henüz doğrulanmadı; ekrandan gönderim "
+                "onayını (kapanan ileti kutusu, 'gönderildi' bildirimi) görmeden hedefi bildirme."
+            )
+        if problem is None and report_count >= MAX_GOAL_REPORTS:
+            problem = (
+                f"Bu görevde kullanıcıya {report_count} hedef bildirimi soruldu; daha fazlası "
+                "sorulmaz. Hedefi kapatmak için yeni kanıtla tek ve net bir bildirim kur ya da "
+                "eksik işi bitirmeye devam et."
+            )
+        if problem is None:
+            problem = goal_report_repeat_problem(evidence_ids, seen_evidence)
+    # Yalnız gerçekten var olan kanıt id'leri "değerlendirildi" sayılır: modelin uydurduğu bir
+    # id, sonradan gerçek bir çağrıya denk gelirse o çağrıyı haksız yere reddettirmemeli.
+    evaluated: frozenset[str] = seen_evidence | frozenset(
+        item for item in evidence_ids if item in evidence
+    )
+    asked: bool = False
     if problem is not None:
         result: ToolResult = {"tool_call_id": call["id"], "ok": False, "error_type": "GoalNotProven",
                               "error": problem, "code": "GOAL_NOT_PROVEN", "recoverable": True}
     else:
+        asked = True
         try:
             # Tek metin alanı: "evet" onaylar; başka yanıt eksik olanı anlatan nottur (Telegram'da düz metin).
             answer: Dict[str, Any] = await runtime.ask(
@@ -704,6 +784,7 @@ async def resolve_goal_report(
                 None,
             )
         except IntegrationStopped as error:
+            asked = False
             result = {"tool_call_id": call["id"], "ok": False, "error_type": "IntegrationStopped",
                       "error": str(error), "code": "STOPPED", "recoverable": False}
         else:
@@ -717,9 +798,14 @@ async def resolve_goal_report(
                     f"Kullanıcı hedefin gerçekleştiğini ONAYLAMADI: {reply or '(açıklama yok)'}\n"
                     "Eksik olanı tamamla, gerekirse ask_user ile sor ve göreve devam et."
                 )}
-    emit({"kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
-          "text": result_text(result), "seconds": round(time.monotonic() - started, 2)})
-    return result, confirmed
+    hosted_finished: AgentEvent = {
+        "kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
+        "text": result_text(result), "seconds": round(time.monotonic() - started, 2),
+    }
+    if result.get("code"):
+        hosted_finished["code"] = str(result["code"])
+    emit(hosted_finished)
+    return result, confirmed, evaluated, asked
 
 
 async def run_agent_with_callback(
@@ -790,10 +876,12 @@ async def run_agent_with_callback(
         experience_file: str = options.get("experience_file") or str(
             Path(options["state_file"]).with_name("experience_memory.json")
         )
+        must_change_source: bool = source_change_expected(goal, options["history"])
         toolbox: Toolbox = Toolbox(
             memory_file=memory_file,
             allow_memory_mutation=memory_mutation_requested(goal),
             history_file=options["state_file"],
+            allow_source_relative_writes=must_change_source,
         )
         session_id: str = str(uuid.uuid4())
         user_content: str = goal
@@ -832,7 +920,6 @@ async def run_agent_with_callback(
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
         file_cwd: Path = Path.cwd()
         file_contract = capture_file_contract(goal, file_cwd)
-        must_change_source: bool = source_change_expected(goal, options["history"])
         allow_edit: bool = must_change_source or (
             file_contract is not None and file_contract["kind"] == "edit"
         )
@@ -857,6 +944,7 @@ async def run_agent_with_callback(
     tool_cache: Dict[str, ToolResult] = {}
     chrome_visits: Dict[str, int] = {}
     final_length_recoveries: int = 0
+    empty_answer_recoveries: int = 0
     unexecuted_tool_recoveries: int = 0
     awaiting_real_tool_call: bool = False
     delivery_recoveries: int = 0
@@ -876,10 +964,7 @@ async def run_agent_with_callback(
     task_ledger: str = ""
     host_task_ledger: TaskLedger = empty_task_ledger()
     combined_ledger: str = ""
-    fast_loop_policy = FastLoopPolicy(
-        soft_uncached_prompt_tokens=SOFT_UNCACHED_PROMPT_TOKEN_BUDGET,
-        soft_tool_calls=SOFT_TOOL_CALL_BUDGET,
-    )
+    fast_loop_policy = FastLoopPolicy()
     fast_loop_state = FastLoopState()
     fast_loop_delivery_entries: int = 0
     fast_loop_stagnation_events: int = 0
@@ -898,20 +983,60 @@ async def run_agent_with_callback(
     tool_seconds: float = 0.0
     experience_tracker: experience.TaskTracker = experience.new_tracker()
     experience_hints: int = 0
+    # Bu turda başarısız olan/yürütülmeyen çağrılar: anahtar → modele verilecek gerekçe.
+    recent_blocked_keys: Dict[str, str] = {}
+    # Aynı görsel state'te daha önce no-op olduğu kanıtlanan doğrudan GUI girdileri. Ekran
+    # değiştiğinde temizlenir; böylece form düzeltildikten sonra aynı submit yeniden denenebilir.
+    no_effect_screen_digest: Optional[str] = None
+    no_effect_action_keys: frozenset[str] = frozenset()
+    goal_reports_seen: frozenset[str] = frozenset()
+    goal_report_count: int = 0
+    # Gönderim koruması: yazılmış bir taslak gönderildikten sonra doğrulanmadan sayfadan
+    # ayrılmayı engeller (canlı kayıtta taslak bu yüzden hiç gönderilmedi).
+    composed_text_seen: bool = False
+    commit_pending_turn: Optional[int] = None
     metrics: sm.EpisodeMetrics
 
-    async def continue_with_direction(stall: str) -> bool:
-        """
-        Sürekli görev takılınca kullanıcının yönünü bağlama ekler ve takılma sayaçlarını sıfırlar;
-        aynı takılma hemen ikinci soruyu üretmez. Kullanıcı durdurduysa False döner.
-        """
-        nonlocal no_progress_turns, fast_loop_state, idle_reports
-        direction: Optional[str] = await ask_for_direction(runtime, stall)
-        if direction is None:
-            return False
-        messages.append({"role": "user", "content": direction_prompt(direction)})
+    def record_visual_action_outcome(
+        digest: Optional[str], previous_digest: Optional[str],
+        calls: List[ToolCallDraft], results: List[ToolResult],
+    ) -> None:
+        """Ekran değişmediyse son doğrudan GUI girdisini mevcut state için no-op olarak kaydeder."""
+        nonlocal no_effect_screen_digest, no_effect_action_keys
+        if digest is None:
+            return
+        if digest != previous_digest:
+            no_effect_screen_digest = digest
+            no_effect_action_keys = frozenset()
+            return
+        guarded_keys: List[str] = []
+        for call, result in zip(calls, results, strict=True):
+            if not result.get("ok"):
+                continue
+            key = no_effect_action_key(call)
+            if key is not None:
+                guarded_keys.append(key)
+        if not guarded_keys:
+            return
+        if no_effect_screen_digest != digest:
+            no_effect_screen_digest = digest
+            no_effect_action_keys = frozenset()
+        # Bir turda birden çok eylem varsa settled ekranı en doğrudan son girdi açıklar.
+        # Önceki adımları yanlışlıkla no-op sayıp ileride meşru kullanımlarını engelleme.
+        no_effect_action_keys = no_effect_action_keys | frozenset({guarded_keys[-1]})
+
+    def recover_continuous(stall: str) -> None:
+        """Takılan sürekli görev için alternatif adımı isteyip sayaçları sıfırlar."""
+        nonlocal no_progress_turns, fast_loop_state, idle_reports, recent_blocked_keys
+        messages.append({"role": "user", "content": (
+            f"HOST — YENİDEN PLANLA: {stall}. Aynı başarısız çağrıyı aynı argümanlarla yineleme. "
+            "Hatanın nedenini kullanarak farklı bir araç, argüman veya yöntem seç ve somut bir adım uygula. "
+            "Gerçekten eksik kullanıcı bilgisi varsa ask_user çağır."
+        )})
         no_progress_turns, fast_loop_state, idle_reports = 0, FastLoopState(), 0
-        return True
+        # Tekrar engeli kalkar: hata geçici olabilir (ağ, açılmayan uygulama) ve host zaten yeni
+        # bir deneme istiyor. Aksi hâlde bir kez düşen çağrı görev boyunca bir daha denenemiyordu.
+        recent_blocked_keys = {}
 
     try:
         for iteration in range(1, max_iterations + 1):
@@ -963,6 +1088,9 @@ async def run_agent_with_callback(
             model_finished_event: AgentEvent = {
                 "kind": "model_finished", "turn": iteration,
                 "seconds": round(model_elapsed, 2), "usage": turn["usage"],
+                "finish_reason": turn["finish_reason"],
+                "tool_call_count": len(turn["tool_calls"]),
+                "empty_content": not bool(turn["content"].strip()),
             }
             if not guarded_final_output:
                 emit(model_finished_event)
@@ -1024,12 +1152,34 @@ async def run_agent_with_callback(
                     if idle_reports < MAX_IDLE_REPORTS:
                         messages.append({"role": "user", "content": CONTINUE_PROMPT})
                         continue
-                    if not await continue_with_direction(f"{idle_reports} ardışık yanıtta hiçbir araç çalışmadı"):
-                        outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
-                        break
+                    recover_continuous(f"{idle_reports} ardışık yanıtta hiçbir araç çalışmadı")
                     continue
                 outcome = turn["content"]
                 success, reason = final_verdict(outcome, turn["finish_reason"])
+                if (
+                    not success
+                    and not outcome.strip()
+                    and turn["finish_reason"] not in ("length", "content_filter")
+                    and empty_answer_recoveries < MAX_EMPTY_ANSWER_RECOVERIES
+                ):
+                    # Model araç çağrısı olmadan tamamen boş bir yanıt döndürebiliyor (sağlayıcı
+                    # aksaklığı veya kesilmiş akış); bu tek başına görevi bitirmemeli. Bir kez
+                    # gerçek yanıt veya araç çağrısı istenir; boş yanıtın kaynağı raporda ayrıca
+                    # `empty_model_answers` olarak görünür.
+                    empty_answer_recoveries += 1
+                    emit({"kind": "notice", "level": "warning",
+                          "text": "Model boş yanıt döndü; gerçek yanıt veya araç çağrısı isteniyor."})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Önceki yanıt tamamen boştu; ne metin ne araç çağrısı ürettin. Görevi "
+                            "sürdür: gerekiyorsa gerekli işlemi API'nin gerçek tool_calls alanıyla "
+                            "çağır, aksi hâlde STATE ve mevcut bulgularla kısa, tam bir final yanıt ver."
+                        ),
+                    })
+                    outcome, reason, success = "", "", False
+                    finish_guarded_turn()
+                    continue
                 navigation_gap = requested_chrome_navigation_gap(goal, steps) if success else None
                 if navigation_gap is not None:
                     if delivery_recoveries < MAX_ACTION_EVIDENCE_RECOVERIES:
@@ -1208,10 +1358,101 @@ async def run_agent_with_callback(
             ]
             confirmed_goal: Optional[str] = None
             try:
-                regular_results: List[ToolResult] = await _execute_tool_calls(
-                    regular_calls, toolbox, tool_cache, emit, options["should_stop"],
-                ) if regular_calls else []
+                commit_guard: bool = (
+                    commit_pending_turn is not None
+                    and iteration <= commit_pending_turn + COMMIT_GUARD_TURNS
+                )
+
+                def no_effect_blocked(candidate: ToolCallDraft) -> bool:
+                    """Aynı GUI girdisi aynı son gözlem state'inde daha önce no-op oldu mu."""
+                    key = no_effect_action_key(candidate)
+                    return bool(
+                        key is not None
+                        and no_effect_screen_digest is not None
+                        and no_effect_screen_digest == last_observation_digest
+                        and key in no_effect_action_keys
+                    )
+
+                # Aynı turdaki yaz → gönder → gezin dizisini yürütmeden önce denetle.
+                # Araçlar sırayla çalışsa da sonuçlar ancak tur sonunda geldiğinden,
+                # önceki çağrıların niyetini ihtiyatlı biçimde korumaya dahil et.
+                block_reasons: List[Optional[str]] = []
+                batch_composed: bool = composed_text_seen
+                batch_commit_guard: bool = commit_guard
+                for candidate in regular_calls:
+                    if (
+                        (batch_commit_guard and commit_navigation_call(candidate))
+                        or commit_then_navigation_in_sequence(candidate)
+                    ):
+                        blocked = COMMIT_UNVERIFIED_MESSAGE
+                    elif no_effect_blocked(candidate):
+                        blocked = REPEATED_NO_EFFECT_ACTION_MESSAGE
+                    else:
+                        blocked = recent_blocked_keys.get(failed_call_key(candidate))
+                    block_reasons.append(blocked)
+                    if blocked is None:
+                        batch_composed = batch_composed or text_entry_call(candidate)
+                        batch_commit_guard = batch_commit_guard or (
+                            batch_composed and commit_action_call(candidate)
+                        )
+                blocked_mask: List[bool] = [reason is not None for reason in block_reasons]
+                runnable_calls: List[ToolCallDraft] = [
+                    call for call, blocked in zip(regular_calls, blocked_mask, strict=True) if not blocked
+                ]
+                runnable_results: List[ToolResult] = await _execute_tool_calls(
+                    runnable_calls, toolbox, tool_cache, emit, options["should_stop"],
+                ) if runnable_calls else []
+                blocked_results: List[ToolResult] = []
+                for index, (call, blocked) in enumerate(zip(regular_calls, blocked_mask, strict=True)):
+                    if not blocked:
+                        continue
+                    message: str = block_reasons[index] or REPEATED_FAILED_CALL_MESSAGE
+                    committed: bool = message == COMMIT_UNVERIFIED_MESSAGE
+                    no_effect: bool = no_effect_blocked(call)
+                    if committed:
+                        code, error_type = "COMMIT_UNVERIFIED", "CommitNotVerified"
+                    elif no_effect:
+                        code, error_type = "REPEATED_NO_EFFECT_ACTION", "RepeatedNoEffectAction"
+                    else:
+                        code, error_type = "REPEATED_FAILED_CALL", "RepeatedFailedCall"
+                    emit({"kind": "tool_started", "call_id": call["id"], "index": index,
+                          "name": call["name"], "preview": preview_arguments(call["name"], call["arguments"]),
+                          "argument_tag": argument_tag(call["name"], call["arguments"]),
+                          "point": argument_point(call["name"], call["arguments"])})
+                    emit({"kind": "tool_finished", "call_id": call["id"], "ok": False,
+                          "text": message, "seconds": 0.0, "code": code})
+                    blocked_results.append({"tool_call_id": call["id"], "ok": False,
+                                            "error_type": error_type,
+                                            "error": message, "code": code, "recoverable": True})
+                regular_results: List[ToolResult] = merge_call_results(
+                    blocked_mask, runnable_results, blocked_results,
+                )
+                attempted_keys: frozenset[str] = frozenset(
+                    failed_call_key(call) for call, blocked in zip(regular_calls, blocked_mask, strict=True)
+                    if not blocked
+                )
+                if attempted_keys:
+                    recent_blocked_keys = {
+                        failed_call_key(call): REPEATED_FAILED_CALL_MESSAGE
+                        for call, result, blocked in zip(regular_calls, regular_results, blocked_mask, strict=True)
+                        if not blocked and not result.get("ok")
+                    }
                 goal_evidence = record_goal_evidence(goal_evidence, regular_calls, regular_results)
+                # Host araçları aynı turdaki GUI sonuçlarından sonra işlenir. Gönderim
+                # doğrulanmadan report_goal_met ile kullanıcıya başarı sorulmasını engelle.
+                executed_regular_calls: List[Optional[ToolCallDraft]] = [
+                    executed_call_prefix(call, result)
+                    for call, result in zip(regular_calls, regular_results, strict=True)
+                ]
+                turn_composed: bool = composed_text_seen or any(
+                    call is not None and text_entry_call(call) for call in executed_regular_calls
+                )
+                turn_commit_pending: bool = commit_guard or (
+                    turn_composed and any(
+                        call is not None and commit_action_call(call)
+                        for call in executed_regular_calls
+                    )
+                )
                 hosted_results: List[ToolResult] = []
                 for index, (call, hosted) in enumerate(zip(turn["tool_calls"], hosted_mask, strict=True)):
                     if hosted and confirmed_goal is not None:
@@ -1219,9 +1460,13 @@ async def run_agent_with_callback(
                         hosted_results.append({"tool_call_id": call["id"], "ok": True,
                                                "result": "Hedef bu turda zaten onaylandı."})
                     elif hosted:
-                        hosted_result, confirmed = await resolve_goal_report(
+                        hosted_result, confirmed, goal_reports_seen, asked = await resolve_goal_report(
                             call, index, goal_evidence, runtime, emit,
+                            goal_reports_seen, goal_report_count, turn_commit_pending,
                         )
+                        # Tavan yalnız kullanıcıya gerçekten sorulan bildirimleri sayar: geçersiz
+                        # kanıtla yapılan denemeler sonraki meşru bildirimi engellememeli.
+                        goal_report_count += int(asked)
                         hosted_results.append(hosted_result)
                         confirmed_goal = confirmed
                 results: List[ToolResult] = merge_call_results(hosted_mask, regular_results, hosted_results)
@@ -1229,13 +1474,20 @@ async def run_agent_with_callback(
                 tool_seconds += time.monotonic() - tools_started
 
             failures_in_turn: int = 0
+            facts_before_turn = dict(host_task_ledger["facts"])
             pending_shots: List[ToolCallDraft] = []
             turn_observation_digests: List[str] = []
             duplicate_navigation_notes: List[str] = []
             for call, result in zip(turn["tool_calls"], results, strict=True):
                 ok: bool = bool(result.get("ok"))
                 detail: str = result_text(result)
-                steps.append(sm.make_step_record(call["name"], call["arguments"], ok, detail))
+                steps.append(sm.make_step_record(
+                    call["name"], call["arguments"], ok, detail,
+                    partial_steps=int(result.get("completed_steps") or 0),
+                ))
+                host_task_ledger = record_tool_receipt(
+                    host_task_ledger, call["id"], call["name"], ok, detail, iteration,
+                )
                 if file_contract is not None:
                     file_receipts += receipt_for_call(call, result, file_cwd)
                 if ok and call["name"] == "take_screenshot":
@@ -1249,9 +1501,16 @@ async def run_agent_with_callback(
                     host_task_ledger = record_tool_result(host_task_ledger, call["name"], detail, iteration)
                 # Deneyim belleği yalnız hata anında konuşur: aynı hata imzası için doğrulanmış
                 # önceki çözüm ve görev içi tekrar uyarısı araç sonucunun altına eklenir.
-                experience_tracker, observed = experience.observe_result(
-                    experience_state, experience_tracker, call["name"], call["arguments"], ok, detail, iteration,
-                )
+                if result.get("code") in (
+                    "REPEATED_FAILED_CALL", "REPEATED_NO_EFFECT_ACTION", "COMMIT_UNVERIFIED",
+                ):
+                    # Host'un yürütmediği çağrı gerçek bir araç hatası değildir; deneyim belleğine
+                    # yazılırsa aynı imza için sahte "doğrulanmış çözüm" dersleri birikir.
+                    observed = {"notes": [], "lesson_id": None}
+                else:
+                    experience_tracker, observed = experience.observe_result(
+                        experience_state, experience_tracker, call["name"], call["arguments"], ok, detail, iteration,
+                    )
                 tool_message: Dict[str, Any] = _tool_result_to_message(call, result)
                 if observed["notes"]:
                     tool_message = {**tool_message, "content": tool_message["content"] + "\n\n" + "\n\n".join(observed["notes"])}
@@ -1274,7 +1533,8 @@ async def run_agent_with_callback(
             # Ekran gözlemleri TÜM araç mesajlarından SONRA eklenir: tool sonuçları assistant
             # tool_calls'ı kesintisiz izlemeli; araya user mesajı 400'e yol açar.
             turn_acted: bool = any(
-                call["name"] in _GUI_VERIFICATION_TOOLS and result.get("ok")
+                call["name"] in _GUI_VERIFICATION_TOOLS
+                and (result.get("ok") or int(result.get("completed_steps") or 0) > 0)
                 for call, result in zip(turn["tool_calls"], results, strict=True)
             )
             for shot_call in pending_shots:
@@ -1282,8 +1542,12 @@ async def run_agent_with_callback(
                     observation, digest = await _screenshot_observation_with_digest(shot_call)
                     observations += 1
                     turn_observation_digests.append(digest)
+                    previous_observation_digest = last_observation_digest
                     shot_note: Optional[str] = (
-                        unchanged_screen_note(digest, last_observation_digest) if turn_acted else None
+                        unchanged_screen_note(digest, previous_observation_digest) if turn_acted else None
+                    )
+                    record_visual_action_outcome(
+                        digest, previous_observation_digest, turn["tool_calls"], results,
                     )
                     messages.append(with_observation_note(observation, shot_note))
                     last_observation_digest = digest
@@ -1308,11 +1572,15 @@ async def run_agent_with_callback(
                 observations += 1
                 if observation_digest is not None:
                     turn_observation_digests.append(observation_digest)
+                previous_observation_digest = last_observation_digest
                 action_note: Optional[str] = (
-                    unchanged_screen_note(observation_digest, last_observation_digest) if turn_acted else None
+                    unchanged_screen_note(observation_digest, previous_observation_digest) if turn_acted else None
+                )
+                record_visual_action_outcome(
+                    observation_digest, previous_observation_digest, turn["tool_calls"], results,
                 )
                 if should_reuse_observation(
-                    observation_digest, last_observation_digest,
+                    observation_digest, previous_observation_digest,
                     current_turn=iteration, last_injected_turn=last_observation_injected_turn,
                 ):
                     observations_reused += 1
@@ -1331,6 +1599,9 @@ async def run_agent_with_callback(
 
             if duplicate_navigation_notes:
                 messages.append({"role": "user", "content": "\n".join(duplicate_navigation_notes)})
+            failure_recovery: Optional[str] = failed_tool_recovery_message(turn["tool_calls"], results)
+            if failure_recovery is not None:
+                messages.append({"role": "user", "content": failure_recovery})
             if turn["finish_reason"] == "length":
                 messages.append({
                     "role": "user",
@@ -1341,14 +1612,36 @@ async def run_agent_with_callback(
                     ),
                 })
 
-            all_failed: bool = bool(results) and failures_in_turn == len(results)
-            previous_ledger: str = task_ledger
-            previous_facts_count: int = len(host_task_ledger["facts"])
+            # Gönderim koruması: yazılmış bir taslak gönderildiyse sonraki turlarda sayfadan ayrılma
+            # kilitlenir; ajan ekrandan gönderimi doğrulayınca (ya da gönder düğmesine yeniden
+            # basınca) koruma kalkar. Canlı kayıtta ajan gönderiyi yayınlamadan sayfayı
+            # değiştirdi ve taslak hiç gönderilmedi.
+            turn_pairs: List[Tuple[ToolCallDraft, ToolResult]] = list(
+                zip(turn["tool_calls"], results, strict=True)
+            )
+            executed_turn_calls: List[Optional[ToolCallDraft]] = [
+                executed_call_prefix(call, result) for call, result in turn_pairs
+            ]
+            if any(call is not None and text_entry_call(call) for call in executed_turn_calls):
+                composed_text_seen = True
+            if composed_text_seen and any(
+                call is not None and commit_action_call(call) for call in executed_turn_calls
+            ):
+                commit_pending_turn = iteration
+            # Başka bir GUI tıklaması gönderim onayı değildir; koruma süre penceresi boyunca sürer.
+            if any(result.get("ok") and commit_navigation_call(call) for call, result in turn_pairs):
+                # Sayfa gerçekten değiştiyse önceki taslak bağlamı bitti.
+                composed_text_seen = False
+
+            all_failed: bool = bool(results) and all(
+                not result.get("ok") and int(result.get("completed_steps") or 0) == 0
+                for result in results
+            )
             task_ledger = extract_task_ledger(task_ledger, turn["content"])
             if turn["content"]:
                 host_task_ledger = record_model_state(host_task_ledger, turn["content"])
             combined_ledger = format_ledger_prompt(host_task_ledger) or task_ledger
-            ledger_changed: bool = (task_ledger != previous_ledger) or (len(host_task_ledger["facts"]) > previous_facts_count)
+            ledger_changed: bool = host_task_ledger["facts"] != facts_before_turn
             unresolved_deliverables: int = 0 if (_ledger_delivery_ready(task_ledger) or _ledger_delivery_ready(combined_ledger)) else 1
             observation_digest: Optional[str] = ":".join(turn_observation_digests)[:512] or None
             signature: str = turn_progress_signature(
@@ -1382,42 +1675,37 @@ async def run_agent_with_callback(
             )
             if not semantic_progress:
                 fast_loop_stagnation_events += 1
-            previous_phase = fast_loop_state.phase
-            decision = advance_fast_loop(
-                fast_loop_state,
-                TurnSignal(
-                    signature=signature,
-                    semantic_progress=semantic_progress,
-                    unresolved_deliverables=unresolved_deliverables,
-                    uncached_prompt_tokens=max(0, usage["prompt_tokens"] - usage["cached_tokens"]),
-                    tool_calls=tool_call_count,
-                    delivery_ready=_ledger_delivery_ready(task_ledger) or _ledger_delivery_ready(combined_ledger),
-                    visual_turn=bool(turn_observation_digests),
-                ),
-                fast_loop_policy,
-            )
-            fast_loop_state = decision.state
-            if decision.notice:
-                emit({"kind": "notice", "level": "warning", "text": decision.notice})
-            if decision.request_replan:
-                messages.append({"role": "user", "content": _fast_loop_prompt("replan", combined_ledger)})
-            elif decision.entered_delivery:
-                fast_loop_delivery_entries += 1
-                messages.append({"role": "user", "content": _fast_loop_prompt("delivery", combined_ledger)})
-            elif previous_phase != fast_loop_state.phase and fast_loop_state.phase == "conserve":
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "HOST FAST LOOP — CONSERVE: Opsiyonel keşfi ve tekrar kontrollerini azalt; "
-                        "mevcut STATE ile zorunlu işi en kısa yoldan sürdür."
+            if not continuous:
+                previous_phase = fast_loop_state.phase
+                decision = advance_fast_loop(
+                    fast_loop_state,
+                    TurnSignal(
+                        signature=signature,
+                        semantic_progress=semantic_progress,
+                        unresolved_deliverables=unresolved_deliverables,
+                        delivery_ready=_ledger_delivery_ready(task_ledger) or _ledger_delivery_ready(combined_ledger),
+                        visual_turn=bool(turn_observation_digests),
                     ),
-                })
-            if decision.stop_reason is not None:
-                if not continuous:
+                    fast_loop_policy,
+                )
+                fast_loop_state = decision.state
+                if decision.notice:
+                    emit({"kind": "notice", "level": "warning", "text": decision.notice})
+                if decision.request_replan:
+                    messages.append({"role": "user", "content": _fast_loop_prompt("replan", combined_ledger)})
+                elif decision.entered_delivery:
+                    fast_loop_delivery_entries += 1
+                    messages.append({"role": "user", "content": _fast_loop_prompt("delivery", combined_ledger)})
+                elif previous_phase != fast_loop_state.phase and fast_loop_state.phase == "conserve":
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "HOST FAST LOOP — CONSERVE: Opsiyonel keşfi ve tekrar kontrollerini azalt; "
+                            "mevcut STATE ile zorunlu işi en kısa yoldan sürdür."
+                        ),
+                    })
+                if decision.stop_reason is not None:
                     reason = decision.stop_reason
-                    break
-                if not await continue_with_direction(decision.stop_reason):
-                    outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
                     break
 
             # Her tur sonunda oturum kontrol noktası atomik olarak saklanır
@@ -1426,7 +1714,7 @@ async def run_agent_with_callback(
                 save_checkpoint(
                     session_id=session_id,
                     goal=goal,
-                    facts=host_task_ledger["facts"],
+                    facts={key: fact["value"] for key, fact in host_task_ledger["facts"].items()},
                     completed_steps=completed_summary,
                     turn_count=iteration,
                 )
@@ -1442,9 +1730,7 @@ async def run_agent_with_callback(
                 if not continuous:
                     reason = stall
                     break
-                if not await continue_with_direction(stall):
-                    outcome, reason = "Kullanıcı tarafından durduruldu.", "durduruldu"
-                    break
+                recover_continuous(stall)
         else:
             success = False
             reason = f"maksimum iterasyon sayısına ({max_iterations}) ulaşıldı"
@@ -1587,3 +1873,14 @@ if __name__ == "__main__":
     # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
     apply_stored_api_keys()
     asyncio.run(run_agent(cli_goal))
+
+
+# Genel API: modülün dışa açtığı adlar. Testlerin kastî olarak yamaladığı iç seam'ler (ör.
+# _trim_old_turns, _call_model_with_retries, _screenshot_observation_with_digest) alt çizgiyle
+# başladığı için burada yer almaz; modülde erişilebilir kalır. Star-import yalnız bu adları getirir.
+__all__: List[str] = sorted(
+    name for name, value in globals().items()
+    if not name.startswith("_")
+    and (getattr(value, "__module__", None) == __name__
+         or isinstance(value, (str, int, float, bool, tuple, frozenset, list)))
+)

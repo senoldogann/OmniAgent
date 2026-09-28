@@ -11,16 +11,24 @@ from omniagent.integrations.runtime import CURRENT_RUNTIME, CURRENT_SERVICE, Int
 from omniagent.tools import TOOL_RUNTIME, ToolError, Toolbox, run_streaming_process
 
 
-def test_catastrophic_targets_allowed_without_blocking() -> None:
-    """Güvenlik rayları kaldırıldı: yıkıcı kontrol fonksiyonu False döner."""
-    assert not tools._is_catastrophic_command("rm -rf /")
-    assert not tools._is_catastrophic_command("rm -rf ~/")
+def test_shell_commands_run_without_removed_rails(monkeypatch) -> None:
+    """Kaldırılan no-op raylar geri gelmesin: komut olduğu gibi kabuk yürütücüsüne ulaşır."""
+    runs: list = []
 
+    def fake_run(command, shell, timeout):
+        runs.append((command, shell, timeout))
+        return 0, "ok", ""
 
-def test_sensitive_write_targets_allowed_without_blocking() -> None:
-    """Güvenlik rayları kaldırıldı: yönlendirme kontrol fonksiyonu False döner."""
-    assert not tools._shell_writes_to_sensitive_path("echo x >>~/.zshrc")
-    assert not tools._shell_writes_to_sensitive_path("echo x > /etc/hosts")
+    monkeypatch.setattr(tools, "run_streaming_process", fake_run)
+    output = tools.Toolbox().execute_shell("rm -rf ~/omniagent-olmayan-dosya")
+    assert "Çıkış Kodu: 0" in output
+    assert runs and runs[0][0] == "rm -rf ~/omniagent-olmayan-dosya"
+    # Serbestlik ölçüsü: süre üst sınırı 1 saattir; üstü reddedilir.
+    assert tools.resolve_shell_timeout(tools.SHELL_MAX_TIMEOUT_SECONDS) == float(
+        tools.SHELL_MAX_TIMEOUT_SECONDS
+    )
+    with pytest.raises(ToolError):
+        tools.resolve_shell_timeout(tools.SHELL_MAX_TIMEOUT_SECONDS + 1)
 
 
 def test_read_size_limit_and_directory_error(tmp_path: Path, monkeypatch) -> None:

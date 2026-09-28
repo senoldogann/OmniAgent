@@ -17,8 +17,6 @@ class FastLoopPolicy:
     stagnation_window: int = 2
     visual_stagnation_window: int = 3
     delivery_stagnation_limit: int = 2
-    soft_uncached_prompt_tokens: int = 60_000
-    soft_tool_calls: int = 24
 
 
 @dataclass(frozen=True)
@@ -30,7 +28,6 @@ class FastLoopState:
     semantic_progress_events: int = 0
     transitions: int = 0
     last_signature: Optional[str] = None
-    pressure_seen: bool = False
 
 
 @dataclass(frozen=True)
@@ -40,8 +37,6 @@ class TurnSignal:
     signature: str
     semantic_progress: bool
     unresolved_deliverables: int
-    uncached_prompt_tokens: int
-    tool_calls: int
     delivery_ready: bool = False
     visual_turn: bool = False
 
@@ -117,10 +112,6 @@ def advance_fast_loop(
 ) -> FastLoopDecision:
     """Advance the execution phase from host-observed semantic progress."""
     progressed = bool(signal.semantic_progress)
-    pressure = (
-        signal.uncached_prompt_tokens >= policy.soft_uncached_prompt_tokens
-        or signal.tool_calls >= policy.soft_tool_calls
-    )
     stagnation_window: int = (
         policy.visual_stagnation_window if signal.visual_turn else policy.stagnation_window
     )
@@ -139,7 +130,6 @@ def advance_fast_loop(
         delivery_stagnant_turns=delivery_stagnant,
         semantic_progress_events=progress_events,
         last_signature=signal.signature,
-        pressure_seen=state.pressure_seen or pressure,
     )
 
     if state.phase == "delivery":
@@ -168,18 +158,6 @@ def advance_fast_loop(
             delivery,
             entered_delivery=True,
             notice="Zorunlu iş teslim aşamasına hazır; opsiyonel keşif kapatılıyor.",
-        )
-
-    if state.phase == "fast" and pressure:
-        conserve = replace(
-            updated,
-            phase="conserve",
-            stagnant_turns=0,
-            transitions=updated.transitions + 1,
-        )
-        return FastLoopDecision(
-            conserve,
-            notice="Çalışma bütçesi baskısı: opsiyonel keşif azaltılıyor, zorunlu iş korunuyor.",
         )
 
     if state.phase == "fast" and stagnant >= stagnation_window:

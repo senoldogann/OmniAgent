@@ -24,6 +24,12 @@ def screen_reading_schemas() -> List[Dict[str, Any]]:
     """
     return [
         _function_schema(
+            "cua_read_visible_text",
+            "Seçili ekranda şu an görünen yazıları tam çözünürlüklü macOS OCR ile okur; metinleri "
+            "0-1000 merkez koordinatlarıyla döner. Küçük veya belirsiz yazıyı söylemeden önce doğrula.",
+            {},
+        ),
+        _function_schema(
             "cua_click_text",
             "Görünür metne (bağlantı, düğme, sekme, liste/ilan başlığı, menü öğesi, onay kutusu etiketi) "
             "OCR ile bulup tam ortasına tıklar; nokta tahmininden kesindir. Metin birden çok yerdeyse "
@@ -39,7 +45,8 @@ def screen_reading_schemas() -> List[Dict[str, Any]]:
         _function_schema(
             "cua_scroll",
             "point'in altındaki paneli/sayfayı kaydırır. amount görüntü yüksekliğinin binde biridir "
-            "(500 = yarım görüntü). Sonuç 'KAYMADI' derse o yönde içerik bitmiştir.",
+            "(500 = yarım görüntü). 'KAYMADI' sonucu sonu veya yanlış/kaydırılamaz hedefi gösterir; "
+            "tam kapsam için cua_read_scrollable sonucunu doğrula.",
             {
                 "point": POINT_SCHEMA,
                 "direction": {"type": "string", "enum": ["down", "up", "right", "left"]},
@@ -205,7 +212,7 @@ def route_tool_schemas(
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},
             "timeout_seconds": {
                 "type": ["integer", "null"],
-                "description": "null: 60 sn. Uzun kurulum/derleme/indirme için en çok 900.",
+                "description": "null: 60 sn. Uzun kurulum/derleme/indirme için en çok 3600.",
             },
         }),
         _function_schema("process_list", "Süreç sayısını ve CPU'ya göre en ağır 15 süreci döner.", {}),
@@ -297,7 +304,8 @@ def route_tool_schemas(
         ),
         _function_schema(
             "take_screenshot",
-            "Seçilen ekranın 1000×1000 görüntüsünü alır. display_index=2 ikinci monitörü seçer; "
+            "Seçilen ekranı en-boy oranıyla dosyaya kaydeder; modele 1000×1000 koordinat haritası "
+            "ve oranı korunmuş ayrıntı görüntüsü gönderir. display_index=2 ikinci monitörü seçer; "
             "sonraki görüntü ve tıklamalar aynı ekranda kalır. Noktalar tıklama araçlarıyla aynı uzaydadır. "
             "Son eylemden sonra ekranın durulmasını kendisi bekler.",
             {
@@ -305,6 +313,11 @@ def route_tool_schemas(
                 "display_index": {
                     "type": ["integer", "null"],
                     "description": "1 ana ekran, 2 ikinci ekran; null/eksik son seçilen ekran (başlangıçta ana).",
+                },
+                "detail": {
+                    "type": "boolean",
+                    "description": "Ekranı tarif etmek/küçük ayrıntıyı incelemek için true (varsayılan); "
+                                   "hızlı eylem doğrulaması için false.",
                 },
             },
             required=["filename"],
@@ -339,11 +352,15 @@ def route_tool_schemas(
         ),
         _function_schema(
             "run_action_sequence",
-            "Fare/klavye eylemlerini TEK çağrıda sırayla çalıştırır. click/move: point [x, y] (ekran "
+            "Fare/klavye ve metin okuma adımlarını TEK çağrıda sırayla çalıştırır. "
+            "click_text: text ve isteğe bağlı near; read_scrollable: point ve max_pages. "
+            "Bu ikisini listedeki birkaç öğenin detayını art arda açıp okumak için çiftler halinde kullan. "
+            "click/move: point [x, y] (ekran "
             "görüntüsü/AX uzayı); click clicks=2 çift tıklar (dosya/uygulama açma, kelime seçme); drag: "
             "point'ten to'ya basılı sürükler (dosya taşıma, kaydırıcı, metin seçimi); type: text (her "
             "Unicode metin, Türkçe dahil); press: key ('enter', 'tab', 'escape', 'cmd+c', 'cmd+shift+t'); "
-            "wait: seconds (en çok 5).",
+            "wait: seconds (en çok 5). Var olan alan değerini değiştirmek için click_text → type "
+            "kullanma: metin eklenir. cua_fill_field çağır veya tıklamadan sonra cmd+a → type yap.",
             {
                 "steps": {
                     "type": "array",
@@ -351,8 +368,10 @@ def route_tool_schemas(
                     "items": {
                         "type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["click", "drag", "move", "type", "press", "wait"]},
+                            "action": {"type": "string", "enum": ["click", "click_text", "read_scrollable", "drag", "move", "type", "press", "wait"]},
                             "point": POINT_SCHEMA,
+                            "near": {**POINT_SCHEMA, "description": "click_text: hedef metnin yakınındaki [x, y]; bilinmiyorsa atla."},
+                            "max_pages": {"type": "integer", "description": "read_scrollable: en çok 1-15 sayfa."},
                             "to": {**POINT_SCHEMA, "description": "drag: bırakılacak [x, y] noktası."},
                             "button": {"type": "string", "enum": ["left", "right", "middle"]},
                             "clicks": {"type": "integer", "enum": [1, 2, 3], "description": "click: 2 çift, 3 üçlü tıklama."},
@@ -386,7 +405,7 @@ def route_tool_schemas(
         excluded = {
             "browse_url", "discover_capabilities", "fetch_raw", "web_search",
             "execute_shell", "execute_js", "process_list",
-            "run_action_sequence", "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
+            "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
         }
         if skills_sh_goal(goal):
             # Açık Chrome eylemleri görünür kalır; açıkça istenen skill kaynağı okunabilir.
@@ -510,6 +529,7 @@ _DETERMINISTIC_PROGRESS_TOOLS: frozenset[str] = frozenset({
 })
 _READ_PROGRESS_TOOLS: frozenset[str] = frozenset({
     "web_search", "fetch_raw", "read_file", "browse_url", "cua_read_scrollable",
+    "cua_read_visible_text",
 })
 AUTO_OBSERVATION_PREVIEW: str = "otomatik gözlem"
 VERIFICATION_OBSERVATION_PREVIEW: str = "bitiş doğrulaması"

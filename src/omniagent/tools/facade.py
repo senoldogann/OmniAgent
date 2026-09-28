@@ -36,7 +36,7 @@ from omniagent.memory import user as memory
 from omniagent.platform.macos import screen_text as st
 from omniagent.config import redact
 from omniagent.core import schedule, state as sm
-from omniagent.paths import schedules_file
+from omniagent.paths import schedules_file, workspace_dir
 from omniagent.integrations.runtime import CURRENT_RUNTIME, DeliveryFailed
 from omniagent.approval import approval_granted
 
@@ -50,7 +50,7 @@ from .types import (
     HISTORY_RESULT_LIMIT, JS_TIMEOUT_SECONDS,
     MAX_WAIT_SECONDS, MODEL_SCREEN_SIZE,
     PAGE_ACTION_TIMEOUT_MS, PAGE_ELEMENT_LIMIT,
-    PAGE_LOAD_TIMEOUT_MS, READ_EDGE_UNITS,
+    PAGE_LOAD_TIMEOUT_MS, OCR_AFTER_INPUT_MIN_SECONDS, READ_EDGE_UNITS,
     READ_FIRST_STEP_SHARE, READ_GAP_MARKER,
     READ_MAX_PAGES, READ_STEP_SHARE,
     READ_TEXT_LIMIT, READ_TOP_ATTEMPTS,
@@ -66,7 +66,7 @@ from .types import (
     SHELL_STDERR_LIMIT, SHELL_STDOUT_LIMIT,
     SHELL_TIMEOUT_SECONDS, STREAM_READ_CHARS,
     STREAM_STDERR_MAX_BYTES, STREAM_STDOUT_MAX_BYTES,
-    TEXT_CANDIDATE_LIMIT, TIMEOUT_OUTPUT_TAIL,
+    TEXT_CANDIDATE_LIMIT, TEXT_FOCUS_RADIUS, TEXT_NEAR_MAX_DISTANCE, TIMEOUT_OUTPUT_TAIL,
     TOOL_RUNTIME, TYPED_TEXT_ECHO_LIMIT,
     UNICODE_CHUNK_DELAY_SECONDS, UNICODE_CHUNK_UNITS,
     ActionStep, AXElement, BrowserAction,
@@ -75,17 +75,14 @@ from .types import (
 )
 
 from .system import (
-    _call_approved, _clip, _command_words, _dangerous_rm_target,
-    _has_shell_expansion, _is_catastrophic_command, _nested_shell_commands,
-    _pump_lines, _shell_path, _shell_segments, _shell_tokens,
-    _shell_writes_to_sensitive_path, child_environment,
+    _call_approved, _clip, _command_words, _nested_shell_commands,
+    _pump_lines, _shell_segments, _shell_tokens, child_environment,
     output_tail, parent_process_name, resolve_shell_timeout,
     run_streaming_process, shell_command_words,
 )
 
 from .filesystem import (
-    _backup_file, _is_sensitive_path, _logical_path,
-    _sensitive_prefixes, _sensitive_read_allowed, _sensitive_write_allowed,
+    _backup_file, _logical_path,
     clean_html, edit_file_content, missing_path_hint,
     read_file_content, read_full_file, write_file_content,
 )
@@ -151,6 +148,7 @@ class Toolbox:
         memory_file: Optional[str] = None,
         allow_memory_mutation: bool = False,
         history_file: Optional[str] = None,
+        allow_source_relative_writes: bool = False,
     ) -> None:
         self._headless_browser: HeadlessBrowserSession = HeadlessBrowserSession()
         self.cua: CUA = CUA()
@@ -159,6 +157,11 @@ class Toolbox:
         self._memory_file: Optional[str] = memory_file
         self._allow_memory_mutation: bool = allow_memory_mutation
         self._history_file: Optional[str] = history_file
+        # Yalnız görev kaynak deposunu açıkça hedefliyorsa (source_change_expected) True:
+        # o zaman write_file/take_screenshot göreli yolları eskisi gibi süreç çalışma
+        # dizinine (proje köküne) çözer. Aksi halde göreli yol workspace_dir()'a bağlanır;
+        # "leads.md" gibi hedefsiz dosya adları artık kaynak deposuna düşmez.
+        self._allow_source_relative_writes: bool = allow_source_relative_writes
         self._chrome_applescript_available: Optional[bool] = None
         self._screen_scope_app: Optional[str] = None
         self._visual_geometry: Optional[ScreenGeometry] = None
@@ -424,18 +427,6 @@ class Toolbox:
         if not command.strip():
             raise ToolError("Boş kabuk komutu çalıştırılamaz.", "EMPTY_COMMAND", False)
         limit = resolve_shell_timeout(timeout_seconds)
-        if _is_catastrophic_command(command):
-            raise ToolError(
-                f"Bilinen yıkıcı komut kalıbıyla eşleşti, çalıştırma engellendi: {command}",
-                "CATASTROPHIC_COMMAND_BLOCKED",
-                False,
-            )
-        if _shell_writes_to_sensitive_path(command) and not _sensitive_write_allowed():
-            raise ToolError(
-                f"Komut korunan bir sistem/kimlik yoluna yönlendirme yapıyor, engellendi: {command}.",
-                "SENSITIVE_PATH_BLOCKED",
-                False,
-            )
         full_command: Union[str, List[str]] = (
             ["sudo", "-n", "/bin/sh", "-c", command] if use_sudo else command
         )
@@ -450,9 +441,14 @@ class Toolbox:
                 error.code, error.recoverable,
             ) from error
         if returncode != 0:
+            partial_note = (
+                " Önceki adımlar çıktı üretti ve yan etki yapmış olabilir: aynı çok adımlı "
+                "komutu baştan çalıştırmadan önce güncel durumu oku; yalnız eksik adımı sürdür."
+                if stdout.strip() else ""
+            )
             raise ToolError(
                 f"Kabuk komutu başarısız: çıkış={returncode}, "
-                f"stdout={_clip(stdout, 1000)}, stderr={_clip(stderr, 1000)}",
+                f"stdout={_clip(stdout, 1000)}, stderr={_clip(stderr, 1000)}.{partial_note}",
                 "SHELL_EXIT",
                 True,
             )
@@ -490,9 +486,17 @@ class Toolbox:
         top = sorted(lines, key=cpu_key, reverse=True)[:15]
         return f"Toplam süreç sayısı: {len(lines)}\nEn ağır 15 süreç (CPU'ya göre):\n" + "\n".join(top)
 
-    def take_screenshot(self, filename: str, display_index: Optional[int] = None) -> str:
+    def take_screenshot(
+        self, filename: str, display_index: Optional[int] = None, detail: bool = True,
+    ) -> str:
         """Etkin pencere veya ekran kapsamını model koordinatlarıyla kaydeder."""
-        target = Path(filename).expanduser()
+        if not isinstance(detail, bool):
+            raise ToolError("detail true veya false olmalı.", "INVALID_SCREEN_DETAIL", False)
+        raw_target = Path(filename).expanduser()
+        target = (
+            raw_target if raw_target.is_absolute() or self._allow_source_relative_writes
+            else workspace_dir() / raw_target
+        )
         settle_note = ""
         if self._pending_input is not None:
             _require_screen_capture()
@@ -538,10 +542,15 @@ class Toolbox:
             if self._screen_scope_app is not None
             else f"Ekran {display_index} — " if display_index is not None else ""
         )
+        detail_note = (
+            " ve oranı korunmuş ayrıntı görüntüsü"
+            if detail and (frame.width != frame.height or frame.width > MODEL_SCREEN_SIZE) else ""
+        )
         return (
             f"{scope_label}Ekran görüntüsü {target} dosyasına kaydedildi "
-            f"({geometry['model_width']}×{geometry['model_height']}; bu görüntüdeki koordinatlar tıklama "
-            "araçlarıyla aynı uzayda)."
+            f"({frame.width}×{frame.height} piksel, gerçek en-boy oranı). "
+            f"Modele {geometry['model_width']}×{geometry['model_height']} koordinat haritası"
+            f"{detail_note} iletilir; tıklama noktaları koordinat haritasındadır."
             + settle_note
         )
 
@@ -691,9 +700,38 @@ class Toolbox:
             client_factory=DDGS,
         )
 
+    def _browser_progress(self) -> Optional[Callable[[str], None]]:
+        """
+        browse_url adımlarını kullanıcıya canlı gösteren yayın geri çağrısı. Arka plandaki
+        Chromium penceresi görünmediği için ajanın ne yaptığı yalnız bu tool_output olaylarıyla
+        izlenir; satırlar modele/transcripte gitmeden önce bilinen sırlardan arındırılır.
+        """
+        runtime = TOOL_RUNTIME.get()
+        if runtime is None:
+            return None
+        emit = runtime["emit_output"]
+        return lambda line: emit(redact(line))
+
     async def browse_url(self, url: Optional[str], actions: List[BrowserAction]) -> str:
-        page = await self._get_page()
-        return await browse_page_actions(page, url, actions)
+        """
+        Arka plandaki ayrı Chromium'da sayfa açar. Tarayıcı motoru kurulu değilse salt okuma
+        çağrısı boşa düşmesin: fetch_raw (statik HTML) sonucu açık bir notla döner. Her
+        gezinme/eylem adımı canlı tool_output olayı olarak yayınlanır (bkz. _browser_progress).
+        """
+        progress: Optional[Callable[[str], None]] = self._browser_progress()
+        try:
+            page = await self._get_page()
+        except ToolError as error:
+            if error.code == "BROWSER_UNAVAILABLE" and url is not None and not actions:
+                if progress is not None:
+                    progress(f"⚠ tarayıcı motoru yok; statik okumaya düşülüyor: {url}\n")
+                return (
+                    "TARAYICI MOTORU YOK: ayrı Chromium bu kurulumda başlatılamadı; sayfa "
+                    "fetch_raw (statik HTML) ile okundu. JavaScript gerektiren etkileşim ve "
+                    "sayfadaki öğe listesi bu çağrıda yok.\n\n" + fetch_raw_content(url)
+                )
+            raise
+        return await browse_page_actions(page, url, actions, progress)
 
     def fetch_raw(self, url: str) -> str:
         return fetch_raw_content(url)
@@ -788,12 +826,80 @@ class Toolbox:
             if frame_change_ratio(before, after, SCROLL_PIXEL_DELTA) < SCROLL_MOVED_RATIO:
                 return
 
+    def _wait_pending_input(self) -> None:
+        """Önceki GUI girdisinin yüklenmesini sonraki okuma/kaydırmadan önce bekler."""
+        if self._pending_input is None:
+            return
+        wait_for_screen_settle(
+            self._pending_input["baseline"], self._pending_input["at"],
+            self._settle_frame, OCR_AFTER_INPUT_MIN_SECONDS,
+        )
+        self._pending_input = None
+
     def _screen_text(self) -> Tuple[List[st.TextLine], ScreenGeometry]:
+        self._wait_pending_input()
         image, geometry = self._scope_image(Quartz.kCGWindowImageDefault)
         try:
             return st.recognize_text(image), geometry
         except st.TextRecognitionError as error:
             raise ToolError(str(error), "OCR_FAILED", True) from error
+
+    def cua_read_visible_text(self) -> str:
+        """Görünen ekran metnini tam çözünürlüklü OCR ile koordinatlarıyla okur."""
+        lines, _geometry = self._screen_text()
+        if not lines:
+            return "Görünür metin bulunamadı."
+        rendered = [
+            f"@{st.box_center(line['box'])} {line['text']}"
+            for line in lines
+        ]
+        return _clip(f"Görünen metin ({len(lines)} satır; noktalar 0-1000 uzayında):\n"
+                     + "\n".join(rendered), READ_TEXT_LIMIT)
+
+    def _focused_text_match(
+        self, text: str, near: Tuple[int, int], geometry: ScreenGeometry,
+    ) -> Optional[st.TextMatch]:
+        """Tam ekran OCR hedefi kaçırınca aynı ekranın hedef bölgesini yeniden okur."""
+        image, current_geometry = self._scope_image(Quartz.kCGWindowImageDefault)
+        if current_geometry != geometry:
+            raise ToolError("Ekran geometrisi değişti; yeni görüntü al.", "SCREEN_GEOMETRY_CHANGED", True)
+        left = max(0, near[0] - TEXT_FOCUS_RADIUS)
+        top = max(0, near[1] - TEXT_FOCUS_RADIUS)
+        right = min(MODEL_SCREEN_SIZE, near[0] + TEXT_FOCUS_RADIUS)
+        bottom = min(MODEL_SCREEN_SIZE, near[1] + TEXT_FOCUS_RADIUS)
+        image_width = Quartz.CGImageGetWidth(image)
+        image_height = Quartz.CGImageGetHeight(image)
+        pixel_left = round(left * image_width / MODEL_SCREEN_SIZE)
+        pixel_top = round(top * image_height / MODEL_SCREEN_SIZE)
+        pixel_right = round(right * image_width / MODEL_SCREEN_SIZE)
+        pixel_bottom = round(bottom * image_height / MODEL_SCREEN_SIZE)
+        crop = Quartz.CGImageCreateWithImageInRect(
+            image, Quartz.CGRectMake(pixel_left, pixel_top,
+                                     max(1, pixel_right - pixel_left), max(1, pixel_bottom - pixel_top)),
+        )
+        if crop is None:
+            raise ToolError("Yakın bölgenin görüntüsü alınamadı.", "OCR_FOCUS_FAILED", True)
+        try:
+            lines = st.recognize_text(crop)
+        except st.TextRecognitionError as error:
+            raise ToolError(str(error), "OCR_FAILED", True) from error
+        local_near = (
+            round((near[0] - left) * MODEL_SCREEN_SIZE / (right - left)),
+            round((near[1] - top) * MODEL_SCREEN_SIZE / (bottom - top)),
+        )
+        chosen, tied = st.select_text_match(st.find_text_matches(lines, text), local_near)
+        if tied:
+            raise ToolError(f"{text!r} yakın bölgede birden çok yerde görünüyor; tıklanmadı.",
+                            "TEXT_AMBIGUOUS", True)
+        if chosen is None:
+            return None
+        box = chosen["box"]
+        return {**chosen, "box": {
+            "left": left + box["left"] * (right - left) / MODEL_SCREEN_SIZE,
+            "top": top + box["top"] * (bottom - top) / MODEL_SCREEN_SIZE,
+            "width": box["width"] * (right - left) / MODEL_SCREEN_SIZE,
+            "height": box["height"] * (bottom - top) / MODEL_SCREEN_SIZE,
+        }}
 
     @_screen_input
     def cua_click_text(self, text: str, near: Optional[List[int]]) -> str:
@@ -801,6 +907,8 @@ class Toolbox:
         if not isinstance(text, str) or not text.strip():
             raise ToolError("Tıklanacak metin boş olamaz.", "INVALID_TEXT", False)
         near_point = parse_point(near) if near is not None else None
+        if near_point is not None and not all(0 <= value < MODEL_SCREEN_SIZE for value in near_point):
+            raise ToolError("near noktası 0-999 aralığında olmalı.", "INVALID_POINT", False)
         lines, geometry = self._screen_text()
         matches = st.find_text_matches(lines, text)
         chosen, tied = st.select_text_match(matches, near_point)
@@ -815,6 +923,23 @@ class Toolbox:
                 "TEXT_AMBIGUOUS",
                 True,
             )
+        if near_point is not None:
+            distant = chosen is None or sum(
+                (value - target) ** 2
+                for value, target in zip(st.box_center(chosen["box"]), near_point, strict=True)
+            ) > TEXT_NEAR_MAX_DISTANCE ** 2
+            if distant:
+                focused = self._focused_text_match(text, near_point, geometry)
+                if focused is not None:
+                    chosen = focused
+                elif chosen is not None:
+                    candidate_point = st.box_center(chosen["box"])
+                    raise ToolError(
+                        f"{text!r} OCR eşleşmesi near={near_point} noktasından uzak; yanlış hedefe tıklanmadı. "
+                        f"Görünen eşleşme @{candidate_point}; yeni görüntü al ve bu eşleşmenin "
+                        "hedef olduğundan emin olunca ona yakın nokta ver.",
+                        "TEXT_TARGET_MISMATCH", True,
+                    )
         if chosen is None:
             similar = st.similar_texts(lines, text, TEXT_CANDIDATE_LIMIT)
             note = f" Benzer görünür metinler: {' · '.join(similar)}." if similar else ""
@@ -899,6 +1024,7 @@ class Toolbox:
                 False,
             )
         geometry = self._input_geometry()
+        self._wait_pending_input()
         move_model_point(x, y, geometry)
         self._scroll_to_start(geometry)
         first_lines, _first_geometry = self._screen_text()
@@ -1063,21 +1189,32 @@ class Toolbox:
                     f'Örnek: {{"action":"click","point":[100,200]}}. Tamamlanan adımlar: {executed}',
                     "INVALID_ACTION_PARAMS",
                     False,
+                    completed_steps=len(executed),
                 )
             try:
-                executed.append(_run_action_step(step, geometry))
+                if step.get("action") == "click_text":
+                    if not isinstance(step.get("text"), str):
+                        raise ToolError("click_text için text gerekli.", "INVALID_ACTION_PARAMS", False)
+                    executed.append(self.cua_click_text(step["text"], step.get("near")))
+                elif step.get("action") == "read_scrollable":
+                    observation = self.cua_read_scrollable(step["point"], step.get("max_pages", 15))
+                    executed.append(observation)
+                else:
+                    executed.append(_run_action_step(step, geometry))
             except (KeyError, TypeError, ValueError) as error:
                 raise ToolError(
                     f"Eylem {index} ({step.get('action')}) geçersiz parametrelerle başarısız: {error}. "
                     f"Tamamlanan adımlar: {executed}",
                     "INVALID_ACTION_PARAMS",
                     False,
+                    completed_steps=len(executed),
                 ) from error
             except ToolError as error:
                 raise ToolError(
                     f"Eylem {index} başarısız: {error}. Tamamlanan adımlar: {executed}",
                     error.code,
                     error.recoverable,
+                    completed_steps=len(executed),
                 ) from error
         return "Eylem dizisi tamamlandı:\n" + "\n".join(executed)
 
@@ -1156,7 +1293,8 @@ class Toolbox:
 
     def write_file(self, path: str, content: str) -> str:
         """Dosyaya tam içeriği atomik yazar."""
-        return write_file_content(path, content, self._read_full)
+        base = None if self._allow_source_relative_writes else workspace_dir()
+        return write_file_content(path, content, self._read_full, default_base=base)
 
     def edit_file(self, path: str, old_text: str, new_text: str) -> str:
         """Benzersiz metni değiştirir; tam içeriği write_file ile güvenle yazar."""
@@ -1187,3 +1325,14 @@ class _ToolsModule(_py_types.ModuleType):
 
 
 sys.modules[__name__].__class__ = _ToolsModule
+
+
+# facade'ın açık yüzeyi: module özgü fonksiyon/sınıflar ve yeniden dışa aktarılan sabitler.
+# Testlerin yamaladığı iç semboller (ör. _pump_lines) alt çizgiyle başladığı için burada yer
+# almaz; `tools` paketi bunları yine de kopyalar.
+__all__: List[str] = sorted(
+    name for name, value in globals().items()
+    if not name.startswith("_")
+    and (getattr(value, "__module__", None) == __name__
+         or isinstance(value, (str, int, float, bool, tuple, frozenset)))
+)

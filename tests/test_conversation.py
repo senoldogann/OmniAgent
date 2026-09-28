@@ -104,3 +104,12 @@ async def test_agent_history_and_all_outcomes(monkeypatch: pytest.MonkeyPatch, t
         assert "deneme hatası" in report["exchange"]["answer"]
     if mode == "stop":
         assert "durduruldu" in report["exchange"]["answer"]
+
+
+def test_system_prompt_teaches_public_material_is_not_a_leak() -> None:
+    """Canlı kayıtta ajan zaten herkese açık bir depoyu 'sızıntı' diye raporladı; kural sabitlendi."""
+    prompt: str = main.build_system_prompt(date.today(), None, "")
+
+    assert "Publicly published or documented material is not a leak" in prompt
+    assert "a filled field, an open composer" in prompt.lower()
+    assert "Never leave a page, tab, dialog or form" in prompt

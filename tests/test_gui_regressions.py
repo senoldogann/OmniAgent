@@ -199,6 +199,32 @@ def test_scan_lists_rows_and_links_with_descendant_labels(monkeypatch: pytest.Mo
     assert elements[0]["enabled"] is True  # eksik AXEnabled "pasif" sayılmaz
 
 
+def test_unlabeled_text_fields_get_a_label_from_link_or_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mail'in To/Konu/Gövde alanları etiketsiz gelir; ilişkili etiket veya tanımlayıcı okunur."""
+    monkeypatch.setattr(gui_input, "AX", _fake_ax())
+    linked = Node(AXRole="AXStaticText", AXValue="Kime:")
+    to_field = Node(
+        AXRole="AXTextField", AXPosition=_point(0, 10), AXSize=_size(300, 20),
+        AXTitleUIElement=linked,
+    )
+    subject = Node(
+        AXRole="AXTextField", AXPosition=_point(0, 40), AXSize=_size(300, 20),
+        AXIdentifier="mail-compose-subject",
+    )
+    body = Node(AXRole="AXTextArea", AXPosition=_point(0, 70), AXSize=_size(300, 60))
+    window = Node(AXRole="AXWindow", AXChildren=[to_field, subject, body])
+
+    elements, _refs, _truncated = gui_input.scan_ax_elements(window)
+
+    assert [(item["role"], item["label"]) for item in elements] == [
+        ("AXTextField", "Kime:"),
+        ("AXTextField", "mail-compose-subject"),
+        ("AXTextArea", ""),
+    ]
+
+
 def test_unresponsive_app_is_reported_not_silently_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gui_input, "AX", _fake_ax(copy_error=-25204))
     with pytest.raises(ToolError) as error:

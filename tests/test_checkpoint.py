@@ -3,6 +3,7 @@ Kontrol Noktası ve Durum Saklayıcı Testleri (tests/test_checkpoint.py)
 Atomik yazma, bozuk veri dayanıklılığı, en son checkpoint arama ve scratchpad biçimlendirmesi.
 """
 from pathlib import Path
+import stat
 import pytest
 
 from omniagent.core.checkpoint import (
@@ -36,6 +37,12 @@ def test_checkpoint_save_and_load_roundtrip(tmp_path: Path) -> None:
     assert loaded["facts"]["en_yuksek"] == "IL-12F528 6300 €"
     assert len(loaded["completed_steps"]) == 2
     assert loaded["turn_count"] == 6
+
+
+def test_checkpoint_file_is_owner_only(tmp_path: Path) -> None:
+    """Kontrol noktası yalnız kullanıcıya açık (0600) yazılır; oturum içeriği dışarı sızmasın."""
+    saved = save_checkpoint("run-private", "Gizli iş", {"token": "x"}, [], 1, runs_dir=tmp_path)
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
 
 
 def test_find_latest_checkpoint(tmp_path: Path) -> None:

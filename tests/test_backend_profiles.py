@@ -5,12 +5,32 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 import pytest
 
 from omniagent import config
 from omniagent.app import agent as main
+
+def test_missing_key_warning_state_is_injectable() -> None:
+    """Uyarı kaydı dışarıdan verilebilir; süreç düzeyi kaydı kirletilmez (test izolasyonu)."""
+    profiles: Dict[str, Any] = {
+        "openai": {
+            "provider": "openai", "base_url": "https://api.openai.com/v1", "api_key": None,
+            "model": "gpt-test", "max_tokens": 8, "session_header": None,
+            "extra_headers": {}, "extra_body": {},
+        },
+    }
+    main.model_runtime.reset_missing_key_warnings()
+    warned: Set[str] = set()
+    clients = main.model_runtime.create_model_clients(
+        backends=profiles, api_key_variables={"openai": "OPENAI_API_KEY"},
+        ollama_ready=lambda: False, warned=warned,
+    )
+    assert clients == {}
+    assert warned == {"openai"}
+    assert main.model_runtime._MISSING_KEY_WARNED == set()
+
 
 PROBE: str = (
     "import json; from omniagent import config;"

@@ -19,6 +19,15 @@ SECRET: str = "canli-gizli-anahtar-12345"
 macos_keychain = pytest.mark.skipif(sys.platform != "darwin", reason="macOS Keychain gerektirir")
 
 
+def test_redact_masks_all_known_secrets_in_one_pass(monkeypatch) -> None:
+    """redact tek geçişli kalıpla tüm sırları maskeler; sır yoksa metne dokunmaz."""
+    monkeypatch.setattr(config, "_RUNTIME_KEYS", {"SINAMA_ANAHTARI": SECRET})
+    masked = config.redact(f"iki kez {SECRET} ve {SECRET}")
+    assert SECRET not in masked
+    assert masked.count(config.SECRET_PLACEHOLDER) == 2
+    assert config.redact("sır yok") == "sır yok"
+
+
 class FakeKeyring:
     """Keychain'i taklit eden bellek içi depo (tests/test_outlook_auth.py ile aynı desen)."""
 

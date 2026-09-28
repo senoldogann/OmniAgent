@@ -15,6 +15,16 @@ from omniagent.integrations.mcp import MCPBridge, install_package, load_skill, r
 FIXTURE = Path(__file__).parent / "fixtures/mcp_server.py"
 
 
+def test_install_budget_never_goes_negative() -> None:
+    """Bütçe dolduğunda negatif süre yerine açık hata verilir; taze süreç öldürülmez."""
+    exhausted = mcp_bridge.time.monotonic() - mcp_bridge.INSTALL_BUDGET_SECONDS - 1
+    with pytest.raises(RuntimeError) as error:
+        mcp_bridge.install_step_timeout(exhausted)
+    assert "bütçe" in str(error.value)
+    remaining = mcp_bridge.install_step_timeout(mcp_bridge.time.monotonic())
+    assert 0 < remaining <= mcp_bridge.INSTALL_BUDGET_SECONDS
+
+
 def runtime():
     return IntegrationRuntime(lambda event: None, lambda: False)
 

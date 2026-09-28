@@ -91,6 +91,27 @@ def test_record_tool_result_is_pure_and_merges() -> None:
     assert ledger2["turn"] == 2
 
 
+def test_plain_tool_outcome_survives_long_context_without_becoming_a_model_claim() -> None:
+    original = tl.empty_task_ledger()
+    ledger = tl.record_tool_receipt(original, "w17", "write_file", True, "Dosya yazıldı: rapor.txt", 17)
+    ledger = tl.record_model_state(ledger, "STATE: Her şey tamamlandı")
+    prompt = tl.format_ledger_prompt(ledger)
+    assert original["receipts"] == []
+    assert "[w17] write_file: başarılı" in prompt
+    assert "Dosya yazıldı: rapor.txt" in prompt
+    assert "MODELİN ÇALIŞMA NOTU (doğrulanmamış" in prompt
+    assert "STATE: Her şey tamamlandı" in prompt
+
+
+def test_receipt_window_leaves_room_for_observed_facts() -> None:
+    ledger = tl.record_tool_result(tl.empty_task_ledger(), "read_file", "Status: Active", 1)
+    for turn in range(2, 10):
+        ledger = tl.record_tool_receipt(ledger, f"c{turn}", "read_file", True, "ok " * 50, turn)
+    prompt = tl.format_ledger_prompt(ledger)
+    assert "[c9] read_file" in prompt
+    assert "- status: Active" in prompt
+
+
 def test_record_model_state_captures_state_block() -> None:
     ledger = tl.empty_task_ledger()
     assistant_reply = "Sunucuyu kontrol ediyorum.\n\nSTATE:\nFACTS: cpu=4, memory=16GB\nREMAINING: disk kontrolü yap"

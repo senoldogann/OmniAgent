@@ -81,6 +81,7 @@ def test_screenshot_and_actions_keep_selected_display(
     )
     assert shot_schema["required"] == ["filename"]
     assert "display_index" in shot_schema["properties"]
+    assert "detail" in shot_schema["properties"]
 
 
 def test_display_rearrangement_requires_fresh_screenshot(monkeypatch: pytest.MonkeyPatch) -> None:

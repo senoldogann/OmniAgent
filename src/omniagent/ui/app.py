@@ -7,14 +7,17 @@ import webbrowser
 import json
 import math
 import threading
+import weakref
+from datetime import datetime, timezone
 from io import BytesIO
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import messagebox, simpledialog
 from concurrent.futures import Future
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Optional, Tuple
 
 import customtkinter as ctk
 from openai import AsyncOpenAI
@@ -44,43 +47,39 @@ from omniagent.app.continuous import (
 )
 from omniagent.core.state import EpisodeMetrics
 from omniagent.ui.markdown import render_markdown
+from omniagent.ui.appearance import (
+    AppearanceSettings, appearance_path, default_appearance, load_appearance,
+    save_appearance, validate_appearance,
+)
 from omniagent.core.conversation import Exchange, make_exchange, trim_history
-from omniagent.integrations.capabilities import Capability, CapabilityService
+from omniagent.ui.chats import (
+    ChatRecord, ChatSummary, chats_dir, delete_chat, delete_chats, load_catalog, load_chat, new_chat,
+    rename_chat, restore_chats, save_catalog, save_chat, spans_from_dump,
+)
+from omniagent.integrations.capabilities import CapabilityService
 from omniagent.platform.macos.voice import VoiceInput, VoiceInputError
-
-def format_capability_inventory(entries: List[Capability], show_skills: bool = False) -> str:
-    """Yerel kataloğu model veya ağ çağrısı olmadan kısa metne dönüştürür."""
-    executable = sorted((entry for entry in entries if entry.get("kind") != "skill"),
-                        key=lambda entry: entry.get("id", ""))
-    skills = sorted((entry for entry in entries if entry.get("kind") == "skill"),
-                    key=lambda entry: entry.get("id", ""))
-    if show_skills:
-        lines = [f"Kurulu skill sayısı: {len(skills)}"]
-        lines.extend("• " + str(entry.get("id", "")).removeprefix("skill:") for entry in skills)
-        return "\n".join(lines)
-    lines = ["Kayıtlı entegrasyonlar:"]
-    for entry in executable:
-        name = entry.get("id", "")
-        kind = entry.get("kind", "")
-        status = entry.get("connection", "unknown")
-        lines.append(f"• {name} ({kind}) · {status}")
-    lines.append(f"Kurulu skill sayısı: {len(skills)} · adlar için /skills")
-    return "\n".join(lines)
+# Saf sunum yardımcıları app.py'den ayrıldı (D4); adlar geriye dönük uyum için burada da
+# görünür kalır (ör. testler `ui.app.format_run_stats` kullanır).
+from omniagent.ui.rendering import (
+    COMMAND_LINES, INSERT_MARK, LIVE_TAIL_LINES, SUMMARY_LINES, TABLE_MAX_COLUMNS,
+    ToolView, TurnView, UiItem, clip_line, format_capability_inventory, format_run_stats,
+    summarize_result,
+)
 
 
 # --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
 # yüzeyler, mono transkript, $ komut satırları) ---
-BG: str = "#141413"
-SURFACE: str = "#1C1C1A"
-SURFACE_RAISED: str = "#262624"
-COMMAND_BG: str = "#1E1E1C"
-BORDER: str = "#34332F"
-TEXT: str = "#ECEAE3"
-TEXT_DIM: str = "#A3A199"
-TEXT_FAINT: str = "#6E6C66"
+BG: str = "#12151A"
+SURFACE: str = "#1B2027"
+SURFACE_RAISED: str = "#272E38"
+COMMAND_BG: str = "#1C222B"
+BORDER: str = "#343C47"
+TEXT: str = "#F2F3F5"
+TEXT_DIM: str = "#B4BBC5"
+TEXT_FAINT: str = "#828B98"
 ACCENT: str = "#D97757"
 ACCENT_HOVER: str = "#E48A6C"
-ACCENT_DIM: str = "#7A4634"
+ACCENT_DIM: str = "#40312F"
 SHINE: str = "#F6C4AE"
 SUCCESS: str = "#4EBA65"
 ERROR: str = "#FF6B80"
@@ -122,6 +121,14 @@ GEAR_SVG: str = """
   <path d="M12 3.2v2.4M12 18.4v2.4M3.2 12h2.4M18.4 12h2.4M5.9 5.9l1.7 1.7M16.4 16.4l1.7 1.7M18.1 5.9l-1.7 1.7M7.6 16.4l-1.7 1.7" stroke="ICON_COLOR" stroke-width="1.8" stroke-linecap="round"/>
 </svg>
 """
+EMPTY_SVG: str = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" fill="none">
+  <path d="M48 9l7.8 28.2L84 45l-28.2 7.8L48 81l-7.8-28.2L12 45l28.2-7.8L48 9z"
+        fill="ICON_COLOR"/>
+  <circle cx="72" cy="20" r="4" fill="ICON_COLOR" opacity=".55"/>
+  <circle cx="22" cy="72" r="3" fill="ICON_COLOR" opacity=".45"/>
+</svg>
+"""
 
 
 def _svg_ctk_image(svg: str, color: str, size: int = 20) -> ctk.CTkImage:
@@ -153,116 +160,6 @@ MAX_EVENTS_PER_FRAME: int = 400
 # Daktilo: her karede en az bu kadar karakter; birikme büyükse ~TYPEWRITER_DRAIN_FRAMES karede boşalır
 TYPEWRITER_MIN_CHARS: int = 3
 TYPEWRITER_DRAIN_FRAMES: int = 5
-LIVE_TAIL_LINES: int = 6
-SUMMARY_LINES: int = 4
-COMMAND_LINES: int = 6
-LINE_CLIP: int = 160
-INSERT_MARK: str = "omni_insert"
-# Sütunlu Markdown tablosu en dar pencerede de (560 px) satır kaydırmadan bu kadar mono
-# karaktere sığar; daha geniş tablo etiket/değer satırlarına dönüşür.
-TABLE_MAX_COLUMNS: int = 64
-
-
-class ToolView(TypedDict):
-    """Transkriptteki bir araç bloğunun durumu."""
-    region: str
-    name: str
-    preview: str
-    status: str
-    call_id: str
-    head: List[str]
-    tail: List[str]
-    line_count: int
-    result: str
-    seconds: float
-    started_at: float
-
-
-class TurnView(TypedDict):
-    number: int
-    text_region: Optional[str]
-    reasoning_region: Optional[str]
-    tools: Dict[int, ToolView]
-
-
-class UiItem(TypedDict):
-    """Ajan thread'lerinden arayüz thread'ine giden kuyruk öğesi."""
-    event: Optional[AgentEvent]
-    done: bool
-    error: str
-    report: Optional[RunReport]
-
-
-def _clip_line(line: str) -> str:
-    """Tek satırı gösterim sınırında kırpar. Saf."""
-    single: str = line.rstrip("\n")
-    return single if len(single) <= LINE_CLIP else single[:LINE_CLIP] + "…"
-
-
-def summarize_result(name: str, text: str, head: List[str], line_count: int, ok: bool) -> List[str]:
-    """Bitmiş aracın transkriptte gösterilecek kısa özet satırları (Claude Code tarzı). Saf."""
-    if not ok:
-        lines: List[str] = [line for line in text.strip().splitlines() if line.strip()]
-        more: List[str] = [f"… +{len(lines) - 3} satır"] if len(lines) > 3 else []
-        return [_clip_line(line) for line in lines[:3]] + more
-    if name in ("execute_shell", "execute_js"):
-        if line_count == 0:
-            return ["(çıktı yok)"]
-        rest: List[str] = [f"… +{line_count - SUMMARY_LINES} satır"] if line_count > SUMMARY_LINES else []
-        return [_clip_line(line) for line in head[:SUMMARY_LINES]] + rest
-    if name == "read_file":
-        return [f"{text.count(chr(10)) + 1} satır okundu"]
-    if name == "web_search":
-        try:
-            results: object = json.loads(text)
-        except json.JSONDecodeError:
-            results = []
-        titles: List[str] = [str(item.get("title", "")) for item in results if isinstance(item, dict)] if isinstance(results, list) else []
-        return [f"• {_clip_line(title)}" for title in titles[:SUMMARY_LINES]] or [_clip_line(text)]
-    lines = [line for line in text.strip().splitlines() if line.strip()]
-    tail_note: List[str] = [f"… +{len(lines) - 3} satır"] if len(lines) > 3 else []
-    return [_clip_line(line) for line in lines[:3]] + tail_note
-
-
-def format_run_stats(metrics: EpisodeMetrics) -> List[str]:
-    """Görev bitişinde tam token sayılarını ve süre dağılımını okunur satırlara çevirir."""
-    prompt: int = metrics["prompt_tokens"]
-    cached: int = min(prompt, metrics["cached_tokens"])
-    completion: int = metrics["completion_tokens"]
-    def fmt(value: int) -> str:
-        return f"{value:,}".replace(",", ".")
-    first: str = (
-        f"{metrics['elapsed_seconds']:.1f} sn · {metrics['turns']} tur · "
-        f"{metrics['tool_calls']} araç · {metrics['backend']}"
-    )
-    if "model_seconds" in metrics and "tool_seconds" in metrics:
-        first += f" · model {metrics['model_seconds']:.1f} sn · araç {metrics['tool_seconds']:.1f} sn"
-    second: str = (
-        f"Giriş {fmt(prompt)} (önbellek {fmt(cached)}, yeni {fmt(prompt - cached)})"
-        f" · çıkış {fmt(completion)} · toplam {fmt(prompt + completion)} token"
-    )
-    lines: List[str] = [first, second]
-    integration = metrics.get("integrations", {})
-    if integration:
-        pieces: List[str] = []
-        for key, label, unit in (
-            ("discovery_seconds", "keşif", " sn"),
-            ("install_seconds", "kurulum", " sn"),
-            ("network_seconds", "ağ", " sn"),
-            ("wait_seconds", "bekleme", " sn"),
-            ("user_wait_seconds", "kullanıcı", " sn"),
-            ("network_requests", "ağ isteği", ""),
-            ("operations_ok", "işlem başarılı", ""),
-            ("operations_failed", "işlem hatalı", ""),
-        ):
-            value = integration.get(key, 0)
-            if value:
-                pieces.append(f"{label} {value}{unit}")
-        if pieces:
-            lines.append("Entegrasyon: " + " · ".join(pieces))
-    return lines
-
-
 class OmniUI(ctk.CTk):
     """
     OmniAgent arayüzü: ajanın model yanıtını, araç çağrılarını, çalıştırdığı komutları ve
@@ -274,21 +171,51 @@ class OmniUI(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("dark")
         self.title("OmniAgent")
-        self.geometry("780x880")
-        self.minsize(560, 620)
+        self.geometry("1120x820")
+        self.minsize(800, 600)
         self.configure(fg_color=BG)
         self.bind("<Map>", lambda event: self.after_idle(self._style_native_window)
                   if event.widget is self else None, add="+")
-        self._ui_family: str = tkfont.nametofont("TkDefaultFont").actual("family")
+        self._system_ui_family: str = tkfont.nametofont("TkDefaultFont").actual("family")
+        try:
+            self._appearance: AppearanceSettings = load_appearance()
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            logging.warning("Görünüm ayarları okunamadı: %s", type(error).__name__)
+            self._appearance = default_appearance()
+        family = self._appearance["font_family"]
+        self._ui_family: str = family if family in tkfont.families() else self._system_ui_family
+        self._ui_fonts: Dict[int, Tuple[weakref.ReferenceType[ctk.CTkFont], int]] = {}
+        self.attributes("-alpha", self._window_alpha())
         self._voice_icon: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_DIM)
         self._voice_icon_active: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT)
         self._voice_icon_busy: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_FAINT)
         self._copy_icon: ctk.CTkImage = _svg_ctk_image(COPY_SVG, TEXT_DIM)
         self._gear_icon: ctk.CTkImage = _svg_ctk_image(GEAR_SVG, TEXT_DIM)
+        self._empty_icon: ctk.CTkImage = _svg_ctk_image(EMPTY_SVG, ACCENT, 80)
         self._menu_status = MenuBarTaskStatus()
 
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self._chat_index: List[ChatSummary] = []
+        self._active_chat_id: Optional[str] = None
+        self._last_deleted_chat_ids: List[str] = []
+        self._chat_select_mode: bool = False
+        self._selected_chat_ids: set[str] = set()
+        self._chat_record: Optional[ChatRecord] = None
+        self._chat_last_save: float = 0.0
+        self._chat_store_problem: str = ""
+        self._chat_catalog_writable: bool = True
+        try:
+            self._chat_index, self._active_chat_id = load_catalog()
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            self._chat_store_problem = f"Sohbet listesi okunamadı: {error}"
+            self._chat_catalog_writable = False
+            logging.warning(self._chat_store_problem)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self._main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        self._main.grid(row=0, column=1, sticky="nsew")
+        self._main.grid_columnconfigure(0, weight=1)
+        self._main.grid_rowconfigure(1, weight=1)
+        self._build_sidebar()
         self._build_header()
         self._build_transcript()
         self._build_activity_bar()
@@ -355,11 +282,14 @@ class OmniUI(ctk.CTk):
         self.bind("<Escape>", lambda event: self._request_stop())
         self.bind("<FocusIn>", self._on_focus_return, add="+")
         self.bind("<Command-k>", lambda event: self._clear_transcript())
+        self.bind("<Command-f>", lambda event: self._focus_chat_search())
         self.bind("<Command-comma>", lambda event: self._open_settings())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._text.configure(state="normal")
         self._render_welcome()
         self._text.configure(state="disabled")
+        if self._active_chat_id is not None:
+            self._open_chat(self._active_chat_id, save_current=False)
         self._set_activity_idle()
         if sys.platform == "darwin":
             try:
@@ -399,59 +329,400 @@ class OmniUI(ctk.CTk):
     # --- Yerleşim ---
 
     def _ui_font(self, size: int, weight: str) -> ctk.CTkFont:
-        return ctk.CTkFont(family=self._ui_family, size=size, weight=weight)
+        font = ctk.CTkFont(
+            family=self._ui_family, size=max(9, size + self._appearance["font_size"] - 13), weight=weight,
+        )
+        font_id = id(font)
+        self._ui_fonts[font_id] = (
+            weakref.ref(font, lambda _ref, key=font_id: self._ui_fonts.pop(key, None)), size,
+        )
+        return font
+
+    def _window_alpha(self) -> float:
+        return self._appearance["opacity"] if self._appearance["transparent_window"] else 1.0
+
+    def _refresh_transcript_fonts(self) -> None:
+        """Açık sohbetin mevcut metin etiketlerini yeni yazı ayarlarıyla yeniden çizer."""
+        delta = self._appearance["font_size"] - 13
+        self._mono.configure(size=12 + delta)
+        self._body.configure(family=self._ui_family, size=13 + delta)
+        mono = lambda size, *style: (MONO_FAMILY, size + delta, *style)
+        ui = lambda size, *style: (self._ui_family, size + delta, *style)
+        fonts = {
+            "welcome_mark": mono(28, "bold"), "welcome_title": ui(22, "bold"),
+            "welcome_dim": ui(13), "welcome_example": mono(11),
+            "goal_prompt": mono(12, "bold"), "gap": mono(6),
+            "reasoning_head": mono(11, "italic"), "reasoning": mono(11, "italic"),
+            "tool_name": mono(12, "bold"), "output": mono(11), "output_error": mono(11),
+            "meta": mono(11), "summary_ok": mono(12, "bold"),
+            "summary_error": mono(12, "bold"), "summary_meta": mono(11),
+            "notice_info": mono(11), "notice_warning": mono(11), "notice_error": mono(11),
+            "md_h1": ui(20, "bold"), "md_h2": ui(17, "bold"), "md_h3": ui(14, "bold"),
+            "md_bold": ui(13, "bold"), "md_italic": ui(13, "italic"),
+            "md_code": mono(12), "md_codeblock": mono(12),
+            "md_table": mono(11), "md_table_head": mono(11, "bold"),
+            "md_table_label": ui(12, "bold"),
+        }
+        for tag, font in fonts.items():
+            self._text.tag_configure(tag, font=font)
+        indent = self._mono.measure("⏺ ")
+        output_margin = indent + self._mono.measure("⎿  ")
+        for tag in ("assistant", "cursor", "reasoning", "command", "gutter", "gutter_hidden",
+                    "notice_info", "notice_warning", "notice_error"):
+            self._text.tag_configure(tag, lmargin1=indent)
+        for tag in ("assistant", "cursor", "reasoning", "notice_info", "notice_warning", "notice_error"):
+            self._text.tag_configure(tag, lmargin2=indent)
+        for tag in ("gutter", "gutter_hidden", "output", "output_error"):
+            self._text.tag_configure(tag, lmargin2=output_margin)
+        if hasattr(self, "_activity"):
+            self._activity.configure(font=mono(12))
+
+    def _apply_appearance(self, values: Dict[str, object]) -> bool:
+        """Doğrulanmış görünüm tercihlerini kaydeder ve açık pencerelere uygular."""
+        settings = validate_appearance(values)
+        if settings["font_family"] and settings["font_family"] not in tkfont.families():
+            raise ValueError("Seçilen yazı tipi bu Mac'te kurulu değil.")
+        if settings == self._appearance:
+            return False
+        save_appearance(settings, appearance_path())
+        self._appearance = settings
+        self._ui_family = settings["font_family"] or self._system_ui_family
+        delta = settings["font_size"] - 13
+        for font_ref, base_size in list(self._ui_fonts.values()):
+            font = font_ref()
+            if font is not None:
+                font.configure(family=self._ui_family, size=max(9, base_size + delta))
+        self._refresh_transcript_fonts()
+        self.attributes("-alpha", self._window_alpha())
+        if self._settings_window is not None and self._settings_window.winfo_exists():
+            self._settings_window.attributes("-alpha", self._window_alpha())
+        self._refresh_chat_list()
+        return True
+
+    def _build_sidebar(self) -> None:
+        sidebar = ctk.CTkFrame(self, width=248, fg_color=BG, corner_radius=0)
+        self._sidebar = sidebar
+        sidebar.grid(row=0, column=0, sticky="nsew")
+        sidebar.grid_propagate(False)
+        sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(4, weight=1)
+        brand = ctk.CTkFrame(sidebar, fg_color="transparent")
+        brand.grid(row=0, column=0, sticky="ew", padx=18, pady=(24, 25))
+        ctk.CTkLabel(brand, text="✻", text_color=ACCENT,
+                     font=ctk.CTkFont(family=MONO_FAMILY, size=22, weight="bold")).pack(side="left")
+        ctk.CTkLabel(brand, text="OmniAgent", text_color=TEXT,
+                     font=self._ui_font(16, "bold")).pack(side="left", padx=(10, 0))
+        self.new_chat_btn = ctk.CTkButton(
+            sidebar, text="＋   Yeni sohbet", height=40, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color=BG, corner_radius=10, font=self._ui_font(13, "bold"), anchor="w", command=self._new_chat,
+        )
+        self.new_chat_btn.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 14))
+        self._chat_search = ctk.CTkEntry(
+            sidebar, placeholder_text="⌕   Sohbet ara", height=35, fg_color=BG,
+            border_color=BORDER, corner_radius=9, text_color=TEXT, font=self._ui_font(12, "normal"),
+        )
+        self._chat_search.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 13))
+        self._chat_search.bind("<KeyRelease>", lambda _event: self._refresh_chat_list())
+        selection_bar = ctk.CTkFrame(sidebar, fg_color="transparent")
+        selection_bar.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 5))
+        selection_bar.grid_columnconfigure(0, weight=1)
+        self._select_all_btn = ctk.CTkButton(
+            selection_bar, text="Görünenler", width=84, height=26, fg_color="transparent",
+            hover_color=SURFACE_RAISED, text_color=TEXT_DIM, font=self._ui_font(10, "normal"),
+            command=self._select_visible_chats,
+        )
+        self._select_all_btn.grid(row=0, column=0, sticky="w")
+        self._select_all_btn.grid_remove()
+        self._delete_selected_btn = ctk.CTkButton(
+            selection_bar, text="Sil (0)", width=65, height=26, fg_color="transparent",
+            hover_color=ACCENT_DIM, text_color=ACCENT, font=self._ui_font(10, "bold"),
+            command=self._confirm_delete_selected_chats,
+        )
+        self._delete_selected_btn.grid(row=0, column=1, padx=(0, 4))
+        self._delete_selected_btn.grid_remove()
+        self._select_chats_btn = ctk.CTkButton(
+            selection_bar, text="Seç", width=48, height=26, fg_color="transparent",
+            hover_color=SURFACE_RAISED, text_color=TEXT_DIM, font=self._ui_font(10, "normal"),
+            command=self._toggle_chat_select_mode,
+        )
+        self._select_chats_btn.grid(row=0, column=2)
+        self._chat_list = ctk.CTkScrollableFrame(sidebar, fg_color=BG, corner_radius=0)
+        self._chat_list.grid(row=4, column=0, sticky="nsew", padx=(7, 9))
+        self._chat_list.grid_columnconfigure(0, weight=1)
+        self._undo_chat_btn = ctk.CTkButton(
+            sidebar, text="↶  Silmeyi geri al", height=30, fg_color="transparent",
+            hover_color=SURFACE_RAISED, text_color=TEXT_DIM,
+            font=self._ui_font(11, "normal"), command=self._restore_deleted_chat,
+        )
+        self._undo_chat_btn.grid(row=5, column=0, sticky="ew", padx=14, pady=(4, 0))
+        self._undo_chat_btn.grid_remove()
+        ctk.CTkFrame(sidebar, height=1, fg_color=BORDER, corner_radius=0).grid(
+            row=6, column=0, sticky="ew", padx=14, pady=(10, 10))
+        self.sidebar_settings_btn = ctk.CTkButton(
+            sidebar, text="⚙   Ayarlar", height=36, anchor="w", fg_color="transparent",
+            hover_color=SURFACE_RAISED, text_color=TEXT_DIM, corner_radius=9,
+            font=self._ui_font(12, "normal"), command=self._open_settings,
+        )
+        self.sidebar_settings_btn.grid(row=7, column=0, sticky="ew", padx=14)
+        self._chat_notice = ctk.CTkLabel(sidebar, text=self._chat_store_problem, text_color=WARNING,
+                                         font=self._ui_font(10, "normal"), wraplength=210)
+        self._chat_notice.grid(row=8, column=0, sticky="ew", padx=14, pady=(2, 12))
+        ctk.CTkFrame(sidebar, width=1, fg_color=BORDER, corner_radius=0).grid(
+            row=0, column=1, rowspan=9, sticky="ns")
+        self._refresh_chat_list()
+
+    def _refresh_chat_list(self) -> None:
+        for child in self._chat_list.winfo_children():
+            child.destroy()
+        query: str = self._chat_search.get().strip().casefold()
+        visible: List[ChatSummary] = [chat for chat in self._chat_index if query in chat["title"].casefold()]
+        if not visible:
+            ctk.CTkLabel(
+                self._chat_list, text="Sonuç bulunamadı" if query else "Henüz sohbet yok",
+                text_color=TEXT_FAINT, font=self._ui_font(11, "normal"),
+            ).grid(row=0, column=0, sticky="ew", pady=14)
+        for index, chat in enumerate(visible):
+            selected = chat["id"] == self._active_chat_id
+            checked = chat["id"] in self._selected_chat_ids
+            row = ctk.CTkFrame(self._chat_list, fg_color=ACCENT_DIM if checked or selected and not self._chat_select_mode else "transparent",
+                               corner_radius=9)
+            row.grid(row=index, column=0, sticky="ew", padx=3, pady=1 if self._appearance["compact_sidebar"] else 2)
+            row.grid_columnconfigure(0, weight=1)
+            button = ctk.CTkButton(
+                row, text=("☑   " if checked else "☐   ") + chat["title"][:23]
+                if self._chat_select_mode else "◌   " + chat["title"][:23],
+                height=30 if self._appearance["compact_sidebar"] else 38, anchor="w",
+                fg_color="transparent",
+                hover_color=SURFACE_RAISED, text_color=TEXT if checked or selected else TEXT_DIM,
+                font=self._ui_font(12, "normal"),
+                command=(lambda chat_id=chat["id"]: self._toggle_chat_selection(chat_id))
+                if self._chat_select_mode else (lambda chat_id=chat["id"]: self._open_chat(chat_id)),
+            )
+            button.grid(row=0, column=0, sticky="ew")
+            if not self._chat_select_mode:
+                more = ctk.CTkButton(
+                    row, text="⋯", width=29, height=30, fg_color="transparent",
+                    hover_color=SURFACE_RAISED, text_color=TEXT_DIM,
+                    font=self._ui_font(17, "normal"),
+                    command=lambda chat_id=chat["id"], anchor=row: self._show_chat_menu(chat_id, anchor),
+                )
+                more.grid(row=0, column=1, padx=(0, 3))
+                button.bind("<Button-2>", lambda event, chat_id=chat["id"]: self._show_chat_menu(chat_id, event.widget))
+        self._delete_selected_btn.configure(
+            text=f"Sil ({len(self._selected_chat_ids)})",
+            state="normal" if self._selected_chat_ids else "disabled",
+        )
+        if hasattr(self, "chat_title_label"):
+            active = next((chat for chat in self._chat_index if chat["id"] == self._active_chat_id), None)
+            title = active["title"] if active else "Yeni sohbet"
+            self.chat_title_label.configure(text=title[:31] + "…" if len(title) > 32 else title)
+
+    def _toggle_chat_select_mode(self) -> None:
+        if self._agent_future is not None:
+            return
+        self._chat_select_mode = not self._chat_select_mode
+        self._selected_chat_ids.clear()
+        self._select_chats_btn.configure(text="Bitti" if self._chat_select_mode else "Seç")
+        if self._chat_select_mode:
+            self._select_all_btn.grid()
+            self._delete_selected_btn.grid()
+        else:
+            self._select_all_btn.grid_remove()
+            self._delete_selected_btn.grid_remove()
+        self._refresh_chat_list()
+
+    def _toggle_chat_selection(self, chat_id: str) -> None:
+        if chat_id in self._selected_chat_ids:
+            self._selected_chat_ids.remove(chat_id)
+        else:
+            self._selected_chat_ids.add(chat_id)
+        self._refresh_chat_list()
+
+    def _select_visible_chats(self) -> None:
+        query = self._chat_search.get().strip().casefold()
+        self._selected_chat_ids.update(
+            chat["id"] for chat in self._chat_index if query in chat["title"].casefold()
+        )
+        self._refresh_chat_list()
+
+    def _confirm_delete_selected_chats(self) -> None:
+        count = len(self._selected_chat_ids)
+        if count and messagebox.askyesno(
+            "Sohbetleri sil", f"Seçilen {count} sohbet silinsin mi?\n\nBu işlem geri alınabilir.", parent=self,
+        ):
+            self._delete_selected_chats()
+
+    def _delete_selected_chats(self) -> bool:
+        if self._agent_future is not None or not self._chat_catalog_writable or not self._selected_chat_ids:
+            return False
+        if not self._save_current_chat(force=True):
+            return False
+        selected = [chat["id"] for chat in self._chat_index if chat["id"] in self._selected_chat_ids]
+        was_active = self._active_chat_id in self._selected_chat_ids
+        try:
+            remaining, next_active = delete_chats(selected, self._chat_index, self._active_chat_id)
+        except (OSError, ValueError) as error:
+            self._chat_notice.configure(text=f"Sohbetler silinemedi: {error}")
+            return False
+        self._chat_index = remaining
+        self._last_deleted_chat_ids = selected
+        self._undo_chat_btn.configure(text=f"↶  {len(selected)} sohbeti geri al")
+        self._undo_chat_btn.grid()
+        self._chat_notice.configure(text="")
+        self._toggle_chat_select_mode()
+        if was_active:
+            self._active_chat_id = None
+            self._chat_record = None
+            if next_active is not None:
+                self._open_chat(next_active, save_current=False)
+            else:
+                self._reset_chat_view(show_welcome=True)
+                self._refresh_chat_list()
+        return True
+
+    def _focus_chat_search(self) -> None:
+        self._chat_search.focus_set()
+        self._chat_search.select_range(0, "end")
+
+    def _show_chat_menu(self, chat_id: str, anchor: tk.Misc) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Yeniden adlandır", command=lambda: self._prompt_rename_chat(chat_id))
+        menu.add_command(label="Sil…", command=lambda: self._confirm_delete_chat(chat_id))
+        try:
+            menu.tk_popup(anchor.winfo_rootx() + anchor.winfo_width() - 4,
+                          anchor.winfo_rooty() + anchor.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _prompt_rename_chat(self, chat_id: str) -> None:
+        if self._agent_future is not None:
+            return
+        chat = next((item for item in self._chat_index if item["id"] == chat_id), None)
+        if chat is None:
+            return
+        title = simpledialog.askstring("Sohbeti yeniden adlandır", "Yeni sohbet adı:",
+                                       initialvalue=chat["title"], parent=self)
+        if title is not None:
+            self._rename_chat(chat_id, title)
+
+    def _rename_chat(self, chat_id: str, title: str) -> bool:
+        if self._agent_future is not None or not self._chat_catalog_writable:
+            return False
+        if chat_id == self._active_chat_id and not self._save_current_chat(force=True):
+            return False
+        try:
+            updated = rename_chat(chat_id, title, self._chat_index, self._active_chat_id)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            self._chat_notice.configure(text=f"Sohbet adı değiştirilemedi: {error}")
+            return False
+        self._chat_index = updated
+        if self._chat_record is not None and self._chat_record["id"] == chat_id:
+            self._chat_record["title"] = next(item["title"] for item in updated if item["id"] == chat_id)
+        self._chat_notice.configure(text="")
+        self._refresh_chat_list()
+        return True
+
+    def _confirm_delete_chat(self, chat_id: str) -> None:
+        if self._agent_future is not None:
+            return
+        chat = next((item for item in self._chat_index if item["id"] == chat_id), None)
+        if chat is not None and messagebox.askyesno(
+            "Sohbeti sil", f"“{chat['title']}” sohbeti silinsin mi?\n\nSon silinen sohbet geri alınabilir.",
+            parent=self,
+        ):
+            self._delete_chat(chat_id)
+
+    def _delete_chat(self, chat_id: str) -> bool:
+        if self._agent_future is not None or not self._chat_catalog_writable:
+            return False
+        if not self._save_current_chat(force=True):
+            return False
+        was_active: bool = chat_id == self._active_chat_id
+        try:
+            remaining, next_active = delete_chat(chat_id, self._chat_index, self._active_chat_id)
+        except (OSError, ValueError) as error:
+            self._chat_notice.configure(text=f"Sohbet silinemedi: {error}")
+            return False
+        self._chat_index = remaining
+        self._last_deleted_chat_ids = [chat_id]
+        self._undo_chat_btn.configure(text="↶  Sohbeti geri al")
+        self._undo_chat_btn.grid()
+        self._chat_notice.configure(text="")
+        if was_active:
+            self._active_chat_id = None
+            self._chat_record = None
+            if next_active is not None:
+                self._open_chat(next_active, save_current=False)
+            else:
+                self._reset_chat_view(show_welcome=True)
+                self._refresh_chat_list()
+        else:
+            self._refresh_chat_list()
+        return True
+
+    def _restore_deleted_chat(self) -> None:
+        if not self._last_deleted_chat_ids or self._agent_future is not None:
+            return
+        try:
+            updated = restore_chats(self._last_deleted_chat_ids, self._chat_index, self._active_chat_id)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            self._chat_notice.configure(text=f"Sohbet geri alınamadı: {error}")
+            return
+        self._chat_index = updated
+        self._last_deleted_chat_ids = []
+        self._undo_chat_btn.grid_remove()
+        self._chat_notice.configure(text="")
+        self._refresh_chat_list()
 
     def _build_header(self) -> None:
-        header: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0, height=48)
-        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 0))
-        header.grid_columnconfigure(2, weight=1)
-        ctk.CTkLabel(header, text="✻", text_color=ACCENT, font=ctk.CTkFont(family=MONO_FAMILY, size=20, weight="bold")).grid(
-            row=0, column=0, padx=(0, 8))
-        ctk.CTkLabel(header, text="OmniAgent", text_color=TEXT, font=self._ui_font(16, "bold")).grid(row=0, column=1)
-        self.context_label: ctk.CTkLabel = ctk.CTkLabel(
-            header, text="bağlam: 0 mesaj", text_color=TEXT_FAINT,
-            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+        header: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0, height=72)
+        header.grid(row=0, column=0, sticky="ew", padx=30, pady=(22, 0))
+        header.grid_columnconfigure(0, weight=1)
+        self.chat_title_label = ctk.CTkLabel(
+            header, text="Yeni sohbet", text_color=TEXT, font=self._ui_font(19, "bold"), anchor="w",
         )
-        self.context_label.grid(row=1, column=1, columnspan=3, sticky="w")
+        self.chat_title_label.grid(row=0, column=0, sticky="w")
+        self.context_label: ctk.CTkLabel = ctk.CTkLabel(
+            header, text="bağlam: 0 mesaj", text_color=TEXT_FAINT, anchor="w",
+            font=self._ui_font(11, "normal"),
+        )
+        self.context_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
         self.model_label: ctk.CTkLabel = ctk.CTkLabel(
             header, text=self._model_text(DEFAULT_BACKEND), text_color=TEXT_FAINT,
             font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
-        self.model_label.grid(row=0, column=3, padx=(0, 8))
+        self.model_label.grid(row=1, column=1, columnspan=3, sticky="e", padx=(0, 8), pady=(0, 8))
         self.task_status_label: ctk.CTkLabel = ctk.CTkLabel(
             header, text="", text_color=ACCENT,
             font=ctk.CTkFont(family=MONO_FAMILY, size=11, weight="bold"),
         )
-        self.task_status_label.grid(row=0, column=2, sticky="e", padx=(0, 12))
+        self.task_status_label.grid(row=0, column=1, sticky="e", padx=(0, 12))
         self.copy_btn: ctk.CTkButton = ctk.CTkButton(
-            header, text="", image=self._copy_icon, width=30, height=28, corner_radius=8,
+            header, text="", image=self._copy_icon, width=34, height=32, corner_radius=9,
             fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
             border_color=BORDER, command=self._copy_transcript, cursor="hand2",
         )
-        self.copy_btn.grid(row=0, column=4, padx=(0, 6))
+        self.copy_btn.grid(row=0, column=2, padx=(0, 8))
         # Kopyala düğmesiyle birebir aynı kutu ve ikon boyutu (metin glifi daha küçük kalıyordu).
         self.settings_btn: ctk.CTkButton = ctk.CTkButton(
-            header, text="", image=self._gear_icon, width=30, height=28, corner_radius=8,
+            header, text="", image=self._gear_icon, width=34, height=32, corner_radius=9,
             fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
             border_color=BORDER, command=self._open_settings, cursor="hand2",
         )
-        self.settings_btn.grid(row=0, column=5, padx=(0, 6))
-        ctk.CTkButton(
-            header, text="Temizle", width=64, height=26, corner_radius=8, fg_color="transparent",
-            hover_color=SURFACE_RAISED, border_width=1, border_color=BORDER, text_color=TEXT_DIM,
-            font=self._ui_font(12, "normal"), command=self._clear_transcript,
-        ).grid(row=0, column=6)
+        self.settings_btn.grid(row=0, column=3)
+        ctk.CTkFrame(self._main, height=1, fg_color=BORDER, corner_radius=0).grid(
+            row=0, column=0, sticky="sew")
 
     def _build_transcript(self) -> None:
-        frame: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        frame.grid(row=1, column=0, sticky="nsew", padx=(6, 6), pady=(8, 0))
+        frame: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0)
+        frame.grid(row=1, column=0, sticky="nsew", padx=(22, 22), pady=(12, 0))
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
         self._mono: tkfont.Font = tkfont.Font(family=MONO_FAMILY, size=12)
         self._body: tkfont.Font = tkfont.Font(family=self._ui_family, size=13)
         self._text: tk.Text = tk.Text(
             frame, bg=BG, fg=TEXT, font=self._mono, wrap="word", bd=0, highlightthickness=0,
-            padx=16, pady=10, insertwidth=0, cursor="arrow", spacing1=1, spacing3=1,
+            padx=12, pady=18, insertwidth=0, cursor="arrow", spacing1=1, spacing3=1,
             selectbackground=ACCENT_DIM, selectforeground=TEXT, exportselection=True,
         )
         self._text.grid(row=0, column=0, sticky="nsew")
@@ -466,9 +737,12 @@ class OmniUI(ctk.CTk):
         mono_bold = (MONO_FAMILY, 12, "bold")
         small = (MONO_FAMILY, 11)
         tags: Dict[str, Dict[str, object]] = {
-            "welcome_mark": {"foreground": ACCENT, "font": (MONO_FAMILY, 13, "bold")},
-            "welcome_title": {"foreground": TEXT, "font": mono_bold},
-            "welcome_dim": {"foreground": TEXT_FAINT, "font": small, "lmargin1": indent, "lmargin2": indent},
+            "welcome_mark": {"foreground": ACCENT, "font": (MONO_FAMILY, 28, "bold"), "spacing1": 32},
+            "welcome_title": {"foreground": TEXT, "font": (self._ui_family, 22, "bold"), "spacing1": 16},
+            "welcome_dim": {"foreground": TEXT_DIM, "font": (self._ui_family, 13),
+                            "spacing1": 4, "spacing3": 5},
+            "welcome_example": {"foreground": TEXT_FAINT, "font": (MONO_FAMILY, 11),
+                                "spacing1": 10, "spacing3": 4},
             "goal": {"foreground": TEXT, "background": SURFACE_RAISED, "lmargin1": 10, "lmargin2": 10 + indent,
                      "spacing1": 8, "spacing3": 8, "rmargin": 10},
             "goal_prompt": {"foreground": ACCENT, "background": SURFACE_RAISED, "font": mono_bold},
@@ -523,10 +797,13 @@ class OmniUI(ctk.CTk):
         })
         for name, options in tags.items():
             self._text.tag_configure(name, **options)
+        self._refresh_transcript_fonts()
+        self._empty_state = ctk.CTkLabel(frame, text="", image=self._empty_icon, fg_color="transparent")
+        self._empty_state.place(relx=0.5, rely=0.5, anchor="center")
 
     def _build_activity_bar(self) -> None:
-        bar: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0, height=26)
-        bar.grid(row=2, column=0, sticky="ew", padx=22, pady=(4, 2))
+        bar: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0, height=26)
+        bar.grid(row=2, column=0, sticky="ew", padx=34, pady=(6, 4))
         bar.grid_columnconfigure(0, weight=1)
         self._activity: tk.Text = tk.Text(
             bar, height=1, bg=BG, fg=TEXT_FAINT, bd=0, highlightthickness=0, wrap="none",
@@ -541,62 +818,57 @@ class OmniUI(ctk.CTk):
         self._activity.configure(state="disabled")
 
     def _build_composer(self) -> None:
-        composer: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER)
-        composer.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 4))
-        composer.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(composer, text="›", text_color=ACCENT, font=ctk.CTkFont(family=MONO_FAMILY, size=18, weight="bold")).grid(
-            row=0, column=0, padx=(14, 4), pady=10)
+        composer: ctk.CTkFrame = ctk.CTkFrame(
+            self._main, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER,
+        )
+        composer.grid(row=3, column=0, sticky="ew", padx=28, pady=(2, 4))
+        composer.grid_columnconfigure(0, weight=1)
         self.entry: ctk.CTkEntry = ctk.CTkEntry(
-            composer, placeholder_text="Bir hedef yaz… (örn. masaüstündeki PDF'leri listele)", height=36,
+            composer, placeholder_text="OmniAgent'a bir görev ver…", height=46,
             fg_color=SURFACE, border_width=0, text_color=TEXT, placeholder_text_color=TEXT_FAINT,
             font=self._ui_font(14, "normal"),
         )
-        self.entry.grid(row=0, column=1, sticky="ew", pady=8)
+        self.entry.grid(row=0, column=0, columnspan=4, sticky="ew", padx=14, pady=(12, 4))
         self.entry.bind("<Return>", lambda event: self._on_primary_button())
+        toolbar = ctk.CTkFrame(composer, fg_color="transparent")
+        toolbar.grid(row=1, column=0, columnspan=4, sticky="ew", padx=16, pady=(1, 12))
+        toolbar.grid_columnconfigure(2, weight=1)
         self.mode_menu: ctk.CTkOptionMenu = ctk.CTkOptionMenu(
-            composer, values=list(RUN_MODE_CHOICES), width=82, height=28, corner_radius=8,
+            toolbar, values=list(RUN_MODE_CHOICES), width=94, height=30, corner_radius=8,
             fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
             dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED, dropdown_text_color=TEXT,
             text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
             dropdown_font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
         self.mode_menu.set(RUN_MODE_CHOICES[0])
-        self.mode_menu.grid(row=0, column=2, padx=(6, 4))
+        self.mode_menu.grid(row=0, column=0, padx=(0, 8))
         self.backend_menu: ctk.CTkOptionMenu = ctk.CTkOptionMenu(
-            composer, values=list(BACKEND_CHOICES), width=126, height=28, corner_radius=8,
+            toolbar, values=list(BACKEND_CHOICES), width=138, height=30, corner_radius=8,
             fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
             dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED, dropdown_text_color=TEXT,
             text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
             dropdown_font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
         self.backend_menu.set("Otomatik")
-        self.backend_menu.grid(row=0, column=3, padx=(4, 6))
+        self.backend_menu.grid(row=0, column=1)
         self.voice_btn: ctk.CTkButton = ctk.CTkButton(
-            composer, text="", image=self._voice_icon, width=34, height=34, corner_radius=17,
+            toolbar, text="", image=self._voice_icon, width=34, height=34, corner_radius=10,
             fg_color=SURFACE_RAISED, hover_color=SURFACE_RAISED, text_color=TEXT_DIM,
             command=self._toggle_voice, cursor="hand2",
         )
-        self.voice_btn.grid(row=0, column=4, padx=(0, 6))
+        self.voice_btn.grid(row=0, column=3, padx=(0, 8))
         self.primary_btn: ctk.CTkButton = ctk.CTkButton(
-            composer, text="↑", width=34, height=34, corner_radius=17, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            toolbar, text="↑", width=34, height=34, corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_HOVER,
             text_color=BG, font=ctk.CTkFont(family=self._ui_family, size=17, weight="bold"),
             command=self._on_primary_button,
         )
-        self.primary_btn.grid(row=0, column=5, padx=(0, 10))
+        self.primary_btn.grid(row=0, column=4)
 
     def _build_footer(self) -> None:
-        footer: ctk.CTkFrame = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        footer.grid(row=4, column=0, sticky="ew", padx=22, pady=(0, 10))
-        footer.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(
-            footer, text="enter gönder · esc durdur · ⌘K temizle", text_color=TEXT_FAINT,
-            font=ctk.CTkFont(family=MONO_FAMILY, size=10), anchor="w",
-        ).grid(row=0, column=0, sticky="w")
         self.stats_label: ctk.CTkLabel = ctk.CTkLabel(
-            footer, text="", text_color=TEXT_FAINT, font=ctk.CTkFont(family=MONO_FAMILY, size=10),
+            self._main, text="", text_color=TEXT_FAINT, font=ctk.CTkFont(family=MONO_FAMILY, size=10),
             anchor="w", justify="left",
         )
-        self.stats_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
 
     # --- Ayarlar sayfası (API anahtarları, Keychain ile senkron) ---
 
@@ -699,23 +971,108 @@ class OmniUI(ctk.CTk):
         window: ctk.CTkToplevel = ctk.CTkToplevel(self)
         self._settings_window = window
         window.title("OmniAgent — Ayarlar")
-        window.geometry("660x700")
-        window.minsize(560, 450)
+        window.geometry("720x760")
+        window.minsize(600, 520)
         window.configure(fg_color=BG)
+        window.attributes("-alpha", self._window_alpha())
         window.transient(self)
+        top = ctk.CTkFrame(window, fg_color=BG, corner_radius=0)
+        top.pack(fill="x", padx=30, pady=(26, 18))
+        ctk.CTkLabel(
+            top, text="Ayarlar", text_color=TEXT, font=self._ui_font(25, "bold"), anchor="w",
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            top, text="Modelleri, anahtarları ve çalışma sınırlarını yönet.", text_color=TEXT_FAINT,
+            font=self._ui_font(12, "normal"), anchor="w",
+        ).pack(anchor="w", pady=(1, 0))
+        ctk.CTkFrame(window, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x")
         panel: ctk.CTkScrollableFrame = ctk.CTkScrollableFrame(window, fg_color=BG)
-        panel.pack(fill="both", expand=True, padx=6, pady=6)
+        panel.pack(fill="both", expand=True, padx=18, pady=(12, 0))
         ctk.CTkLabel(
-            panel, text="Ayarlar", text_color=TEXT, font=self._ui_font(17, "bold"), anchor="w",
-        ).pack(anchor="w", padx=12, pady=(8, 0))
+            panel, text="Görünüm", text_color=TEXT, anchor="w", font=self._ui_font(16, "bold"),
+        ).pack(anchor="w", padx=12, pady=(8, 8))
+        appearance_card = ctk.CTkFrame(
+            panel, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
+        )
+        appearance_card.pack(fill="x", padx=12, pady=(0, 8))
+        appearance_card.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(
-            panel, text="API ANAHTARLARI", text_color=TEXT_FAINT, anchor="w",
-            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
-        ).pack(anchor="w", padx=12, pady=(14, 2))
+            appearance_card, text="Yazı tipi", text_color=TEXT, font=self._ui_font(12, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(15, 8))
+        installed_fonts = set(tkfont.families())
+        font_choices = list(dict.fromkeys(
+            name for name in (self._system_ui_family, "Helvetica Neue", "Avenir Next", "Arial", "Menlo")
+            if name in installed_fonts
+        ))
+        font_menu = ctk.CTkOptionMenu(
+            appearance_card, values=font_choices, width=180, height=32, corner_radius=8,
+            fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
+            dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED,
+            text_color=TEXT, dropdown_text_color=TEXT, font=self._ui_font(12, "normal"),
+        )
+        font_menu.set(self._ui_family)
+        font_menu.grid(row=0, column=1, sticky="e", padx=14, pady=(15, 8))
         ctk.CTkLabel(
-            panel, text=SETTINGS_HINT, text_color=TEXT_DIM, wraplength=560, justify="left",
+            appearance_card, text="Yazı boyutu", text_color=TEXT, font=self._ui_font(12, "bold"),
+        ).grid(row=1, column=0, sticky="w", padx=14, pady=8)
+        size_value = ctk.CTkLabel(
+            appearance_card, text=f"{self._appearance['font_size']} pt", text_color=TEXT_DIM,
+            font=self._ui_font(11, "normal"), width=42,
+        )
+        size_value.grid(row=1, column=2, padx=(0, 14))
+        size_slider = ctk.CTkSlider(
+            appearance_card, from_=11, to=18, number_of_steps=7,
+            fg_color=BORDER, progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            command=lambda value: size_value.configure(text=f"{round(value)} pt"),
+        )
+        size_slider.set(self._appearance["font_size"])
+        size_slider.grid(row=1, column=1, sticky="ew", padx=14, pady=8)
+        transparency_var = tk.BooleanVar(value=self._appearance["transparent_window"])
+        opacity_value = ctk.CTkLabel(
+            appearance_card, text=f"%{round(self._appearance['opacity'] * 100)}", text_color=TEXT_DIM,
+            font=self._ui_font(11, "normal"), width=42,
+        )
+        opacity_slider = ctk.CTkSlider(
+            appearance_card, from_=0.65, to=1.0, number_of_steps=35,
+            fg_color=BORDER, progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            command=lambda value: opacity_value.configure(text=f"%{round(value * 100)}"),
+        )
+        opacity_slider.set(self._appearance["opacity"])
+
+        def toggle_opacity() -> None:
+            opacity_slider.configure(state="normal" if transparency_var.get() else "disabled")
+
+        ctk.CTkSwitch(
+            appearance_card, text="Pencere saydamlığı", variable=transparency_var,
+            command=toggle_opacity, fg_color=BORDER, progress_color=ACCENT,
+            button_color=TEXT, text_color=TEXT, font=self._ui_font(12, "bold"),
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=14, pady=(14, 3))
+        ctk.CTkLabel(
+            appearance_card, text="Opaklık", text_color=TEXT_DIM, font=self._ui_font(12, "normal"),
+        ).grid(row=3, column=0, sticky="w", padx=14, pady=8)
+        opacity_slider.grid(row=3, column=1, sticky="ew", padx=14, pady=8)
+        opacity_value.grid(row=3, column=2, padx=(0, 14))
+        toggle_opacity()
+        compact_var = tk.BooleanVar(value=self._appearance["compact_sidebar"])
+        ctk.CTkSwitch(
+            appearance_card, text="Kompakt sohbet listesi", variable=compact_var,
+            fg_color=BORDER, progress_color=ACCENT, button_color=TEXT,
+            text_color=TEXT, font=self._ui_font(12, "normal"),
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=14, pady=(10, 4))
+        ctk.CTkLabel(
+            appearance_card, text="Saydamlık pencerenin tamamına uygulanır.",
+            text_color=TEXT_FAINT, font=self._ui_font(10, "normal"),
+        ).grid(row=5, column=0, columnspan=3, sticky="w", padx=14, pady=(0, 14))
+        ctk.CTkLabel(
+            panel, text="API Anahtarları", text_color=TEXT, anchor="w",
+            font=self._ui_font(16, "bold"),
+        ).pack(anchor="w", padx=12, pady=(18, 3))
+        ctk.CTkLabel(
+            panel, text=SETTINGS_HINT, text_color=TEXT_DIM, wraplength=500, justify="left",
             font=self._ui_font(11, "normal"), anchor="w",
-        ).pack(anchor="w", padx=12, pady=(0, 8))
+        ).pack(anchor="w", padx=12, pady=(0, 12))
 
         entries: Dict[str, ctk.CTkEntry] = {}
         chips: Dict[str, ctk.CTkLabel] = {}
@@ -723,19 +1080,19 @@ class OmniUI(ctk.CTk):
             card: ctk.CTkFrame = ctk.CTkFrame(
                 panel, fg_color=SURFACE, corner_radius=12, border_width=1, border_color=BORDER,
             )
-            card.pack(fill="x", padx=12, pady=6)
+            card.pack(fill="x", padx=12, pady=5)
             card.grid_columnconfigure(0, weight=1)
             profiles: List[str] = [name for name, var in API_KEY_VARIABLES.items() if var == variable]
             ctk.CTkLabel(
                 card, text=variable, text_color=TEXT, anchor="w",
-                font=ctk.CTkFont(family=MONO_FAMILY, size=12, weight="bold"),
+                font=self._ui_font(12, "bold"),
             ).grid(row=0, column=0, sticky="w", padx=14, pady=(12, 0))
             chip: ctk.CTkLabel = ctk.CTkLabel(
                 card, text="", anchor="e", font=ctk.CTkFont(family=MONO_FAMILY, size=10),
             )
             chip.grid(row=0, column=1, sticky="e", padx=14, pady=(12, 0))
             entry: ctk.CTkEntry = ctk.CTkEntry(
-                card, show="•", height=32, fg_color=SURFACE_RAISED, border_width=1, border_color=BORDER,
+                card, show="•", height=36, fg_color=BG, border_width=1, border_color=BORDER,
                 text_color=TEXT, placeholder_text="anahtar gir", placeholder_text_color=TEXT_FAINT,
                 font=ctk.CTkFont(family=MONO_FAMILY, size=12),
             )
@@ -747,7 +1104,7 @@ class OmniUI(ctk.CTk):
                 f"{name} → {BACKENDS[name]['model']} ({BACKENDS[name]['base_url']})" for name in profiles
             )
             ctk.CTkLabel(
-                card, text=detail, text_color=TEXT_FAINT, wraplength=520, justify="left", anchor="w",
+                card, text=detail, text_color=TEXT_FAINT, wraplength=500, justify="left", anchor="w",
                 font=ctk.CTkFont(family=MONO_FAMILY, size=9),
             ).grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 12))
 
@@ -763,9 +1120,9 @@ class OmniUI(ctk.CTk):
         refresh_chips()
 
         ctk.CTkLabel(
-            panel, text="MODELLER", text_color=TEXT_FAINT, anchor="w",
-            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
-        ).pack(anchor="w", padx=12, pady=(16, 2))
+            panel, text="Modeller", text_color=TEXT, anchor="w",
+            font=self._ui_font(16, "bold"),
+        ).pack(anchor="w", padx=12, pady=(24, 3))
         ctk.CTkLabel(
             panel, text="Sağlayıcı modelleri arka planda yüklenir. Seçim sonraki görevde kullanılır.",
             text_color=TEXT_DIM, wraplength=560, justify="left", anchor="w",
@@ -802,9 +1159,9 @@ class OmniUI(ctk.CTk):
             model_notes[name] = note
 
         ctk.CTkLabel(
-            panel, text="SÜREKLİ MOD", text_color=TEXT_FAINT, anchor="w",
-            font=ctk.CTkFont(family=MONO_FAMILY, size=10),
-        ).pack(anchor="w", padx=12, pady=(14, 2))
+            panel, text="Sürekli Mod", text_color=TEXT, anchor="w",
+            font=self._ui_font(16, "bold"),
+        ).pack(anchor="w", padx=12, pady=(24, 3))
         ctk.CTkLabel(
             panel, text=(
                 "Sürekli görev sen durdurana, sınır dolana veya hedefi onaylayana kadar çalışır; "
@@ -922,10 +1279,10 @@ class OmniUI(ctk.CTk):
             text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         ).pack(anchor="w", padx=12, pady=(6, 2))
         status: ctk.CTkLabel = ctk.CTkLabel(
-            panel, text="", text_color=TEXT_FAINT, anchor="w", wraplength=560, justify="left",
+            window, text="", text_color=TEXT_FAINT, anchor="w", wraplength=540, justify="left",
             font=ctk.CTkFont(family=MONO_FAMILY, size=10),
         )
-        status.pack(anchor="w", padx=12, pady=(6, 0))
+        status.pack(fill="x", padx=30, pady=(4, 8))
 
         def close() -> None:
             generation[0] += 1
@@ -935,6 +1292,18 @@ class OmniUI(ctk.CTk):
             window.destroy()
 
         def save() -> None:
+            try:
+                appearance_changed = self._apply_appearance({
+                    "font_family": "" if font_menu.get() == self._system_ui_family else font_menu.get(),
+                    "font_size": round(size_slider.get()),
+                    "transparent_window": transparency_var.get(),
+                    "opacity": opacity_slider.get(),
+                    "compact_sidebar": compact_var.get(),
+                })
+                appearance_error = ""
+            except (OSError, ValueError, tk.TclError) as error:
+                appearance_changed = False
+                appearance_error = str(error)
             changed, failed = self._apply_settings(
                 {variable: field.get() for variable, field in entries.items()}
             )
@@ -977,8 +1346,10 @@ class OmniUI(ctk.CTk):
                                    ("notice_info",))])
                 self._text.see("end")
                 self._text.configure(state="disabled")
-            if failed or model_error or limits_error:
+            if failed or model_error or limits_error or appearance_error:
                 problems = []
+                if appearance_error:
+                    problems.append("Görünüm: " + appearance_error)
                 if failed:
                     problems.append("API anahtarı: " + ", ".join(failed))
                 if model_error:
@@ -987,26 +1358,28 @@ class OmniUI(ctk.CTk):
                     problems.append("Sürekli mod: " + limits_error)
                 status.configure(text="Kaydedilemedi: " + " · ".join(problems), text_color=ERROR)
                 return
-            if not changed and not model_changed and not limits_changed:
+            if not changed and not model_changed and not limits_changed and not appearance_changed:
                 status.configure(text="Değişiklik yok.", text_color=TEXT_FAINT)
                 return
             limits_note: str = " · sürekli mod sınırları" if limits_changed else ""
+            appearance_note: str = " · görünüm" if appearance_changed else ""
             status.configure(
-                text=f"Kaydedildi · {len(model_changed)} model{limits_note} · hazır profiller: {ready}{suffix}",
+                text=f"Kaydedildi · {len(model_changed)} model{limits_note}{appearance_note} · hazır profiller: {ready}{suffix}",
                 text_color=WARNING if self._clients_stale or shell_left else SUCCESS,
             )
 
-        buttons: ctk.CTkFrame = ctk.CTkFrame(panel, fg_color=BG)
-        buttons.pack(fill="x", padx=12, pady=(10, 14))
+        ctk.CTkFrame(window, height=1, fg_color=BORDER, corner_radius=0).pack(fill="x")
+        buttons: ctk.CTkFrame = ctk.CTkFrame(window, fg_color=BG, corner_radius=0)
+        buttons.pack(fill="x", padx=30, pady=16)
         ctk.CTkButton(
             buttons, text="Kaydet", width=110, height=32, corner_radius=8, fg_color=ACCENT,
             hover_color=ACCENT_HOVER, text_color=BG, font=self._ui_font(13, "bold"), command=save,
-        ).pack(side="left")
+        ).pack(side="right")
         ctk.CTkButton(
             buttons, text="Kapat", width=90, height=32, corner_radius=8, fg_color="transparent",
             hover_color=SURFACE_RAISED, border_width=1, border_color=BORDER, text_color=TEXT_DIM,
             font=self._ui_font(12, "normal"), command=close,
-        ).pack(side="left", padx=8)
+        ).pack(side="right", padx=(0, 8))
         window.protocol("WM_DELETE_WINDOW", close)
         window.after(60, window.lift)
         self._schedule_titlebar_style(window)
@@ -1021,20 +1394,24 @@ class OmniUI(ctk.CTk):
 
     # --- Transkript bölgeleri (etiket tabanlı; her bölge '\n' ile biter, asla boş kalmaz) ---
 
+    def _bind_link_tag(self, tag: str) -> None:
+        if tag.startswith("md_href:") and tag not in self._text.tag_names():
+            url: str = tag.removeprefix("md_href:")
+            self._text.tag_bind(tag, "<Button-1>", lambda _event, target=url: webbrowser.open(target))
+            self._text.tag_bind(tag, "<Enter>", lambda _event: self._text.configure(cursor="hand2"))
+            self._text.tag_bind(tag, "<Leave>", lambda _event: self._text.configure(cursor="arrow"))
+
     def _insert_parts(self, index: str, region: str, parts: List[Tuple[str, Tuple[str, ...]]]) -> None:
         self._text.mark_set(INSERT_MARK, index)
         self._text.mark_gravity(INSERT_MARK, "right")
         for content, tags in parts:
             if content:
                 for tag in tags:
-                    if tag.startswith("md_href:") and tag not in self._text.tag_names():
-                        url = tag.removeprefix("md_href:")
-                        self._text.tag_bind(tag, "<Button-1>", lambda _event, target=url: webbrowser.open(target))
-                        self._text.tag_bind(tag, "<Enter>", lambda _event: self._text.configure(cursor="hand2"))
-                        self._text.tag_bind(tag, "<Leave>", lambda _event: self._text.configure(cursor="arrow"))
+                    self._bind_link_tag(tag)
                 self._text.insert(INSERT_MARK, content, tags + (region,))
 
     def _new_region(self, parts: List[Tuple[str, Tuple[str, ...]]]) -> str:
+        self._empty_state.place_forget()
         self._region_seq += 1
         region: str = f"r{self._region_seq}"
         self._insert_parts("end-1c", region, parts)
@@ -1295,7 +1672,7 @@ class OmniUI(ctk.CTk):
         parts: List[Tuple[str, Tuple[str, ...]]] = [("⏺ ", (bullet_tag,)), (tool_label(view["name"]), ("tool_name",))]
         is_command: bool = view["name"] in ("execute_shell", "execute_js")
         if not is_command and view["preview"]:
-            parts.append((f"({_clip_line(view['preview'].splitlines()[0])})", ("tool_args",)))
+            parts.append((f"({clip_line(view['preview'].splitlines()[0])})", ("tool_args",)))
         if view["status"] in ("ok", "error"):
             parts.append((f" · {view['seconds']:.1f}sn", ("meta",)))
         parts.append(("\n", ()))
@@ -1305,7 +1682,7 @@ class OmniUI(ctk.CTk):
             for index, command_line in enumerate(shown):
                 prompt: str = ("$ " if view["name"] == "execute_shell" else "› ") if index == 0 else "  "
                 parts.append((prompt, ("command_prompt",)))
-                parts.append((_clip_line(command_line) + "\n", ("command",)))
+                parts.append((clip_line(command_line) + "\n", ("command",)))
         if view["status"] == "running":
             if view["tail"]:
                 hidden: int = view["line_count"] - len(view["tail"])
@@ -1314,7 +1691,7 @@ class OmniUI(ctk.CTk):
                     parts.append((f"… {hidden} satır daha\n", ("meta",)))
                 for position, line in enumerate(view["tail"]):
                     parts.append(("⎿  ", ("gutter",) if position == 0 and hidden <= 0 else ("gutter_hidden",)))
-                    parts.append((_clip_line(line) + "\n", ("output",)))
+                    parts.append((clip_line(line) + "\n", ("output",)))
             else:
                 elapsed: float = time.monotonic() - view["started_at"]
                 parts.append(("⎿  ", ("gutter",)))
@@ -1327,13 +1704,7 @@ class OmniUI(ctk.CTk):
         self._replace_region(view["region"], parts)
 
     def _render_welcome(self) -> None:
-        self._new_region([
-            ("✻ ", ("welcome_mark",)), ("OmniAgent'a hoş geldin\n", ("welcome_title",)),
-            (f"cwd: {Path.cwd()}\n", ("welcome_dim",)),
-            ("Kabuk, dosya, web ve macOS arayüzü üzerinde görevleri senin yerine yürütür.\n", ("welcome_dim",)),
-            ("Örnek: \"İndirilenler'deki en büyük 5 dosyayı listele\"\n", ("welcome_dim",)),
-            ("\n", ("gap",)),
-        ])
+        self._empty_state.place(relx=0.5, rely=0.5, anchor="center")
 
     def _render_goal(self, goal: str) -> None:
         self._new_region([("\n", ("gap",))])
@@ -1519,6 +1890,8 @@ class OmniUI(ctk.CTk):
         self._text.configure(state="disabled")
         if changed and at_bottom:
             self._text.see("end")
+        if changed:
+            self._save_current_chat()
         self._animate(now)
         delay: int = FRAME_MS if any(self._pending_text.values()) else (
             RUNNING_IDLE_FRAME_MS if running else IDLE_FRAME_MS
@@ -1659,6 +2032,8 @@ class OmniUI(ctk.CTk):
         goal: str = self.entry.get().strip()
         if not goal:
             return
+        if not self._ensure_chat(goal):
+            return
         if self._voice.active:
             self._voice.cancel()
             # Eski oturumun idle callback'i yeni görev composer'ına yazmasın.
@@ -1678,6 +2053,7 @@ class OmniUI(ctk.CTk):
             self._new_region([(inventory + "\n", ("notice_info",))])
             self._text.configure(state="disabled")
             self._text.see("end")
+            self._save_current_chat(force=True)
             return
         self._active_goal = goal
         self.entry.delete(0, "end")
@@ -1685,6 +2061,7 @@ class OmniUI(ctk.CTk):
         self._render_goal(goal)
         self._text.configure(state="disabled")
         self._text.see("end")
+        self._save_current_chat(force=True)
         self._turn = None
         self._tools_by_call = {}
         self._completed_tokens = 0
@@ -1828,12 +2205,124 @@ class OmniUI(ctk.CTk):
             if not background:
                 self.entry.focus_set()
         self._sync_menu_status()
+        self._save_current_chat(force=True)
 
-    def _clear_transcript(self) -> None:
+    def _save_catalog(self) -> bool:
+        if not self._chat_catalog_writable:
+            return False
+        try:
+            save_catalog(self._chat_index, self._active_chat_id)
+        except OSError as error:
+            self._chat_store_problem = f"Sohbet listesi kaydedilemedi: {error}"
+            self._chat_notice.configure(text=self._chat_store_problem)
+            logging.warning(self._chat_store_problem)
+            return False
+        return True
+
+    def _ensure_chat(self, goal: str) -> bool:
+        if not self._chat_catalog_writable:
+            return False
+        if self._chat_record is None:
+            fresh: ChatRecord = new_chat(goal)
+            try:
+                save_chat(fresh)
+            except OSError as error:
+                self._chat_store_problem = f"Sohbet oluşturulamadı: {error}"
+                self._chat_notice.configure(text=self._chat_store_problem)
+                return False
+            self._chat_record = fresh
+            self._active_chat_id = self._chat_record["id"]
+        now: str = datetime.now(timezone.utc).isoformat()
+        self._chat_index = [
+            {"id": self._chat_record["id"], "title": self._chat_record["title"], "updated_at": now},
+            *[chat for chat in self._chat_index if chat["id"] != self._chat_record["id"]],
+        ]
+        if not self._save_catalog():
+            return False
+        self._refresh_chat_list()
+        return True
+
+    def _save_current_chat(self, force: bool = False) -> bool:
+        if self._chat_record is None:
+            return True
+        now: float = time.monotonic()
+        if not force and now - self._chat_last_save < 1.5:
+            return True
+        self._chat_last_save = now
+        self._chat_record["history"] = list(self._history)
+        self._chat_record["spans"] = spans_from_dump(self._text.dump("1.0", "end-1c", text=True, tag=True))
+        self._chat_record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            save_chat(self._chat_record)
+        except (OSError, ValueError) as error:
+            self._chat_store_problem = f"Sohbet kaydedilemedi: {error}"
+            self._chat_notice.configure(text=self._chat_store_problem)
+            logging.warning(self._chat_store_problem)
+            return False
+        else:
+            if self._chat_store_problem.startswith("Sohbet kaydedilemedi"):
+                self._chat_store_problem = ""
+                self._chat_notice.configure(text="")
+            return True
+
+    def _open_chat(self, chat_id: str, save_current: bool = True) -> None:
         if self._agent_future is not None:
             return
+        if save_current and chat_id == self._active_chat_id:
+            return
+        if save_current:
+            if not self._save_current_chat(force=True):
+                return
+        try:
+            record: ChatRecord = load_chat(chat_id)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            self._chat_store_problem = f"Sohbet açılamadı: {error}"
+            self._chat_notice.configure(text=self._chat_store_problem)
+            return
+        self._reset_chat_view(show_welcome=False)
+        self._chat_record = record
+        self._active_chat_id = chat_id
+        self._history = list(record["history"])
+        self._text.configure(state="normal")
+        legacy_welcome = bool(record["spans"]) and not record["history"] and all(
+            set(span["tags"]) <= {"welcome_mark", "welcome_title", "welcome_dim", "welcome_example", "gap"}
+            for span in record["spans"]
+        )
+        if record["spans"] and not legacy_welcome:
+            self._empty_state.place_forget()
+            for span in record["spans"]:
+                for tag in span["tags"]:
+                    self._bind_link_tag(tag)
+                self._text.insert("end-1c", span["text"], tuple(span["tags"]))
+        else:
+            self._render_welcome()
+        self._text.configure(state="disabled")
+        self._text.see("end")
+        self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
+        self._save_catalog()
+        self._refresh_chat_list()
+
+    def _new_chat(self) -> None:
+        if self._agent_future is not None:
+            return
+        if not self._save_current_chat(force=True):
+            return
+        self._active_chat_id = None
+        self._chat_record = None
+        self._reset_chat_view(show_welcome=True)
+        self._save_catalog()
+        self._refresh_chat_list()
+        self.entry.delete(0, "end")
+        self.entry.focus_set()
+
+    def _clear_transcript(self) -> None:
+        """Eski temizleme çağrılarını geçmişi koruyan yeni sohbet akışına yönlendirir."""
+        self._new_chat()
+
+    def _reset_chat_view(self, show_welcome: bool) -> None:
         self._text.configure(state="normal")
         self._text.delete("1.0", "end")
+        self._empty_state.place_forget()
         for card in self._artifact_widgets:
             card.destroy()
         self._artifact_widgets = []
@@ -1848,12 +2337,15 @@ class OmniUI(ctk.CTk):
         self._region_text_tag = {}
         self._streaming_regions = {}
         self._live_regions = {}
-        self._render_welcome()
+        self._active_goal = ""
+        if show_welcome:
+            self._render_welcome()
         self._text.configure(state="disabled")
         self.stats_label.configure(text="")
 
     def _on_close(self) -> None:
         """Pencere kapanırken ses/istemci kaynaklarını kapatıp event loop'u durdurur."""
+        self._save_current_chat(force=True)
         if self._visibility_hotkey is not None:
             self._visibility_hotkey.close()
         self._voice.cancel()

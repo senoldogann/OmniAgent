@@ -56,6 +56,8 @@ SETTLE_POLL_SECONDS: float = 0.03
 SETTLE_REACTION_SECONDS: float = 1.0
 SETTLE_QUIET_SECONDS: float = 0.45
 SETTLE_MAX_SECONDS: float = 3.0
+# Gecikmeli metin yükleyen sayfada OCR, ilk iskelet değişiminden hemen sonra eski metni okumamalı.
+OCR_AFTER_INPUT_MIN_SECONDS: float = 0.9
 # Uyuyan ekranın kullanıcı etkinliği bildirimiyle açılmasını bekleme sınırı
 DISPLAY_WAKE_SECONDS: float = 2.0
 
@@ -82,10 +84,15 @@ READ_GAP_MARKER: str = "[… olası atlama …]"
 READ_EDGE_UNITS: float = 6.0
 READ_TOP_ATTEMPTS: int = 4
 TEXT_CANDIDATE_LIMIT: int = 8
+# Yaklaşık hedef noktasından uzak OCR eşleşmesi tıklanmaz; önce yerel kırpma yeniden okunur.
+TEXT_NEAR_MAX_DISTANCE: int = 180
+TEXT_FOCUS_RADIUS: int = 190
 
 # Süreç ve kabuk sabitleri
+# Komut serbestliği: ajan uzun kurulum/derleme/indirmeleri tek çağrıda bitirebilsin. Kullanıcı
+# kararı gereği kabuk komutları engellenmez; yalnız süre üst sınırı vardır (1 saat).
 SHELL_TIMEOUT_SECONDS: float = 60.0
-SHELL_MAX_TIMEOUT_SECONDS: int = 900
+SHELL_MAX_TIMEOUT_SECONDS: int = 3600
 TIMEOUT_OUTPUT_TAIL: int = 1500
 JS_TIMEOUT_SECONDS: float = 20.0
 FETCH_ERROR_BODY_LIMIT: int = 800
@@ -99,10 +106,11 @@ ACCESSIBILITY_SETTINGS_URL: str = "x-apple.systempreferences:com.apple.preferenc
 
 class ToolError(Exception):
     """Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı."""
-    def __init__(self, message: str, code: str, recoverable: bool) -> None:
+    def __init__(self, message: str, code: str, recoverable: bool, completed_steps: int = 0) -> None:
         super().__init__(message)
         self.code: str = code
         self.recoverable: bool = recoverable
+        self.completed_steps: int = completed_steps
 
 
 class ToolRuntime(TypedDict):
@@ -143,6 +151,8 @@ class ActionStep(TypedDict, total=False):
     button: str
     clicks: int
     text: str
+    near: Optional[List[int]]
+    max_pages: int
     key: str
     seconds: float
 

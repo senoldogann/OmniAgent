@@ -16,7 +16,7 @@ from omniagent.app.tool_schema import (
 )
 from omniagent.app.types import ToolCallDraft, ToolResult
 from omniagent.config import redact
-from omniagent.core.events import EventSink, preview_arguments
+from omniagent.core.events import AgentEvent, EventSink, argument_point, argument_tag, preview_arguments
 from omniagent.integrations.capabilities import ToolEntry, validate_arguments
 from omniagent.integrations.runtime import (
     CURRENT_RUNTIME,
@@ -42,6 +42,17 @@ EVENT_RESULT_LIMIT: int = 4000
 def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
     """Önbellek anahtarı: araç adı + kararlı (sıralı) argüman JSON'u."""
     return name + ":" + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+
+
+def failed_call_key(call: ToolCallDraft) -> str:
+    """Aynı araç ve eşdeğer JSON argümanlarını tek tekrar anahtarına dönüştürür."""
+    try:
+        arguments: object = json.loads(call["arguments"] or "{}")
+    except json.JSONDecodeError:
+        return f"{call['name']}:{call['arguments']}"
+    if isinstance(arguments, dict):
+        return _tool_cache_key(call["name"], arguments)
+    return f"{call['name']}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
 
 
 def approval_request_for_call(
@@ -116,11 +127,17 @@ async def require_approval(tool: str, request: approval.ApprovalRequest) -> None
 async def execute_tool(
     call: ToolCallDraft, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
     should_stop: Callable[[], bool],
+    inflight: Optional[Dict[str, asyncio.Future[ToolResult]]] = None,
 ) -> ToolResult:
     """
     Tek bir araç çağrısını çalıştırır; başarı/hata durumunu yapılandırılmış şekilde döner.
     Çalışırken üretilen canlı çıktı (komut satırları) tool_output olayı olarak yayınlanır;
     kullanıcı durdurursa çalışan komut hemen sonlandırılır.
+
+    `inflight`, aynı turda paralel yürüyen eşdeğer salt-okur çağrıların aynı işi iki kez
+    yapmasını önler: önbellek kontrolü ile sonucun yazılması arasında `await` olduğu için iki
+    eşdeğer `read_file`/`fetch_raw` çağrısı ikisi de önbelleği boş görüp çalışıyordu. İlk çağrı
+    anahtarı rezerve eder, sonuç önbelleğe yazıldıktan sonra bekleyenler o sonucu alır.
     """
     name: str = call["name"]
     try:
@@ -149,10 +166,18 @@ async def execute_tool(
         }
 
     cache_key: Optional[str] = None
+    pending: Optional[asyncio.Future[ToolResult]] = None
     if name in _CACHEABLE_TOOLS:
         cache_key = _tool_cache_key(name, arguments)
         if cache_key in cache:
             return {**cache[cache_key], "tool_call_id": call["id"]}
+        if inflight is not None:
+            running = inflight.get(cache_key)
+            if running is not None:
+                # Eşdeğer çağrı aynı turda paralel yürüyor; onun sonucunu paylaş.
+                return {**(await running), "tool_call_id": call["id"]}
+            pending = asyncio.get_running_loop().create_future()
+            inflight[cache_key] = pending
 
     method: Callable[..., Any] = dynamic["execute"] if dynamic else getattr(toolbox, name)
     integration_started = time.monotonic()
@@ -160,6 +185,12 @@ async def execute_tool(
         "emit_output": lambda text: emit({"kind": "tool_output", "call_id": call["id"], "text": text}),
         "should_stop": should_stop,
         "approved": False,
+    }
+    # İptal gibi bir BaseException dışarı taşınırsa bekleyen eşdeğer çağrı askıda kalmasın diye
+    # sonuç önceden güvenli bir başarısızlıkla doldurulur; normal yol bunu ezber.
+    outcome: ToolResult = {
+        "tool_call_id": call["id"], "ok": False,
+        "error_type": "Interrupted", "error": "Araç çağrısı tamamlanmadan kesildi.",
     }
     token = TOOL_RUNTIME.set(call_context)
     try:
@@ -179,8 +210,8 @@ async def execute_tool(
             result: Any = await runtime.wait(operation) if runtime is not None and not dynamic else await operation
         else:
             result = await asyncio.to_thread(method, **arguments)
-        outcome: ToolResult = {"tool_call_id": call["id"], "ok": True,
-                               "result": json.dumps(result, ensure_ascii=False) if dynamic else str(result)}
+        outcome = {"tool_call_id": call["id"], "ok": True,
+                   "result": json.dumps(result, ensure_ascii=False) if dynamic else str(result)}
         if name == "capture_photo" and toolbox.last_capture_path is not None:
             outcome["artifact_path"] = toolbox.last_capture_path
     except (IntegrationStopped, InteractionRequired) as error:
@@ -192,6 +223,7 @@ async def execute_tool(
             "tool_call_id": call["id"], "ok": False,
             "error_type": "ToolError", "error": str(error),
             "code": error.code, "recoverable": error.recoverable,
+            "completed_steps": error.completed_steps,
         }
     except TypeError as error:
         outcome = {
@@ -206,13 +238,15 @@ async def execute_tool(
         }
     finally:
         TOOL_RUNTIME.reset(token)
-
-    if dynamic and service:
-        service.record(dynamic["capability"], time.monotonic() - integration_started, bool(outcome.get("ok")))
-    if _is_side_effect(name):
-        cache.clear()
-    if cache_key is not None and outcome.get("ok"):
-        cache[cache_key] = outcome
+        if dynamic and service:
+            service.record(dynamic["capability"], time.monotonic() - integration_started, bool(outcome.get("ok")))
+        if _is_side_effect(name):
+            cache.clear()
+        if cache_key is not None and outcome.get("ok"):
+            cache[cache_key] = outcome
+        # Bekleyen eşdeğer çağrı, sonuç önbelleğe yazıldıktan SONRA serbest bırakılır.
+        if pending is not None and not pending.done():
+            pending.set_result(outcome)
     return outcome
 
 
@@ -231,13 +265,22 @@ def result_text(result: ToolResult) -> str:
 async def _run_tool_with_events(
     index: int, call: ToolCallDraft, preview: str, toolbox: Toolbox, cache: Dict[str, ToolResult],
     emit: EventSink, should_stop: Callable[[], bool],
+    inflight: Optional[Dict[str, asyncio.Future[ToolResult]]] = None,
 ) -> ToolResult:
     """Aracı çalıştırır; başlangıcını (önizlemeyle) ve bitişini (süre + sonuç) olay olarak yayınlar."""
-    emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"], "preview": preview})
+    emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
+          "preview": preview, "argument_tag": argument_tag(call["name"], call["arguments"]),
+          "point": argument_point(call["name"], call["arguments"])})
     started: float = time.monotonic()
-    result: ToolResult = await execute_tool(call, toolbox, cache, emit, should_stop)
-    emit({"kind": "tool_finished", "call_id": call["id"], "ok": bool(result.get("ok")),
-          "text": result_text(result)[:EVENT_RESULT_LIMIT], "seconds": round(time.monotonic() - started, 2)})
+    result: ToolResult = await execute_tool(call, toolbox, cache, emit, should_stop, inflight)
+    finished: AgentEvent = {"kind": "tool_finished", "call_id": call["id"],
+                            "ok": bool(result.get("ok")),
+                            "text": result_text(result)[:EVENT_RESULT_LIMIT],
+                            "seconds": round(time.monotonic() - started, 2)}
+    failure_code = result.get("code") or (result.get("error_type") if not result.get("ok") else None)
+    if failure_code:
+        finished["code"] = str(failure_code)
+    emit(finished)
     return result
 
 
@@ -259,6 +302,9 @@ async def _execute_tool_calls(
     """
     results: List[Optional[ToolResult]] = [None] * len(calls)
     previews: List[str] = [preview_arguments(call["name"], call["arguments"]) for call in calls]
+    # Aynı turda paralel yürüyen eşdeğer salt-okur çağrılar tek kez çalışsın diye paylaşılan
+    # rezervasyon tablosu (bkz. execute_tool).
+    inflight: Dict[str, asyncio.Future[ToolResult]] = {}
     index: int = 0
     while index < len(calls):
         if _is_side_effect(calls[index]["name"]):
@@ -270,7 +316,8 @@ async def _execute_tool_calls(
         while stop < len(calls) and not _is_side_effect(calls[stop]["name"]):
             stop += 1
         group: List[ToolResult] = list(await asyncio.gather(
-            *(_run_tool_with_events(k, calls[k], previews[k], toolbox, cache, emit, should_stop)
+            *(_run_tool_with_events(k, calls[k], previews[k], toolbox, cache, emit, should_stop,
+                                    inflight)
               for k in range(index, stop))
         ))
         results[index:stop] = group

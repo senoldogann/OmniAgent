@@ -205,6 +205,33 @@ def test_recovered_failure_sentence_is_not_misread_as_final_failure() -> None:
     assert success and not reason
 
 
+def test_unfinished_required_actions_after_partial_success_fail_final_verdict() -> None:
+    """Başarılı bir yan adım, yapılmadığı söylenen zorunlu teslimi gizlememeli."""
+    success, reason = main.final_verdict(
+        "Bakiye ayarlandı. API uçları doğrulanamadığı için emre ve kapanışa "
+        "geçilememiştir. Diğer adımlar gerçekleşmediği için raporlanamamıştır.",
+        "stop",
+    )
+    assert not success
+    assert "tamamlanmadığını" in reason
+
+
+def test_recovered_unfinished_action_sentence_can_still_be_successful() -> None:
+    """İlk başarısız deneme sonraki doğrulanmış tamamlamayı bozmamalı."""
+    success, reason = main.final_verdict(
+        "İlk emir gerçekleşmedi, ancak ikinci emir tamamlandı ve doğrulandı.", "stop",
+    )
+    assert success and not reason
+
+
+def test_scoped_inability_note_does_not_fail_completed_delivery() -> None:
+    """Teslim edilmiş işte kapsamlı bir okuma notu başarıyı düşürmemeli (yanlış pozitif)."""
+    success, reason = main.final_verdict(
+        "Rapor kaydedildi: ~/Desktop/rapor.md. Not: 3. sayfayı okuyamadım, PDF bozuktu.", "stop",
+    )
+    assert success and not reason
+
+
 def test_unread_feed_is_never_marked_complete() -> None:
     success, reason = main.final_verdict(
         "LinkedIn sayfasına eriştim ancak akışınızdaki içerikleri okuyamıyorum. "

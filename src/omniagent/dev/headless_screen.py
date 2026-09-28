@@ -74,6 +74,18 @@ class HeadlessPage:
     def goto(self, url: str) -> None:
         self._run(lambda page: page.goto(url, wait_until="domcontentloaded"))
 
+    def new_tab(self, url: Optional[str]) -> None:
+        """Canlı Chrome'daki new_tab argümanını aynı görünmez oturumda uygular."""
+        def open_page(_previous: Page) -> None:
+            if self._browser is None:
+                raise RuntimeError("Görünmez tarayıcı kapalı.")
+            self._page = self._browser.new_page(
+                viewport={"width": VIEW_WIDTH, "height": VIEW_HEIGHT}, device_scale_factor=2,
+            )
+            if url is not None:
+                self._page.goto(url, wait_until="domcontentloaded")
+        self._run(open_page)
+
     def title_and_url(self) -> Tuple[str, str]:
         return self._run(lambda page: (page.title(), page.url))
 
@@ -187,7 +199,9 @@ def install(page: HeadlessPage) -> None:
         def _scope_gray(self) -> np.ndarray:
             return gray(tools.SCROLL_DIFF_EDGE)
 
-        def take_screenshot(self, filename: str, display_index: Optional[int] = None) -> str:
+        def take_screenshot(
+            self, filename: str, display_index: Optional[int] = None, detail: bool = True,
+        ) -> str:
             note: str = ""
             if self._pending_input is not None:
                 waited: float = tools.wait_for_screen_settle(
@@ -201,12 +215,18 @@ def install(page: HeadlessPage) -> None:
             )
             frame.save(filename)
             self._visual_geometry = GEOMETRY
+            detail_note = (
+                " ve oranı korunmuş ayrıntı görüntüsü"
+                if detail else ""
+            )
             return (f"Ekran görüntüsü {filename} dosyasına kaydedildi ({VIEW_WIDTH}×{VIEW_HEIGHT}, gerçek "
-                    "en-boy oranı). Sana 1000×1000 kare olarak gösterilir; o görüntüdeki koordinatlar tıklama "
-                    "araçlarıyla aynı uzaydadır." + note)
+                    f"en-boy oranı). Modele 1000×1000 koordinat haritası{detail_note} "
+                    "iletilir; tıklama noktaları koordinat haritasındadır." + note)
 
         def chrome_active_tab(self, url: Optional[str], new_tab: bool = False) -> str:
-            if url is not None:
+            if new_tab:
+                page.new_tab(url)
+            elif url is not None:
                 page.goto(url)
             title, current = page.title_and_url()
             # Gezinmeden sonraki gözlem sayfanın durulmasını beklesin (boyut farkı = tepki görüldü)

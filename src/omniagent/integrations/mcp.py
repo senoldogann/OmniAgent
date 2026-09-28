@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -61,6 +62,26 @@ def _install_python() -> str:
     return python
 
 
+# Kurulum adımlarının paylaştığı toplam bütçe ve bir adıma ayrılacak en az süre.
+INSTALL_BUDGET_SECONDS: float = 60.0
+MIN_INSTALL_STEP_SECONDS: float = 5.0
+
+
+def install_step_timeout(start: float, budget: float = INSTALL_BUDGET_SECONDS) -> float:
+    """
+    Kurulum adımına ayrılacak kalan süreyi döner. Bütçe dolmuşsa (ya da kalan süre bir adımı
+    tamamlayamayacak kadar azsa) açık bir hata yükseltir: eskiden negatif süre run_install'a
+    geçiyor, runtime.wait anında TimeoutError yükseltiyor ve finally yeni başlayan kurulum
+    sürecini killpg ile öldürüyordu (pip install hiç çalışmıyordu). Saf fonksiyon.
+    """
+    remaining: float = budget - (time.monotonic() - start)
+    if remaining < MIN_INSTALL_STEP_SECONDS:
+        raise RuntimeError(
+            f"Kurulum {budget:g} saniyelik bütçesini aştı; kalan adımlar çalıştırılmadı."
+        )
+    return remaining
+
+
 async def install_package(root: Path, entry: Capability, runtime: IntegrationRuntime) -> List[str]:
     package = entry.get("package", {})
     if not entry.get("trusted") or not entry.get("source") or not package:
@@ -107,23 +128,23 @@ async def install_package(root: Path, entry: Capability, runtime: IntegrationRun
             if uv:
                 python = "3.11" if getattr(sys, "frozen", False) else sys.executable
                 await run_install([uv, "venv", "--python", python, str(destination / "venv")],
-                                  runtime, 60 - (time.monotonic() - start))
+                                  runtime, install_step_timeout(start))
                 await run_install([uv, "pip", "install", "--python", str(executable),
                                    "--index-url", "https://pypi.org/simple", name + "==" + version],
-                                  runtime, 60 - (time.monotonic() - start))
+                                  runtime, install_step_timeout(start))
             else:
                 await run_install([_install_python(), "-m", "venv", str(destination / "venv")],
-                                  runtime, 60 - (time.monotonic() - start))
+                                  runtime, install_step_timeout(start))
                 await run_install([str(executable), "-m", "pip", "install",
                                    "--index-url", "https://pypi.org/simple", name + "==" + version],
-                                  runtime, 60 - (time.monotonic() - start))
+                                  runtime, install_step_timeout(start))
         else:
             npm = shutil.which("npm")
             if not npm:
                 raise RuntimeError("Node entegrasyonu için npm gerekiyor.")
             await run_install([npm, "install", "--prefix", str(destination), "--ignore-scripts",
                                "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org",
-                               name + "@" + version], runtime, 60 - (time.monotonic() - start))
+                               name + "@" + version], runtime, install_step_timeout(start))
         if not executable.exists():
             raise RuntimeError("Paket kuruldu ancak giriş komutu bulunamadı.")
         save_json(marker, package)
@@ -166,8 +187,12 @@ class MCPConnection:
             if not self.ready.done():
                 self.ready.set_exception(RuntimeError(f"MCP bağlantısı kurulamadı ({type(error).__name__})."))
             elif not isinstance(error, asyncio.CancelledError):
-                # Arka plan görevinin hatası sonraki çağrıda bağlantı durumuyla anlaşılır.
-                pass
+                # Bağlantı kurulduktan sonraki beklenmedik kopma sessizce yutulmasın: sonraki
+                # araç çağrısı bağlantı durumunu görür, hata da log'da izlenebilir kalır.
+                logging.warning(
+                    "MCP bağlantısı beklenmedik şekilde kapandı",
+                    extra={"error_type": type(error).__name__},
+                )
 
     async def close(self) -> None:
         self.stop.set()

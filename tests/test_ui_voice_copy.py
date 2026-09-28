@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -114,7 +115,8 @@ def test_partial_replaces_voice_segment_and_final_keeps_one_copy() -> None:
 
 
 @pytest.mark.skipif(os.environ.get("OMNI_UI_TEST") != "1", reason="Gerçek Tk testi OMNI_UI_TEST=1 ile etkinleştirilir.")
-def test_svg_icons_are_used_by_real_controls(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_svg_icons_are_used_by_real_controls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(ui, "create_model_clients", lambda: {})
     window = ui.OmniUI()
     try:

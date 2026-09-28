@@ -21,10 +21,11 @@ from omniagent.tools import filesystem
 
 
 @pytest.fixture
-def app(monkeypatch: pytest.MonkeyPatch) -> Iterator[ui.OmniUI]:
+def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[ui.OmniUI]:
     if os.environ.get("OMNI_UI_TEST") != "1":
         pytest.skip("Gerçek Tk testi OMNI_UI_TEST=1 ile etkinleştirilir.")
     monkeypatch.setattr(ui, "create_model_clients", lambda: {})
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     class FakeHotkey:
         def __init__(self, callback: Any) -> None:
             self.callback = callback

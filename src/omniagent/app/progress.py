@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from omniagent.app.constants import (
     MAX_NOVEL_READ_OUTPUTS,
     MAX_NOVEL_SHELL_OUTPUTS,
-    SOFT_TOOL_CALL_BUDGET,
-    SOFT_UNCACHED_PROMPT_TOKEN_BUDGET,
     TASK_LEDGER_LIMIT,
     TRIMMED_ARGS_LIMIT,
     TRIMMED_CONTENT_LIMIT,
@@ -36,21 +34,21 @@ def add_usage(total: TokenUsage, turn: TokenUsage) -> TokenUsage:
     }
 
 
-def budget_pressure_message(usage: TokenUsage, tool_call_count: int) -> Optional[str]:
-    """Uzun görevin bütçe baskısını kısa, eyleme dönük bir model mesajına çevirir. Saf fonksiyon."""
-    uncached: int = max(0, usage["prompt_tokens"] - usage["cached_tokens"])
-    reasons: List[str] = []
-    if uncached >= SOFT_UNCACHED_PROMPT_TOKEN_BUDGET:
-        reasons.append(f"{uncached} önbelleksiz giriş tokenı")
-    if tool_call_count >= SOFT_TOOL_CALL_BUDGET:
-        reasons.append(f"{tool_call_count} araç çağrısı")
-    if not reasons:
+def failed_tool_recovery_message(calls: List[ToolCallDraft], results: List[ToolResult]) -> Optional[str]:
+    """Başarısız araçları bir sonraki tur için kısa, somut kurtarma isteğine çevirir."""
+    failures: List[str] = [
+        f"{call['name']}: {result_text(result)[:180]}"
+        for call, result in zip(calls, results, strict=True) if not result.get("ok")
+    ]
+    if not failures:
         return None
+    summary: str = "\n".join(f"- {item}" for item in failures[:4])
     return (
-        "ÇALIŞMA BÜTÇESİ UYARISI: " + ", ".join(reasons) + ". "
-        "Görevi bırakma; yeni/opsiyonel keşfi ve gereksiz tekrar kontrollerini durdur. "
-        "STATE içindeki doğrulanmış bilgileri yeniden kullan ve kalan zorunlu hesaplama, yazma, "
-        "final doğrulama ve cleanup adımlarını en kısa yoldan tamamla."
+        "HOST — ARAÇ HATASI: Önceki turdaki başarısız çağrılar:\n"
+        f"{summary}\n"
+        "Aynı çağrıyı aynı argümanlarla körlemesine tekrarlama. Hatanın nedenini kullanarak "
+        "argümanı düzelt veya farklı bir araç/yöntem seç ve şimdi somut bir adım uygula. "
+        "Görevin sürmesi için kullanıcıdan gerçekten eksik bilgi gerekiyorsa ask_user çağır."
     )
 
 
@@ -127,16 +125,37 @@ def novel_shell_output_progress(
     return frozenset(updated), progressed
 
 
+def _sequence_read_performed(call: ToolCallDraft, result: ToolResult) -> bool:
+    """Başarılı veya kısmi dizide gerçekten tamamlanan okuma adımı var mı? Saf."""
+    if call["name"] != "run_action_sequence":
+        return False
+    try:
+        arguments = json.loads(call["arguments"] or "{}")
+        steps: object = arguments.get("steps") if isinstance(arguments, dict) else None
+        if isinstance(steps, str):
+            steps = json.loads(steps)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(steps, list):
+        return False
+    completed = len(steps) if result.get("ok") else int(result.get("completed_steps") or 0)
+    return any(
+        isinstance(step, dict) and step.get("action") == "read_scrollable"
+        for step in steps[:completed]
+    )
+
+
 def novel_read_output_progress(
     calls: List[ToolCallDraft], results: List[ToolResult], seen: frozenset[str],
 ) -> Tuple[frozenset[str], bool]:
-    """Yeni başarılı okuma/web çıktısını sınırlı sayıda ilerleme sayar; aynı içeriği tekrar saymaz."""
+    """Gerçekten tamamlanmış yeni okuma çıktısını ilerleme sayar; tekrarı saymaz."""
     updated = set(seen)
     progressed = False
     for call, result in zip(calls, results, strict=True):
-        if call["name"] not in _READ_PROGRESS_TOOLS or not result.get("ok"):
+        sequence_read = _sequence_read_performed(call, result)
+        if not sequence_read and (call["name"] not in _READ_PROGRESS_TOOLS or not result.get("ok")):
             continue
-        rendered = redact(str(result.get("result", ""))).strip()
+        rendered = result_text(result).strip() if sequence_read else redact(str(result.get("result", ""))).strip()
         if not rendered:
             continue
         digest = hashlib.sha256(rendered.encode("utf-8")).hexdigest()

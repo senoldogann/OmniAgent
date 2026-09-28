@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import threading
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.request import urlopen
 
 from openai import AsyncOpenAI, Timeout
@@ -21,7 +22,16 @@ ZERO_USAGE: TokenUsage = {
     "cached_tokens": 0,
     "completion_tokens": 0,
 }
-_MISSING_KEY_WARNED: set[str] = set()
+# Eksik anahtar uyarısı profil başına yalnız bir kez verilir. Kayıt kilitlidir ve dışarıdan
+# enjekte edilebilir (bkz. create_model_clients), böylece testler arasında durum sızmaz.
+_MISSING_KEY_WARNED: Set[str] = set()
+_MISSING_KEY_LOCK: threading.Lock = threading.Lock()
+
+
+def reset_missing_key_warnings() -> None:
+    """Süreç düzeyindeki eksik-anahtar uyarı kaydını temizler (test izolasyonu için)."""
+    with _MISSING_KEY_LOCK:
+        _MISSING_KEY_WARNED.clear()
 
 
 def merge_tool_call_delta(
@@ -31,18 +41,30 @@ def merge_tool_call_delta(
     name: Optional[str],
     arguments: Optional[str],
 ) -> List[ToolCallDraft]:
-    """Streaming tool-call parçasını kararlı bir taslağa birleştirir."""
-    padded: List[ToolCallDraft] = drafts + [
-        {"id": "", "name": "", "arguments": ""}
-        for _ in range(index + 1 - len(drafts))
+    """
+    Streaming tool-call parçasını kararlı bir taslağa birleştirir. Ollama Cloud bazı
+    modellerde ayrı tam çağrıları aynı index=0 ile akıtır; farklı id yeni çağrıdır.
+    Araya hiç gelmemiş index atlarsa boş adlı "hayalet" taslak üretilmez.
+    """
+    if call_id:
+        matching = next((slot for slot, draft in enumerate(drafts) if draft["id"] == call_id), None)
+        if matching is not None:
+            index = matching
+        elif 0 <= index < len(drafts) and drafts[index]["id"]:
+            return list(drafts) + [
+                {"id": call_id, "name": name or "", "arguments": arguments or ""}
+            ]
+    if 0 <= index < len(drafts):
+        current = drafts[index]
+        updated: ToolCallDraft = {
+            "id": call_id or current["id"],
+            "name": current["name"] + (name or ""),
+            "arguments": current["arguments"] + (arguments or ""),
+        }
+        return drafts[:index] + [updated] + drafts[index + 1:]
+    return list(drafts) + [
+        {"id": call_id or "", "name": name or "", "arguments": arguments or ""}
     ]
-    current = padded[index]
-    updated: ToolCallDraft = {
-        "id": call_id or current["id"],
-        "name": current["name"] + (name or ""),
-        "arguments": current["arguments"] + (arguments or ""),
-    }
-    return padded[:index] + [updated] + padded[index + 1:]
 
 
 def ollama_cloud_ready(
@@ -69,8 +91,13 @@ def create_model_clients(
     backends: Dict[str, BackendProfile] = BACKENDS,
     api_key_variables: Dict[str, str] = API_KEY_VARIABLES,
     ollama_ready: Callable[[], bool] = ollama_cloud_ready,
+    warned: Optional[Set[str]] = None,
 ) -> Dict[str, AsyncOpenAI]:
-    """Anahtarı mevcut API profilleri için sıcak istemcileri oluşturur."""
+    """
+    Anahtarı mevcut API profilleri için sıcak istemcileri oluşturur. `warned` uyarılmış
+    profilleri tutar; verilmezse süreç düzeyindeki kayıt kullanılır. Testler kendi set'ini
+    geçerek uyarı durumunun testler arasında sızmasını önler.
+    """
     timeout = Timeout(
         MODEL_REQUEST_TIMEOUT_SECONDS,
         connect=MODEL_CONNECT_TIMEOUT_SECONDS,
@@ -86,15 +113,17 @@ def create_model_clients(
         if profile["api_key"] and name != "ollama-cloud"
     }
 
-    _MISSING_KEY_WARNED.difference_update(clients)
-    for name in backends:
-        if name in clients or name == "ollama-cloud" or name in _MISSING_KEY_WARNED:
-            continue
-        _MISSING_KEY_WARNED.add(name)
-        logging.warning(
-            "Model profili kullanılamıyor: API anahtarı tanımlı değil",
-            extra={"backend": name, "variable": api_key_variables.get(name, "")},
-        )
+    warned_state: Set[str] = _MISSING_KEY_WARNED if warned is None else warned
+    with _MISSING_KEY_LOCK:
+        warned_state.difference_update(clients)
+        for name in backends:
+            if name in clients or name == "ollama-cloud" or name in warned_state:
+                continue
+            warned_state.add(name)
+            logging.warning(
+                "Model profili kullanılamıyor: API anahtarı tanımlı değil",
+                extra={"backend": name, "variable": api_key_variables.get(name, "")},
+            )
 
     if ollama_ready():
         profile = backends["ollama-cloud"]
@@ -176,6 +205,8 @@ async def stream_completion(
     content_parts: List[str] = []
     drafts: List[ToolCallDraft] = []
     previews: Dict[int, str] = {}
+    # Sağlayıcı index=0 değerini birden çok farklı çağrı için yeniden kullanabiliyor.
+    stream_slots: Dict[int, int] = {}
     finish_reason: Optional[str] = None
     usage: TokenUsage = ZERO_USAGE
     try:
@@ -200,21 +231,31 @@ async def stream_completion(
 
             for call_delta in delta.tool_calls or []:
                 function: Any = call_delta.function
+                provider_index: int = call_delta.index
+                slot: int = (
+                    provider_index if call_delta.id
+                    else stream_slots.get(provider_index, provider_index)
+                )
                 drafts = merge_tool_call_delta(
                     drafts,
-                    call_delta.index,
+                    slot,
                     call_delta.id,
                     function.name if function is not None else None,
                     function.arguments if function is not None else None,
                 )
-                draft = drafts[call_delta.index]
+                actual_slot: int = (
+                    next(i for i, draft in enumerate(drafts) if draft["id"] == call_delta.id)
+                    if call_delta.id else min(slot, len(drafts) - 1)
+                )
+                stream_slots[provider_index] = actual_slot
+                draft = drafts[actual_slot]
                 preview = preview_arguments(draft["name"], draft["arguments"])
-                if previews.get(call_delta.index) != preview:
-                    previews[call_delta.index] = preview
+                if previews.get(actual_slot) != preview:
+                    previews[actual_slot] = preview
                     emit(
                         {
                             "kind": "tool_call_preview",
-                            "index": call_delta.index,
+                            "index": actual_slot,
                             "name": draft["name"],
                             "preview": preview,
                         }

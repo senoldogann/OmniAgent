@@ -91,8 +91,8 @@ async def test_verified_recovery_is_learned_and_reminded_only_on_same_failure(tm
     ], seen, tmp_path, events)
 
     assert first["success"]
-    # Aynı hata ikinci kez oluşunca model aynı yaklaşımı tekrarlamaması için uyarılır.
-    assert "TEKRARLANAN HATA" not in seen[1] and "TEKRARLANAN HATA" in seen[2]
+    # Aynı çağrı ikinci kez çalıştırılmadan engellenir ve model farklı adıma yönlendirilir.
+    assert "TEKRARLANAN HATA" not in seen[1] and "RepeatedFailedCall" in seen[2]
     lessons = experience.load_experience(str(tmp_path / "deneyim.json"))["lessons"]
     assert len(lessons) == 1
     # Keşif adımı (--help) düzeltme sayılmaz; gerçek değişiklik öğrenilir.

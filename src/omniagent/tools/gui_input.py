@@ -105,6 +105,36 @@ def _ax_short_text(value: object) -> str:
     return " ".join(value.split())[:60]
 
 
+# Etiketsiz metin alanları için fazladan okunan öznitelikler. Bunlar yalnız alan etiketsizken
+# çağrılır; genel tarama maliyeti artmaz. Canlı kayıtta Mail'in "To/Konu/Gövde" alanları listede
+# `TextField ''` olarak çıkıyor, model de alıcı adresini yanlış alana yazıyordu.
+_AX_LABEL_RESOLVE_LIMIT: int = 12
+
+
+def _ax_linked_label(element: object) -> str:
+    """Etiketsiz denetimin ilişkili etiket metnini (AXTitleUIElement) okur. Saf."""
+    linked: object = _ax_attribute(element, "AXTitleUIElement")
+    if linked is None:
+        return ""
+    for attribute in ("AXValue", "AXTitle", "AXDescription"):
+        try:
+            text: str = _ax_short_text(_ax_attribute(linked, attribute))
+        except (TypeError, ValueError):  # İlişkili öğe gerçek bir AXUIElement değilse
+            return ""
+        if text:
+            return text
+    return ""
+
+
+def _ax_extra_label(element: object) -> str:
+    """Etiketsiz alanı tanımlayıcı özniteliklerden etiketler (AXIdentifier, AXHelp). Saf."""
+    for attribute in ("AXIdentifier", "AXHelp"):
+        text: str = _ax_short_text(_ax_attribute(element, attribute))
+        if text:
+            return text
+    return ""
+
+
 def _ax_descendant_text(element: object) -> str:
     """Etiketsiz öğeler (örn. liste satırları) için ilk alt metni sınırlı genişlikte arar."""
     queue: List[object] = [element]
@@ -133,6 +163,7 @@ def scan_ax_elements(root: object) -> Tuple[List[AXElement], List[object], bool]
     elements: List[AXElement] = []
     refs: List[object] = []
     visited: int = 0
+    label_resolves: int = 0
     while stack:
         if (len(elements) >= AX_ELEMENT_LIMIT or visited >= AX_NODE_LIMIT
                 or time.monotonic() - started > AX_SCAN_BUDGET_SECONDS):
@@ -165,6 +196,11 @@ def scan_ax_elements(root: object) -> Tuple[List[AXElement], List[object], bool]
             "",
         )
         value: str = _ax_short_text(attrs["AXValue"]) if role in _AX_TEXT_INPUT_ROLES else ""
+        if not label and not value and role in _AX_TEXT_INPUT_ROLES and label_resolves < _AX_LABEL_RESOLVE_LIMIT:
+            # Etiketsiz metin alanı: ilişkili etiketi, olmazsa tanımlayıcıyı oku. Böylece
+            # "To/Konu/Gövde" alanları ayırt edilebilir; aksi hâlde üçü de 'TextField '' görünür.
+            label_resolves += 1
+            label = _ax_linked_label(node) or _ax_extra_label(node)
         if not label and not value:
             label = _ax_descendant_text(node)
         elements.append({

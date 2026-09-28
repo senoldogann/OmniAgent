@@ -70,6 +70,9 @@ def save_checkpoint(
             target.write(content)
             target.flush()
             os.fsync(target.fileno())
+        # Kontrol noktası oturum içeriği taşır; yalnız kullanıcıya açık (0600) olmalı
+        # (state.py, memory/user.py ve runtime.save_json ile aynı davranış).
+        os.chmod(temp_path, 0o600)
         os.replace(temp_path, destination)
         return destination
     finally:

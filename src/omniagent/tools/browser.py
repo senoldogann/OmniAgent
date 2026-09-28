@@ -5,9 +5,8 @@ Sovereign seviyesinde yüksek performanslı Playwright yönetimi ve Chrome enteg
 import asyncio
 import logging
 import subprocess
-import time
-from typing import Dict, List, Optional, Tuple, Union
-from urllib.parse import SplitResult, urlsplit
+from typing import Callable, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     Browser, BrowserContext, Error as PlaywrightError,
@@ -199,6 +198,32 @@ def run_chrome_active_tab(
     kind = "Yeni Chrome sekmesi" if new_tab else "Görünür Chrome sekmesi"
     return f"{kind}: {lines[0]}\nBaşlık: {' '.join(lines[1:-1])}{loading}", new_as_available
 
+# Playwright tarayıcı ikilisi kurulu değilse her browse_url çağrısı ham "Executable doesn't exist"
+# hatasıyla düşüyordu; model de kurulum komutlarını deneyip boşa tur harcıyordu. Eksik motoru
+# tanıyıp kısa ve uygulanabilir bir ToolError üret (Toolbox.browse_url salt okumada fetch_raw'a düşer).
+_BROWSER_MISSING_MARKERS: Tuple[str, ...] = (
+    "executable doesn't exist",
+    "browser executable",
+    "please run the following command",
+)
+
+
+def browser_launch_error(error: PlaywrightError) -> ToolError:
+    """Playwright başlatma hatasını eksik motor / diğer hata diye sınıflar. Saf."""
+    rendered: str = str(error)
+    if any(marker in rendered.casefold() for marker in _BROWSER_MISSING_MARKERS):
+        return ToolError(
+            "Tarayıcı motoru (Playwright Chromium) bu kurulumda yok; browse_url açılamaz. "
+            "Statik sayfaları fetch_raw ile oku; kurulum komutunu kendi başına deneme. "
+            "Etkileşimli sayfa gerçekten zorunluysa bunu kullanıcıya bildir.",
+            "BROWSER_UNAVAILABLE",
+            False,
+        )
+    return ToolError(
+        f"Tarayıcı başlatılamadı: {_clip(rendered, 400)}", "BROWSER_LAUNCH_FAILED", True,
+    )
+
+
 class HeadlessBrowserSession:
     def __init__(self) -> None:
         self.playwright_instance: Optional[Playwright] = None
@@ -207,23 +232,42 @@ class HeadlessBrowserSession:
         self.page: Optional[Page] = None
         self._lock: asyncio.Lock = asyncio.Lock()
 
+    async def _discard(self) -> None:
+        """Yarıda kalan Playwright başlatmasını temizler (kilidi çağıran taraf tutar)."""
+        instance: Optional[Playwright] = self.playwright_instance
+        self.playwright_instance = self.browser = self.browser_context = self.page = None
+        if instance is not None:
+            try:
+                await instance.stop()
+            except Exception:  # Sürücü ölmüşse temizlik hatası başlatma hatasını gölgelemesin
+                logging.debug("Playwright örneği kapatılamadı", exc_info=True)
+
     async def get_page(self) -> Page:
         async with self._lock:
             if self.browser_context is None:
-                self.playwright_instance = await async_playwright().start()
-                self.browser = await self.playwright_instance.chromium.launch(headless=True)
-                self.browser_context = await self.browser.new_context(
-                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
+                try:
+                    self.playwright_instance = await async_playwright().start()
+                    self.browser = await self.playwright_instance.chromium.launch(headless=True)
+                    self.browser_context = await self.browser.new_context(
+                        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                except PlaywrightError as error:
+                    # Eksik motor kalıcı bir durumdur; yarım kalan sürücüyü bırakma ki
+                    # sonraki çağrı aynı hatayı hızlı ve deterministik biçimde versin.
+                    await self._discard()
+                    raise browser_launch_error(error) from error
             if self.page is None or self.page.is_closed():
                 self.page = await self.browser_context.new_page()
                 self.page.set_default_timeout(PAGE_ACTION_TIMEOUT_MS)
                 self.page.set_default_navigation_timeout(PAGE_LOAD_TIMEOUT_MS)
             return self.page
 
-    async def browse(self, url: Optional[str], actions: List[BrowserAction]) -> str:
+    async def browse(
+        self, url: Optional[str], actions: List[BrowserAction],
+        progress: Optional[Callable[[str], None]] = None,
+    ) -> str:
         page = await self.get_page()
-        return await browse_page_actions(page, url, actions)
+        return await browse_page_actions(page, url, actions, progress)
 
     async def close(self) -> None:
         async with self._lock:
@@ -231,19 +275,46 @@ class HeadlessBrowserSession:
             if self.playwright_instance: await self.playwright_instance.stop()
             self.browser = self.browser_context = self.page = None
 
-async def browse_page_actions(page: Page, url: Optional[str], actions: List[BrowserAction]) -> str:
+def _progress(sink: Optional[Callable[[str], None]], text: str) -> None:
+    """İlerleme geri çağrısını güvenle çağırır; yayın hatası tarayıcı akışını bozmasın."""
+    if sink is None:
+        return
+    try:
+        sink(text)
+    except Exception:  # Arayüz/köprü hatası tarayıcı eylemini düşürmemeli.
+        logging.debug("Tarayıcı ilerleme olayı yayınlanamadı", exc_info=True)
+
+
+async def browse_page_actions(
+    page: Page, url: Optional[str], actions: List[BrowserAction],
+    progress: Optional[Callable[[str], None]] = None,
+) -> str:
+    """
+    Sayfayı açar, sırayla eylemleri uygular ve metin + etkileşimli öğe listesini döner.
+
+    `progress` verilirse gezinme ve her eylem adımı canlı olarak bildirilir: browse_url arka
+    plandaki ayrı Chromium'da çalışırken kullanıcı ajanın ne yaptığını görebilsin.
+    """
     if url:
+        _progress(progress, f"→ sayfa açılıyor: {url}\n")
         try: await page.goto(url, wait_until="domcontentloaded")
-        except PlaywrightError as e: raise ToolError(f"Sayfa açılamadı: url={url}, ayrıntı={e}", "PAGE_LOAD_FAILED", True) from e
+        except PlaywrightError as e:
+            _progress(progress, f"✗ sayfa açılamadı: {url}\n")
+            raise ToolError(f"Sayfa açılamadı: url={url}, ayrıntı={e}", "PAGE_LOAD_FAILED", True) from e
     elif page.url == "about:blank":
         raise ToolError("Açık sayfa yok; ilk çağrıda url ver.", "NO_PAGE", False)
+    else:
+        _progress(progress, f"→ mevcut sayfa: {page.url}\n")
 
     for i, action in enumerate(actions):
         kind, selector, value = action.get("action"), str(action.get("selector") or ""), action.get("value")
+        _progress(progress, f"→ eylem {i + 1}/{len(actions)}: {kind} {selector}\n")
         try:
             if kind == "click": await page.click(selector)
             # Boş metinle fill alanı temizler; yalnız değer hiç yoksa geçersizdir
-            elif kind == "fill" and value is not None: await page.fill(selector, value)
+            elif kind == "fill" and value is not None:
+                _progress(progress, f"  yazılan değer: {str(value)[:120]}\n")
+                await page.fill(selector, value)
             elif kind == "press" and value is not None: await page.press(selector, normalize_browser_key(value))
             elif kind == "wait_for":
                 state = value if value in ("visible", "hidden", "attached", "detached") else "visible"
@@ -254,6 +325,7 @@ async def browse_page_actions(page: Page, url: Optional[str], actions: List[Brow
                     "INVALID_BROWSER_ACTION", False,
                 )
         except PlaywrightTimeoutError as e:
+            _progress(progress, f"✗ eylem {i + 1} başarısız: {kind} {selector}\n")
             elements = await page.evaluate(_PAGE_ELEMENTS_SCRIPT, PAGE_ELEMENT_LIMIT)
             raise ToolError(
                 f"Tarayıcı eylemi {i} ({kind} {selector}) {PAGE_ACTION_TIMEOUT_MS}ms içinde yapılamadı "
@@ -265,6 +337,7 @@ async def browse_page_actions(page: Page, url: Optional[str], actions: List[Brow
     text = await asyncio.to_thread(clean_html, await page.content())
     elements = await page.evaluate(_PAGE_ELEMENTS_SCRIPT, PAGE_ELEMENT_LIMIT)
     title = " ".join((await page.title()).split())
+    _progress(progress, f"✓ sayfa hazır: {title or '(başlıksız)'} — {len(elements)} etkileşimli öğe\n")
     return (
         "Tarayıcı: arka planda çalışan ayrı Chromium; açık Google Chrome oturumunda görünmez.\n"
         f"URL: {page.url}\nBaşlık: {title}\n\nSAYFA METNİ:\n{text}\n\n"

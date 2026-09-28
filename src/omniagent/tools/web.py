@@ -3,19 +3,22 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 import json
-import logging
 import re
-import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .types import ToolError
 
 
 SearchClientFactory = Callable[[], Any]
-# Sağlayıcı geçici olarak hız sınırlar/engellerse (bkz. AGENTS.md dış servis kuralı):
-# son hatayı fırlatmadan önce kısa gecikmeyle birkaç kez daha dene.
-_SEARCH_MAX_ATTEMPTS: int = 3
-_SEARCH_RETRY_DELAY_SECONDS: float = 2.0
+
+# Arama motoru kümeleri sırayla denenir: ddgs varsayılanı "auto" bazı ortamlarda erişilemeyen
+# startpage'i seçip ConnectError ya da boş sonuç döndürüyordu; canlı kayıtta tüm metin aramaları
+# böyle düşüyordu. İlk küme haber yolunda zaten üretimde olan doğrulanmış kümedir.
+SEARCH_BACKENDS: Tuple[str, ...] = (
+    "bing,duckduckgo,yahoo",
+    "brave,google,mojeek",
+    "auto",
+)
 
 
 def search_web(
@@ -120,37 +123,33 @@ def search_web(
         fresh.sort(key=lambda pair: pair[0], reverse=True)
         return [item for _, item in fresh] or undated
 
+    max_results: int = 12 if mode == "news" else 8
+    results: List[Dict[str, Any]] = []
     last_error: Optional[Exception] = None
-    for attempt in range(1, _SEARCH_MAX_ATTEMPTS + 1):
-        try:
-            with client_factory() as client:
+    try:
+        with client_factory() as client:
+            def attempt(backend: str) -> List[Dict[str, Any]]:
+                """Tek motor kümesiyle arar; haber modunda sonuç boşsa metin yoluna düşer. Saf."""
+                kwargs: Dict[str, Any] = {"max_results": max_results, "backend": backend}
+                if timelimit is not None:
+                    kwargs["timelimit"] = timelimit
                 if mode == "news":
-                    kwargs: Dict[str, Any] = {
-                        "max_results": 12,
-                        "backend": "bing,duckduckgo,yahoo",
-                    }
-                    if timelimit is not None:
-                        kwargs["timelimit"] = timelimit
-                    results = fresh_news(list(client.news(search_query, **kwargs)))
-                    if not results:
-                        results = list(client.text(search_query, **kwargs))
-                else:
-                    kwargs = {"max_results": 8, "backend": "auto"}
-                    if timelimit is not None:
-                        kwargs["timelimit"] = timelimit
-                    results = list(client.text(search_query, **kwargs))
-            last_error = None
-            break
-        except Exception as error:
-            last_error = error
-            if attempt < _SEARCH_MAX_ATTEMPTS:
-                logging.warning(
-                    "Web araması denemesi başarısız, tekrar denenecek",
-                    extra={"attempt": attempt, "max_attempts": _SEARCH_MAX_ATTEMPTS,
-                           "error": str(error)},
-                )
-                time.sleep(_SEARCH_RETRY_DELAY_SECONDS)
-    if last_error is not None:
+                    return fresh_news(list(client.news(search_query, **kwargs))) or list(
+                        client.text(search_query, **kwargs)
+                    )
+                return list(client.text(search_query, **kwargs))
+
+            for backend in SEARCH_BACKENDS:
+                try:
+                    results = attempt(backend)
+                except Exception as error:  # Motor erişilemez/boş: sıradaki kümeyi dene
+                    last_error = error
+                    continue
+                if results:
+                    break
+        if not results and last_error is not None:
+            raise last_error
+    except Exception as error:
         raise ToolError(
             f"Web araması başarısız: {last_error}", "WEB_SEARCH_FAILED", True
         ) from last_error

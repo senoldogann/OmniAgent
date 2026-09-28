@@ -1,5 +1,7 @@
 """Sağlayıcı isteklerinin ve kurulum alt süreçlerinin regresyon denetimi."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from omniagent.config import API_KEY_VARIABLES, BACKENDS
@@ -56,6 +58,54 @@ async def test_model_token_limit_matches_provider(backend, token_field):
         assert kwargs["tool_choice"] == "auto"
     if backend == "openai" and BACKENDS[backend]["model"] in ("gpt-6-luna", "gpt-6-sol"):
         assert kwargs["extra_body"]["reasoning_effort"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_ollama_same_index_stream_yields_two_calls_and_previews():
+    """Sağlayıcının index=0 tekrarını gerçek iki çağrı ve iki önizleme olarak ayırır."""
+    class TwoCallStream:
+        def __init__(self):
+            self.chunks = iter([
+                SimpleNamespace(usage=None, choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content=None, model_extra={}, tool_calls=[
+                        SimpleNamespace(index=0, id=call_id, function=SimpleNamespace(
+                            name="read_file", arguments=arguments,
+                        )),
+                    ]), finish_reason=finish,
+                )])
+                for call_id, arguments, finish in [
+                    ("first", '{"path":"README.md"}', None),
+                    ("second", '{"path":"Makefile"}', "tool_calls"),
+                ]
+            ])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def close(self):
+            return None
+
+    class TwoCallCompletions(FakeCompletions):
+        async def create(self, **kwargs):
+            return TwoCallStream()
+
+    client = FakeClient()
+    client.chat.completions = TwoCallCompletions()
+    events = []
+    turn = await _stream_completion(
+        client, BACKENDS["ollama-cloud"], [{"role": "user", "content": "İki dosyayı oku"}],
+        [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+        "session", events.append, lambda: False,
+    )
+    assert [call["id"] for call in turn["tool_calls"]] == ["first", "second"]
+    assert [call["name"] for call in turn["tool_calls"]] == ["read_file", "read_file"]
+    assert [event["index"] for event in events if event["kind"] == "tool_call_preview"] == [0, 1]
 
 
 @pytest.mark.asyncio

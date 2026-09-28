@@ -6,6 +6,8 @@ import pytest
 
 from omniagent import tools
 from omniagent.tools import ToolError, Toolbox, screen
+from omniagent.app.verification import gui_verification_needed, needs_action_observation
+from omniagent.core import state as sm
 
 GEOMETRY: tools.ScreenGeometry = {"point_width": 2000, "point_height": 1000, "model_width": 1000, "model_height": 1000}
 
@@ -37,6 +39,28 @@ def test_click_routes_single_double_and_drag(monkeypatch: pytest.MonkeyPatch) ->
         ("drag", (50, 60), (700, 800), "left"),
     ]
     assert "sürüklendi" in result
+
+
+def test_sequence_reads_each_detail_after_its_own_text_click(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Liste öğeleri tek araç turunda sırayla açılıp okunabilir."""
+    box = _toolbox(monkeypatch)
+    calls: List[Tuple[Any, ...]] = []
+    monkeypatch.setattr(box, "cua_click_text", lambda text, near: calls.append(("click", text, near)) or text)
+    monkeypatch.setattr(box, "cua_read_scrollable",
+                        lambda point, max_pages: calls.append(("read", point, max_pages)) or "İlan kodu: K-1")
+
+    result = box.run_action_sequence([
+        {"action": "click_text", "text": "İlk ilan", "near": [80, 200]},
+        {"action": "read_scrollable", "point": [600, 500], "max_pages": 15},
+        {"action": "click_text", "text": "İkinci ilan", "near": [80, 400]},
+        {"action": "read_scrollable", "point": [600, 500], "max_pages": 15},
+    ])
+
+    assert calls == [
+        ("click", "İlk ilan", [80, 200]), ("read", [600, 500], 15),
+        ("click", "İkinci ilan", [80, 400]), ("read", [600, 500], 15),
+    ]
+    assert result.count("İlan kodu: K-1") == 2
 
 
 @pytest.mark.parametrize("step", [
@@ -105,3 +129,35 @@ def test_unknown_mouse_button_is_rejected(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(ToolError) as error:
         screen.multi_click_model_point(1, 1, "thumb", 2, GEOMETRY)
     assert error.value.code == "INVALID_BUTTON"
+
+
+def test_partial_sequence_marks_executed_steps_for_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Son adım hata verse de önceki tıklama gerçek eylemdir ve gözlemlenir."""
+    box = _toolbox(monkeypatch)
+    monkeypatch.setattr(tools, "click_model_point", lambda x, y, button, geometry: "tıklandı")
+    steps = [{"action": "click", "point": [20, 30]}, {"action": "bilinmeyen"}]
+
+    with pytest.raises(ToolError) as caught:
+        box.run_action_sequence(steps)
+
+    assert caught.value.completed_steps == 1
+    call = {"id": "partial", "name": "run_action_sequence", "arguments": '{"steps":[]}'}
+    result = {"tool_call_id": "partial", "ok": False, "completed_steps": 1, "error": str(caught.value)}
+    assert needs_action_observation([call], [result])
+    record = sm.make_step_record("run_action_sequence", "{}", False, str(caught.value), partial_steps=1)
+    assert gui_verification_needed([record])
+
+
+def test_sequence_preserves_long_scrollable_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Birden çok ilanı tek çağrıda okurken orta bölgedeki değerler kaybolmamalı."""
+    box = _toolbox(monkeypatch)
+    middle = "ORTADAKİ KRİTİK DEĞER: 6742"
+    observation = "başlangıç\n" + "a" * 1500 + middle + "b" * 1500 + "\nson"
+    monkeypatch.setattr(box, "cua_read_scrollable", lambda point, max_pages: observation)
+
+    result = box.run_action_sequence([
+        {"action": "read_scrollable", "point": [600, 500], "max_pages": 15},
+    ])
+
+    assert middle in result
+    assert observation in result
