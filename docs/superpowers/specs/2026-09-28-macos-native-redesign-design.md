@@ -25,9 +25,11 @@ Kullanıcıyla görüşülüp **1** seçildi.
 ## Gerçekçi kısıtlar (dürüstlük bölümü)
 
 - Tk üst pencereleri macOS'ta zaten native `NSWindow`'dur — traffic-light düğmeleri zaten native; bu bir kazanım değil, mevcut bir gerçek.
-- Gerçek vibrancy (`NSVisualEffectView`) stok Tk'de yok; projede zaten `rubicon-objc` bağımlılığı olduğundan (AX/Quartz araçları için kullanılıyor) bunun üzerinden native bir katman eklenecek — bu, spec'teki tek gerçek "native köprü" parçasıdır ve ayrı, izole bir modülde (`ui/native_macos.py`) yaşayacak, import edilemezse (Linux/CI, test ortamı) sessizce devre dışı kalacak şekilde yazılacak.
+- **Kod incelemesiyle düzeltme (ilk taslaktaki varsayımlar yanlıştı):** `ui/app.py` zaten `import AppKit` (düz PyObjC bağlaması, `rubicon-objc` değil) kullanarak pencere başlık çubuğunu içerikle aynı renge boyuyor (`_style_native_titlebar`, satır ~402) ve SVG ikonları native `NSImage`'a çeviriyor (satır ~136). Yeni native köprü kodu **aynı `import AppKit` deseniyle** yazılacak; `rubicon-objc` bu katmana dahil edilmeyecek (o bağımlılık GUI otomasyon araçlarına ait, ayrı bir kaygı).
+- **Sistem fontu zaten çözülüyor, ek iş gerekmiyor:** `self._ui_family = tkfont.nametofont("TkDefaultFont").actual("family")` (satır 287) bu makinede doğrulandı — Tk'nin `TkDefaultFont`'u macOS'ta zaten `.AppleSystemUIFont`'a (gerçek SF Pro) çözülüyor. İlk taslaktaki `_resolve_system_font()`/`UI_FAMILY` fallback zinciri **kapsam dışı bırakıldı**: zaten var olan bir şeyi yeniden icat ederdi.
+- **Açılışta tema tespiti kapsam dışı bırakıldı:** uygulama `ctk.set_appearance_mode("dark")` ile kasıtlı olarak sabit koyu temalı (satır 280); `BG`/`SURFACE`/`TEXT` paleti yalnızca koyu yüzeyler için tasarlı. Sistem açık modunu "tespit edip" yine de koyu paletle çizmek anlamsız ve yanıltıcı olurdu; gerçek açık tema desteği ayrı bir renk paleti gerektirir ve bu spec'in (ve kullanıcı isteğinin) kapsamında değildir. Uygulama koyu temalı kalır — bu bir eksiklik değil, projenin zaten benimsediği tasarım dilidir (bkz. `AGENTS.md`: "nötr koyu yüzeyler").
+- Gerçek vibrancy (`NSVisualEffectView`) stok Tk'de yok ve şu an hiçbir yerde uygulanmıyor (koda bakıldı, doğrulandı) — bu, spec'teki tek gerçek yeni "native köprü" parçasıdır; `ui/native_macos.py`'de, mevcut `_style_native_titlebar` ile aynı korumalı desenle (`if sys.platform != "darwin": return`) yazılacak.
 - Tk'nin animasyon yeteneği ilkeldir (`after()` ile kare kare); yay fiziği/gerçek SwiftUI akıcılığı hedeflenmiyor, yalnızca ease-out eğrili sade geçişler.
-- Native metin render'ı (kerning/ligature) AppKit'inkiyle piksel piksel aynı olmayacak; sistem fontu + doğru boyut/ağırlık ile görsel olarak yakınsanacak.
 
 ## Tasarım jetonları (başlangıç değerleri — görsel QA'da ayarlanabilir)
 
@@ -39,25 +41,26 @@ Mevcut palet (`ui/app.py:78-95`) korunur ve genişletilir, yeniden icat edilmez:
 | `TEXT` `#ECEAE3`, `TEXT_DIM` `#A3A199`, `TEXT_FAINT` `#6E6C66` | var | değişmiyor |
 | `ACCENT` `#D97757` ailesi | var | değişmiyor — marka kimliği |
 | `MONO_FAMILY` `"Menlo"` | var | değişmiyor — kod/komut bloklarında kalır |
-| `UI_FAMILY` (yeni) | yok (CustomTkinter varsayılanı) | `.AppleSystemUIFont` denenir (macOS'ta gerçek SF Pro'ya karşılık gelir); `tkfont.families()` içinde yoksa `"Helvetica Neue"`'ye, o da yoksa CustomTkinter varsayılanına düşer — sessiz istisna yutmadan, tek bir `_resolve_system_font()` saf fonksiyonuyla. |
+| Gövde fontu (`self._ui_family`) | `tkfont.nametofont("TkDefaultFont").actual("family")` → bu makinede doğrulandı: zaten `.AppleSystemUIFont` | **İş yok** — zaten native. |
 | `RADIUS_SM/MD/LG` (yeni) | CustomTkinter varsayılanları (widget başına dağınık) | 6 / 10 / 14 piksel olarak tek yerden standardize edilir |
 | `SPACE_UNIT` (yeni) | yok (elle seçilmiş boşluklar) | 8px taban birim; bileşenler `SPACE_UNIT * n` kullanır |
 
 ## Native köprü modülü: `ui/native_macos.py`
 
-Yeni, izole, saf-olmayan tek dosya (dış sisteme bağlandığı için OOP/sınıf kullanımı burada meşru — global kurallardaki "OOP yalnız dış sistem konnektörleri için" istisnası):
+Yeni dosya, mevcut `_style_native_titlebar` ile **aynı düz-fonksiyon + `import AppKit` deseni** (sınıf değil — mevcut kod tabanı bu iş için zaten sınıfsız düz fonksiyon/metot kullanıyor, o desen korunur):
 
-- `apply_vibrancy(tk_window, material="sidebar") -> bool`: `rubicon-objc` ile pencerenin `contentView`'ının arkasına `NSVisualEffectView` yerleştirir; başarısız olursa (rubicon yok, pencere tanıtıcısı alınamadı, İmport hatası) `False` döner ve **çağıran taraf sessizce eski opak yüzeye devam eder** — vibrancy dekoratif bir katmandır, arayüz onsuz da tam işlevseldir.
-- `system_appearance() -> Literal["light", "dark"]`: açılışta `NSApplication`'ın etkin görünümünü okur; okunamazsa `"dark"` varsayılanına düşer (mevcut davranış zaten koyu tema).
-- `install_native_menu_bar(app_name)`: standart uygulama menüsü (Hakkında/Tercihler ⌘,/Çıkış) kurar.
+- `apply_vibrancy(window_title: str, material: int) -> bool`: `AppKit.NSApplication.sharedApplication().windows()` içinde başlığı eşleşen pencereyi bulur (mevcut `_style_native_titlebar`'daki arama deseniyle aynı), `contentView`'ının arkasına bir `NSVisualEffectView` yerleştirir. `sys.platform != "darwin"` ise veya herhangi bir `AppKit`/Cocoa çağrısı istisna verirse `False` döner ve **çağıran taraf sessizce eski opak yüzeye devam eder** — vibrancy dekoratif bir katmandır, arayüz onsuz da tam işlevseldir.
+- `install_native_menu_bar(app_name: str) -> bool`: standart uygulama menüsü (Hakkında/Tercihler ⌘,/Çıkış) kurar; aynı hata toleransıyla.
 
-Bu üç fonksiyon da **çağrıldıkları an başarısız olabileceklerini varsayarak** yazılır (dönüş değeriyle bildirir, istisna yutmaz); `ui/app.py` bunları en-iyi-çaba (best-effort) olarak çağırır, sonucunu loglar, akışı bloklamaz.
+(Açılışta tema tespiti — `system_appearance()` — yukarıdaki "Gerçekçi kısıtlar" bölümünde açıklandığı üzere kapsam dışı bırakıldı: uygulama kasıtlı olarak koyu temalı kalıyor.)
+
+Bu iki fonksiyon da **çağrıldıkları an başarısız olabileceklerini varsayarak** yazılır (dönüş değeriyle bildirir, istisna yutmaz); `ui/app.py` bunları `_style_native_titlebar` çağrıldığı yerin hemen yanında, en-iyi-çaba (best-effort) olarak çağırır, sonucunu loglar, akışı bloklamaz.
 
 ## Alt projeler / yol haritası
 
 Her biri kendi worktree/dalında, kendi PR'ında, bir öncekini bozmadan teslim edilir:
 
-1. **Temel (bu spec'in ilk uygulama dilimi):** `native_macos.py`, jeton modülü, `_resolve_system_font()`, açılışta vibrancy + menü çubuğu kurulumu. Görünür etki: pencere arka planı bulanık/vibrant olur, gövde metni sistem fontuna geçer — kenar çubuğu/transkript içeriği henüz yeniden tasarlanmaz.
+1. **Temel (bu spec'in ilk uygulama dilimi):** `native_macos.py` (vibrancy + native menü çubuğu), `RADIUS_*`/`SPACE_UNIT` jetonları. Görünür etki: pencere arka planı bulanık/vibrant olur, standart bir uygulama menüsü belirir — kenar çubuğu/transkript içeriği henüz yeniden tasarlanmaz.
 2. Kenar çubuğu (`chats.py` mantığı korunur) — native liste satırı/seçim/hover.
 3. Transkript + composer — asıl sohbet deneyimi.
 4. Ayarlar sayfası — gruplu liste stiline geçiş.
@@ -75,5 +78,4 @@ Her alt proje bağımsız bir PR; biri sorun çıkarırsa yalnızca o commit ger
 
 ## Açık riskler
 
-- `.AppleSystemUIFont`'un bu Tk/Tcl sürümünde gerçekten SF Pro'ya çözüldüğü varsayımı; ilk uygulama diliminde doğrulanacak, çözülmezse `Helvetica Neue`'ye sessizce düşülecek (kullanıcıya görünür bir hata değil).
-- `rubicon-objc` ile `NSVisualEffectView` yerleştirmenin CustomTkinter'ın kendi çizim döngüsüyle çakışma ihtimali; ilk uygulama diliminde tek bir izole pencere üzerinde doğrulanacak.
+- `NSVisualEffectView`'i mevcut `contentView`'ın arkasına yerleştirmenin CustomTkinter'ın kendi Tk çizim döngüsüyle (frame'in her `_tick`'te yeniden boyanması) çakışma ihtimali; ilk uygulama diliminde tek bir izole pencere üzerinde doğrulanacak. Çakışırsa `apply_vibrancy` `False` döner, uygulama mevcut opak yüzeyle çalışmaya devam eder.
