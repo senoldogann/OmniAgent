@@ -26,6 +26,7 @@ from omniagent.config import (
     load_api_key, refresh_api_keys, set_api_key, set_backend_model,
 )
 from omniagent.core.events import AgentEvent, compact_count, tool_label
+from omniagent.ui import native_macos
 from omniagent.platform.macos.desktop_status import MenuBarTaskStatus, app_is_active, is_backgrounded, notify_finished, set_dock_badge
 from omniagent.platform.macos.host_lock import host_task_lock
 from omniagent.platform.macos.visibility import GlobalVisibilityHotkey, VisibilityHotkeyError, set_application_hidden
@@ -276,7 +277,7 @@ class OmniUI(ctk.CTk):
         self.geometry("780x880")
         self.minsize(560, 620)
         self.configure(fg_color=BG)
-        self.bind("<Map>", lambda event: self.after_idle(self._style_native_titlebar)
+        self.bind("<Map>", lambda event: self.after_idle(self._style_native_window)
                   if event.widget is self else None, add="+")
         self._ui_family: str = tkfont.nametofont("TkDefaultFont").actual("family")
         self._voice_icon: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_DIM)
@@ -370,7 +371,7 @@ class OmniUI(ctk.CTk):
                             "text": f"Genel ⌘X kullanılamıyor: {error}"})
         self.after(FRAME_MS, self._tick)
         self.after(120, self.entry.focus_set)
-        self.after(120, self._style_native_titlebar)
+        self.after(120, self._style_native_window)
 
     def _style_native_titlebar(self, title: Optional[str] = None) -> None:
         """
@@ -387,6 +388,13 @@ class OmniUI(ctk.CTk):
             if str(window.title()) == target:
                 window.setTitlebarAppearsTransparent_(True)
                 window.setBackgroundColor_(color)
+
+    def _style_native_window(self, title: Optional[str] = None) -> None:
+        """Başlık çubuğu rengini ve vibrancy'yi birlikte uygular; ikisi de en-iyi-çaba."""
+        self._style_native_titlebar(title)
+        applied = native_macos.apply_vibrancy(title or self.title(), "sidebar")
+        if not applied and sys.platform == "darwin":
+            logging.info("Vibrancy uygulanamadı (pencere henüz görünür olmayabilir).")
 
     # --- Yerleşim ---
 
@@ -1009,7 +1017,7 @@ class OmniUI(ctk.CTk):
         penceresi de ana pencereyle aynı arka plan renginde görünür.
         """
         title: str = window.title()
-        window.after(120, lambda: self._style_native_titlebar(title))
+        window.after(120, lambda: self._style_native_window(title))
 
     # --- Transkript bölgeleri (etiket tabanlı; her bölge '\n' ile biter, asla boş kalmaz) ---
 
@@ -1883,6 +1891,8 @@ def main() -> None:
         # Finder'ın / çalışma dizini araçların çıktı yazmasını engeller.
         os.chdir(Path.home())
     app = OmniUI()
+    if not native_macos.install_native_menu_bar("OmniAgent"):
+        logging.info("Native menü çubuğu kurulamadı (macOS dışında beklenen).")
 
     def load_keys() -> None:
         # Yeni .app kimliği için Keychain izin istemi çıkabilir; önce pencereyi göster.
