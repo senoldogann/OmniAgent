@@ -32,8 +32,10 @@ def test_model_lists_filter_specialized_models() -> None:
     ]}
     assert catalog._listed_ids("openai", rows) == ("gpt-4o-mini", "gpt-6-luna")
     assert catalog._listed_ids("ollama-cloud", {
-        "models": [{"name": "gemma4:cloud"}, {"name": "llama3:latest"}],
-    }) == ("gemma4:cloud",)
+        "models": [
+            {"name": "gemma4:cloud"}, {"name": "gpt-oss:20b-cloud"}, {"name": "llama3:latest"},
+        ],
+    }) == ("gemma4:cloud", "gpt-oss:20b-cloud")
 
 
 @pytest.mark.asyncio
