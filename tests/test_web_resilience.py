@@ -89,7 +89,6 @@ def test_web_search_falls_back_to_text_when_news_is_empty(monkeypatch: pytest.Mo
 def test_web_search_retries_transient_failures_before_succeeding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
     attempts: list[int] = []
 
     class FlakyThenOk:
@@ -112,7 +111,6 @@ def test_web_search_retries_transient_failures_before_succeeding(
 
 
 def test_web_search_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
     attempts: list[int] = []
 
     class AlwaysFails:
