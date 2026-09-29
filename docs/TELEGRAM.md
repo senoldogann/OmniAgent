@@ -24,7 +24,7 @@ OmniAgent, eşleştirilmiş **tek bir özel Telegram sohbetinden** görev alır.
    .venv/bin/omniagent-telegram install-service
    ```
 
-Hizmet `launchd` kullanıcı oturumunda çalışır; köprü süreci proje kökünde çalışır, ajanın göreli dosya yolları (ekran görüntüsü, dosya yazma, kabuk) orada çözülür. `install-service` çalışan eski köprünün launchd'den tamamen kalkmasını bekler, launchd geçici hata verirse yeniden dener. Bilgisayar açık ve internete bağlı olmalıdır; köprü açıkken Mac prize takılıysa uyumaz (pilde uyuyabilir, uyuyan Mac mesaj alamaz). Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
+Hizmet `launchd` kullanıcı oturumunda çalışır; köprü süreci proje kökünde çalışır; kabuk, `read_file` ve `send_file` göreli yolları orada çözülür. Ekran görüntüsü ve `write_file` göreli adları ise görev kaynak deposunu hedeflemiyorsa `~/Library/Application Support/OmniAgent/workspace/` altına yazılır (kaynak görevinde proje kökünde kalır); köprü fotoğrafı aynı yerden okur. `install-service` çalışan eski köprünün launchd'den tamamen kalkmasını bekler, launchd geçici hata verirse yeniden dener. Bilgisayar açık ve internete bağlı olmalıdır; köprü açıkken Mac prize takılıysa uyumaz (pilde uyuyabilir, uyuyan Mac mesaj alamaz). Telegram webhook'u etkinse `getUpdates` çalışmaz; webhook yapılandırmasını kaldırmanız gerekir. Bot API tokenını proje dosyasına veya Git'e eklemeyin.
 
 ## Sohbet komutları
 
@@ -32,8 +32,11 @@ Hizmet `launchd` kullanıcı oturumunda çalışır; köprü süreci proje kök�
 - `/stop`: çalışan görevi ve kullanıcı yanıtı beklemesini durdurur.
 - `/status`: çalışan hedefi gösterir.
 - `/verbose on` veya `/verbose off`: sonraki görevde ayrıntılı veya kısa görünümü seçer; varsayılan kısa görünümdür.
-- `/model auto` veya `/model <profil>`: sonraki görevin modelini seçer. Profil adları `config.BACKENDS` içindedir: `ollama-cloud`, `openai`, `opencode`, `opencode-think`, `openrouter`. İlgili anahtar (`OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`) tanımlı değilse o profil kullanılamaz; anahtarlar arayüzdeki **Ayarlar** sayfasından girilip Keychain'de saklanabilir ve köprü açılışta bunları kendi süreç-içi deposuna alır. Anahtarlar ortam değişkenlerine yazılmaz, alt süreçlere geçmez ve araç çıktısında maskelenir; kayıtlı anahtar kabukta tanımlı bir değişkeni geçersiz kılar.
+- `/model auto` veya `/model <profil>`: sonraki görevin modelini seçer. Profil adları `config.BACKENDS` içindedir: `ollama-cloud`, `openai`, `opencode`, `opencode-think`, `openrouter`. İlgili anahtar (`OPENAI_API_KEY`, `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`) tanımlı değilse o profil kullanılamaz; anahtarlar arayüzdeki **Ayarlar** sayfasından girilip Keychain'de saklanabilir ve köprü açılışta bunları kendi süreç-içi deposuna alır. Anahtarlar ortam değişkenlerine yazılmaz, alt süreçlere geçmez ve araç çıktısında maskelenir; kayıtlı anahtar kabukta tanımlı bir değişkeni geçersiz kılar. `/model auto` varsayılan profili (`ollama-cloud`) seçer; o hazır değilse (Ollama kapalı) görev `openai` gibi başka sağlayıcıya yalnız yedek sağlayıcı izniyle (`OMNI_FALLBACK_BACKENDS`) taşınır, izin yoksa başlamaz; hazır bir profili açıkça seçmek izin gerektirmez. Köprü, yerel Ollama'nın hazır olup olmadığını her görev başında yeniden yoklar.
 - `/mode normal`, `/mode long`, `/mode autonomous`: sonraki görevin tur/zaman bütçesini seçer.
+- `/mode surekli`: sonraki görevi sürekli modda başlatır. Kullanıcı çevrimdışıyken soru beklemeden bağımsız adımları sürdürür; onay isteyen eylemleri de yürütür (otomatik onay; denetim kaydına `auto_approved` yazılır). Kapıyı kapatmak için `AUTO_APPROVE_IN_CONTINUOUS_MODE = False`.
+- `/btw <mesaj>`: çalışan sürekli oturuma yeni talimat ekler; ajan bunu sonraki model turunda dikkate alır.
+- `/approve`: çalışan sürekli oturumda daha önce kanıtı doğrulanmış hedef bildirimini onaylar ve görevi kapatır. Kanıt bildirimi yoksa görevi kapatmaz.
 - `/schedules`: planlanmış görevleri kimlik, kural ve sonraki çalışma zamanıyla listeler.
 - `/unschedule <kimlik>`: planı siler.
 - `/update`: kodu günceller ve köprüyü yeni kodla yeniden başlatır (bkz. Uzaktan bakım).
@@ -102,12 +105,13 @@ kalmaz, yeni köprüyü başlatır; o görevin yanıtı gelmeyebilir, ~15 sn son
 - **Sizden istenen dosyalar:** Telegram görevlerinde ajan `send_file` aracıyla bilgisayardaki bir dosyayı (en çok
   50 MB) sohbete belge olarak gönderebilir: "masaüstündeki rapor.pdf'i bana gönder" gibi.
 - Bir soruya yanıt beklenirken veya görev çalışırken gelen ek yeni görev başlatmaz; bot durumu yazar.
-- **Sesli komut:** açıklamasız sesli mesaj, OpenAI API anahtarı tanımlıysa (arayüzde ⚙ Ayarlar) yazıya çevrilir;
+- **Sesli komut:** açıklamasız sesli mesaj, OpenAI API anahtarı tanımlıysa (arayüzde ⚙ Ayarlar) ve `openai`
+  yedek sağlayıcı izin listesindeyse (`OMNI_FALLBACK_BACKENDS=openai`) yazıya çevrilir;
   bot önce "🎙️ Anlaşılan: …" diye metni gösterir, sonra komut olarak çalıştırır. Ses kaydı bunun için
   OpenAI'a gönderilir (`gpt-transcribe`, hesapta yoksa `whisper-1`; `OMNI_TRANSCRIBE_MODEL` ile değişir).
-  Anahtar yoksa hiçbir şey gönderilmez ve bot nasıl etkinleştirileceğini yazar. Açıklamalı sesli mesajda
-  açıklama görevdir.
+  Anahtar yoksa ya da `openai` izin listesinde değilse hiçbir şey gönderilmez ve bot nasıl etkinleştirileceğini
+  yazar. Açıklamalı sesli mesajda açıklama görevdir.
 
 Görev geçmişinin son sekiz kaydı yerel `telegram-history.json` dosyasında tutulur. Bot, mesajları yalnız eşleştirilen kullanıcıdan ve özel sohbetten kabul eder. Güncelleme sırası `telegram-offset.json` ile korunur; yeniden başlatma aynı komutu tekrar çalıştırmaz. UI ile Telegram görevi aynı anda ekranı/klavyeyi kullanamaz: ikinci görev hemen “başka görev çalışıyor” yanıtı alır.
 
-Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Sesli komutların yazıya çevrilmesi OpenAI anahtarı gerektirir; macOS konuşma tanıması arka plandaki launchd sürecinde izin alamadığı için kullanılmaz. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.
+Telegram sohbeti bulutta tutulduğu için gönderdiğiniz hedefler, ajan çıktıları ve ekran görüntüleri Telegram'da da bulunur. Bot hesabı tam bilgisayar otomasyonu yetkisi verir; tokenı ve eşleştirilmiş hesabı koruyun. Sesli komutların yazıya çevrilmesi OpenAI anahtarı ve `openai`'ın yedek sağlayıcı izin listesinde olması gerektirir; macOS konuşma tanıması arka plandaki launchd sürecinde izin alamadığı için kullanılmaz. Canlı bot testi için gerçek BotFather tokenı ve eşleştirme gerekir.

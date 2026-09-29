@@ -1,14 +1,10 @@
 """Agent karar politikaları: retry sırası, teslim doğrulama ve eylem kanıtı."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 import json
 from pathlib import Path
 import re
 from typing import List, Optional, Tuple
-
-from openai import APIStatusError
 
 from omniagent.app.tool_schema import _SIDE_EFFECT_TOOLS, memory_mutation_requested
 from omniagent.config import ESCALATION_BACKEND, QUALITY_LADDER
@@ -31,35 +27,23 @@ def next_quality_backend(current: str, available: frozenset[str]) -> Optional[st
     return next((name for name in later if name in available), None)
 
 
-def attempt_plan(backend: str, available: frozenset[str]) -> Tuple[str, ...]:
+def attempt_plan(
+    backend: str, available: frozenset[str], fallback_allowed: frozenset[str],
+) -> Tuple[str, ...]:
     """
-    Geçici hatada aynı profili bir kez dener, sonra hazır ve farklı profillerin hepsine
-    sırayla geçer. Merdiven içindeki profil önce merdivenin kendi sırasını, merdiven
-    dışındaki profil tüm merdiveni izler. Görev kapsamındaki karantinaya alınmış profiller
-    available dışındadır. Saf fonksiyon.
+    Geçici hatada aynı profili bir kez dener. Başka sağlayıcıya YALNIZ fallback_allowed'daki
+    (bkz. fallback_policy.permitted_fallbacks), hazır (available) ve farklı profiller sırayla
+    eklenir: merdiven içindeki profil önce merdivenin kendi sırasını, merdiven dışındaki profil
+    tüm merdiveni izler. İzin kümesi boşsa plan yalnız seçili profildir (veri başka sağlayıcıya
+    gitmez). Görev kapsamındaki karantinaya alınmış profiller available dışındadır. Saf fonksiyon.
     """
     candidates: Tuple[str, ...] = (
         tuple(name for name in QUALITY_LADDER if name != backend)
         if backend in QUALITY_LADDER else QUALITY_LADDER
     )
     return (backend, backend) + tuple(
-        name for name in candidates if name in available
+        name for name in candidates if name in available and name in fallback_allowed
     )
-
-
-def retry_after_seconds(error: APIStatusError) -> float:
-    """429 başlığındaki saniye veya HTTP tarihini güvenli bir bekleme süresine çevirir."""
-    response = getattr(error, "response", None)
-    headers = getattr(response, "headers", {}) if response is not None else {}
-    raw = headers.get("retry-after", "") if headers is not None else ""
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        try:
-            moment = parsedate_to_datetime(str(raw))
-            return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
-        except (TypeError, ValueError, OverflowError):
-            return 1.0
 
 
 # Modelin gerekli içeriğe erişemediğini bildiren ifadeler ve tamamlanmış teslim iddiaları.
@@ -424,7 +408,8 @@ def unmet_wait_status(goal: str, steps: List[sm.StepRecord]) -> Optional[str]:
             continue
         try:
             payload = json.loads(step["detail"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # Aşırı derin iç içe JSON json.loads'ta RecursionError verir: düşman araç çıktısı görevi çökertmez
             continue
         if not isinstance(payload, dict) or not isinstance(payload.get("status"), str):
             continue

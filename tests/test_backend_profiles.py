@@ -127,6 +127,25 @@ async def test_keyless_profile_is_skipped_with_clear_warning(
     )
 
 
+FALLBACK_PROBE: str = (
+    "import json; from omniagent import fallback_policy as policy;"
+    "print(json.dumps(policy.load_fallback_policy()))"
+)
+
+
+def test_default_fallback_policy_is_strict_in_clean_process(tmp_path: Path) -> None:
+    """Ortam ve kayıt yokken (temiz süreç) yedek sağlayıcı izni kapalıdır: istek yalnız seçili sağlayıcıya gider."""
+    environment: Dict[str, str] = {**os.environ, "OMNI_DATA_DIR": str(tmp_path)}
+    for variable in ("OMNI_FALLBACK_BACKENDS", "OMNI_FALLBACK_IMAGES"):
+        environment.pop(variable, None)
+    result = subprocess.run(
+        [sys.executable, "-c", FALLBACK_PROBE], cwd=Path(__file__).parents[1],
+        env=environment, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"backends": [], "allow_images": False}
+
+
 def test_session_based_cli_connector_is_removed() -> None:
     """Bilgisayardaki oturumu kullanan CLI bağlayıcısı geri sızmasın."""
     assert not (Path(__file__).parents[1] / "cli_backends.py").exists()

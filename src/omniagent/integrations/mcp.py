@@ -20,7 +20,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
-from omniagent.approval import financial_tool_name
+from omniagent.approval import financial_tool_name, readonly_conflict
 from .capabilities import Capability, ToolEntry
 from omniagent.config import API_KEY_VARIABLES, register_secret
 from .runtime import IntegrationRuntime, InteractionRequired, read_json, save_json
@@ -275,6 +275,15 @@ class MCPBridge:
         tools: Dict[str, ToolEntry] = {}
         for tool in selected:
             remote_name = tool.name
+            readonly = remote_name in entry.get("readonly_tools", [])
+            # Onay kapısı 'salt okunur değil' koşuluna güvenir; katalog yazılabilir bir dosya olduğundan adı para
+            # hareketi/dış iletişim bildiren aracın salt okunur işaretlenmesi kayıt anında açık hata verir.
+            conflict = readonly_conflict(remote_name) if readonly else None
+            if conflict is not None:
+                raise ValueError(
+                    f"Katalog {remote_name!r} aracını salt okunur işaretlemiş ama adı {conflict} bildiriyor; "
+                    "readonly_tools listesinden çıkarın (araç onay kapısından geçer)."
+                )
             local = "mcp_" + prefix + "_" + hashlib.sha256(remote_name.encode()).hexdigest()[:12]
             def bind(remote: str):
                 async def invoke(**arguments: Any) -> Any:
@@ -296,7 +305,7 @@ class MCPBridge:
                 "schema": {"type": "function", "function": {"name": local,
                            "description": (remote_name + ": " + (tool.description or ""))[:1200],
                            "parameters": tool.inputSchema}},
-                "execute": bind(remote_name), "readonly": remote_name in entry.get("readonly_tools", []),
+                "execute": bind(remote_name), "readonly": readonly,
                 "capability": entry["id"], "label": remote_name,
                 "financial": bool(entry.get("financial")) or financial_tool_name(remote_name),
             }

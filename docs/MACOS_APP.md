@@ -39,6 +39,7 @@ Telegram LaunchAgent'ına dokunulmaz.
 
 Uygulama ilk kez farklı bir imzayla açıldığında macOS mevcut Keychain anahtarlarına erişim isteyebilir.
 İsteği kullanıcı değerlendirir; eski anahtarlar aktarılmasa bile ayarlardan yeniden kaydedilebilir.
+Keychain okuması ilk boyamadan sonra arka plan iş parçacığında yapılır: istem çıkarsa arayüz donmaz.
 Ekran Kaydı, Erişilebilirlik, Mikrofon, Konuşma Tanıma ve Chrome otomasyonu izinleri yeni uygulama
 kimliği için ayrıca istenebilir. Bu izinler macOS Sistem Ayarları'ndan verilir; Telegram hizmetinin
 Python işlemine verilmiş izinleri uygulamaya kendiliğinden taşınmaz.

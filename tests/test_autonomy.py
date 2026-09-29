@@ -69,7 +69,7 @@ async def _scripted_run(goal: str, script: List[Dict[str, Any]], systems: List[s
             patch.setattr(main, "_call_model_with_retries", fake_model)
             return await main.run_agent_with_callback(
                 goal, lambda event: None,
-                {"requested_backend": None, "should_stop": lambda: False,
+                {"requested_backend": "opencode", "should_stop": lambda: False,
                  "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service,
                  "max_iterations": max_iterations},
                 {"opencode": object()},

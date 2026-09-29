@@ -30,6 +30,39 @@ def test_run_mode_rejects_invalid_budget() -> None:
         main.resolve_run_limits({**base, "max_iterations": 0})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode,turns,seconds", [
+    ("normal", 25, 600.0),
+    ("extended", 50, 1200.0),
+    ("autonomous", 100, 2700.0),
+])
+async def test_run_modes_reach_the_real_agent_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: str, turns: int, seconds: float,
+) -> None:
+    """Üç süreli modun bütçesi yalnız sabitte değil gerçek yürütme olayında da görünür."""
+    calls: list[str] = []
+
+    async def fake_model(clients, messages, schemas, session_id, backend, emit, should_stop):
+        calls.append(backend)
+        return {"content": "Görev bitti.", "tool_calls": [], "finish_reason": "stop",
+                "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    events = []
+    report = await main.run_agent_with_callback(
+        "Kısa durum bildir", events.append,
+        {"requested_backend": None, "should_stop": lambda: False,
+         "state_file": str(tmp_path / "memory.json"), "history": [], "run_mode": mode},
+        {DEFAULT_BACKEND: object()},
+    )
+    started = next(event for event in events if event["kind"] == "run_started")
+    assert (started["run_mode"], started["max_turns"], started["max_wall_clock_seconds"]) == (
+        mode, turns, seconds,
+    )
+    assert report["success"] and report["metrics"]["turns"] == 1
+    assert calls == [DEFAULT_BACKEND]
+
+
 def test_empty_history_and_order() -> None:
     assert to_messages([]) == []
     history = [make_exchange("ilk", "bir", []), make_exchange("ikinci", "iki", [])]

@@ -165,7 +165,7 @@ async def _schemas_seen(goal: str, tmp_path: Path, options: Dict[str, Any], monk
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
     await main.run_agent_with_callback(
         goal, lambda event: None,
-        {"requested_backend": None, "should_stop": lambda: False,
+        {"requested_backend": "opencode", "should_stop": lambda: False,
          "state_file": str(tmp_path / "memory.json"), "history": [], **options},
         {"opencode": object()},
     )

@@ -8,6 +8,9 @@ from typing import Any, Callable, Optional
 
 
 _COMMAND_MODIFIER = 1 << 8
+# Salt ⌘X, sistemin Kes kısayoluyla birebir çakışıyordu: T3 Code gibi bir uygulamada metin
+# keserken pencere de gizlenip gösteriliyordu. Shift eklenip çakışma kaldırıldı.
+_SHIFT_MODIFIER = 1 << 9
 _X_KEY_CODE = 0x07
 _KEYBOARD_EVENT_CLASS = 0x6B657962  # 'keyb'
 _HOTKEY_PRESSED = 5
@@ -91,12 +94,12 @@ class GlobalVisibilityHotkey:
         if status:
             raise VisibilityHotkeyError(f"⌘X olay dinleyicisi kurulamadı (OSStatus {status}).")
         status = library.RegisterEventHotKey(
-            _X_KEY_CODE, _COMMAND_MODIFIER, _EventHotKeyID(_HOTKEY_SIGNATURE, 1),
+            _X_KEY_CODE, _COMMAND_MODIFIER | _SHIFT_MODIFIER, _EventHotKeyID(_HOTKEY_SIGNATURE, 1),
             target, 1, ctypes.byref(self._hotkey_ref),
         )
         if status:
             self.close()
-            raise VisibilityHotkeyError(f"Genel ⌘X kaydedilemedi (OSStatus {status}).")
+            raise VisibilityHotkeyError(f"Genel ⌘⇧X kaydedilemedi (OSStatus {status}).")
         self.available = True
 
     def close(self) -> None:
@@ -127,3 +130,12 @@ def set_application_hidden(hidden: bool, window: Any) -> None:
         window.deiconify()
         window.lift()
         app.activate()
+
+
+def application_is_hidden(window: Any) -> bool:
+    """Uygulamanın GERÇEK gizli durumunu işletim sisteminden okur (bayrak tutmaz); Tk ana thread'inde çağrılır."""
+    if sys.platform != "darwin":
+        return window.state() == "withdrawn"
+    import AppKit
+
+    return bool(AppKit.NSApplication.sharedApplication().isHidden())

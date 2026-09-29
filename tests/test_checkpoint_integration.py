@@ -41,7 +41,7 @@ async def test_checkpoint_saved_on_turn_and_cleared_on_success(tmp_path: Path, m
         "Sistemi analiz et ve özetle",
         events.append,
         {
-            "requested_backend": None,
+            "requested_backend": "opencode",
             "should_stop": lambda: False,
             "state_file": str(tmp_path / "memory.json"),
             "history": [],
@@ -74,7 +74,7 @@ async def test_checkpoint_keeps_observed_fact_value_as_text(tmp_path: Path, monk
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
     await main.run_agent_with_callback(
         "Durumu oku", lambda event: None,
-        {"requested_backend": None, "should_stop": lambda: False,
+        {"requested_backend": "opencode", "should_stop": lambda: False,
          "state_file": str(tmp_path / "memory.json"), "history": []},
         {"opencode": object()},
     )
@@ -90,7 +90,7 @@ async def test_resume_goal_loads_latest_checkpoint(tmp_path: Path, monkeypatch: 
     monkeypatch.setattr("omniagent.core.checkpoint.RUNS_DIR", runs_dir)
 
     # Önce yarım kalmış bir checkpoint simüle et
-    old_session_id = "test-session-prev-123"
+    old_session_id = "3f2a9c1e-5b7d-4e8a-9c1d-0a1b2c3d4e5f"
     save_checkpoint(
         session_id=old_session_id,
         goal="Kullanıcı rehberini hazırla",
@@ -113,7 +113,7 @@ async def test_resume_goal_loads_latest_checkpoint(tmp_path: Path, monkeypatch: 
         "Kaldığın yerden devam et lütfen",
         events.append,
         {
-            "requested_backend": None,
+            "requested_backend": "opencode",
             "should_stop": lambda: False,
             "state_file": str(tmp_path / "memory.json"),
             "history": [],
@@ -127,3 +127,26 @@ async def test_resume_goal_loads_latest_checkpoint(tmp_path: Path, monkeypatch: 
     assert first_turn_user_msg["role"] == "user"
     assert "### Önceki Oturum Kontrol Noktası" in first_turn_user_msg["content"]
     assert "hedef_dosya: rehber.txt" in first_turn_user_msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_resume_goal_without_a_checkpoint_tells_the_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Uygun kontrol noktası yoksa 'devam et' sessizce sıfırdan başlamaz: kullanıcı bilgilendirilir."""
+    monkeypatch.setattr("omniagent.core.checkpoint.RUNS_DIR", tmp_path / "runs")
+
+    async def fake_model(clients, messages, schemas, session_id, backend, emit, should_stop):
+        return {"content": "Tamam.", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    events: List[AgentEvent] = []
+    report = await main.run_agent_with_callback(
+        "devam et", events.append,
+        {"requested_backend": "opencode", "should_stop": lambda: False,
+         "state_file": str(tmp_path / "memory.json"), "history": []},
+        {"opencode": object()},
+    )
+    assert report["success"] is True
+    notices = [event for event in events if event["kind"] == "notice"]
+    assert any(
+        event["level"] == "warning" and "kontrol noktası bulunamadı" in event["text"] for event in notices
+    ), notices

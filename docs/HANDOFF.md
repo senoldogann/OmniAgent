@@ -3,6 +3,28 @@
 Kurallar, mimari ve performans kararlarının tek kaynağı `AGENTS.md`'dir; bu not yalnızca
 kaldığı yerden devam etmek için gereken durumu içerir.
 
+## 29 Eylül — GUI araç katmanı hızı (paket S)
+- `cua_read_scrollable`: sayfa OCR'ları (tam kare) arka plan iş parçacığında, kaydırma/durulma sürerken koşar; birleştirme sayfa
+  sırasıyla yapılır (işçi sayısından bağımsız); "önce" karesi önceki durulmuş karedir; `@_screen_input` yoktur (okuma ekranı durulmuş
+  bırakır, bekleyen girdi kaydı yok: sonraki OCR/gözlem 0,9-1,0 sn boşuna beklemez). Boşluk kararı (adım yarılama) ilk tam adımın
+  sayfasında (`READ_SYNC_DECISION_PAGES`) beklenir, sonrasında `READ_OCR_LAG_PAGES=1` sayfa gecikir. Çıktı sıralı okumayla birebir
+  aynıdır (üç sayfa uzunluğu ve sistematik aşırı kaydırma dahil, `tests/test_read_scrollable.py`); yalnız ilk tam adımdan SONRAKİ
+  bir boşlukta karar gecikmesi çıktıyı değiştirebilir (en çok bir ek boşluk işareti, kapsam kaybı yok).
+- Ölçüm (görünmez Chromium, gerçek Vision, 7 dönüşümlü koşu, medyan): 14/40/90 paragraflı sayfa 4,75/7,55/12,30 sn -> 3,67/5,38/8,23 sn
+  (-%23/-%29/-%33); okumadan sonraki OCR 1,41 -> 0,35 sn, gözlem 1,23 -> 0,12 sn. Canlı (kendi geçici Chrome'um, 15 sayfa sınırına
+  giden okuma): 16,9 -> 10,2 sn (-%40); okuma sonrası ek bekleme 0,9-1,0 -> 0 sn. Süre çoğunlukla durulma yoklamasıdır (sabitler değişmedi).
+- Kırpılmış bölge (ROI) OCR'ı denendi ve bırakıldı: kırpma aynı sayfada satırları farklı okudu (`ÜcretR`/`Ücret`, `egitim`/`eğitim`,
+  `Bölüm 13-901 :`) ve yalancı örtüşme boşluğu üretti; hız da artmadı (Vision süresi alana değil metin miktarına bağlı). Vision iş
+  parçacığından güvenlidir (GIL bırakılır, çıktı sıralıyla aynı) ama ikinci işçi hız vermedi: `READ_OCR_WORKERS=1`.
+- Otomatik gözlemin ara dosyası sıkıştırmasız BMP (model görüntüsü ve digest PNG ile aynı). `pyautogui.PAUSE` 0,1 -> 0,03 (canlı ölçüm:
+  eylem başına -70 ms; FAILSAFE açık); alan doldurma/gönderme tıklamadan sonra 80 ms odak bekler (kendi AppKit uygulamamda 30/30 doğru
+  doldurma, süre 332 -> 274 ms).
+- CANLI BULGU (DÜZELTİLDİ): `screen.post_scroll` canlı macOS'ta istenen miktarın 10 KATINI kaydırıyordu (Chrome ve NSScrollView'da ölçülen
+  oran 10,00; `round(-dy * 10)`, piksel birimi). Başsız ölçüm bunu göremez; canlıda `cua_scroll` aşırı kaydırıyor ve `cua_read_scrollable`
+  sayfa atlayıp boşluk işareti veriyordu. Çarpan kaldırıldı (`round(-dy)`); düzeltme sonrası canlı kalibrasyon (kendi geçici Chrome'u:
+  dy 50/100/200/400) oran 1,00. Canlıda örtüşen satırlar farklı okunabiliyor (eski akışta da 15 sayfalık okumada 1-2 boşluk işareti;
+  her ikisinde koşudan koşuya değişir).
+
 ## 26 Eylül (sabah) — Telegram'da ekran görüntüsü seli, çalışma dizini, install-service yarışı
 - Kullanıcı şikâyeti: Telegram'da "en basit görevi bile yapamıyor, sürekli ekran resmi atıyor". Kayıtlarda
   web, kabuk ve dosya görevleri başarılı; sorun masaüstü uygulamasındaki ekran görevlerinde.
@@ -93,8 +115,8 @@ kaldığı yerden devam etmek için gereken durumu içerir.
   açmıştı), `chrome_form` 6/7 geçerli gönderim ve dürüst bildirim (15-38 sn, 5-12 tur); başarısız
   koşu gönderim yapmadan "gönderildi" demedi. Çekirdek benchmark 27/27 (json ayrı koşuyla), medyan
   4,2 sn; ev dizininde yan etki yok. Tam pytest 300 geçti, 15 atlandı.
-- Canlı ekranda henüz ölçülmedi: gerçek Chrome'da kaydırma olayı yönü/miktarı, select açılır
-  menüsünün pencere görüntüsüne girmesi, `chrome_ilan/chrome_maas/chrome_form` gerçek koşusu.
+- Canlı ekranda henüz ölçülmedi: select açılır menüsünün pencere görüntüsüne girmesi, `chrome_ilan/chrome_maas/chrome_form`
+  gerçek koşusu (kaydırma miktarı canlıda 10 kat aşıyordu, 29 Eylül'de düzeltildi).
   UI ve Telegram süreçleri yeni kodu yeniden başlatılınca yükler.
 
 ## Güncel model durumu
@@ -189,11 +211,27 @@ Genel senaryolardaki hatalar iki sürümde aynı türdedir (kod önekini düşü
   ve tekrar-URL uyarısı bunu azaltır; uzun içerik artık `cua_read_scrollable` ile metin olarak
   okunur (macOS Vision, `pyobjc-framework-Vision`), ama modelin okuduğu değeri STATE'e aktarması
   hâlâ modele bağlıdır.
-- Chrome'un AX ağacı web içeriğini vermiyor (`AXManualAccessibility` desteklenmiyor,
-  `AXEnhancedUserInterface` ayarlanamıyor); Electron uygulamalarında da AX yalnız pencere
-  çerçevesini gösterebiliyor → bu uygulamalarda ekran görüntüsü gerekir.
-- Otomatik gözlem her GUI yolundadır. Gerçek Chrome'da kaydırma olaylarının yönü/miktarı ve
-  select açılır menüsünün pencere görüntüsüne girmesi canlı olarak henüz ölçülmedi (bkz. 25 Eylül).
+- Chrome'un web AX ağacı varsayılan kapalıdır; `AXEnhancedUserInterface=True` ile ~2 sn içinde gelir
+  (araçlar ilk çağrıda kendileri açar) ve öğe eylemleri arka planda da çalışır. Electron için
+  `AXManualAccessibility` de yazılır ama canlı doğrulanmadı; Electron/canvas uygulamalarında AX yalnız
+  pencere çerçevesini gösterebilir → o uygulamalarda ekran görüntüsü/OCR gerekir.
+- Ödeme/sipariş onay kapısı (`approval.py`) etiket tablosuna dayanır; gerçek dünya yanlış pozitif oranı ölçülmedi
+  (yalnız repo benchmark sayfalarında 0/801). `audit.jsonl` kararları ve etiketleri izlenip tablo ayarlanmalı.
+  ROI OCR sabitleri (`POINT_LABEL_*`) canlı ayarlanmadı. Denetlenmeyen yollar: Enter/boşluk ile gönderim, ikon-only düğme,
+  bağlamsız 'Onayla'/'Gönder', kabuktan tıklama.
+- Klavye girdisi ön plan korumalıdır (`tools/foreground.py`, davranış `docs/CAPABILITIES.md`'de). Canlı ölçülenler (kendi
+  AppKit test uygulamalarıyla, tuş olayı göndermeden): sistem geneli AX okuması yalnız süreçte pencere sunucusu bağlantısı
+  kuruluysa çalışır (CLI'de ilk pencere listesi çağrısı kurar; `read_front_app` bunu yapar); okuma art arda 0,13 ms, boşta
+  aralıklı 4 ms; odak değişimini ilk okumada yansıtır (40/40); ön planda yanıtsız uygulama ya da okuyan sürecin kendisi
+  varsa (OmniAgent arayüzü önde) `-25204`, görünür penceresi olmayan (küçültülmüş) ön plan uygulaması varsa `-25212` döner:
+  girdi reddedilir (`FOREGROUND_UNKNOWN`) ve hata mesajı ipucu verir. Ölçülemeyenler: Finder/parola yöneticisi/Spotlight gibi
+  gerçek uygulamalarda okuma, launchd köprüsü bağlamı, Chrome AppleScript'in gerçek Chrome'da (Apple Events otomasyon izni
+  bu makinede tanımlı değil: `-1744`) yavaş sayfa/çift sekme yokluğu ve soğuk `cua_get_app`. Karar bekleyenler: açık hedef
+  seçilmiş hassas uygulamaya (ör. `cua_get_app('Terminal')` sonrası yazım) izin verilmesi; AX'in okuyamadığı durumlar için
+  ikinci bir kaynak (Process Manager `GetFrontProcess` kendi sürecinin önde olduğunu doğru verdi; küçültülmüş pencereli
+  uygulamada tutarlı doğrulanamadı).
+- Otomatik gözlem her GUI yolundadır. Gerçek Chrome'da select açılır menüsünün pencere görüntüsüne girmesi canlı olarak
+  henüz ölçülmedi (bkz. 25 Eylül); kaydırma miktarı 10 kat fazlaydı, 29 Eylül'de düzeltildi.
 - Hatalardan kalıcı öğrenme yeniden eklendi ama global görev benzerliği olarak değil:
   `experience.py` yalnız aynı araç + hata imzasında, değiştirilmiş çağrının başarıyla
   doğrulandığı ve görevin tamamlandığı kurtarmayı saklar. Ders yalnız aynı hata tekrar
@@ -202,8 +240,10 @@ Genel senaryolardaki hatalar iki sürümde aynı türdedir (kod önekini düşü
   3 tur/2 araç ve 3,6/2,1 sn verdi.
 - Tercih/ortak yol kalıcı belleği `user_memory.json` + `user_memory` aracı olarak eklendi:
   açık kullanıcı tercihleri sistem bağlamına alınabilir; parola/token/API anahtarı kayıtları
-  reddedilir. İstenmemiş kalıcı hafıza mutasyonu ve finansal para hareketleri modelden bağımsız
-  host onay kapısından geçer ve maskelenmiş denetim kaydı üretir.
+  reddedilir. İstenmemiş kalıcı hafıza mutasyonu, finansal para hareketleri, ekrandaki ödeme/sipariş düğmesine
+  tıklama, kart numarası yazma ve geri alınamaz dış iletişim modelden bağımsız host onay kapısından geçer ve
+  maskelenmiş denetim kaydı üretir (kapı ToolRuntime kancasıyla araç içinde çalışır; sürekli modda otomatik onay,
+  denetim kaydına `auto_approved`; kapatmak için `AUTO_APPROVE_IN_CONTINUOUS_MODE = False`).
 - Yarım görev finali son `STATE:` ledger'ını korur; devam mesajında geçmiş alışveriş üzerinden
   FACTS/REMAINING yeniden kullanılabilir. Tam süreç checkpoint'i henüz ayrı workflow motoru değildir.
 - Chromium ilk açılışı ~7sn (soğuk başlatma); statik sayfalar için `fetch_raw` tercih edilmeli.

@@ -23,6 +23,7 @@ from omniagent.app.types import ToolCallDraft, ToolResult
 from omniagent.config import redact
 from omniagent.core.events import TokenUsage
 from omniagent.core.fast_loop import normalize_progress_signature
+from omniagent.tools.bot_wall import ACCESS_CHALLENGE_CODE
 
 
 def add_usage(total: TokenUsage, turn: TokenUsage) -> TokenUsage:
@@ -35,7 +36,13 @@ def add_usage(total: TokenUsage, turn: TokenUsage) -> TokenUsage:
 
 
 def failed_tool_recovery_message(calls: List[ToolCallDraft], results: List[ToolResult]) -> Optional[str]:
-    """Başarısız araçları bir sonraki tur için kısa, somut kurtarma isteğine çevirir."""
+    """
+    Başarısız araçları bir sonraki tur için kısa, somut kurtarma isteğine çevirir. Erişim engeli hatası olan turda
+    mesaj verilmez: 'farklı araç/yöntem seç' talimatı engeli aşmaya yöneltir; aracın kendi iletisi (aşma, kullanıcıya
+    bildir) tek yönergedir.
+    """
+    if any(result.get("code") == ACCESS_CHALLENGE_CODE for result in results):
+        return None
     failures: List[str] = [
         f"{call['name']}: {result_text(result)[:180]}"
         for call, result in zip(calls, results, strict=True) if not result.get("ok")
@@ -200,3 +207,18 @@ def _fast_loop_prompt(kind: str, ledger: str) -> str:
             "dosya/rapor yazma, açıkça istenen final doğrulama ve cleanup adımlarını tamamla."
         )
     return f"{instruction}\n\n{ledger_text}"
+
+
+def _fast_loop_wall_prompt(ledger: str) -> str:
+    """
+    Görevde bir site doğrulama/erişim engeli görüldüyse 'YENİDEN PLAN' yerine gider: 'tek somut alternatif dene'
+    engeli araç değiştirerek aşmaya iterdi. Engelli adres aşılmaz; kullanıcıya bildirilir, yön ask_user ile istenir.
+    """
+    ledger_text: str = ledger or "STATE: henüz kalıcı görev kaydı yok"
+    return (
+        "HOST FAST LOOP — ENGEL: Anlamlı ilerleme durdu; bu görevde bir site doğrulama veya erişim engeli gösterdi. "
+        "Engelli adresi başka araç, kimlik, proxy, adres değişikliği veya yeniden denemeyle aşmaya ÇALIŞMA. Engeli "
+        "STATE'e yaz ve kullanıcıya bildir; yön gerekiyorsa ask_user (kind=confirm) çağır. Engelle ilgisiz kalan "
+        "zorunlu iş varsa yalnız onu tamamla; yoksa engeli raporlayıp bitir.\n\n"
+        f"{ledger_text}"
+    )

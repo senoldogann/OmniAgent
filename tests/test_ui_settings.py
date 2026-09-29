@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 from omniagent.platform.macos import api_keys
 from omniagent import config
 from omniagent.ui import app as ui
+from tests.test_ui_conversation import close_window
 
 
 class FakeKeyring:
@@ -90,7 +91,7 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[ui.OmniUI]:
     window: ui.OmniUI = ui.OmniUI()
     window.withdraw()
     yield window
-    window._on_close()
+    close_window(window)
 
 
 def test_header_has_settings_entry(app: ui.OmniUI) -> None:
@@ -190,6 +191,20 @@ def test_settings_page_reveals_keys_on_request(app: ui.OmniUI, keychain: FakeKey
     checks[0].toggle()
     assert all(entry.cget("show") == "" for entry in entries)
     window.destroy()
+
+def test_settings_brings_a_minimized_main_window_back_before_opening(
+    app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simge durumundaki ana pencerenin geçici Ayarlar penceresi Tk olay döngüsünü kilitler: önce geri getirilir."""
+    calls: List[tuple[bool, bool]] = []
+    monkeypatch.setattr(app, "state", lambda: "iconic")
+    monkeypatch.setattr(
+        ui, "set_application_hidden", lambda hidden, window: calls.append((hidden, app._settings_window is None)))
+    app._open_settings()
+    assert calls == [(False, True)]  # Ayarlar penceresi kurulmadan ÖNCE çağrıldı
+    assert app._settings_window is not None
+    app._settings_window.destroy()
+
 
 def test_composer_tools_commands_show_local_inventory_without_agent(app: ui.OmniUI) -> None:
     """Yerel katalog komutları model görevi başlatmadan sonuç verir."""

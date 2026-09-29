@@ -343,7 +343,7 @@ async def test_agent_sees_attached_image_and_sends_file_end_to_end(
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
     report = await main.run_agent_with_callback(
         "Ekteki hatayı çöz ve cevap.txt dosyasını bana gönder", lambda event: None,
-        {"requested_backend": None, "should_stop": lambda: False,
+        {"requested_backend": "opencode", "should_stop": lambda: False,
          "state_file": str(tmp_path / "memory.json"), "history": [],
          "deliver": deliver, "images": [str(photo)]},
         {"opencode": object()})

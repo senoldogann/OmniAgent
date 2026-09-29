@@ -148,6 +148,50 @@ def test_partial_sequence_marks_executed_steps_for_observation(monkeypatch: pyte
     assert gui_verification_needed([record])
 
 
+def _keyboard_sequence_events(monkeypatch: pytest.MonkeyPatch) -> List[str]:
+    """Tıklama, klavye ve ön plan denetimi olaylarını tek listeye SIRAYLA yazan yamalar."""
+    events: List[str] = []
+    monkeypatch.setattr(tools, "click_model_point", lambda x, y, button, geometry: events.append("click") or "tıklandı")
+    monkeypatch.setattr(tools, "type_unicode_text", lambda text: events.append(f"type:{text}"))
+    monkeypatch.setattr(tools, "press_key_spec", lambda key: events.append(f"key:{key}") or "basıldı")
+    monkeypatch.setattr(tools, "require_front_app", lambda expected, wait_seconds: events.append(f"front:{expected}"))
+    monkeypatch.setattr(tools, "require_no_sensitive_front", lambda wait_seconds: events.append("sensitive"))
+    return events
+
+
+def test_sequence_guards_each_keyboard_step_right_before_it_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Tıklama uygulamayı öne getirir ama etkinleşme ms sürer: her type/press'ten hemen önce ön plan doğrulanır. cmd+space
+    (Spotlight) hassas ön plandan çıkış yoludur: denetlenmez ve sonrasında hedef beklentisi bırakılır.
+    """
+    events = _keyboard_sequence_events(monkeypatch)
+    box = _toolbox(monkeypatch)
+    box._input_app = "Notes"
+    box.run_action_sequence([
+        {"action": "click", "point": [10, 20]}, {"action": "type", "text": "a"}, {"action": "press", "key": "enter"},
+        {"action": "press", "key": "cmd+space"}, {"action": "type", "text": "b"},
+    ])
+    assert events == ["click", "front:Notes", "type:a", "front:Notes", "key:enter", "key:cmd+space", "sensitive", "type:b"]
+    assert box._input_app is None
+
+
+def test_sequence_stops_at_a_failed_foreground_check_and_reports_completed_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    events = _keyboard_sequence_events(monkeypatch)
+    mismatch = ToolError("Ön planda Terminal var", "FOREGROUND_MISMATCH", True)
+
+    def refuse(wait_seconds: float) -> None:
+        raise mismatch
+
+    monkeypatch.setattr(tools, "require_no_sensitive_front", refuse)
+    with pytest.raises(ToolError) as caught:
+        _toolbox(monkeypatch).run_action_sequence([
+            {"action": "click", "point": [10, 20]}, {"action": "type", "text": "gizli"}, {"action": "press", "key": "enter"},
+        ])
+    assert caught.value.code == "FOREGROUND_MISMATCH" and caught.value.recoverable
+    assert caught.value.completed_steps == 1 and "Tamamlanan adımlar" in str(caught.value)
+    assert events == ["click"]  # denetim başarısız: ne yazı ne tuş gitti, sonraki adım çalışmadı
+
+
 def test_sequence_preserves_long_scrollable_result(monkeypatch: pytest.MonkeyPatch) -> None:
     """Birden çok ilanı tek çağrıda okurken orta bölgedeki değerler kaybolmamalı."""
     box = _toolbox(monkeypatch)
@@ -161,3 +205,28 @@ def test_sequence_preserves_long_scrollable_result(monkeypatch: pytest.MonkeyPat
 
     assert middle in result
     assert observation in result
+
+
+def test_input_pause_is_reduced_but_failsafe_stays_enabled() -> None:
+    """pyautogui'nin her çağrı sonrası beklemesi düşürülür; köşe acil durdurması (FAILSAFE) kullanıcı için açık kalır."""
+    assert 0 < screen.pyautogui.PAUSE < 0.1  # kütüphane varsayılanı 0,1 sn
+    assert screen.pyautogui.PAUSE == screen.INPUT_PAUSE_SECONDS
+    assert screen.pyautogui.FAILSAFE is True
+
+
+def test_fill_and_submit_wait_for_field_focus_between_click_and_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Alan doldurma/gönderme tıklamadan sonra alanın odak alması için beklenir: PAUSE düşürülünce eski >=0,1 sn tıklama-yazma
+    aralığı bu bekleme ile korunur; ilk klavye olayından (cmd+a) önce, ön plan doğrulamasından bağımsız gelir.
+    """
+    events = _keyboard_sequence_events(monkeypatch)
+    monkeypatch.setattr(tools.time, "sleep", lambda seconds: events.append(f"sleep:{seconds}"))
+    box = _toolbox(monkeypatch)
+    box._input_app = "Notes"
+    box.cua_fill_field([10, 20], "ad")
+    waits = [event for event in events if event.startswith("sleep:")]
+    assert len(waits) == 1 and float(waits[0].removeprefix("sleep:")) == tools.FIELD_FOCUS_WAIT_SECONDS
+    assert events == ["click", waits[0], "front:Notes", "key:cmd+a", "type:ad"]
+    events.clear()
+    box.cua_submit_text([10, 20], "ad")
+    assert events == ["click", waits[0], "front:Notes", "key:cmd+a", "type:ad", "key:enter"]

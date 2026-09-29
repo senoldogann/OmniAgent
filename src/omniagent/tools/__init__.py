@@ -5,7 +5,7 @@ import sys
 import types as _py_types
 from typing import List
 
-from . import browser, filesystem, gui_input, screen, system, types as tool_types
+from . import browser, filesystem, foreground, gui_input, screen, system, types as tool_types
 from . import facade as facade
 
 
@@ -20,7 +20,7 @@ for _name in _EXPORTED_NAMES:
 # bunları getirir; testlerin patch'lediği iç semboller modülde erişilebilir kalır.
 __all__: List[str] = sorted({
     *_EXPORTED_NAMES,
-    "browser", "filesystem", "gui_input", "screen", "system", "facade", "tool_types",
+    "browser", "filesystem", "foreground", "gui_input", "screen", "system", "facade", "tool_types",
 })
 
 
@@ -31,7 +31,7 @@ class _ToolsModule(_py_types.ModuleType):
         super().__setattr__(name, value)
         if hasattr(facade, name):
             setattr(facade, name, value)
-        for submod in (browser, filesystem, gui_input, screen, system, tool_types):
+        for submod in (browser, filesystem, foreground, gui_input, screen, system, tool_types):
             if hasattr(submod, name):
                 setattr(submod, name, value)
 

@@ -2,10 +2,14 @@ import json
 import os
 import re
 import tempfile
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, TypedDict, NotRequired, Dict, Union
+
+from omniagent.core.observation_filter import MASK_SCAN_CHARS, mask_sensitive_text, mask_typed_arguments
+# ascii_fold artık core/text_norm.py'de (observation_filter'la döngüyü kırmak için); ad, onu state'ten alan modüller
+# için burada korunur (search_stems de kullanır).
+from omniagent.core.text_norm import ascii_fold
 
 # Epizodik bellekte tutulacak en fazla görev sayısı (bellek dosyasının sınırsız
 # büyüyüp her yüklemede yavaşlamasını önler). Kayıt, kullanıcının "geçen gün ne yapmıştık"
@@ -19,17 +23,21 @@ HISTORY_OUTCOME_LIMIT: int = 400
 # Türkçe ekler aramayı bozmasın: sözcüklerin ilk bu kadar harfi karşılaştırılır (rapor/raporları)
 SEARCH_STEM_LENGTH: int = 5
 
-# Epizot kaydında adım ayrıntısının ve argümanlarının saklanacak azami uzunluğu.
+# Epizot dosyasına yazılırken adım ayrıntısının ve argümanlarının azami uzunluğu. Bellek içi adım
+# kayıtları KIRPILMAZ: host kapıları (unmet_wait_status, has_action_evidence, gui_evidence_summary,
+# kod-benzeri belirteç doğrulaması) argümanı ve ayrıntıyı tam metin olarak ayrıştırır; kırpılmış JSON
+# çözülemez ve kırpma işareti kuyrukta olduğundan ayrıntıda görünmez. Dosyaya yazılan metin ise önce hassas
+# kalıplardan geçirilir (bkz. clip_step_for_storage): kalıcı kayıt bellekteki tam metnin sızdırma yolu olmamalı.
 STEP_DETAIL_LIMIT: int = 500
 STEP_ARGS_LIMIT: int = 300
 
 
 class StepRecord(TypedDict):
-    """Bir araç çağrısının epizot kaydındaki sade hâli."""
+    """Bir araç çağrısının adım kaydı: bellekte tam metin, epizot dosyasında kırpılmış (clip_step_for_storage)."""
     tool: str
     args: str
     ok: bool
-    # Başarıda araç sonucu, hatada "hata_tipi: mesaj" (kırpılmış)
+    # Başarıda araç sonucu, hatada "hata_tipi: mesaj"
     detail: str
     partial_steps: NotRequired[int]
 
@@ -58,6 +66,10 @@ class EpisodeMetrics(TypedDict):
     # Deneyim belleği: hatırlatılan ders sayısı ve görevde doğrulanan yeni ders adayı sayısı
     experience_hints: NotRequired[int]
     experience_candidates: NotRequired[int]
+    # Nihai yanıt doğrulaması: düzeltilen, belirsiz (düzeltilmeyen) ve gözlemsiz kod-benzeri belirteç sayıları
+    answer_tokens_corrected: NotRequired[int]
+    answer_tokens_unverified: NotRequired[int]
+    answer_tokens_unobserved: NotRequired[int]
 
 
 class Episode(TypedDict):
@@ -124,16 +136,33 @@ def _clip(text: str, limit: int) -> str:
 def make_step_record(
     tool: str, args: str, ok: bool, detail: str, partial_steps: int = 0,
 ) -> StepRecord:
-    """Araç çağrısını kırpılmış epizot adımına çevirir. Saf fonksiyon."""
-    record: StepRecord = {
-        "tool": tool,
-        "args": _clip(args, STEP_ARGS_LIMIT),
-        "ok": ok,
-        "detail": _clip(detail, STEP_DETAIL_LIMIT),
-    }
+    """Araç çağrısını adım kaydına çevirir; metni kırpmaz (kırpma yalnız saklamada: clip_step_for_storage). Saf fonksiyon."""
+    record: StepRecord = {"tool": tool, "args": args, "ok": ok, "detail": detail}
     if partial_steps > 0:
         record["partial_steps"] = partial_steps
     return record
+
+
+def _masked_clip(text: str, limit: int) -> str:
+    """
+    Kalıcı kayıt için metni ÖNCE hassas kalıplardan geçirir (yalnız ilk MASK_SCAN_CHARS karakter: maliyet sınırı,
+    saklanan kısmın çok üstünde), SONRA kırpar: sınırda bölünen sır parçası maskeden kaçmaz. Saf.
+    """
+    return _clip(mask_sensitive_text(text[:MASK_SCAN_CHARS]), limit)
+
+
+def clip_step_for_storage(step: StepRecord) -> StepRecord:
+    """
+    Adımı epizot dosyasına yazmadan önce maskeler ve kırpar; girdiyi değiştirmez. Argümanda alana yazılan metin
+    (parola olabilir) ve komut satırı sırları (--password değer), ayrıntıda araç çıktısındaki sır kalıpları ve
+    yazma yankısı ([gizli]) dosyaya girmez; bellekteki adım tam kalır. Saf fonksiyon.
+    """
+    clipped: StepRecord = {
+        **step,
+        "args": _masked_clip(mask_typed_arguments(step["tool"], step["args"]), STEP_ARGS_LIMIT),
+        "detail": _masked_clip(step["detail"], STEP_DETAIL_LIMIT),
+    }
+    return clipped
 
 
 def record_episode(
@@ -146,12 +175,12 @@ def record_episode(
 ) -> StateDict:
     """
     Tamamlanan görevi ölçümleriyle birlikte kaydeder; en fazla MAX_EPISODES
-    görev tutulur. Saf fonksiyon: yeni bir durum döner.
+    görev tutulur, adımlar dosyaya kırpılarak yazılır. Saf fonksiyon: yeni bir durum döner.
     """
     episode: Episode = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "goal": goal,
-        "steps": steps[-MAX_STEPS_PER_EPISODE:],
+        "steps": [clip_step_for_storage(step) for step in steps[-MAX_STEPS_PER_EPISODE:]],
         "outcome": outcome,
         "success": success,
         "metrics": metrics,
@@ -165,13 +194,6 @@ class EpisodeSummary(TypedDict):
     goal: str
     success: bool
     outcome: str
-
-
-def ascii_fold(text: str) -> str:
-    """Türkçe harfleri ASCII karşılığına indirir ve küçük harfe çevirir (ı→i, ş→s…). Saf."""
-    replaced: str = text.replace("ı", "i").replace("İ", "i")
-    decomposed: str = unicodedata.normalize("NFKD", replaced)
-    return "".join(character for character in decomposed if not unicodedata.combining(character)).casefold()
 
 
 def search_stems(text: str) -> frozenset[str]:

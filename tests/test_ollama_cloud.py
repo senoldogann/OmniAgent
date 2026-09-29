@@ -42,20 +42,39 @@ async def test_cloud_client_only_when_local_model_is_ready(monkeypatch: pytest.M
 
 
 def test_backend_fallback_follows_api_key_ladder() -> None:
-    """Merdiven sırası korunur: ollama-cloud → openai → openrouter."""
+    """Tam yedek izniyle merdiven sırası korunur: ollama-cloud → openai → openrouter."""
     all_available = frozenset({"ollama-cloud", "openai", "openrouter"})
-    assert main.attempt_plan("ollama-cloud", all_available) == (
+    assert main.attempt_plan("ollama-cloud", all_available, all_available) == (
         "ollama-cloud", "ollama-cloud", "openai", "openrouter",
     )
-    assert main.attempt_plan("openai", all_available) == (
+    assert main.attempt_plan("openai", all_available, all_available) == (
         "openai", "openai", "ollama-cloud", "openrouter",
     )
-    assert main.attempt_plan("openrouter", all_available) == (
+    assert main.attempt_plan("openrouter", all_available, all_available) == (
         "openrouter", "openrouter", "ollama-cloud", "openai",
     )
     # Merdiven dışındaki elle seçilmiş profil tüm merdiveni sırayla izler.
-    assert main.attempt_plan("opencode", all_available) == (
+    assert main.attempt_plan("opencode", all_available, all_available) == (
         "opencode", "opencode", "ollama-cloud", "openai", "openrouter",
     )
     # Yalnız iki profil hazırsa plan hazır olmayan basamağı atlar.
-    assert main.attempt_plan("ollama-cloud", frozenset({"ollama-cloud", "openrouter"}))[-1] == "openrouter"
+    two_ready = frozenset({"ollama-cloud", "openrouter"})
+    assert main.attempt_plan("ollama-cloud", two_ready, all_available)[-1] == "openrouter"
+
+
+@pytest.mark.parametrize("backend,allowed,expected", [
+    # İzin kümesi boşsa (varsayılan) plan yalnız seçili profildir: istek başka sağlayıcıya gitmez.
+    ("ollama-cloud", frozenset(), ("ollama-cloud", "ollama-cloud")),
+    ("openai", frozenset(), ("openai", "openai")),
+    ("opencode", frozenset(), ("opencode", "opencode")),
+    # Kısmi izin yalnız izinli profili ekler.
+    ("ollama-cloud", frozenset({"openrouter"}), ("ollama-cloud", "ollama-cloud", "openrouter")),
+    # Hazır olmayan izinli profil (istemcisi yok) plana girmez.
+    ("openrouter", frozenset({"ollama-cloud", "openai"}), ("openrouter", "openrouter", "ollama-cloud")),
+])
+def test_backend_fallback_needs_explicit_permission(
+    backend: str, allowed: frozenset[str], expected: tuple[str, ...],
+) -> None:
+    """Yedek adayı yalnız hazır VE izinli profildir; izin dışındaki hazır profil plana girmez."""
+    ready = frozenset({"ollama-cloud", "openrouter"}) | frozenset({backend})
+    assert main.attempt_plan(backend, ready, allowed) == expected

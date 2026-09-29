@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from datetime import datetime, timezone
 import json
 import logging
+import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from omniagent import approval
 from omniagent.app.tool_schema import (
@@ -26,6 +29,7 @@ from omniagent.integrations.runtime import (
     InteractionRequired,
     data_root,
 )
+from omniagent.paths import APP_NAME, workspace_dir
 from omniagent.tools import (
     TOOL_RUNTIME,
     ToolError,
@@ -55,14 +59,89 @@ def failed_call_key(call: ToolCallDraft) -> str:
     return f"{call['name']}:{json.dumps(arguments, sort_keys=True, ensure_ascii=False)}"
 
 
+# Kabuk komutunda korumalı dosya adı geçiyor, komut yazma/silme/taşıma yapabiliyor VE komut veri kökünü gösteriyorsa onay
+# istenir. Salt okuma (cat, less, grep) ve veri kökü dışındaki aynı adlı proje dosyaları ('git add catalog.json',
+# 'python build.py > catalog.json', 'ls 2>&1 | tee telegram.json') sorulmaz. Yazma göstergeleri sözcük sınırlıdır: 'add'
+# içindeki 'dd' eşleşmez. En iyi çabadır: değişken birleştirme veya kodlama gibi kabuk kaçışları bunu geçebilir.
+_SHELL_WRITE_MARKER: re.Pattern[str] = re.compile(
+    r">|\b(?:tee|sed|mv|cp|rm|truncate|dd|install|ln|python\d?|node|perl|ruby)\b|\b(?:ba)?sh\s+-c\b"
+)
+# Veri kökünü gösteren ifadeler ('Application Support/OmniAgent', OMNI_DATA_DIR, göreli '..' çıkışı ve kökün mutlak yolu)
+_SHELL_DATA_ROOT_HINTS: Tuple[str, ...] = (f"application support/{APP_NAME.casefold()}", "omni_data_dir", "..")
+
+
+def _same_filesystem_object(first: Path, second: Path) -> bool:
+    """
+    İki yol aynı dosya sistemi nesnesi (aygıt + inode) mi? Yazım farkını (APFS büyük/küçük harfe duyarsızdır),
+    /System/Volumes/Data firmlink'ini ve sert bağları aşar. Yollardan biri yoksa ya da bir bileşeni dizin değilse
+    False (var olmayan hedef başka bir nesnedir). Salt okur.
+    """
+    try:
+        return first.samefile(second)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
+def _protected_name(resolved: Path, root: Path) -> Optional[str]:
+    """
+    Çözülmüş hedef veri kökündeki korumalı dosyalardan biri mi? Kimlikle denetlenir, yazımla değil: (1) ad korumalı
+    (küçük harf karşılaştırılır) ve üst dizin veri köküyle AYNI dizin (farklı harfle yazılmış dizin adı ve firmlink
+    dahil; dosya henüz yoksa da: provider_fallback.json ilk yazılışta yoktur) ya da (2) hedef zaten var ve korumalı
+    dosyalardan biriyle AYNI dosya (sert bağ). Küçük harfli korumalı adı ya da None döner.
+    """
+    name: str = resolved.name.casefold()
+    if name in approval.PROTECTED_DATA_FILES and _same_filesystem_object(resolved.parent, root):
+        return name
+    return next(
+        (protected for protected in sorted(approval.PROTECTED_DATA_FILES)
+         if _same_filesystem_object(resolved, root / protected)),
+        None,
+    )
+
+
+def _protected_data_file(path: str) -> Optional[str]:
+    """
+    write_file/edit_file hedefi veri kökündeki korumalı dosyalardan biri mi (bkz. approval.PROTECTED_DATA_FILES)?
+    Göreli yol iki biçimde çözülür (iş alanı ve süreç dizini: araç hangisini seçeceğini görev hedefinden bilir);
+    sembolik bağlar çözülür, '..' ile veri köküne çıkış yakalanır; farklı harfli dizin adı, firmlink ve sert bağ da
+    kimlikle yakalanır (bkz. _protected_name). Küçük harfli adı ya da None döner.
+    """
+    if not path.strip():
+        return None
+    root: Path = data_root().resolve()
+    typed: Path = Path(path).expanduser()
+    for candidate in (workspace_dir() / typed, typed):
+        protected: Optional[str] = _protected_name(candidate.resolve(), root)
+        if protected is not None:
+            return protected
+    return None
+
+
+def _shell_protected_data_file(command: str, root: Path) -> Optional[str]:
+    """
+    Kabuk komutu veri kökündeki korumalı bir dosyayı yazabilir mi? En iyi çaba; adı ya da None döner. Komut, sözcük
+    sınırlı bir yazma göstergesi taşımalı ve veri kökünü göstermeli (bkz. _SHELL_DATA_ROOT_HINTS ve kökün mutlak yolu,
+    çözülmüş biçimi dahil); yalnız dosya adı + gösterge yetmez. Ters eğik çizgiler atılır ('Application\\ Support').
+    Dosya sistemine yalnız kökün gerçek yolunu çözmek için bakar.
+    """
+    lowered: str = command.casefold().replace("\\", "")
+    hints: Tuple[str, ...] = (*_SHELL_DATA_ROOT_HINTS, str(root).casefold(), str(root.resolve()).casefold())
+    if _SHELL_WRITE_MARKER.search(lowered) is None or not any(hint in lowered for hint in hints):
+        return None
+    return next((name for name in sorted(approval.PROTECTED_DATA_FILES) if name in lowered), None)
+
+
 def approval_request_for_call(
     name: str, arguments: Dict[str, Any], dynamic: Optional[ToolEntry], memory_mutation_allowed: bool,
 ) -> Optional[approval.ApprovalRequest]:
     """
-    Çağrının çalışmadan önce kullanıcı onayı gerektirip gerektirmediğine karar verir: hedefin
-    açıkça istemediği kalıcı hafıza değişikliği, finansal işaretli entegrasyon araçları ve para
-    hareketi yapan kabuk/JS çağrıları. Ayrıştırılamayan kabuk komutu için onay istenmez; araç
-    kendisi reddeder. Saf fonksiyon.
+    Çağrının çalışmadan önce kullanıcı onayı gerektirip gerektirmediğine karar verir (yalnız argümanlara
+    bakarak): hedefin açıkça istemediği kalıcı hafıza değişikliği, finansal veya geri alınamaz dış iletişim
+    yapan entegrasyon araçları, ödeme kartı numarası yazan GUI/tarayıcı araçları, para hareketi yapan
+    kabuk/JS çağrıları ve veri kökündeki güvenlik/ilke dosyalarına (yedek sağlayıcı izni, denetim kaydı,
+    kalıcı hafıza, zamanlanmış görevler...) dosya/kabuk aracıyla yazma. Ekranda tıklanan hedefin etiketine bağlı kararlar burada verilemez: onları araç
+    hedefi çözümledikten sonra ToolRuntime onay kancasıyla ister (bkz. execute_tool). Ayrıştırılamayan kabuk
+    komutu için onay istenmez; araç kendisi reddeder. Saf fonksiyon.
     """
     if name == "user_memory":
         action: str = str(arguments.get("action", "")).strip().casefold()
@@ -70,9 +149,25 @@ def approval_request_for_call(
             return approval.memory_request(arguments)
         return None
     if dynamic is not None:
-        if dynamic.get("financial", False) and not dynamic["readonly"]:
-            return approval.financial_request(dynamic.get("label", name), arguments, "finansal entegrasyon işlemi")
+        if dynamic["readonly"]:
+            return None
+        label: str = dynamic.get("label", name)
+        if dynamic.get("financial", False):
+            return approval.financial_request(label, arguments, "finansal entegrasyon işlemi")
+        if approval.outbound_tool_name(label):
+            return approval.outbound_request(label, arguments, "geri alınamaz dış iletişim")
         return None
+    if name in ("write_file", "edit_file"):
+        protected_file: Optional[str] = _protected_data_file(str(arguments.get("path", "")))
+        if protected_file is not None:
+            return approval.config_write_request(name, protected_file)
+    if name == "execute_shell":
+        protected_by_shell: Optional[str] = _shell_protected_data_file(str(arguments.get("command", "")), data_root())
+        if protected_by_shell is not None:
+            return approval.config_write_request(name, protected_by_shell)
+    masked_card: Optional[str] = approval.typed_card_number(name, arguments)
+    if masked_card is not None:
+        return approval.card_entry_request(name, masked_card)
     reason: Optional[str] = None
     if name == "execute_shell":
         command: str = str(arguments.get("command", ""))
@@ -88,13 +183,15 @@ def approval_request_for_call(
 _APPROVAL_REFUSALS: Dict[str, Tuple[str, str]] = {
     "unavailable": (
         "Bu işlem kullanıcı onayı gerektiriyor ama etkileşimli kanal (arayüz/Telegram) yok; yapılmadı. "
-        "Onay gerektiğini final yanıtında açıkça bildir.", "APPROVAL_UNAVAILABLE",
+        "Onay gerektiğini final yanıtında açıkça bildir.", approval.APPROVAL_UNAVAILABLE_CODE,
     ),
     "timeout": (
         f"Kullanıcı onayı {approval.APPROVAL_TIMEOUT_SECONDS / 60:.0f} dakika içinde gelmedi; işlem yapılmadı.",
-        "APPROVAL_TIMEOUT",
+        approval.APPROVAL_TIMEOUT_CODE,
     ),
-    "denied": ("Kullanıcı bu işlemi onaylamadı; yapılmadı. Aynı işlemi yeniden deneme.", "APPROVAL_DENIED"),
+    "denied": (
+        "Kullanıcı bu işlemi onaylamadı; yapılmadı. Aynı işlemi yeniden deneme.", approval.APPROVAL_DENIED_CODE,
+    ),
 }
 
 
@@ -103,10 +200,20 @@ async def require_approval(tool: str, request: approval.ApprovalRequest) -> None
     Onayı arayüz/Telegram üzerinden sorar ve kararı (onay/ret/zaman aşımı/kanal yok) denetim
     kaydına yazar; kayıt yazılamazsa işlem yürütülmez. Onaylanmayan çağrı ToolError ile
     reddedilir; kullanıcı görevi durdurursa IntegrationStopped yükselir.
+
+    BYPASS MODU: İki yolda kullanıcıya sorulmaz ve denetim kaydına "auto_approved" yazılır: (1) istek
+    güvenli host listesine/tutar limitine giriyorsa (approval.should_auto_approve), (2) sürekli modda
+    (unattended) AUTO_APPROVE_IN_CONTINUOUS_MODE açıkken. Ajan serbest çalışır; denetim izi kalır.
     """
     runtime: Optional[IntegrationRuntime] = CURRENT_RUNTIME.get()
     decision: str = "unavailable"
-    if runtime is not None and runtime.answer is not None:
+
+    # BYPASS: (1) güvenli host/tutar, (2) sürekli mod → otomatik onay
+    if approval.should_auto_approve(request.get("url", ""), request.get("amount")):
+        decision = "auto_approved"
+    elif runtime is not None and runtime.unattended and approval.AUTO_APPROVE_IN_CONTINUOUS_MODE:
+        decision = "auto_approved"
+    elif runtime is not None and runtime.answer is not None and not runtime.unattended:
         try:
             answer: Dict[str, Any] = await runtime.ask(
                 request["title"], approval.approval_fields(request), approval.APPROVAL_TIMEOUT_SECONDS,
@@ -119,9 +226,57 @@ async def require_approval(tool: str, request: approval.ApprovalRequest) -> None
         data_root() / "audit.jsonl",
         approval.audit_record(tool, request, decision, datetime.now(timezone.utc).isoformat()),
     )
-    if decision != "approved":
+    if decision not in ("approved", "auto_approved"):
         message, code = _APPROVAL_REFUSALS[decision]
         raise ToolError(message, code, False)
+
+
+# İş parçacığı aracı onay beklerken durdurma bayrağını bu aralıkla yoklar
+APPROVAL_POLL_SECONDS: float = 0.1
+
+
+def _running_loop() -> Optional[asyncio.AbstractEventLoop]:
+    """Bu iş parçacığında çalışan olay döngüsü; yoksa None."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _async_approver(tool: str) -> Callable[[approval.ApprovalRequest], Awaitable[None]]:
+    """Olay döngüsündeki (async) araçlar için onay kancası: çözümlenen hedefi require_approval'a taşır."""
+    async def request_approval(request: approval.ApprovalRequest) -> None:
+        await require_approval(tool, request)
+    return request_approval
+
+
+def _blocking_approver(
+    tool: str, loop: asyncio.AbstractEventLoop, should_stop: Callable[[], bool],
+) -> Callable[[approval.ApprovalRequest], None]:
+    """
+    Eşzamanlı (asyncio.to_thread) araçlar için köprü: onayı olay döngüsünde require_approval ile çalıştırır,
+    kararı iş parçacığında bekler. ToolError/IntegrationStopped burada yeniden yükselir (denetim kaydı
+    require_approval'dadır). Kullanıcı görevi durdurursa bekleme kesilir. Olay döngüsü iş parçacığından
+    çağrılırsa (kilitlenirdi) açık hata verir; yalnız araç iş parçacığı içindir.
+    """
+    def request_approval_blocking(request: approval.ApprovalRequest) -> None:
+        if _running_loop() is loop:
+            raise RuntimeError(
+                f"{tool}: bloklayan onay kancası olay döngüsü iş parçacığından çağrıldı (kilitlenirdi); "
+                "async araçlar ToolRuntime.request_approval kullanmalı."
+            )
+        future: concurrent.futures.Future[None] = asyncio.run_coroutine_threadsafe(
+            require_approval(tool, request), loop,
+        )
+        while True:
+            finished, _pending = concurrent.futures.wait([future], timeout=APPROVAL_POLL_SECONDS)
+            if finished:
+                future.result()
+                return
+            if should_stop():
+                future.cancel()
+                raise ToolError("Kullanıcı tarafından durduruldu.", "STOPPED", False)
+    return request_approval_blocking
 
 
 async def execute_tool(
@@ -185,6 +340,8 @@ async def execute_tool(
         "emit_output": lambda text: emit({"kind": "tool_output", "call_id": call["id"], "text": text}),
         "should_stop": should_stop,
         "approved": False,
+        "request_approval": _async_approver(name),
+        "request_approval_blocking": _blocking_approver(name, asyncio.get_running_loop(), should_stop),
     }
     # İptal gibi bir BaseException dışarı taşınırsa bekleyen eşdeğer çağrı askıda kalmasın diye
     # sonuç önceden güvenli bir başarısızlıkla doldurulur; normal yol bunu ezber.

@@ -2,6 +2,7 @@
 import json
 from typing import Any, Dict, List, TypedDict
 
+from .observation_filter import mask_sensitive_text
 from .state import StepRecord
 
 MAX_EXCHANGES: int = 8
@@ -29,7 +30,9 @@ def tool_digest(steps: List[StepRecord]) -> List[str]:
     for step in steps:
         try:
             arguments = json.loads(step["args"])
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
+            # Aşırı derin iç içe argüman json.loads'ta RecursionError verir; adım kırpılmadan geldiği için
+            # (core/state.py) düşman argüman sohbet özetini kuran görev sonunu çökertmemeli.
             arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
@@ -38,7 +41,9 @@ def tool_digest(steps: List[StepRecord]) -> List[str]:
         label = step["tool"] + (" " + " · ".join(values) if values else "")
         if not step["ok"]:
             label = "başarısız: " + label
-        label = _clip(label.replace("\n", " "), TOOL_TEXT_LIMIT)
+        # Önce maskele, sonra kırp: sohbet geçmişi modele geri verilir ve diske yazılır; kırpma sınırındaki
+        # bir sırrın ön eki açıkta kalmasın.
+        label = _clip(mask_sensitive_text(label).replace("\n", " "), TOOL_TEXT_LIMIT)
         if label in summaries:
             summaries.remove(label)
         summaries.append(label)

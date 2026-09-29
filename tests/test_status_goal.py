@@ -18,6 +18,23 @@ def test_status_goal_uses_last_successful_json_observation() -> None:
     assert main.unmet_wait_status("Mevcut durumu raporla", [pending]) is None
 
 
+def test_status_goal_reads_json_longer_than_step_detail_limit() -> None:
+    """500 karakteri aşan JSON gözlemi kırpılıp çözülemez hâle gelmez (fetch_raw 4000 karaktere kadar tam gelir)."""
+    body = json.dumps({"status": "ready", "items": [{"id": index, "name": "x" * 20} for index in range(30)]})
+    assert 500 < len(body) < 4000
+    step = sm.make_step_record("fetch_raw", "{}", True, body)
+    assert main.unmet_wait_status("status 'ready' olana kadar kontrol et", [step]) is None
+
+
+def test_status_goal_skips_adversarially_nested_json_instead_of_crashing() -> None:
+    """Aşırı derin iç içe JSON (json.loads RecursionError verir) görevi çökertmez; o gözlem atlanır."""
+    goal = "status 'ready' olana kadar kontrol et"
+    hostile = sm.make_step_record("fetch_raw", "{}", True, "[" * 2000)
+    ready = sm.make_step_record("fetch_raw", "{}", True, '{"status":"ready"}')
+    assert main.unmet_wait_status(goal, [ready, hostile]) is None
+    assert main.unmet_wait_status(goal, [hostile]) == "beklenen status doğrulanmadı"
+
+
 @pytest.mark.asyncio
 async def test_agent_does_not_report_success_when_wait_condition_is_pending(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

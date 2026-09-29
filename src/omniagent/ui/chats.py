@@ -7,7 +7,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple, TypedDict
+from typing import List, NotRequired, Optional, Sequence, Tuple, TypedDict
 
 from omniagent.core.conversation import Exchange
 from omniagent.integrations.runtime import save_json
@@ -19,10 +19,25 @@ class TranscriptSpan(TypedDict):
     tags: List[str]
 
 
+# Kalıcı transkripte YAZILMAYAN geçici Tk durumu. Seçim ve canlı bölge kimlikleri yalnız etiket
+# olarak atılır (metin kalır); akış imleci, takılı 'akıyor' işareti ve dönen araç glifi ise
+# etiketiyle birlikte metni de atılır: yüklenince kalıcı imleç/işaret gibi görünmesinler.
+TRANSIENT_TAGS: frozenset[str] = frozenset({"sel"})
+TRANSIENT_TEXT_TAGS: frozenset[str] = frozenset({"cursor", "bullet_streaming", "tool_spin"})
+_REGION_TAG: re.Pattern[str] = re.compile(r"r\d+")
+# Bir sohbette biten son görevin sonucu (kenar çubuğu durum noktası için). Eski kayıtlarda alan yoktur.
+OUTCOME_DONE: str = "done"
+OUTCOME_FAILED: str = "failed"
+OUTCOME_STOPPED: str = "stopped"
+CHAT_OUTCOMES: frozenset[str] = frozenset({OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_STOPPED})
+
+
 class ChatSummary(TypedDict):
     id: str
     title: str
     updated_at: str
+    # Son biten görevin sonucu; görev başlayınca silinir, bitince yazılır (eski dizinlerde bulunmaz).
+    last_outcome: NotRequired[str]
 
 
 class ChatRecord(TypedDict):
@@ -32,11 +47,46 @@ class ChatRecord(TypedDict):
     updated_at: str
     history: List[Exchange]
     spans: List[TranscriptSpan]
+    last_outcome: NotRequired[str]
 
 
 def chats_dir() -> Path:
     """Sohbetlerin kalıcı dizinini döndürür."""
     return data_root() / "desktop_chats"
+
+
+def known_outcome(value: object) -> Optional[str]:
+    """Diskten okunan değer bilinen bir görev sonucuysa onu, aksi halde (liste/sözlük dahil) None döndürür. Saf."""
+    return value if isinstance(value, str) and value in CHAT_OUTCOMES else None
+
+
+def parse_updated_at(chat_id: str, value: str) -> datetime:
+    """
+    Sohbetin zaman damgasını (ISO 8601) çözer. Tarihe göre gruplama buna dayanır: bozuk değer sessizce
+    gizlenmez, hangi sohbetin bozuk olduğunu söyleyen açık bir ValueError verir. Saf.
+    """
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f"Sohbet zaman damgası okunamadı: {chat_id}") from error
+
+
+def summary_of(record: ChatRecord) -> ChatSummary:
+    """Sohbet kaydının dizin satırını (varsa son görev sonucuyla birlikte) çıkarır. Saf."""
+    summary: ChatSummary = {"id": record["id"], "title": record["title"], "updated_at": record["updated_at"]}
+    if "last_outcome" in record:
+        summary["last_outcome"] = record["last_outcome"]
+    return summary
+
+
+def with_outcome(summary: ChatSummary, outcome: Optional[str]) -> ChatSummary:
+    """Dizin satırının son görev sonucu değiştirilmiş kopyası; None sonucu siler. Saf."""
+    if outcome is not None and outcome not in CHAT_OUTCOMES:
+        raise ValueError(f"Bilinmeyen görev sonucu: {outcome}")
+    kept: ChatSummary = {"id": summary["id"], "title": summary["title"], "updated_at": summary["updated_at"]}
+    if outcome is not None:
+        kept["last_outcome"] = outcome
+    return kept
 
 
 def _valid_id(chat_id: str) -> bool:
@@ -70,7 +120,12 @@ def load_catalog(root: Optional[Path] = None) -> Tuple[List[ChatSummary], Option
         if (isinstance(item, dict) and isinstance(item.get("id"), str)
                 and _valid_id(item["id"]) and isinstance(item.get("title"), str)
                 and isinstance(item.get("updated_at"), str)):
-            chats.append({"id": item["id"], "title": item["title"], "updated_at": item["updated_at"]})
+            parse_updated_at(item["id"], item["updated_at"])
+            summary: ChatSummary = {"id": item["id"], "title": item["title"], "updated_at": item["updated_at"]}
+            outcome: Optional[str] = known_outcome(item.get("last_outcome"))
+            if outcome is not None:
+                summary["last_outcome"] = outcome
+            chats.append(summary)
     active: object = raw.get("active_id")
     active_id: Optional[str] = active if isinstance(active, str) and any(item["id"] == active for item in chats) else None
     return chats, active_id
@@ -102,9 +157,17 @@ def load_chat(chat_id: str, root: Optional[Path] = None) -> ChatRecord:
     for item in raw_spans:
         if isinstance(item, dict) and isinstance(item.get("text"), str) and isinstance(item.get("tags"), list):
             spans.append({"text": item["text"], "tags": [tag for tag in item["tags"] if isinstance(tag, str)]})
-    return {"id": chat_id, "title": str(raw.get("title", "Yeni sohbet")),
-            "created_at": str(raw.get("created_at", "")), "updated_at": str(raw.get("updated_at", "")),
-            "history": history, "spans": spans}
+    # Eski kayıtlarda kalmış geçici Tk durumu (seçim, akış imleci, takılı işaretler) yüklerken
+    # temizlenir; dosya bir sonraki kayıtta düzelir.
+    record: ChatRecord = {
+        "id": chat_id, "title": str(raw.get("title", "Yeni sohbet")),
+        "created_at": str(raw.get("created_at", "")), "updated_at": str(raw.get("updated_at", "")),
+        "history": history, "spans": sanitize_spans(spans),
+    }
+    outcome: Optional[str] = known_outcome(raw.get("last_outcome"))
+    if outcome is not None:
+        record["last_outcome"] = outcome
+    return record
 
 
 def save_chat(record: ChatRecord, root: Optional[Path] = None) -> None:
@@ -199,10 +262,8 @@ def restore_chat(chat_id: str, chats: Sequence[ChatSummary],
     os.replace(source, target)
     try:
         record: ChatRecord = load_chat(chat_id, base)
-        updated: List[ChatSummary] = [
-            {"id": chat_id, "title": record["title"], "updated_at": record["updated_at"]},
-            *[dict(item) for item in chats],
-        ]
+        parse_updated_at(chat_id, record["updated_at"])  # bozuk zaman damgası kataloğa girmesin (geri alma yolu)
+        updated: List[ChatSummary] = [summary_of(record), *[dict(item) for item in chats]]
         save_catalog(updated, active_id, base)
     except (OSError, ValueError, json.JSONDecodeError):
         os.replace(target, source)
@@ -226,10 +287,9 @@ def restore_chats(chat_ids: Sequence[str], chats: Sequence[ChatSummary],
             os.replace(source, target)
             moved.append((source, target))
         restored = [load_chat(chat_id, base) for chat_id in selected]
-        updated: List[ChatSummary] = [
-            {"id": record["id"], "title": record["title"], "updated_at": record["updated_at"]}
-            for record in restored
-        ] + [dict(item) for item in chats]
+        for record in restored:
+            parse_updated_at(record["id"], record["updated_at"])  # bozuk zaman damgası kataloğa girmesin
+        updated: List[ChatSummary] = [summary_of(record) for record in restored] + [dict(item) for item in chats]
         save_catalog(updated, active_id, base)
     except (OSError, ValueError, json.JSONDecodeError):
         for source, target in reversed(moved):
@@ -238,21 +298,38 @@ def restore_chats(chat_ids: Sequence[str], chats: Sequence[ChatSummary],
     return updated
 
 
+def sanitize_spans(spans: Sequence[TranscriptSpan]) -> List[TranscriptSpan]:
+    """
+    Geçici Tk durumunu parçalardan çıkarır ve komşu, aynı etiketli parçaları birleştirir:
+    seçim ('sel') ve canlı bölge kimlikleri ('rN') etiketten; akış imleci, takılı 'akıyor'
+    işareti ve dönen araç glifi etiketiyle birlikte metninden atılır. Girdiyi değiştirmez;
+    hem kayıtta hem yüklemede kullanılır (idempotent). Saf.
+    """
+    cleaned: List[TranscriptSpan] = []
+    for span in spans:
+        if TRANSIENT_TEXT_TAGS.intersection(span["tags"]):
+            continue
+        tags: List[str] = [
+            tag for tag in span["tags"] if tag not in TRANSIENT_TAGS and not _REGION_TAG.fullmatch(tag)
+        ]
+        if cleaned and cleaned[-1]["tags"] == tags:
+            cleaned[-1] = {"text": cleaned[-1]["text"] + span["text"], "tags": tags}
+        else:
+            cleaned.append({"text": span["text"], "tags": tags})
+    return cleaned
+
+
 def spans_from_dump(items: Sequence[Tuple[str, str, str]]) -> List[TranscriptSpan]:
-    """Tk metin dökümünü geçici bölge etiketleri olmadan kalıcı parçalara çevirir."""
+    """Tk metin dökümünü kalıcı parçalara çevirir; geçici Tk durumu sanitize_spans ile atılır."""
     active: List[str] = []
-    spans: List[TranscriptSpan] = []
+    raw: List[TranscriptSpan] = []
     for kind, value, _index in items:
         if kind == "tagon":
-            if not re.fullmatch(r"r\d+", value) and value not in active:
+            if value not in active:
                 active.append(value)
         elif kind == "tagoff":
             if value in active:
                 active.remove(value)
         elif kind == "text" and value:
-            tags: List[str] = list(active)
-            if spans and spans[-1]["tags"] == tags:
-                spans[-1]["text"] += value
-            else:
-                spans.append({"text": value, "tags": tags})
-    return spans
+            raw.append({"text": value, "tags": list(active)})
+    return sanitize_spans(raw)

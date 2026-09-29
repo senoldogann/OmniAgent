@@ -1,23 +1,28 @@
 import asyncio
+import gc
 import logging
 import os
+import subprocess
 import sys
 import uuid
 import webbrowser
 import json
-import math
 import threading
 import weakref
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from io import BytesIO
+from io import BytesIO, TextIOWrapper
+from logging.handlers import RotatingFileHandler
 import time
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox, simpledialog
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Dict, List, Optional, Tuple
+from types import TracebackType
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple, TypedDict
 
 import customtkinter as ctk
 from openai import AsyncOpenAI
@@ -26,13 +31,17 @@ from PIL import Image, ImageOps
 from omniagent.platform.macos import api_keys
 from omniagent.config import (
     API_KEY_VARIABLES, BACKENDS, DEFAULT_BACKEND, api_key_source, apply_stored_api_keys,
-    load_api_key, refresh_api_keys, set_api_key, set_backend_model,
+    load_api_key, redact, refresh_api_keys, set_api_key, set_backend_model,
 )
-from omniagent.core.events import AgentEvent, compact_count, tool_label
+from omniagent.integrations.runtime import INPUT_TIMEOUT_FIELD
+from omniagent.paths import data_root
+from omniagent.core.events import AgentEvent, compact_count, provider_fallback_text, tool_label
 from omniagent.ui import native_macos
 from omniagent.platform.macos.desktop_status import MenuBarTaskStatus, app_is_active, is_backgrounded, notify_finished, set_dock_badge
 from omniagent.platform.macos.host_lock import host_task_lock
-from omniagent.platform.macos.visibility import GlobalVisibilityHotkey, VisibilityHotkeyError, set_application_hidden
+from omniagent.platform.macos.visibility import (
+    GlobalVisibilityHotkey, VisibilityHotkeyError, application_is_hidden, set_application_hidden,
+)
 from omniagent.model_catalog import (
     ModelCatalogError, cached_models, list_provider_models, load_model_preferences,
     save_model_preferences, valid_model_id,
@@ -52,41 +61,37 @@ from omniagent.ui.appearance import (
     save_appearance, validate_appearance,
 )
 from omniagent.core.conversation import Exchange, make_exchange, trim_history
-from omniagent.ui.chats import (
-    ChatRecord, ChatSummary, chats_dir, delete_chat, delete_chats, load_catalog, load_chat, new_chat,
-    rename_chat, restore_chats, save_catalog, save_chat, spans_from_dump,
+from omniagent.ui.attention import (
+    ALERT_NOTIFY, ALERT_RAISE, input_alert_action, notify_input_required, request_user_attention,
 )
+from omniagent.ui.chats import (
+    OUTCOME_DONE, OUTCOME_FAILED, OUTCOME_STOPPED, ChatRecord, ChatSummary, TranscriptSpan, chats_dir,
+    delete_chat, delete_chats, load_catalog, load_chat, new_chat, rename_chat, restore_chats,
+    save_catalog, save_chat, spans_from_dump, summary_of, with_outcome,
+)
+from omniagent.ui.composer import ComposerInput
 from omniagent.integrations.capabilities import CapabilityService
 from omniagent.platform.macos.voice import VoiceInput, VoiceInputError
 # Saf sunum yardımcıları app.py'den ayrıldı (D4); adlar geriye dönük uyum için burada da
 # görünür kalır (ör. testler `ui.app.format_run_stats` kullanır).
 from omniagent.ui.rendering import (
-    COMMAND_LINES, INSERT_MARK, LIVE_TAIL_LINES, SUMMARY_LINES, TABLE_MAX_COLUMNS,
-    ToolView, TurnView, UiItem, clip_line, format_capability_inventory, format_run_stats,
-    summarize_result,
+    DOT_FAILED, DOT_RUNNING, INSERT_MARK, LIVE_TAIL_LINES, SUMMARY_LINES, TABLE_MAX_COLUMNS,
+    TONE_CHECKED, TONE_NONE, TONE_UNCHECKED, ChatRowLook, ToolGroup, ToolView, TurnView, UiItem, activity_meta,
+    chat_dot, chat_row_look, fold_tags, format_capability_inventory, format_input_deadline,
+    format_run_stats, group_chats_by_date, group_head_parts, parse_fold_tag, path_within, plain_transcript,
+    remap_fold_tags, summary_parts, tool_parts,
+)
+# Renk, tipografi ve sütun ölçüleri ui/theme.py'de tek yerdedir; adlar geriye dönük uyum için
+# burada da görünür kalır (ör. testler `ui.SURFACE`, `ui.SUCCESS` kullanır).
+from omniagent.ui.theme import (
+    ACCENT, ACCENT_DIM, ACCENT_HOVER, ACCENT_MUTED, BASE_FONT_SIZE, BG, BORDER, BORDER_SOFT,
+    BUBBLE_COLLAPSE_LINES, BUBBLE_COLLAPSED_LINES, BUBBLE_MAX_RATIO, BUBBLE_MIN_TEXT_WIDTH,
+    BUBBLE_PAD_X, BUBBLE_PAD_Y, BUBBLE_RADIUS, CHAT_MARKER_WIDTH, COLUMN_MAX_WIDTH, COLUMN_MIN_SIDE,
+    COMPOSER_FOCUS_BORDER, COMPOSER_PAD_X, COMPOSER_RADIUS, ERROR, HEADER_TITLE_MAX_CHARS, MONO_FAMILY,
+    READING_SIZE, SIDEBAR_WIDTH, SUCCESS, SURFACE, SURFACE_HOVER, SURFACE_RAISED, TEXT, TEXT_DIM,
+    TEXT_FAINT, WARNING, column_side, column_width, transcript_tag_styles,
 )
 
-
-# --- Palet: Claude Code (turuncu vurgu, ⏺ ⎿ glifleri, yıldız spinner) + Codex (nötr koyu
-# yüzeyler, mono transkript, $ komut satırları) ---
-BG: str = "#12151A"
-SURFACE: str = "#1B2027"
-SURFACE_RAISED: str = "#272E38"
-COMMAND_BG: str = "#1C222B"
-BORDER: str = "#343C47"
-TEXT: str = "#F2F3F5"
-TEXT_DIM: str = "#B4BBC5"
-TEXT_FAINT: str = "#828B98"
-ACCENT: str = "#D97757"
-ACCENT_HOVER: str = "#E48A6C"
-ACCENT_DIM: str = "#40312F"
-SHINE: str = "#F6C4AE"
-SUCCESS: str = "#4EBA65"
-ERROR: str = "#FF6B80"
-WARNING: str = "#FFC107"
-INFO: str = "#B1B9F9"
-
-MONO_FAMILY: str = "Menlo"
 SETTINGS_HINT: str = (
     "Anahtarlar macOS Keychain'de saklanır ve yalnızca bu makinede kalır. Kaydettiğiniz anda "
     "ilgili model profili kullanılabilir olur; alanı boş bırakıp Kaydet demek kaydı siler. "
@@ -101,6 +106,12 @@ RUN_MODE_KEYS: Dict[str, str] = {
     profile["label"]: key for key, profile in RUN_MODE_PROFILES.items()
 }
 VOICE_MAX_SECONDS: int = 55
+# Kenar çubuğu satırı sol sütun işaretinin renkleri (çalışan noktanınki yanıp sönmeye göre _marker_color'da).
+MARKER_COLORS: Dict[str, str] = {
+    DOT_FAILED: ERROR, TONE_CHECKED: ACCENT, TONE_UNCHECKED: TEXT_FAINT, TONE_NONE: TEXT_FAINT,
+}
+# Model çağırmadan yetenek envanterini gösteren komutlar (görev başlatmaz).
+INVENTORY_COMMANDS: frozenset[str] = frozenset({"/tools", "/yetenekler", "/skills"})
 
 MICROPHONE_SVG: str = """
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
@@ -157,18 +168,153 @@ SHIMMER_INTERVAL: float = 0.07
 BLINK_INTERVAL: float = 0.45
 RUNNING_REFRESH_INTERVAL: float = 0.2
 MAX_EVENTS_PER_FRAME: int = 400
-# Daktilo: her karede en az bu kadar karakter; birikme büyükse ~TYPEWRITER_DRAIN_FRAMES karede boşalır
-TYPEWRITER_MIN_CHARS: int = 3
-TYPEWRITER_DRAIN_FRAMES: int = 5
+# Model akışını yapay gecikme eklemeden göster; çok büyük parçalar Tk karelerini kilitlemesin.
+STREAM_CHARS_PER_FRAME: int = 4096
+# Kare istisna verirse döngü bu gecikmeyle yeniden kurulur; kalıcı hata saniyede yüzlerce kayıt üretmez.
+ERROR_FRAME_MS: int = 250
+CHAT_AUTOSAVE_INTERVAL: float = 1.5
+# Anlık görüntü (Text.dump) Tk süresinin en çok ~%5'ini yesin: otomatik kayıt aralığı
+# max(CHAT_AUTOSAVE_INTERVAL, CHAT_SNAPSHOT_DUTY x ölçülen görüntü süresi) olur.
+CHAT_SNAPSHOT_DUTY: float = 20.0
+# Sohbet değiştirme/silme/yeniden adlandırma gibi eylemlerde Tk'nin diske yazılmasını bekleyeceği en uzun süre.
+CHAT_FLUSH_TIMEOUT_SECONDS: float = 10.0
+# Arka plan thread'lerinden Tk'ye kare başına taşınan en çok iş sayısı.
+TK_CALLS_PER_FRAME: int = 50
+# Açılış: ilk boyama turundan sonra bu kadar bekleyip ağır işler başlar; Keychain yavaşsa ipucu
+# gösterilir (STARTUP_HINT_DELAY_MS) ve görev gönderme kapısı bir süre sonra açılır (KEYCHAIN_WAIT_LIMIT_MS).
+FIRST_PAINT_DELAY_MS: int = 30
+STARTUP_HINT_DELAY_MS: int = 1500
+KEYCHAIN_WAIT_LIMIT_MS: int = 45000
+# Sohbet ara kutusuna yazarken liste bu gecikmeden sonra bir kez güncellenir.
+CHAT_LIST_DEBOUNCE_MS: int = 150
+# Çalışan sohbetin durum noktası bu aralıkla yavaşça yanıp söner.
+DOT_PULSE_INTERVAL: float = 0.9
+# Kapanış: Tk'nin kapatma işinin bitmesini en çok bu kadar beklediği kısa süre (pencere zaten gizlidir),
+# sohbetin son yazımı ve çalışan ajan için bekleme süreleri, tüm kapatma üst sınırı ve Tk'nin bitişi yokladığı aralık.
+# Üst sınır iki beklemenin toplamından (2 + 3 sn) ve bağlantıları kapatma payından büyük olmalıdır.
+CLOSE_GRACE_SECONDS: float = 0.3
+CLOSE_FLUSH_WAIT_SECONDS: float = 2.0
+CLOSE_AGENT_WAIT_SECONDS: float = 3.0
+CLOSE_TIMEOUT_SECONDS: float = 8.0
+CLOSE_POLL_MS: int = 25
+KEYCHAIN_HINT: str = (
+    "Anahtarlar Keychain'den okunuyor; macOS izin penceresi çıktıysa yanıtlayın, sonra tekrar deneyin."
+)
+KEYCHAIN_LATE_HINT: str = (
+    "Keychain yanıt vermedi; anahtarlar yanıt gelince yüklenecek (şimdilik yalnız yerel/ortam profilleri)."
+)
+# Tk'de bir etiketin `elide` ayarını kaldırır (bölüm açık); False verilseydi iç içe etiketlerde
+# üstteki gizlemeyi ezerdi.
+ELIDE_UNSET: str = ""
+# Asistan metin bölgesinin başındaki küçük boşluk satırı: kabarcıksız düz metni öncekinden ayırır.
+ASSISTANT_HEAD: Tuple[str, Tuple[str, ...]] = ("\n", ("gap",))
+
+# Günlük dosyası: paketli uygulamada stderr görünmez; uyarı ve hatalar veri klasöründeki dönen dosyaya yazılır.
+LOG_FILE_NAME: str = "ui.log"
+LOG_MAX_BYTES: int = 512 * 1024
+LOG_BACKUP_COUNT: int = 2
+_LOG_RECORD_FIELDS: frozenset[str] = frozenset(
+    logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+) | {"message", "asctime", "taskName"}
+
+
+class StructuredFormatter(logging.Formatter):
+    """`extra=` alanlarını mesaja gömmeden mesaj satırının sonuna ayrı bir JSON olarak ekler (traceback altta kalır)."""
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        base: str = super().formatMessage(record)
+        fields: Dict[str, object] = {
+            name: value for name, value in record.__dict__.items() if name not in _LOG_RECORD_FIELDS
+        }
+        # Çağıranın maskelediği izleme metni (`traceback` alanı) JSON'a gömülmez, satırın altına yazılır.
+        trace: object = fields.pop("traceback", None)
+        line: str = f"{base} {json.dumps(fields, ensure_ascii=False, default=str)}" if fields else base
+        return f"{line}\n{trace}" if isinstance(trace, str) else line
+
+
+class PrivateRotatingFileHandler(RotatingFileHandler):
+    """Dönen günlük dosyası; her yeni dosya (dönüş sonrasında açılan dahil) yalnız kullanıcıya açık (0600) olur."""
+
+    def _open(self) -> TextIOWrapper:
+        stream: TextIOWrapper = super()._open()
+        os.chmod(self.baseFilename, 0o600)
+        return stream
+
+
+def configure_ui_logging(log_path: Path) -> logging.Handler:
+    """
+    Kök logger'a dönen günlük dosyası işleyicisi ekler (WARNING ve üstü, yapısal alanlarla) ve
+    işleyiciyi döndürür. Veri klasörü zaten 0700'dür; dosyalar 0600 açılır.
+    """
+    handler: PrivateRotatingFileHandler = PrivateRotatingFileHandler(
+        log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+    )
+    handler.setFormatter(StructuredFormatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    root: logging.Logger = logging.getLogger()
+    root.addHandler(handler)
+    root.setLevel(logging.WARNING)
+    return handler
+
+
+class BubbleView(TypedDict):
+    """Kullanıcı mesajının transkripte gömülü kabarcığı ve katlama durumu."""
+    frame: ctk.CTkFrame
+    clip: tk.Frame
+    label: tk.Label
+    toggle: tk.Label
+    expanded: bool
+
+
+class ChatRow(TypedDict):
+    """Kenar çubuğundaki bir sohbet satırının widget'ları, son uygulanan görünümü ve üzerine gelme durumu."""
+    frame: ctk.CTkFrame
+    marker: ctk.CTkLabel
+    button: ctk.CTkButton
+    more: Optional[ctk.CTkButton]
+    look: ChatRowLook
+    hover: bool
+
+
+class DeferredInput(TypedDict):
+    """Uygulama gizliyken gelen, pencere açılması ertelenen yanıt isteği ve istendiği an."""
+    title: str
+    fields: Dict[str, object]
+    requested_at: datetime
+
+
+def _run_startup(future: "Future[Dict[str, AsyncOpenAI]]") -> None:
+    """
+    Arka plan thread'i: Keychain anahtarlarını uygular ve model istemcilerini kurar. Sonuç ya da istisna
+    Future ile Tk thread'ine taşınır ve orada yeniden yükselir (sessiz yutulmaz).
+    """
+    try:
+        apply_stored_api_keys()
+        clients: Dict[str, AsyncOpenAI] = create_model_clients()
+    except Exception as error:
+        future.set_exception(error)
+        return
+    future.set_result(clients)
+
+
 class OmniUI(ctk.CTk):
     """
     OmniAgent arayüzü: ajanın model yanıtını, araç çağrılarını, çalıştırdığı komutları ve
     komut çıktılarını AKIŞ olarak, animasyonlu gösterir. Olaylar ajan thread'lerinden
     kuyruğa gelir; tüm çizim ~60 fps'lik tek bir kare döngüsünde (Tk thread'i) yapılır.
+
+    Transkript modeli: metin alanı yalnız içerik sütunu genişliğindedir (theme.column_side/
+    column_width; pencere değişince _apply_column_layout günceller). İçerik `rN` bölgeleridir;
+    asistan metni kabarcıksız düz metindir. Kullanıcı mesajı gizli (elide) metin + gömülü yuvarlak
+    kabarcık penceresidir. Araç grubu, satırı ve ayrıntısı yalnız etiketlerle katlanır (rendering.
+    fold_tags: durum etiketlerin `elide` ayarındadır, kayıttan yüklenince kapalı gelir). Sondaysa
+    (_stick_to_end) yeni içerik görünümü sona kaydırır.
     """
 
     def __init__(self) -> None:
         super().__init__()
+        # Kapanış başladıysa kare döngüsü yeniden kurulmaz; aynı hata tekrar ederse günlük seyrelir.
+        self._closing: bool = False
+        self._callback_error_counts: Dict[str, int] = {}
         ctk.set_appearance_mode("dark")
         self.title("OmniAgent")
         self.geometry("1120x820")
@@ -182,8 +328,9 @@ class OmniUI(ctk.CTk):
         except (OSError, ValueError, json.JSONDecodeError) as error:
             logging.warning("Görünüm ayarları okunamadı: %s", type(error).__name__)
             self._appearance = default_appearance()
-        family = self._appearance["font_family"]
-        self._ui_family: str = family if family in tkfont.families() else self._system_ui_family
+        family: str = self._appearance["font_family"]
+        # Kurulu yazı tipi listesi soğukken ~70 ms sürer: yalnız özel bir yazı tipi seçiliyse sorulur.
+        self._ui_family: str = family if family and family in tkfont.families() else self._system_ui_family
         self._ui_fonts: Dict[int, Tuple[weakref.ReferenceType[ctk.CTkFont], int]] = {}
         self.attributes("-alpha", self._window_alpha())
         self._voice_icon: ctk.CTkImage = _svg_ctk_image(MICROPHONE_SVG, TEXT_DIM)
@@ -209,6 +356,38 @@ class OmniUI(ctk.CTk):
             self._chat_store_problem = f"Sohbet listesi okunamadı: {error}"
             self._chat_catalog_writable = False
             logging.warning(self._chat_store_problem)
+        # Sohbet kaydı Tk thread'inde diske yazılmaz: anlık görüntü Tk'de alınır, yazma tek thread'li
+        # sıralı yazıcıdadır (son durum kazanır); sonuçlar _call_in_tk ile Tk'ye döner.
+        self._chat_executor: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="chat-writer")
+        self._chat_write: Optional["Future[None]"] = None
+        self._chat_snapshot_seconds: float = 0.0
+        self._tk_calls: "Queue[Callable[[], None]]" = Queue()
+        # Kenar çubuğu: görünen satırlar yerinde güncellenir, her değişiklikte yeniden kurulmaz.
+        self._chat_rows: Dict[str, ChatRow] = {}
+        self._chat_group_labels: Dict[str, ctk.CTkLabel] = {}
+        self._chat_rows_layout: Optional[Tuple[bool, bool]] = None
+        self._chat_empty_label: Optional[ctk.CTkLabel] = None
+        self._chat_list_refresh_id: Optional[str] = None
+        self._last_dot_pulse: float = 0.0
+        self._dot_bright: bool = True
+        # Açılış: Keychain okuması ve istemci kurulumu ilk boyamadan sonra arka planda yapılır.
+        self._first_paint_done: bool = False
+        self._startup_pending: bool = False
+        self._startup_future: Optional["Future[Dict[str, AsyncOpenAI]]"] = None
+        # Kapanışta Tk en çok CLOSE_GRACE_SECONDS bekler; işi biten yoksa bloklanmadan bitişi yoklar.
+        self._destroyed: bool = False
+        self._close_future: Optional["Future[None]"] = None
+        self._close_deadline: float = 0.0
+        # İçerik sütunu ölçüleri pencere boyutuna göre _apply_column_layout'ta güncellenir.
+        self._column_side: int = COLUMN_MIN_SIDE
+        self._column_width: int = COLUMN_MAX_WIDTH
+        # Sütuna hizalı ana öğeler (üst şerit, durum satırı, composer, ipucu) ve sol iç girintileri.
+        self._column_widgets: List[Tuple[tk.Misc, int]] = []
+        self._bubbles: List[BubbleView] = []
+        # Kullanıcı sondayken yeni içerik transkripti sona kaydırır; yukarı çıkınca durur.
+        self._stick_to_end: bool = True
+        self._activity_bar: Optional[ctk.CTkFrame] = None
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
         self._main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -216,8 +395,10 @@ class OmniUI(ctk.CTk):
         self._main.grid_columnconfigure(0, weight=1)
         self._main.grid_rowconfigure(1, weight=1)
         self._build_sidebar()
-        self._build_header()
+        # Transkript önce kurulur: başlık, durum satırı ve composer sütun kenarlarını kaydırma
+        # çubuğunun gerçek genişliğine göre hizalar (_column_padding).
         self._build_transcript()
+        self._build_header()
         self._build_activity_bar()
         self._build_composer()
         self._build_footer()
@@ -228,10 +409,13 @@ class OmniUI(ctk.CTk):
         self._visibility_hotkey: Optional[GlobalVisibilityHotkey] = None
         self._stop_event: threading.Event = threading.Event()
         self._agent_future: Optional["Future[RunReport]"] = None
+        self._active_run_mode: str = "normal"
+        self._control_messages: "Queue[str]" = Queue()
         self._history: List[Exchange] = []
         self._active_goal: str = ""
         self._input_futures: Dict[str, asyncio.Future] = {}
         self._input_windows: Dict[str, ctk.CTkToplevel] = {}
+        self._deferred_inputs: Dict[str, DeferredInput] = {}
         self._voice_queue: "Queue[Tuple[str, str]]" = Queue()
         self._voice_base_text: str = ""
         self._voice_partial_text: str = ""
@@ -253,6 +437,15 @@ class OmniUI(ctk.CTk):
         self._dirty_tools: Dict[str, ToolView] = {}
         self._artifact_widgets: List[ctk.CTkFrame] = []
         self._artifact_images: List[ctk.CTkImage] = []
+        # Araç grupları ve katlanabilir bölümler: durum yalnız etiketlerin elide ayarında tutulur;
+        # açık bölümler ve kullanıcının elle değiştirdikleri burada izlenir.
+        self._tool_group: Optional[ToolGroup] = None
+        self._tool_groups: Dict[int, ToolGroup] = {}
+        self._fold_seq: int = 0
+        self._open_folds: Set[Tuple[str, int]] = set()
+        self._manual_folds: Set[Tuple[str, int]] = set()
+        self._prepared_tags: Set[str] = set()
+        self._chat_dirty: bool = False
         self._run_started_at: float = 0.0
         self._task_status: str = "idle"
         self._badge_pending: bool = False
@@ -272,7 +465,9 @@ class OmniUI(ctk.CTk):
         # her görev sıcak HTTP bağlantılarıyla başlar (TLS el sıkışması tekrarlanmaz).
         self._loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, daemon=True).start()
-        self._clients: Dict[str, AsyncOpenAI] = create_model_clients()
+        # İstemciler Keychain anahtarlarına bağlıdır: boş başlar, begin_background_startup() ilk boyamadan
+        # sonra arka planda doldurur (Keychain izin istemi Tk'yi bloklamasın).
+        self._clients: Dict[str, AsyncOpenAI] = {}
         # Ayarlar sayfası anahtar kaydederse istemciler yenilenir; görev sürerken beklemeye alınır.
         self._clients_stale: bool = False
         self._pending_model_choices: Dict[str, str] = {}
@@ -285,11 +480,17 @@ class OmniUI(ctk.CTk):
         self.bind("<Command-f>", lambda event: self._focus_chat_search())
         self.bind("<Command-comma>", lambda event: self._open_settings())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        if sys.platform == "darwin":
+            # ⌘Q, Dock > Çık ve oturum kapatma: tanımlı değilse Tk varsayılanı Tcl `exit` çağırır (tkinter bunu
+            # SystemExit'e çevirir), mainloop'tan çıkılır ve _on_close (kayıt, bağlantı kapatma) hiç çalışmaz.
+            # Kanca tk_mac(n)'de belgelidir; idlelib de aynı kalıbı kullanır.
+            self.createcommand("::tk::mac::Quit", self._on_close)
         self._text.configure(state="normal")
         self._render_welcome()
         self._text.configure(state="disabled")
-        if self._active_chat_id is not None:
-            self._open_chat(self._active_chat_id, save_current=False)
+        # Kenar çubuğu listesi ve son açık sohbet ilk boyamadan sonra yüklenir: büyük bir sohbeti
+        # senkron yüklemek __init__'i bloke edip boş/çizilmemiş pencere bırakıyordu.
+        self._after_first_paint(self._post_paint_init)
         self._set_activity_idle()
         if sys.platform == "darwin":
             try:
@@ -298,10 +499,57 @@ class OmniUI(ctk.CTk):
                 )
             except (VisibilityHotkeyError, OSError) as error:
                 self._post({"kind": "notice", "level": "warning",
-                            "text": f"Genel ⌘X kullanılamıyor: {error}"})
+                            "text": f"Genel ⌘⇧X kullanılamıyor: {error}"})
         self.after(FRAME_MS, self._tick)
         self.after(120, self.entry.focus_set)
         self.after(120, self._style_native_window)
+
+    def report_callback_exception(self, exc: type[BaseException], val: BaseException,
+                                  tb: Optional[TracebackType]) -> None:
+        """
+        Tk geri çağrısındaki (after/bind/command) istisnayı günlüğe yazar ve kullanıcıya bildirir;
+        döngüyü sürdürmek _tick'in işidir. Aynı hata art arda gelirse kayıt 1, 2, 4, 8… aralıkla
+        yazılır; transkript bildirimi yalnız ilkinde eklenir. Sırlar günlüğe maskelenerek geçer.
+        """
+        message: str = redact(str(val))[:300]
+        key: str = f"{exc.__name__}:{message[:80]}"
+        count: int = self._callback_error_counts.get(key, 0) + 1
+        self._callback_error_counts[key] = count
+        if count & (count - 1) == 0:
+            # exc_info verilmez: ham istisna metni maskelenmemiş sır taşıyabilir; izleme metni maskelenir.
+            logging.error(
+                "Arayüz geri çağrısında beklenmeyen hata",
+                extra={"error_type": exc.__name__, "error_message": message, "occurrences": count,
+                       "traceback": redact("".join(traceback.format_exception(exc, val, tb))).rstrip()},
+            )
+        if count == 1:
+            self._post({"kind": "notice", "level": "error",
+                        "text": f"Arayüz hatası ({exc.__name__}): {message[:200]}. Ayrıntı günlükte."})
+
+    @contextmanager
+    def _writable_transcript(self) -> Iterator[None]:
+        """Transkripti yazılabilir yapar; istisna olsa bile salt okunura döner (kullanıcı yazamasın)."""
+        self._text.configure(state="normal")
+        try:
+            yield
+        finally:
+            self._text.configure(state="disabled")
+
+    def _call_in_tk(self, action: Callable[[], None]) -> None:
+        """
+        Herhangi bir thread'den çağrılır (Tk'ye doğrudan dokunmaz); eylem sonraki karede Tk thread'inde
+        çalışır. Transkripte yazacak eylem doğrudan yazmaz (Text salt okunurdur): _post(notice) kullanır.
+        """
+        self._tk_calls.put(action)
+
+    def _drain_tk_calls(self) -> None:
+        """Arka plan thread'lerinden gelen eylemleri kare başına en çok TK_CALLS_PER_FRAME kadar çalıştırır."""
+        for _ in range(TK_CALLS_PER_FRAME):
+            try:
+                action: Callable[[], None] = self._tk_calls.get_nowait()
+            except Empty:
+                return
+            action()
 
     def _style_native_titlebar(self, title: Optional[str] = None) -> None:
         """
@@ -320,11 +568,8 @@ class OmniUI(ctk.CTk):
                 window.setBackgroundColor_(color)
 
     def _style_native_window(self, title: Optional[str] = None) -> None:
-        """Başlık çubuğu rengini ve vibrancy'yi birlikte uygular; ikisi de en-iyi-çaba."""
+        """Tk içeriğini örten native efekt eklemeden başlık çubuğunu renklendirir."""
         self._style_native_titlebar(title)
-        applied = native_macos.apply_vibrancy(title or self.title(), "sidebar")
-        if not applied and sys.platform == "darwin":
-            logging.info("Vibrancy uygulanamadı (pencere henüz görünür olmayabilir).")
 
     # --- Yerleşim ---
 
@@ -341,41 +586,18 @@ class OmniUI(ctk.CTk):
     def _window_alpha(self) -> float:
         return self._appearance["opacity"] if self._appearance["transparent_window"] else 1.0
 
+    def _font_delta(self) -> int:
+        """Görünüm ayarındaki yazı boyutunun tabana (BASE_FONT_SIZE) farkı; tüm yazı boyutları bu kadar kayar."""
+        return self._appearance["font_size"] - BASE_FONT_SIZE
+
     def _refresh_transcript_fonts(self) -> None:
-        """Açık sohbetin mevcut metin etiketlerini yeni yazı ayarlarıyla yeniden çizer."""
-        delta = self._appearance["font_size"] - 13
-        self._mono.configure(size=12 + delta)
-        self._body.configure(family=self._ui_family, size=13 + delta)
-        mono = lambda size, *style: (MONO_FAMILY, size + delta, *style)
-        ui = lambda size, *style: (self._ui_family, size + delta, *style)
-        fonts = {
-            "welcome_mark": mono(28, "bold"), "welcome_title": ui(22, "bold"),
-            "welcome_dim": ui(13), "welcome_example": mono(11),
-            "goal_prompt": mono(12, "bold"), "gap": mono(6),
-            "reasoning_head": mono(11, "italic"), "reasoning": mono(11, "italic"),
-            "tool_name": mono(12, "bold"), "output": mono(11), "output_error": mono(11),
-            "meta": mono(11), "summary_ok": mono(12, "bold"),
-            "summary_error": mono(12, "bold"), "summary_meta": mono(11),
-            "notice_info": mono(11), "notice_warning": mono(11), "notice_error": mono(11),
-            "md_h1": ui(20, "bold"), "md_h2": ui(17, "bold"), "md_h3": ui(14, "bold"),
-            "md_bold": ui(13, "bold"), "md_italic": ui(13, "italic"),
-            "md_code": mono(12), "md_codeblock": mono(12),
-            "md_table": mono(11), "md_table_head": mono(11, "bold"),
-            "md_table_label": ui(12, "bold"),
-        }
-        for tag, font in fonts.items():
-            self._text.tag_configure(tag, font=font)
-        indent = self._mono.measure("⏺ ")
-        output_margin = indent + self._mono.measure("⎿  ")
-        for tag in ("assistant", "cursor", "reasoning", "command", "gutter", "gutter_hidden",
-                    "notice_info", "notice_warning", "notice_error"):
-            self._text.tag_configure(tag, lmargin1=indent)
-        for tag in ("assistant", "cursor", "reasoning", "notice_info", "notice_warning", "notice_error"):
-            self._text.tag_configure(tag, lmargin2=indent)
-        for tag in ("gutter", "gutter_hidden", "output", "output_error"):
-            self._text.tag_configure(tag, lmargin2=output_margin)
+        """Transkript etiketlerini (renk, yazı tipi, boşluk) geçerli yazı ayarlarıyla yeniden yapılandırır."""
+        delta: int = self._font_delta()
+        self._body.configure(family=self._ui_family, size=READING_SIZE + delta)
+        for name, style in transcript_tag_styles(self._ui_family, delta).items():
+            self._text.tag_configure(name, **style)
         if hasattr(self, "_activity"):
-            self._activity.configure(font=mono(12))
+            self._configure_activity_tags(delta)
 
     def _apply_appearance(self, values: Dict[str, object]) -> bool:
         """Doğrulanmış görünüm tercihlerini kaydeder ve açık pencerelere uygular."""
@@ -387,12 +609,13 @@ class OmniUI(ctk.CTk):
         save_appearance(settings, appearance_path())
         self._appearance = settings
         self._ui_family = settings["font_family"] or self._system_ui_family
-        delta = settings["font_size"] - 13
+        delta = self._font_delta()
         for font_ref, base_size in list(self._ui_fonts.values()):
             font = font_ref()
             if font is not None:
                 font.configure(family=self._ui_family, size=max(9, base_size + delta))
         self._refresh_transcript_fonts()
+        self._relayout_bubbles()
         self.attributes("-alpha", self._window_alpha())
         if self._settings_window is not None and self._settings_window.winfo_exists():
             self._settings_window.attributes("-alpha", self._window_alpha())
@@ -400,7 +623,7 @@ class OmniUI(ctk.CTk):
         return True
 
     def _build_sidebar(self) -> None:
-        sidebar = ctk.CTkFrame(self, width=248, fg_color=BG, corner_radius=0)
+        sidebar = ctk.CTkFrame(self, width=SIDEBAR_WIDTH, fg_color=SURFACE, corner_radius=0)
         self._sidebar = sidebar
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
@@ -422,7 +645,7 @@ class OmniUI(ctk.CTk):
             border_color=BORDER, corner_radius=9, text_color=TEXT, font=self._ui_font(12, "normal"),
         )
         self._chat_search.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 13))
-        self._chat_search.bind("<KeyRelease>", lambda _event: self._refresh_chat_list())
+        self._chat_search.bind("<KeyRelease>", lambda _event: self._schedule_chat_list_refresh())
         selection_bar = ctk.CTkFrame(sidebar, fg_color="transparent")
         selection_bar.grid(row=3, column=0, sticky="ew", padx=14, pady=(0, 5))
         selection_bar.grid_columnconfigure(0, weight=1)
@@ -446,7 +669,11 @@ class OmniUI(ctk.CTk):
             command=self._toggle_chat_select_mode,
         )
         self._select_chats_btn.grid(row=0, column=2)
-        self._chat_list = ctk.CTkScrollableFrame(sidebar, fg_color=BG, corner_radius=0)
+        # İnce ve sönük kaydırma çubuğu: varsayılan açık gri çubuk kenar çubuğunda baskın duruyordu.
+        self._chat_list = ctk.CTkScrollableFrame(
+            sidebar, fg_color=SURFACE, corner_radius=0, scrollbar_fg_color=SURFACE,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=TEXT_FAINT,
+        )
         self._chat_list.grid(row=4, column=0, sticky="nsew", padx=(7, 9))
         self._chat_list.grid_columnconfigure(0, weight=1)
         self._undo_chat_btn = ctk.CTkButton(
@@ -469,53 +696,202 @@ class OmniUI(ctk.CTk):
         self._chat_notice.grid(row=8, column=0, sticky="ew", padx=14, pady=(2, 12))
         ctk.CTkFrame(sidebar, width=1, fg_color=BORDER, corner_radius=0).grid(
             row=0, column=1, rowspan=9, sticky="ns")
+
+    def _schedule_chat_list_refresh(self) -> None:
+        """Ara kutusuna yazarken liste her tuşta değil, yazma durunca bir kez güncellenir."""
+        if self._chat_list_refresh_id is not None:
+            self.after_cancel(self._chat_list_refresh_id)
+        self._chat_list_refresh_id = self.after(CHAT_LIST_DEBOUNCE_MS, self._run_scheduled_chat_list_refresh)
+
+    def _run_scheduled_chat_list_refresh(self) -> None:
+        self._chat_list_refresh_id = None
         self._refresh_chat_list()
 
+    def _agent_running(self) -> bool:
+        return self._agent_future is not None and not self._agent_future.done()
+
     def _refresh_chat_list(self) -> None:
-        for child in self._chat_list.winfo_children():
-            child.destroy()
+        """
+        Kenar çubuğunu tarihe göre gruplayarak (Bugün, Dün, Önceki 7 gün, Daha eski) YERİNDE günceller:
+        değişmeyen satırlara dokunulmaz, yalnız görünümü değişenler yapılandırılır, görünmeyenler yok
+        edilir. Seçim modu ya da kompakt liste değişince (nadir) tüm satırlar yeniden kurulur.
+        """
         query: str = self._chat_search.get().strip().casefold()
         visible: List[ChatSummary] = [chat for chat in self._chat_index if query in chat["title"].casefold()]
-        if not visible:
-            ctk.CTkLabel(
-                self._chat_list, text="Sonuç bulunamadı" if query else "Henüz sohbet yok",
-                text_color=TEXT_FAINT, font=self._ui_font(11, "normal"),
-            ).grid(row=0, column=0, sticky="ew", pady=14)
-        for index, chat in enumerate(visible):
-            selected = chat["id"] == self._active_chat_id
-            checked = chat["id"] in self._selected_chat_ids
-            row = ctk.CTkFrame(self._chat_list, fg_color=ACCENT_DIM if checked or selected and not self._chat_select_mode else "transparent",
-                               corner_radius=9)
-            row.grid(row=index, column=0, sticky="ew", padx=3, pady=1 if self._appearance["compact_sidebar"] else 2)
-            row.grid_columnconfigure(0, weight=1)
-            button = ctk.CTkButton(
-                row, text=("☑   " if checked else "☐   ") + chat["title"][:23]
-                if self._chat_select_mode else "◌   " + chat["title"][:23],
-                height=30 if self._appearance["compact_sidebar"] else 38, anchor="w",
-                fg_color="transparent",
-                hover_color=SURFACE_RAISED, text_color=TEXT if checked or selected else TEXT_DIM,
-                font=self._ui_font(12, "normal"),
-                command=(lambda chat_id=chat["id"]: self._toggle_chat_selection(chat_id))
-                if self._chat_select_mode else (lambda chat_id=chat["id"]: self._open_chat(chat_id)),
-            )
-            button.grid(row=0, column=0, sticky="ew")
-            if not self._chat_select_mode:
-                more = ctk.CTkButton(
-                    row, text="⋯", width=29, height=30, fg_color="transparent",
-                    hover_color=SURFACE_RAISED, text_color=TEXT_DIM,
-                    font=self._ui_font(17, "normal"),
-                    command=lambda chat_id=chat["id"], anchor=row: self._show_chat_menu(chat_id, anchor),
+        layout: Tuple[bool, bool] = (self._chat_select_mode, self._appearance["compact_sidebar"])
+        if layout != self._chat_rows_layout:
+            self._destroy_chat_rows(list(self._chat_rows))
+            self._chat_rows_layout = layout
+        groups = group_chats_by_date(visible, datetime.now().astimezone())
+        wanted: Set[str] = {chat["id"] for group in groups for chat in group["chats"]}
+        self._destroy_chat_rows([chat_id for chat_id in self._chat_rows if chat_id not in wanted])
+        titles: Set[str] = {group["title"] for group in groups}
+        for title in [name for name in self._chat_group_labels if name not in titles]:
+            self._chat_group_labels.pop(title).destroy()
+        if visible:
+            self._hide_empty_label()
+        else:
+            self._show_empty_label(query)
+        running_id: Optional[str] = self._active_chat_id if self._agent_running() else None
+        grid_row: int = 0
+        for group in groups:
+            self._chat_group_label(group["title"]).grid(
+                row=grid_row, column=0, sticky="ew", padx=(14, 0), pady=(12 if grid_row else 4, 3))
+            grid_row += 1
+            for chat in group["chats"]:
+                look: ChatRowLook = chat_row_look(
+                    chat["title"], chat["id"] == self._active_chat_id, chat["id"] in self._selected_chat_ids,
+                    self._chat_select_mode, chat_dot(chat.get("last_outcome"), chat["id"] == running_id),
                 )
-                more.grid(row=0, column=1, padx=(0, 3))
-                button.bind("<Button-2>", lambda event, chat_id=chat["id"]: self._show_chat_menu(chat_id, event.widget))
+                row: Optional[ChatRow] = self._chat_rows.get(chat["id"])
+                if row is None:
+                    row = self._create_chat_row(chat["id"], look)
+                    self._chat_rows[chat["id"]] = row
+                elif row["look"] != look:
+                    self._apply_chat_row_look(row, look)
+                row["frame"].grid(row=grid_row, column=0, sticky="ew", padx=3, pady=1 if layout[1] else 2)
+                grid_row += 1
         self._delete_selected_btn.configure(
             text=f"Sil ({len(self._selected_chat_ids)})",
             state="normal" if self._selected_chat_ids else "disabled",
         )
-        if hasattr(self, "chat_title_label"):
-            active = next((chat for chat in self._chat_index if chat["id"] == self._active_chat_id), None)
-            title = active["title"] if active else "Yeni sohbet"
-            self.chat_title_label.configure(text=title[:31] + "…" if len(title) > 32 else title)
+        self._sync_chat_title()
+
+    def _sync_chat_title(self) -> None:
+        """Üst şeritteki sohbet başlığını etkin sohbete uydurur; uzun başlık '…' ile kısalır."""
+        active: Optional[ChatSummary] = next(
+            (chat for chat in self._chat_index if chat["id"] == self._active_chat_id), None)
+        title: str = active["title"] if active else "Yeni sohbet"
+        if len(title) > HEADER_TITLE_MAX_CHARS:
+            title = title[:HEADER_TITLE_MAX_CHARS - 1].rstrip() + "…"
+        self.chat_title_label.configure(text=title)
+
+    def _destroy_chat_rows(self, chat_ids: List[str]) -> None:
+        for chat_id in chat_ids:
+            self._chat_rows.pop(chat_id)["frame"].destroy()
+
+    def _chat_group_label(self, title: str) -> ctk.CTkLabel:
+        """Tarih grubunun küçük, soluk başlığı; aynı başlık yeniden kullanılır."""
+        label: Optional[ctk.CTkLabel] = self._chat_group_labels.get(title)
+        if label is None:
+            label = ctk.CTkLabel(
+                self._chat_list, text=title, anchor="w", text_color=TEXT_FAINT, font=self._ui_font(11, "bold"),
+            )
+            self._chat_group_labels[title] = label
+        return label
+
+    def _show_empty_label(self, query: str) -> None:
+        text: str = "Sonuç bulunamadı" if query else "Henüz sohbet yok"
+        if self._chat_empty_label is None:
+            self._chat_empty_label = ctk.CTkLabel(
+                self._chat_list, text=text, text_color=TEXT_FAINT, font=self._ui_font(11, "normal"),
+            )
+            self._chat_empty_label.grid(row=0, column=0, sticky="ew", pady=14)
+        else:
+            self._chat_empty_label.configure(text=text)
+
+    def _hide_empty_label(self) -> None:
+        if self._chat_empty_label is not None:
+            self._chat_empty_label.destroy()
+            self._chat_empty_label = None
+
+    def _marker_color(self, tone: str) -> str:
+        """Satır sol sütun işaretinin rengi; çalışan noktanın rengi yavaş yanıp sönmeye göre değişir."""
+        if tone == DOT_RUNNING:
+            return ACCENT if self._dot_bright else ACCENT_MUTED
+        return MARKER_COLORS[tone]  # bilinmeyen ton KeyError ile açıkça patlar
+
+    def _create_chat_row(self, chat_id: str, look: ChatRowLook) -> ChatRow:
+        """
+        Sohbet satırını kurar: sol sütunda durum noktası (seçim modunda ☐/☑), başlık düğmesi ve yalnız
+        üzerine gelince görünen '⋯' menü düğmesi. Satırın her yerine tıklamak sohbeti açar.
+        """
+        compact: bool = self._appearance["compact_sidebar"]
+        select_mode: bool = self._chat_select_mode
+        activate: Callable[[], None] = (
+            (lambda: self._toggle_chat_selection(chat_id)) if select_mode else (lambda: self._open_chat(chat_id))
+        )
+        frame = ctk.CTkFrame(self._chat_list, fg_color="transparent", corner_radius=9)
+        frame.grid_columnconfigure(1, weight=1)
+        marker = ctk.CTkLabel(
+            frame, text=look["marker"], width=CHAT_MARKER_WIDTH, text_color=self._marker_color(look["tone"]),
+            font=self._ui_font(13 if select_mode else 10, "normal"),
+        )
+        marker.grid(row=0, column=0, padx=(6, 0))
+        button = ctk.CTkButton(
+            frame, text=look["label"], height=30 if compact else 38, anchor="w", fg_color="transparent",
+            hover_color=SURFACE_RAISED if look["highlighted"] else SURFACE_HOVER,
+            text_color=TEXT if look["bright"] else TEXT_DIM, font=self._ui_font(12, "normal"), command=activate,
+        )
+        button.grid(row=0, column=1, sticky="ew")
+        more: Optional[ctk.CTkButton] = None
+        if not select_mode:
+            more = ctk.CTkButton(
+                frame, text="⋯", width=29, height=30, fg_color="transparent", hover_color=BORDER,
+                text_color=TEXT_DIM, font=self._ui_font(17, "normal"),
+                command=lambda: self._show_chat_menu(chat_id, frame),
+            )
+            more.grid(row=0, column=2, padx=(0, 3))
+            more.grid_remove()
+            button.bind("<Button-2>", lambda event: self._show_chat_menu(chat_id, event.widget), add="+")
+        row: ChatRow = {"frame": frame, "marker": marker, "button": button, "more": more, "look": look,
+                        "hover": False}
+        for widget in (frame, marker, button, more):
+            if widget is not None:
+                widget.bind("<Enter>", lambda _event: self._hover_chat_row(chat_id, True), add="+")
+                widget.bind("<Leave>", lambda _event: self._hover_chat_row(chat_id, False), add="+")
+        for widget in (frame, marker):
+            widget.bind("<Button-1>", lambda _event: activate(), add="+")
+        self._paint_chat_row(row)
+        return row
+
+    def _apply_chat_row_look(self, row: ChatRow, look: ChatRowLook) -> None:
+        """Yalnız görünümü değişen satırı yapılandırır (başlık, işaret, vurgu)."""
+        row["look"] = look
+        row["marker"].configure(text=look["marker"], text_color=self._marker_color(look["tone"]))
+        row["button"].configure(
+            text=look["label"], text_color=TEXT if look["bright"] else TEXT_DIM,
+            hover_color=SURFACE_RAISED if look["highlighted"] else SURFACE_HOVER,
+        )
+        self._paint_chat_row(row)
+
+    def _paint_chat_row(self, row: ChatRow) -> None:
+        """Satır zemini: seçili/etkin satır belirgin, üzerine gelinen satır hafif vurgulu, diğerleri saydam."""
+        if row["look"]["highlighted"]:
+            background: str = SURFACE_RAISED
+        else:
+            background = SURFACE_HOVER if row["hover"] else "transparent"
+        row["frame"].configure(fg_color=background)
+
+    def _hover_chat_row(self, chat_id: str, inside: bool) -> None:
+        """Fare satıra girince zemini vurgular ve '⋯' düğmesini gösterir; satırın kendi çocuklarına geçiş çıkış sayılmaz."""
+        row: Optional[ChatRow] = self._chat_rows.get(chat_id)
+        if row is None:
+            return
+        if not inside:
+            try:
+                under: Optional[tk.Misc] = self.winfo_containing(*self.winfo_pointerxy())
+            except KeyError:
+                under = None  # Python'un tanımadığı iç Tk penceresi (ör. açılır menü): satırın dışındadır
+            if under is not None and path_within(str(under), str(row["frame"])):
+                return
+        row["hover"] = inside
+        self._paint_chat_row(row)
+        if row["more"] is not None:
+            if inside:
+                row["more"].grid()
+            else:
+                row["more"].grid_remove()
+
+    def _pulse_running_dot(self, now: float) -> None:
+        """Çalışan sohbetin durum noktası yavaşça sönüp yanar; yalnız o noktanın rengi değişir."""
+        if now - self._last_dot_pulse < DOT_PULSE_INTERVAL:
+            return
+        self._last_dot_pulse = now
+        self._dot_bright = not self._dot_bright
+        for row in self._chat_rows.values():
+            if row["look"]["tone"] == DOT_RUNNING:
+                row["marker"].configure(text_color=self._marker_color(DOT_RUNNING))
 
     def _toggle_chat_select_mode(self) -> None:
         if self._agent_future is not None:
@@ -555,7 +931,7 @@ class OmniUI(ctk.CTk):
     def _delete_selected_chats(self) -> bool:
         if self._agent_future is not None or not self._chat_catalog_writable or not self._selected_chat_ids:
             return False
-        if not self._save_current_chat(force=True):
+        if not self._save_current_chat():
             return False
         selected = [chat["id"] for chat in self._chat_index if chat["id"] in self._selected_chat_ids]
         was_active = self._active_chat_id in self._selected_chat_ids
@@ -608,7 +984,7 @@ class OmniUI(ctk.CTk):
     def _rename_chat(self, chat_id: str, title: str) -> bool:
         if self._agent_future is not None or not self._chat_catalog_writable:
             return False
-        if chat_id == self._active_chat_id and not self._save_current_chat(force=True):
+        if chat_id == self._active_chat_id and not self._save_current_chat():
             return False
         try:
             updated = rename_chat(chat_id, title, self._chat_index, self._active_chat_id)
@@ -635,7 +1011,7 @@ class OmniUI(ctk.CTk):
     def _delete_chat(self, chat_id: str) -> bool:
         if self._agent_future is not None or not self._chat_catalog_writable:
             return False
-        if not self._save_current_chat(force=True):
+        if not self._save_current_chat():
             return False
         was_active: bool = chat_id == self._active_chat_id
         try:
@@ -674,195 +1050,337 @@ class OmniUI(ctk.CTk):
         self._chat_notice.configure(text="")
         self._refresh_chat_list()
 
+    def _column_padding(self, inset: int) -> Tuple[int, int]:
+        """
+        Ana sütundaki bir öğenin (sol, sağ) boşluğu: transkript metin sütununun iki kenarıyla hizalanır
+        (sağda kaydırma çubuğunun genişliği de düşülür); `inset`, sol kenardan ek içeri girintidir.
+        """
+        return self._column_side + inset, self._column_side + self._scrollbar.winfo_reqwidth()
+
+    def _grid_in_column(self, widget: tk.Misc, row: int, inset: int, pady: Tuple[int, int]) -> None:
+        """
+        Ana pencere sütununun `row` satırına yerleştirir: kenarları transkript metin sütunuyla hizalıdır
+        ve pencere yeniden boyutlanınca _align_column_widgets aynı ölçüyle günceller.
+        """
+        self._column_widgets.append((widget, inset))
+        widget.grid(row=row, column=0, sticky="ew", padx=self._column_padding(inset), pady=pady)
+
+    def _align_column_widgets(self) -> None:
+        """Üst şerit, durum satırı, composer kartı ve ipucu satırının kenarlarını transkript sütununa hizalar."""
+        for widget, inset in self._column_widgets:
+            widget.grid_configure(padx=self._column_padding(inset))
+
     def _build_header(self) -> None:
-        header: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0, height=72)
-        header.grid(row=0, column=0, sticky="ew", padx=30, pady=(22, 0))
+        """
+        Üst şerit: sohbet başlığı ve altında ince bağlam satırı (mesaj sayısı · model), sağda görev durumu,
+        kopyala ve ayarlar düğmeleri. Sol ve sağ kenarı transkript sütunuyla hizalıdır (_grid_in_column).
+        """
+        header: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0)
+        self._header: ctk.CTkFrame = header
+        self._grid_in_column(header, 0, 0, (20, 0))
         header.grid_columnconfigure(0, weight=1)
         self.chat_title_label = ctk.CTkLabel(
             header, text="Yeni sohbet", text_color=TEXT, font=self._ui_font(19, "bold"), anchor="w",
         )
         self.chat_title_label.grid(row=0, column=0, sticky="w")
+        meta: ctk.CTkFrame = ctk.CTkFrame(header, fg_color="transparent")
+        meta.grid(row=1, column=0, sticky="w", pady=(0, 12))
         self.context_label: ctk.CTkLabel = ctk.CTkLabel(
-            header, text="bağlam: 0 mesaj", text_color=TEXT_FAINT, anchor="w",
+            meta, text="bağlam: 0 mesaj", text_color=TEXT_FAINT, anchor="w",
             font=self._ui_font(11, "normal"),
         )
-        self.context_label.grid(row=1, column=0, sticky="w", pady=(0, 8))
+        self.context_label.pack(side="left")
+        ctk.CTkLabel(
+            meta, text="·", text_color=TEXT_FAINT, font=self._ui_font(11, "normal"),
+        ).pack(side="left", padx=7)
         self.model_label: ctk.CTkLabel = ctk.CTkLabel(
-            header, text=self._model_text(DEFAULT_BACKEND), text_color=TEXT_FAINT,
+            meta, text=self._model_text(DEFAULT_BACKEND), text_color=TEXT_FAINT,
             font=ctk.CTkFont(family=MONO_FAMILY, size=11),
         )
-        self.model_label.grid(row=1, column=1, columnspan=3, sticky="e", padx=(0, 8), pady=(0, 8))
+        self.model_label.pack(side="left")
         self.task_status_label: ctk.CTkLabel = ctk.CTkLabel(
             header, text="", text_color=ACCENT,
             font=ctk.CTkFont(family=MONO_FAMILY, size=11, weight="bold"),
         )
-        self.task_status_label.grid(row=0, column=1, sticky="e", padx=(0, 12))
+        self.task_status_label.grid(row=0, column=1, rowspan=2, sticky="e", padx=(0, 10))
         self.copy_btn: ctk.CTkButton = ctk.CTkButton(
-            header, text="", image=self._copy_icon, width=34, height=32, corner_radius=9,
-            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
-            border_color=BORDER, command=self._copy_transcript, cursor="hand2",
+            header, text="", image=self._copy_icon, width=32, height=32, corner_radius=8,
+            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=0,
+            command=self._copy_transcript, cursor="hand2",
         )
-        self.copy_btn.grid(row=0, column=2, padx=(0, 8))
+        self.copy_btn.grid(row=0, column=2, rowspan=2, padx=(0, 4))
         # Kopyala düğmesiyle birebir aynı kutu ve ikon boyutu (metin glifi daha küçük kalıyordu).
         self.settings_btn: ctk.CTkButton = ctk.CTkButton(
-            header, text="", image=self._gear_icon, width=34, height=32, corner_radius=9,
-            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=1,
-            border_color=BORDER, command=self._open_settings, cursor="hand2",
+            header, text="", image=self._gear_icon, width=32, height=32, corner_radius=8,
+            fg_color="transparent", hover_color=SURFACE_RAISED, border_width=0,
+            command=self._open_settings, cursor="hand2",
         )
-        self.settings_btn.grid(row=0, column=3)
-        ctk.CTkFrame(self._main, height=1, fg_color=BORDER, corner_radius=0).grid(
+        self.settings_btn.grid(row=0, column=3, rowspan=2)
+        ctk.CTkFrame(self._main, height=1, fg_color=BORDER_SOFT, corner_radius=0).grid(
             row=0, column=0, sticky="sew")
 
     def _build_transcript(self) -> None:
         frame: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0)
-        frame.grid(row=1, column=0, sticky="nsew", padx=(22, 22), pady=(12, 0))
+        frame.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         frame.grid_columnconfigure(0, weight=1)
         frame.grid_rowconfigure(0, weight=1)
-        self._mono: tkfont.Font = tkfont.Font(family=MONO_FAMILY, size=12)
-        self._body: tkfont.Font = tkfont.Font(family=self._ui_family, size=13)
+        self._transcript_frame: ctk.CTkFrame = frame
+        self._body: tkfont.Font = tkfont.Font(family=self._ui_family, size=READING_SIZE)
+        # Metin alanı yalnız içerik sütunu genişliğindedir (iki yanında eşit boşluk): Tk etiket
+        # arka planları satırın tamamını boyadığı için kod/komut blokları ancak böyle sütuna sığar.
         self._text: tk.Text = tk.Text(
-            frame, bg=BG, fg=TEXT, font=self._mono, wrap="word", bd=0, highlightthickness=0,
-            padx=12, pady=18, insertwidth=0, cursor="arrow", spacing1=1, spacing3=1,
+            frame, bg=BG, fg=TEXT, font=self._body, wrap="word", bd=0, highlightthickness=0,
+            padx=0, pady=18, insertwidth=0, cursor="arrow", spacing1=0, spacing3=0,
             selectbackground=ACCENT_DIM, selectforeground=TEXT, exportselection=True,
         )
-        self._text.grid(row=0, column=0, sticky="nsew")
+        self._text.grid(row=0, column=0, sticky="nsew", padx=self._column_side)
         scrollbar: ctk.CTkScrollbar = ctk.CTkScrollbar(
-            frame, command=self._text.yview, fg_color=BG, button_color=BORDER, button_hover_color=TEXT_FAINT,
+            frame, command=self._on_scrollbar, fg_color=BG, button_color=BORDER, button_hover_color=TEXT_FAINT,
         )
         scrollbar.grid(row=0, column=1, sticky="ns")
+        self._scrollbar: ctk.CTkScrollbar = scrollbar
         self._text.configure(yscrollcommand=scrollbar.set, state="disabled")
-        indent: int = self._mono.measure("⏺ ")
-        # Kayan (wrap) çıktı satırları '⎿  ' sonrasındaki metin sütununa hizalanır
-        output_margin: int = indent + self._mono.measure("⎿  ")
-        mono_bold = (MONO_FAMILY, 12, "bold")
-        small = (MONO_FAMILY, 11)
-        tags: Dict[str, Dict[str, object]] = {
-            "welcome_mark": {"foreground": ACCENT, "font": (MONO_FAMILY, 28, "bold"), "spacing1": 32},
-            "welcome_title": {"foreground": TEXT, "font": (self._ui_family, 22, "bold"), "spacing1": 16},
-            "welcome_dim": {"foreground": TEXT_DIM, "font": (self._ui_family, 13),
-                            "spacing1": 4, "spacing3": 5},
-            "welcome_example": {"foreground": TEXT_FAINT, "font": (MONO_FAMILY, 11),
-                                "spacing1": 10, "spacing3": 4},
-            "goal": {"foreground": TEXT, "background": SURFACE_RAISED, "lmargin1": 10, "lmargin2": 10 + indent,
-                     "spacing1": 8, "spacing3": 8, "rmargin": 10},
-            "goal_prompt": {"foreground": ACCENT, "background": SURFACE_RAISED, "font": mono_bold},
-            "gap": {"font": (MONO_FAMILY, 6)},
-            "bullet_text": {"foreground": TEXT, "spacing1": 9},
-            "assistant": {"foreground": TEXT, "font": self._body, "lmargin1": indent,
-                          "lmargin2": indent, "spacing2": 3, "rmargin": 20},
-            "cursor": {"foreground": ACCENT, "lmargin1": indent, "lmargin2": indent},
-            "reasoning_head": {"foreground": TEXT_FAINT, "font": (MONO_FAMILY, 11, "italic"), "spacing1": 9},
-            "reasoning": {"foreground": TEXT_FAINT, "font": (MONO_FAMILY, 11, "italic"), "lmargin1": indent, "lmargin2": indent},
-            "bullet_streaming": {"foreground": TEXT_FAINT, "spacing1": 9},
-            "bullet_running": {"foreground": ACCENT, "spacing1": 9},
-            "bullet_ok": {"foreground": SUCCESS, "spacing1": 9},
-            "bullet_error": {"foreground": ERROR, "spacing1": 9},
-            "tool_name": {"foreground": TEXT, "font": mono_bold},
-            "tool_args": {"foreground": TEXT_DIM},
-            "command": {"foreground": TEXT, "background": COMMAND_BG, "lmargin1": indent, "lmargin2": indent + 16},
-            "command_prompt": {"foreground": ACCENT, "background": COMMAND_BG, "lmargin1": indent},
-            "gutter": {"foreground": TEXT_FAINT, "lmargin1": indent, "lmargin2": output_margin},
-            "gutter_hidden": {"foreground": BG, "lmargin1": indent, "lmargin2": output_margin},
-            "output": {"foreground": TEXT_DIM, "font": small, "lmargin2": output_margin},
-            "output_error": {"foreground": ERROR, "font": small, "lmargin2": output_margin},
-            "meta": {"foreground": TEXT_FAINT, "font": small},
-            "summary_ok": {"foreground": SUCCESS, "font": mono_bold},
-            "summary_error": {"foreground": ERROR, "font": mono_bold},
-            "summary_meta": {"foreground": TEXT_FAINT, "font": small},
-            "notice_info": {"foreground": INFO, "font": small, "lmargin1": indent, "lmargin2": indent},
-            "notice_warning": {"foreground": WARNING, "font": small, "lmargin1": indent, "lmargin2": indent},
-            "notice_error": {"foreground": ERROR, "font": small, "lmargin1": indent, "lmargin2": indent},
-        }
-        tags.update({
-            "md_h1": {"font": (self._ui_family, 20, "bold"), "spacing1": 14, "spacing3": 5},
-            "md_h2": {"font": (self._ui_family, 17, "bold"), "spacing1": 12, "spacing3": 4},
-            "md_h3": {"font": (self._ui_family, 14, "bold"), "spacing1": 9, "spacing3": 3},
-            "md_bold": {"font": (self._ui_family, 13, "bold")},
-            "md_italic": {"font": (self._ui_family, 13, "italic")},
-            "md_code": {"font": (MONO_FAMILY, 12), "background": COMMAND_BG, "foreground": TEXT},
-            "md_codeblock": {"font": (MONO_FAMILY, 12), "background": COMMAND_BG,
-                             "spacing1": 1, "spacing2": 2, "spacing3": 1},
-            "md_codeblock_first": {"spacing1": 8},
-            "md_codeblock_last": {"spacing3": 8},
-            "md_bullet": {"lmargin2": indent + 16},
-            "md_quote": {"foreground": TEXT_DIM, "lmargin1": indent + 12, "lmargin2": indent + 12},
-            "md_rule": {"foreground": BORDER},
-            "md_table": {"font": (MONO_FAMILY, 11)},
-            "md_table_head": {"font": (MONO_FAMILY, 11, "bold"), "foreground": TEXT_DIM},
-            "md_table_label": {"font": (self._ui_family, 12, "bold"), "foreground": ACCENT,
-                               "spacing1": 7},
-            "md_table_value": {"lmargin1": indent + 10, "lmargin2": indent + 10},
-            "md_table_gap": {"font": (MONO_FAMILY, 4)},
-            "md_link": {"foreground": INFO, "underline": True},
-        })
-        for name, options in tags.items():
-            self._text.tag_configure(name, **options)
         self._refresh_transcript_fonts()
-        self._empty_state = ctk.CTkLabel(frame, text="", image=self._empty_icon, fg_color="transparent")
-        self._empty_state.place(relx=0.5, rely=0.5, anchor="center")
+        frame.bind("<Configure>", lambda _event: self._apply_column_layout())
+        frame.bind("<MouseWheel>", self._scroll_transcript)
+        # Kullanıcının kaydırması (tekerlek, tuşlar) sondan ayrılıp ayrılmadığını izletir.
+        self._text.bind("<MouseWheel>", lambda _event: self._after_user_scroll(), add="+")
+        self._text.bind("<Key>", lambda _event: self._after_user_scroll(), add="+")
+        self._empty_state = ctk.CTkFrame(frame, fg_color="transparent", corner_radius=0)
+        ctk.CTkLabel(self._empty_state, text="", image=self._empty_icon).pack(pady=(0, 20))
+        ctk.CTkLabel(
+            self._empty_state, text="Ne üzerinde çalışalım?", text_color=TEXT,
+            font=self._ui_font(23, "bold"),
+        ).pack()
+        ctk.CTkLabel(
+            self._empty_state, text="Bir görev yazın. İlerlemeyi burada canlı izleyin.",
+            text_color=TEXT_FAINT, font=self._ui_font(12, "normal"),
+        ).pack(pady=(7, 0))
+        self._empty_state.place(relx=0.5, rely=0.45, anchor="center")
 
     def _build_activity_bar(self) -> None:
         bar: ctk.CTkFrame = ctk.CTkFrame(self._main, fg_color=BG, corner_radius=0, height=26)
-        bar.grid(row=2, column=0, sticky="ew", padx=34, pady=(6, 4))
+        self._grid_in_column(bar, 2, 0, (6, 4))
         bar.grid_columnconfigure(0, weight=1)
+        self._activity_bar = bar
         self._activity: tk.Text = tk.Text(
-            bar, height=1, bg=BG, fg=TEXT_FAINT, bd=0, highlightthickness=0, wrap="none",
-            font=(MONO_FAMILY, 12), insertwidth=0, cursor="arrow", padx=0, pady=2,
+            bar, height=1, bg=BG, fg=TEXT_DIM, bd=0, highlightthickness=0, wrap="none",
+            font=(self._ui_family, 13), insertwidth=0, cursor="arrow", padx=0, pady=2,
         )
         self._activity.grid(row=0, column=0, sticky="ew")
-        self._activity.tag_configure("glyph", foreground=ACCENT, font=(MONO_FAMILY, 13, "bold"))
-        self._activity.tag_configure("verb", foreground=ACCENT)
-        self._activity.tag_configure("shine", foreground=SHINE)
-        self._activity.tag_configure("meta", foreground=TEXT_FAINT, font=(MONO_FAMILY, 11))
-        self._activity.tag_raise("shine")
+        self._configure_activity_tags(self._font_delta())
         self._activity.configure(state="disabled")
 
+    def _configure_activity_tags(self, delta: int) -> None:
+        """Akış durum satırının yazı tiplerini ve renklerini yapılandırır (glif vurgu rengi, metin soluk)."""
+        self._activity.configure(font=(self._ui_family, 13 + delta))
+        self._activity.tag_configure("glyph", foreground=ACCENT, font=(MONO_FAMILY, 13 + delta, "bold"))
+        self._activity.tag_configure("meta", foreground=TEXT_DIM)
+        self._activity.tag_configure("verb", foreground=TEXT_DIM)
+        self._activity.tag_configure("shine", foreground=TEXT)
+        self._activity.tag_raise("shine")
+
+    # --- İçerik sütunu ve kullanıcı kabarcıkları ---
+
+    def _apply_column_layout(self) -> None:
+        """
+        İçerik sütununu pencere genişliğine göre yeniden hesaplar: sütun en çok COLUMN_MAX_WIDTH
+        olur, iki yanında eşit boşluk kalır (dar pencerede COLUMN_MIN_SIDE). Metin alanı, üst şerit,
+        durum satırı, composer ve gömülü kabarcıklar yeni ölçüye uyar; ölçü değişmediyse hiçbir
+        şey yapılmaz.
+        """
+        available: int = self._transcript_frame.winfo_width() - self._scrollbar.winfo_reqwidth()
+        side: int = column_side(available)
+        width: int = column_width(available)
+        if side == self._column_side and width == self._column_width:
+            return
+        self._column_side = side
+        self._column_width = width
+        self._text.grid_configure(padx=side)
+        self._align_column_widgets()
+        self._relayout_bubbles()
+        if self._stick_to_end:
+            # Satırlar yeni genişlikte yeniden sarılır; sondaysa görünüm sonda kalır.
+            self.after_idle(self._scroll_to_end)
+
+    def _scroll_transcript(self, event: "tk.Event[tk.Misc]") -> str:
+        """Kenar boşluğu ve gömülü pencereler üzerindeki tekerlek hareketini transkripte yönlendirir."""
+        self._text.yview_scroll(-int(event.delta), "units")
+        self._after_user_scroll()
+        return "break"
+
+    def _on_scrollbar(self, *arguments: str | float) -> None:
+        """Kaydırma çubuğu hareketini metne iletir ve kullanıcının sondan ayrılıp ayrılmadığını izler."""
+        self._text.yview(*arguments)
+        self._after_user_scroll()
+
+    def _after_user_scroll(self) -> None:
+        """Kullanıcı kaydırdı: sınıf bağlamaları bittikten sonra 'sondayım' bilgisini yeniler."""
+        self.after_idle(self._sync_stick_to_end)
+
+    def _sync_stick_to_end(self) -> None:
+        self._stick_to_end = self._text.yview()[1] >= 0.995
+
+    def _scroll_to_end(self) -> None:
+        """
+        Transkripti sona kaydırır. Eklenen satırların yerleşimi (özellikle sarılan uzun satırlar)
+        boşta çalışan işlerde hesaplanır; hemen kaydırmak sonu kaçırır, bu yüzden önce bekleyen
+        boşta işleri tamamlanır. Tüm belgenin satır ölçümü (sync) beklenmez: büyük sohbette saniyeler alır.
+        """
+        self._text.update_idletasks()
+        self._text.see("end")
+
+    def _create_bubble(self, goal: str) -> BubbleView:
+        """Kullanıcı mesajı için yuvarlak köşeli kabarcık penceresini kurar; henüz yerleştirmez."""
+        frame: ctk.CTkFrame = ctk.CTkFrame(
+            self._text, fg_color=SURFACE_RAISED, bg_color=BG, corner_radius=BUBBLE_RADIUS,
+        )
+        clip: tk.Frame = tk.Frame(frame, bg=SURFACE_RAISED, bd=0, highlightthickness=0)
+        label: tk.Label = tk.Label(
+            clip, text=goal, bg=SURFACE_RAISED, fg=TEXT, font=self._body, justify="left",
+            anchor="nw", bd=0, highlightthickness=0, padx=0, pady=0,
+        )
+        label.place(x=0, y=0)
+        toggle: tk.Label = tk.Label(
+            frame, text="Daha fazla", bg=SURFACE_RAISED, fg=TEXT_DIM, font=(self._ui_family, 12),
+            cursor="hand2", bd=0, highlightthickness=0, padx=0, pady=0,
+        )
+        clip.grid(row=0, column=0, padx=BUBBLE_PAD_X, pady=BUBBLE_PAD_Y)
+        toggle.grid(row=1, column=0, sticky="w", padx=BUBBLE_PAD_X, pady=(0, BUBBLE_PAD_Y - 3))
+        bubble: BubbleView = {"frame": frame, "clip": clip, "label": label,
+                              "toggle": toggle, "expanded": False}
+        toggle.bind("<Button-1>", lambda _event, view=bubble: self._toggle_bubble(view))
+        toggle.bind("<Enter>", lambda _event, link=toggle: link.configure(fg=TEXT))
+        toggle.bind("<Leave>", lambda _event, link=toggle: link.configure(fg=TEXT_DIM))
+        for widget in (frame, clip, label, toggle):
+            widget.bind("<MouseWheel>", self._scroll_transcript)
+        return bubble
+
+    def _layout_bubble(self, bubble: BubbleView) -> None:
+        """Kabarcığın satır kırma genişliğini ve (uzunsa) katlanmış yüksekliğini geçerli sütuna göre ayarlar."""
+        text_width: int = max(
+            BUBBLE_MIN_TEXT_WIDTH, int(self._column_width * BUBBLE_MAX_RATIO) - 2 * BUBBLE_PAD_X,
+        )
+        label: tk.Label = bubble["label"]
+        label.configure(wraplength=text_width)
+        line_height: int = max(1, self._body.metrics("linespace"))
+        full_height: int = label.winfo_reqheight()
+        collapsible: bool = round(full_height / line_height) > BUBBLE_COLLAPSE_LINES
+        height: int = full_height if bubble["expanded"] or not collapsible else (
+            BUBBLE_COLLAPSED_LINES * line_height)
+        bubble["clip"].configure(width=label.winfo_reqwidth(), height=height)
+        if collapsible:
+            bubble["toggle"].configure(text="Daha az" if bubble["expanded"] else "Daha fazla",
+                                       font=(self._ui_family, 12 + self._font_delta()))
+            bubble["toggle"].grid()
+        else:
+            bubble["toggle"].grid_remove()
+
+    def _relayout_bubbles(self) -> None:
+        """Sütun genişliği ya da yazı ayarı değişince tüm kabarcıkları yeniden ölçer."""
+        for bubble in self._bubbles:
+            self._layout_bubble(bubble)
+
+    def _toggle_bubble(self, bubble: BubbleView) -> None:
+        """Uzun kullanıcı mesajını 'Daha fazla / Daha az' ile açar ya da katlar."""
+        bubble["expanded"] = not bubble["expanded"]
+        self._layout_bubble(bubble)
+
+    def _embed_bubble(self, index: str, goal: str) -> None:
+        """Kullanıcı mesajının kabarcığını verilen konuma gömer; satır sağa yaslanır."""
+        bubble: BubbleView = self._create_bubble(goal)
+        self._layout_bubble(bubble)
+        self._text.window_create(index, window=bubble["frame"], padx=0, pady=1)
+        self._text.tag_add("user_line", index)
+        self._bubbles.append(bubble)
+
+    def _restore_user_bubbles(self) -> None:
+        """Kayıttan yüklenen sohbette gizli kullanıcı metinlerinin başına kabarcık penceresini yerleştirir."""
+        ranges: Tuple[object, ...] = self._text.tag_ranges("user_msg")
+        starts: List[str] = [str(item) for item in ranges[0::2]]
+        ends: List[str] = [str(item) for item in ranges[1::2]]
+        for start, end in reversed(list(zip(starts, ends))):
+            self._embed_bubble(start, self._text.get(start, end))
+
+    def _composer_menu(self, parent: ctk.CTkFrame, values: Tuple[str, ...], width: int,
+                       command: Optional[Callable[[str], None]]) -> ctk.CTkOptionMenu:
+        """Composer alt satırındaki küçük, sade açılır menü (mod ve sağlayıcı seçimi)."""
+        return ctk.CTkOptionMenu(
+            parent, values=list(values), width=width, height=28, corner_radius=8,
+            fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
+            dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED, dropdown_text_color=TEXT,
+            text_color=TEXT_DIM, font=self._ui_font(12, "normal"), dropdown_font=self._ui_font(12, "normal"),
+            command=command,
+        )
+
     def _build_composer(self) -> None:
-        composer: ctk.CTkFrame = ctk.CTkFrame(
-            self._main, fg_color=SURFACE, corner_radius=14, border_width=1, border_color=BORDER,
+        """
+        Composer: transkript sütunu genişliğinde tek yuvarlak kart. Üstte çok satırlı giriş (Enter gönderir,
+        Shift+Enter yeni satır; içerik kadar büyür), altta mod ve sağlayıcı menüleri, sağda mikrofon ile
+        gönder/durdur düğmesi. Kartın üstündeki boş `_composer_attachments` şeridi (ek önizlemeleri) ve alt
+        satırın sol başındaki boş `_composer_attach_slot` (ek düğmesi) ileride eklenecek ek (attachment)
+        için ayrılmıştır; boşken yer kaplamazlar. Ek altyapısı ayrı bir karardır.
+        """
+        card: ctk.CTkFrame = ctk.CTkFrame(
+            self._main, fg_color=SURFACE, corner_radius=COMPOSER_RADIUS, border_width=1, border_color=BORDER,
         )
-        composer.grid(row=3, column=0, sticky="ew", padx=28, pady=(2, 4))
-        composer.grid_columnconfigure(0, weight=1)
-        self.entry: ctk.CTkEntry = ctk.CTkEntry(
-            composer, placeholder_text="OmniAgent'a bir görev ver…", height=46,
-            fg_color=SURFACE, border_width=0, text_color=TEXT, placeholder_text_color=TEXT_FAINT,
-            font=self._ui_font(14, "normal"),
+        self._composer_card: ctk.CTkFrame = card
+        self._grid_in_column(card, 3, 0, (2, 0))
+        card.grid_columnconfigure(0, weight=1)
+        self._composer_attachments: ctk.CTkFrame = ctk.CTkFrame(card, height=0, fg_color="transparent")
+        # pady=(1, 0): alt widget'lar kartın kenarlığının üstüne çizilir; boş şerit bile 1 px üst çizgiyi örterdi.
+        self._composer_attachments.grid(row=0, column=0, sticky="ew", padx=COMPOSER_PAD_X, pady=(1, 0))
+        self.entry: ComposerInput = ComposerInput(
+            card, self._ui_font(14, "normal"), "OmniAgent'a bir görev ver…",
+            self._on_primary_button, self._on_composer_focus,
         )
-        self.entry.grid(row=0, column=0, columnspan=4, sticky="ew", padx=14, pady=(12, 4))
-        self.entry.bind("<Return>", lambda event: self._on_primary_button())
-        toolbar = ctk.CTkFrame(composer, fg_color="transparent")
-        toolbar.grid(row=1, column=0, columnspan=4, sticky="ew", padx=16, pady=(1, 12))
-        toolbar.grid_columnconfigure(2, weight=1)
-        self.mode_menu: ctk.CTkOptionMenu = ctk.CTkOptionMenu(
-            toolbar, values=list(RUN_MODE_CHOICES), width=94, height=30, corner_radius=8,
-            fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
-            dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED, dropdown_text_color=TEXT,
-            text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
-            dropdown_font=ctk.CTkFont(family=MONO_FAMILY, size=11),
-        )
+        self.entry.widget.grid(row=1, column=0, sticky="ew", padx=COMPOSER_PAD_X, pady=(16, 10))
+        card.bind("<Button-1>", lambda _event: self.entry.focus_set(), add="+")
+        toolbar: ctk.CTkFrame = ctk.CTkFrame(card, fg_color="transparent")
+        toolbar.grid(row=2, column=0, sticky="ew", padx=COMPOSER_PAD_X - 8, pady=(0, 10))
+        toolbar.grid_columnconfigure(3, weight=1)
+        self._composer_attach_slot: ctk.CTkFrame = ctk.CTkFrame(toolbar, width=0, height=0, fg_color="transparent")
+        self._composer_attach_slot.grid(row=0, column=0)
+        self.mode_menu: ctk.CTkOptionMenu = self._composer_menu(
+            toolbar, RUN_MODE_CHOICES, 92, self._update_mode_hint)
         self.mode_menu.set(RUN_MODE_CHOICES[0])
-        self.mode_menu.grid(row=0, column=0, padx=(0, 8))
-        self.backend_menu: ctk.CTkOptionMenu = ctk.CTkOptionMenu(
-            toolbar, values=list(BACKEND_CHOICES), width=138, height=30, corner_radius=8,
-            fg_color=SURFACE_RAISED, button_color=SURFACE_RAISED, button_hover_color=BORDER,
-            dropdown_fg_color=SURFACE, dropdown_hover_color=SURFACE_RAISED, dropdown_text_color=TEXT,
-            text_color=TEXT_DIM, font=ctk.CTkFont(family=MONO_FAMILY, size=11),
-            dropdown_font=ctk.CTkFont(family=MONO_FAMILY, size=11),
-        )
+        self.mode_menu.grid(row=0, column=1, padx=(0, 6))
+        self.backend_menu: ctk.CTkOptionMenu = self._composer_menu(toolbar, BACKEND_CHOICES, 132, None)
         self.backend_menu.set("Otomatik")
-        self.backend_menu.grid(row=0, column=1)
+        self.backend_menu.grid(row=0, column=2)
         self.voice_btn: ctk.CTkButton = ctk.CTkButton(
             toolbar, text="", image=self._voice_icon, width=34, height=34, corner_radius=10,
             fg_color=SURFACE_RAISED, hover_color=SURFACE_RAISED, text_color=TEXT_DIM,
             command=self._toggle_voice, cursor="hand2",
         )
-        self.voice_btn.grid(row=0, column=3, padx=(0, 8))
+        self.voice_btn.grid(row=0, column=4, padx=(0, 8))
         self.primary_btn: ctk.CTkButton = ctk.CTkButton(
             toolbar, text="↑", width=34, height=34, corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_HOVER,
             text_color=BG, font=ctk.CTkFont(family=self._ui_family, size=17, weight="bold"),
             command=self._on_primary_button,
         )
-        self.primary_btn.grid(row=0, column=4)
+        self.primary_btn.grid(row=0, column=5)
+        # Seçilen modun sınırı (ve açılıştaki Keychain ipucu) kartın altında, giriş metniyle hizalı durur.
+        self.mode_hint: ctk.CTkLabel = ctk.CTkLabel(
+            self._main, text="", anchor="w", text_color=TEXT_FAINT, font=self._ui_font(11, "normal"),
+        )
+        self._grid_in_column(self.mode_hint, 4, COMPOSER_PAD_X, (6, 12))
+        self._update_mode_hint(self.mode_menu.get())
+
+    def _on_composer_focus(self, focused: bool) -> None:
+        """Composer'a odaklanınca kart kenarlığı belirginleşir."""
+        self._composer_card.configure(border_color=COMPOSER_FOCUS_BORDER if focused else BORDER)
+
+    def _update_mode_hint(self, label: str) -> None:
+        """Seçilen modun çalışma sınırını composer'ın altında görünür kılar."""
+        mode: str = RUN_MODE_KEYS.get(label, "normal")
+        if mode == "continuous":
+            hint: str = "Sürekli · çevrimdışı sürer · /btw ile yön ver · /approve kullanıcı onayı"
+        else:
+            profile = RUN_MODE_PROFILES[mode]
+            minutes = int(profile["max_wall_clock_seconds"] / 60)
+            hint = f"{profile['max_iterations']} tur · {minutes} dk sınırı"
+        self.mode_hint.configure(text=hint, text_color=TEXT_FAINT)
 
     def _build_footer(self) -> None:
         self.stats_label: ctk.CTkLabel = ctk.CTkLabel(
@@ -936,6 +1454,91 @@ class OmniUI(ctk.CTk):
         save_continuous_limits(path, limits)
         return True
 
+    # --- Açılış: Keychain ve model istemcileri ilk boyamadan sonra arka planda ---
+
+    def _after_first_paint(self, action: Callable[[], None]) -> None:
+        """
+        Eylemi ilk boyama turu bittikten sonra çalıştırır: boşta işleri (yerleşim, çizim) bittikten sonra
+        bir kısa bekleme turu geçer. update() bilerek kullanılmaz: mainloop öncesinde kare, after ve
+        <Map> geri çağrılarını yarım kurulmuş nesnede yeniden çalıştırırdı.
+        """
+        self.after_idle(lambda: self.after(FIRST_PAINT_DELAY_MS, action))
+
+    def _post_paint_init(self) -> None:
+        """İlk kare çizildikten sonra: sohbet listesini kurar ve son açık sohbeti yükler."""
+        self._first_paint_done = True
+        # Liste koşulsuz kurulur: son açık sohbetin dosyası bozuksa _open_chat erken döner ve liste boş kalırdı.
+        self._refresh_chat_list()
+        if self._active_chat_id is not None and self._chat_record is None:
+            self._open_chat(self._active_chat_id, save_current=False)
+
+    def begin_background_startup(self) -> None:
+        """
+        main() çağırır: Keychain okuması ve istemci kurulumu ilk boyamadan sonra arka planda başlar. Bitene
+        dek görev göndermek ve Ayarlar açmak bekletilir (bayat Keychain değeri yarışı olmasın).
+        """
+        self._startup_pending = True
+        self._after_first_paint(self._start_startup_worker)
+
+    def _start_startup_worker(self) -> None:
+        future: "Future[Dict[str, AsyncOpenAI]]" = Future()
+        self._startup_future = future
+        future.add_done_callback(lambda done: self._call_in_tk(lambda: self._apply_startup(done)))
+        threading.Thread(target=_run_startup, args=(future,), name="omni-startup", daemon=True).start()
+        self.after(STARTUP_HINT_DELAY_MS, self._hint_if_startup_slow)
+        self.after(KEYCHAIN_WAIT_LIMIT_MS, self._release_startup_gate)
+
+    def _keychain_busy(self) -> bool:
+        return self._startup_future is not None and not self._startup_future.done()
+
+    def _show_startup_hint(self) -> None:
+        self.mode_hint.configure(text=KEYCHAIN_HINT, text_color=WARNING)
+
+    def _hint_if_startup_slow(self) -> None:
+        """Keychain 1,5 sn içinde yanıt vermediyse (macOS izin penceresi olabilir) ipucu ve durum gösterilir."""
+        if self._keychain_busy():
+            self._set_task_status("keys")
+            self._show_startup_hint()
+
+    def _release_startup_gate(self) -> None:
+        """Keychain uzun süre yanıt vermezse görev gönderme açılır; anahtarlar yanıt gelince yüklenir."""
+        if not self._startup_pending:
+            return
+        self._startup_pending = False
+        if self._task_status == "keys":
+            self._set_task_status("idle")
+        self.mode_hint.configure(text=KEYCHAIN_LATE_HINT, text_color=WARNING)
+
+    def _apply_startup(self, done: "Future[Dict[str, AsyncOpenAI]]") -> None:
+        """Tk thread'i: açılış işinin sonucunu uygular; işçinin istisnası burada yeniden yükselir."""
+        self._startup_pending = False
+        if self._task_status == "keys":
+            self._set_task_status("idle")
+        self._update_mode_hint(self.mode_menu.get())
+        clients: Dict[str, AsyncOpenAI] = done.result()
+        if self._agent_running():
+            self._clients_stale = True  # görev bitince _rebuild_clients yeni anahtarlarla kurar
+            self._retire_clients(clients)  # kullanılmayacak istemcilerin bağlantı havuzu kapatılır
+            return
+        replaced: Dict[str, AsyncOpenAI] = self._clients
+        self._clients = clients
+        self.model_label.configure(text=self._model_text(DEFAULT_BACKEND))
+        self._retire_clients(replaced)
+
+    def _retire_clients(self, replaced: Dict[str, AsyncOpenAI]) -> None:
+        """Eski bağlantı havuzunu event loop'ta kapatır; kapanış hatası döngüyü düşürmez."""
+        if not replaced:
+            return
+
+        async def retire() -> None:
+            try:
+                await close_model_clients(replaced)
+            except Exception as error:
+                logging.warning("Eski model istemcileri kapatılamadı",
+                                extra={"error_type": type(error).__name__})
+
+        # Eski bağlantı havuzu yalnız çalışan görev yokken kapatılır.
+        asyncio.run_coroutine_threadsafe(retire(), self._loop)
 
     def _rebuild_clients(self) -> None:
         """Model istemcilerini yeni anahtarlarla kurar; görev sürüyorsa görev bitince uygular."""
@@ -949,17 +1552,7 @@ class OmniUI(ctk.CTk):
         self._clients = create_model_clients()
         self.model_label.configure(text=self._model_text(DEFAULT_BACKEND))
         self._clients_stale = False
-
-        async def retire() -> None:
-            """Eski bağlantı havuzunu kapatır; kapanış hatası event loop'u düşürmez."""
-            try:
-                await close_model_clients(replaced)
-            except Exception as error:
-                logging.warning("Eski model istemcileri kapatılamadı",
-                                extra={"error_type": type(error).__name__})
-
-        # Eski bağlantı havuzu yalnız burada, çalışan görev yokken kapatılır.
-        asyncio.run_coroutine_threadsafe(retire(), self._loop)
+        self._retire_clients(replaced)
 
     def _open_settings(self) -> None:
         """Tema ile uyumlu Ayarlar sayfasını açar; kaydedilen anahtarlar anında etkinleşir."""
@@ -968,6 +1561,15 @@ class OmniUI(ctk.CTk):
             existing.lift()
             existing.focus_force()
             return
+        if self._startup_pending or self._keychain_busy():
+            # Açılıştaki Keychain okuması sürerken Ayarlar açılırsa bayat anahtar değerleri gösterilirdi
+            # (kapı 45 sn sonra açılsa da okuma bitene dek kapalı kalır).
+            self._show_startup_hint()
+            return
+        if self.state() == "iconic":
+            # Simge durumundaki ana pencerenin geçici (transient) Ayarlar penceresi Tk'de olay döngüsünü
+            # kilitler (Configure fırtınası; deneyle doğrulandı): önce ana pencere geri getirilir.
+            set_application_hidden(False, self)
         window: ctk.CTkToplevel = ctk.CTkToplevel(self)
         self._settings_window = window
         window.title("OmniAgent — Ayarlar")
@@ -1164,8 +1766,9 @@ class OmniUI(ctk.CTk):
         ).pack(anchor="w", padx=12, pady=(24, 3))
         ctk.CTkLabel(
             panel, text=(
-                "Sürekli görev sen durdurana, sınır dolana veya hedefi onaylayana kadar çalışır; "
-                "yanıtını beklediği süre sınıra sayılmaz."
+                "Sürekli görev sen durdurana, sınır dolana veya hedefi /approve ile onaylayana kadar çalışır; "
+                "bilgisayar başında olmasan da bağımsız işleri sürdürür. Çalışırken /btw <mesaj> ile yön verirsin. "
+                "Kanıtlı hedef onayı beklerken süre sınırı işlemeye devam eder."
             ),
             text_color=TEXT_DIM, wraplength=560, justify="left", anchor="w",
             font=self._ui_font(11, "normal"),
@@ -1394,12 +1997,74 @@ class OmniUI(ctk.CTk):
 
     # --- Transkript bölgeleri (etiket tabanlı; her bölge '\n' ile biter, asla boş kalmaz) ---
 
-    def _bind_link_tag(self, tag: str) -> None:
-        if tag.startswith("md_href:") and tag not in self._text.tag_names():
+    def _prepare_tag(self, tag: str) -> None:
+        """
+        Etiketin tıklama davranışını ve başlangıç durumunu ilk kullanımda kurar: bağlantılar
+        tarayıcıda açılır, katlama başlıkları aç/kapa olur, kayıttan yüklenen katlama bölümleri
+        (bu oturumda açılmamış) kapalı gelir.
+        """
+        if tag in self._prepared_tags:
+            return
+        if tag.startswith("md_href:"):
             url: str = tag.removeprefix("md_href:")
             self._text.tag_bind(tag, "<Button-1>", lambda _event, target=url: webbrowser.open(target))
             self._text.tag_bind(tag, "<Enter>", lambda _event: self._text.configure(cursor="hand2"))
             self._text.tag_bind(tag, "<Leave>", lambda _event: self._text.configure(cursor="arrow"))
+            self._prepared_tags.add(tag)
+            return
+        fold: Optional[Tuple[str, str, int]] = parse_fold_tag(tag)
+        if fold is None:
+            return
+        kind, part, ident = fold
+        self._prepared_tags.add(tag)
+        if part == "h":
+            self._text.tag_bind(tag, "<Button-1>", lambda _event, k=kind, i=ident: self._toggle_fold(k, i))
+            self._text.tag_bind(tag, "<Enter>", lambda _event, k=kind, i=ident: self._hover_fold(k, i, True))
+            self._text.tag_bind(tag, "<Leave>", lambda _event, k=kind, i=ident: self._hover_fold(k, i, False))
+        elif part in ("b", "o"):
+            self._text.tag_configure(tag, elide=True)
+
+    def _new_fold(self, kind: str, open_now: bool) -> int:
+        """Yeni bir katlanabilir bölümün kimliğini ayırır ve etiketlerini istenen durumda kurar."""
+        self._fold_seq += 1
+        ident: int = self._fold_seq
+        tags = fold_tags(kind, ident)
+        self._prepare_tag(tags["click"])
+        self._prepared_tags.update((tags["body"], tags["open"], tags["closed"]))
+        self._set_fold(kind, ident, open_now)
+        return ident
+
+    def _set_fold(self, kind: str, ident: int, open_now: bool) -> None:
+        """
+        Bölümü açar ya da kapatır. Gövde ve 'açık' işareti kapalıyken, 'kapalı' işareti açıkken
+        gizlenir (elide). Açık durum `elide` ayarının kaldırılmasıyla ("") ifade edilir, False ile
+        değil: iç içe etiketlerde False üst gizlemeyi ezerdi.
+        """
+        tags = fold_tags(kind, ident)
+        self._text.tag_configure(tags["body"], elide=ELIDE_UNSET if open_now else True)
+        self._text.tag_configure(tags["open"], elide=ELIDE_UNSET if open_now else True)
+        self._text.tag_configure(tags["closed"], elide=True if open_now else ELIDE_UNSET)
+        if open_now:
+            self._open_folds.add((kind, ident))
+        else:
+            self._open_folds.discard((kind, ident))
+        self._paint_fold(kind, ident, False)
+
+    def _toggle_fold(self, kind: str, ident: int) -> None:
+        """Kullanıcının tıkladığı bölümü açar/kapatır; seçim otomatik katlamaya karşı korunur."""
+        self._manual_folds.add((kind, ident))
+        self._set_fold(kind, ident, (kind, ident) not in self._open_folds)
+
+    def _paint_fold(self, kind: str, ident: int, hover: bool) -> None:
+        """Araç satırının zeminini günceller: üstünde ya da açıkken vurgulu, aksi halde zemin ayarı kaldırılır."""
+        if kind == "t":
+            highlighted: bool = hover or (kind, ident) in self._open_folds
+            self._text.tag_configure(fold_tags(kind, ident)["click"], background=SURFACE if highlighted else "")
+
+    def _hover_fold(self, kind: str, ident: int, inside: bool) -> None:
+        """Fare katlama başlığına girince/çıkınca imleci ve satır zeminini günceller."""
+        self._text.configure(cursor="hand2" if inside else "arrow")
+        self._paint_fold(kind, ident, inside)
 
     def _insert_parts(self, index: str, region: str, parts: List[Tuple[str, Tuple[str, ...]]]) -> None:
         self._text.mark_set(INSERT_MARK, index)
@@ -1407,7 +2072,7 @@ class OmniUI(ctk.CTk):
         for content, tags in parts:
             if content:
                 for tag in tags:
-                    self._bind_link_tag(tag)
+                    self._prepare_tag(tag)
                 self._text.insert(INSERT_MARK, content, tags + (region,))
 
     def _new_region(self, parts: List[Tuple[str, Tuple[str, ...]]]) -> str:
@@ -1437,6 +2102,7 @@ class OmniUI(ctk.CTk):
         self._region_text_tag.pop(region, None)
         self._streaming_regions.pop(region, None)
         self._live_regions.pop(region, None)
+        self._dirty_tools.pop(region, None)
 
     def _append_streaming(self, region: str, text: str, tag: str) -> None:
         """Akan bölgeye, sondaki '▌\\n' imlecinden önce metin ekler."""
@@ -1451,8 +2117,9 @@ class OmniUI(ctk.CTk):
         if bounds is not None and self._streaming_regions.get(region):
             self._text.delete(f"{bounds[1]} - 2 chars", f"{bounds[1]} - 1 chars")
         if self._streaming_regions.get(region) and region in self._raw_text:
-            self._replace_region(region, [("⏺ ", ("bullet_text",))] + render_markdown(self._raw_text[region], max_columns=TABLE_MAX_COLUMNS))
-            self._text.see("end")
+            self._replace_region(region, [ASSISTANT_HEAD] + render_markdown(self._raw_text[region], max_columns=TABLE_MAX_COLUMNS))
+            if self._stick_to_end:
+                self._text.see("end")
         self._streaming_regions[region] = False
 
     # --- Olay → durum ---
@@ -1473,13 +2140,16 @@ class OmniUI(ctk.CTk):
         if self._turn is None:
             raise RuntimeError("Metin bölgesi için etkin model turu yok.")
         if self._turn["text_region"] is None:
-            self._turn["text_region"] = self._new_streaming_region(("⏺ ", ("bullet_text",)), "assistant")
+            # Asistan konuşmaya devam ediyor: önceki araç grubu biter ve başlığa katlanır.
+            self._close_tool_group()
+            self._turn["text_region"] = self._new_streaming_region(ASSISTANT_HEAD, "assistant")
         return self._turn["text_region"]
 
     def _reasoning_region(self) -> str:
         if self._turn is None:
             raise RuntimeError("Düşünce bölgesi için etkin model turu yok.")
         if self._turn["reasoning_region"] is None:
+            self._close_tool_group()
             self._turn["reasoning_region"] = self._new_streaming_region(("∴ düşünce ", ("reasoning_head",)), "reasoning")
         return self._turn["reasoning_region"]
 
@@ -1490,15 +2160,84 @@ class OmniUI(ctk.CTk):
             if not self._pending_text.get(region):
                 self._finish_streaming(region)
 
+    # --- Araç grupları ---
+
+    def _current_tool_group(self) -> ToolGroup:
+        """Art arda araç çağrılarının toplandığı açık grubu döndürür; yoksa başlığıyla birlikte açar."""
+        if self._tool_group is None:
+            ident: int = self._new_fold("g", True)
+            region: str = self._new_region(group_head_parts(ident, 0, True))
+            self._tool_group = {"id": ident, "region": region, "views": []}
+            self._tool_groups[ident] = self._tool_group
+        return self._tool_group
+
+    def _refresh_group_head(self, group: ToolGroup) -> None:
+        """Grup başlığındaki araç sayısını ve 'çalışıyor/çalıştırıldı' durumunu günceller."""
+        running: bool = any(view["status"] in ("streaming", "running") for view in group["views"])
+        self._replace_region(group["region"], group_head_parts(group["id"], len(group["views"]), running))
+
+    def _close_tool_group(self) -> None:
+        """
+        Grup bitti (asistan devam etti ya da görev sona erdi): kullanıcı elle açıp kapatmadıysa
+        başlığa katlanır. Hâlâ akan ya da çalışan araç varsa grup açık ve güncel kalır.
+        """
+        group: Optional[ToolGroup] = self._tool_group
+        if group is None or any(view["status"] in ("streaming", "running") for view in group["views"]):
+            return
+        self._tool_group = None
+        if ("g", group["id"]) not in self._manual_folds:
+            self._set_fold("g", group["id"], False)
+
+    def _drop_tool_view(self, view: ToolView) -> None:
+        """Hiç başlamamış (akışı yarıda kesilmiş) araç satırını ve gerekirse boşalan grubu siler."""
+        self._delete_region(view["region"])
+        group: Optional[ToolGroup] = self._tool_groups.get(view["group_id"])
+        if group is None:
+            return
+        group["views"].remove(view)
+        if group["views"]:
+            self._refresh_group_head(group)
+            return
+        self._delete_region(group["region"])
+        del self._tool_groups[group["id"]]
+        if self._tool_group is group:
+            self._tool_group = None
+
+    def _drop_unstarted_tool_views(self) -> None:
+        """Önizlemesi görünüp hiç başlamamış araç satırlarını kaldırır; takılı dönen glif kalmaz."""
+        if self._turn is None:
+            return
+        for index, view in list(self._turn["tools"].items()):
+            if view["status"] == "streaming":
+                self._drop_tool_view(view)
+                del self._turn["tools"][index]
+
+    def _settle_running_tool_views(self) -> None:
+        """Görev bitti: sonuç olayı gelmemiş çalışan araçlar hata olarak kapanır (dönen glif takılı kalmaz)."""
+        for view in self._tools_by_call.values():
+            if view["status"] == "running":
+                view.update({"status": "error", "result": "Görev sona erdi; araç sonucu alınamadı.",
+                             "seconds": max(0.0, time.monotonic() - view["started_at"])})
+                if ("t", view["fold_id"]) not in self._manual_folds:
+                    self._set_fold("t", view["fold_id"], False)
+                self._render_tool(view)
+                self._refresh_group_head(self._tool_groups[view["group_id"]])
+
     def _tool_view(self, index: int, name: str) -> ToolView:
         if self._turn is None:
             raise RuntimeError("Araç görünümü için etkin model turu yok.")
         if index not in self._turn["tools"]:
+            group: ToolGroup = self._current_tool_group()
             view: ToolView = {
-                "region": self._new_region([("⏺\n", ("bullet_streaming",))]), "name": name, "preview": "",
-                "status": "streaming", "call_id": "", "head": [], "tail": [], "line_count": 0,
-                "result": "", "seconds": 0.0, "started_at": 0.0,
+                "region": "", "name": name, "preview": "", "status": "streaming", "call_id": "",
+                "head": [], "tail": [], "line_count": 0, "result": "", "seconds": 0.0, "started_at": 0.0,
+                "group_id": group["id"], "fold_id": self._new_fold("t", False),
+                "more_id": self._new_fold("m", False),
             }
+            view["region"] = self._new_region(
+                tool_parts(view, time.monotonic(), SPINNER_FRAMES[self._spinner_index]))
+            group["views"].append(view)
+            self._refresh_group_head(group)
             self._turn["tools"][index] = view
         return self._turn["tools"][index]
 
@@ -1510,10 +2249,11 @@ class OmniUI(ctk.CTk):
             self._activity_verb = event["text"]
             self._new_region([(event["text"] + "\n", ("notice_info",))])
         elif event["kind"] == "user_input_required":
-            self._show_input(event["request_id"], event["title"], event["fields"])
+            self._on_input_required(event["request_id"], event["title"], event["fields"])
         elif event["kind"] == "run_started":
             self.model_label.configure(text=self._model_text(event["backend"]))
         elif event["kind"] == "turn_started":
+            self._drop_unstarted_tool_views()
             self._turn = {"number": event["turn"], "text_region": None, "reasoning_region": None, "tools": {}}
             self._turn_streamed_chars = 0
             self._activity_verb = "Düşünüyor"
@@ -1539,10 +2279,7 @@ class OmniUI(ctk.CTk):
             for region_name in (self._turn["text_region"], self._turn["reasoning_region"]):
                 if region_name is not None:
                     self._delete_region(region_name)
-            for index, view in list(self._turn["tools"].items()):
-                if view["status"] == "streaming":
-                    self._delete_region(view["region"])
-                    del self._turn["tools"][index]
+            self._drop_unstarted_tool_views()
             self._turn["text_region"] = None
             self._turn["reasoning_region"] = None
             self._new_region([(f"↻ akış yeniden deneniyor: {event['reason']}\n", ("notice_warning",))])
@@ -1563,6 +2300,8 @@ class OmniUI(ctk.CTk):
             view.update({"status": "running", "call_id": event["call_id"], "name": event["name"],
                          "preview": event["preview"] or view["preview"], "started_at": time.monotonic()})
             self._tools_by_call[event["call_id"]] = view
+            # Çalışan araç canlı çıktısıyla açık görünür; bitince kendiliğinden kapanır.
+            self._set_fold("t", view["fold_id"], True)
             self._activity_verb = "Komut çalıştırıyor" if event["name"] == "execute_shell" else f"{tool_label(event['name'])} çalışıyor"
             self._mark_dirty(view)
         elif event["kind"] == "tool_output" and event["call_id"] in self._tools_by_call:
@@ -1576,6 +2315,9 @@ class OmniUI(ctk.CTk):
         elif event["kind"] == "tool_finished" and event["call_id"] in self._tools_by_call:
             view = self._tools_by_call[event["call_id"]]
             view.update({"status": "ok" if event["ok"] else "error", "result": event["text"], "seconds": event["seconds"]})
+            if ("t", view["fold_id"]) not in self._manual_folds:
+                self._set_fold("t", view["fold_id"], False)
+            self._refresh_group_head(self._tool_groups[view["group_id"]])
             self._mark_dirty(view)
             if all(v["status"] in ("ok", "error") for v in self._tools_by_call.values()):
                 self._activity_verb = "Düşünüyor"
@@ -1584,9 +2326,14 @@ class OmniUI(ctk.CTk):
         elif event["kind"] == "backend_changed":
             self.model_label.configure(text=self._model_text(event["backend"]))
             self._new_region([(f"↻ {event['backend']} modeline geçildi ({event['reason']})\n", ("notice_info",))])
+        elif event["kind"] == "provider_fallback":
+            # İstek içeriği (varsa ekran görüntüleriyle) izinli yedek sağlayıcıya gidiyor: kalıcı uyarı.
+            self.model_label.configure(text=self._model_text(event["to_backend"]))
+            self._new_region([(f"⚠ {provider_fallback_text(event)}\n", ("notice_warning",))])
         elif event["kind"] == "notice":
             self._new_region([(f"{'⚠' if event['level'] != 'info' else 'ℹ'} {event['text']}\n", (f"notice_{event['level']}",))])
         elif event["kind"] == "run_finished":
+            self._close_tool_group()
             self._render_summary(event["success"], event["reason"], event["metrics"])
             status: str = "✓" if event["success"] else "■" if event["reason"] == "durduruldu" else "✗"
             metrics = event["metrics"]
@@ -1608,7 +2355,7 @@ class OmniUI(ctk.CTk):
                                ("notice_warning",))])
             return
         viewport = self._text.winfo_width()
-        card_width = max(320, min(620, (viewport if viewport > 100 else 700) - 74))
+        card_width = max(320, min(620, (viewport if viewport > 100 else 700) - 40))
         card = ctk.CTkFrame(
             self._text, width=card_width, fg_color=SURFACE, border_width=1,
             border_color=BORDER, corner_radius=12,
@@ -1635,7 +2382,8 @@ class OmniUI(ctk.CTk):
                     row=row, column=0, padx=14, pady=(10, 4), sticky="w",
                 )
                 row += 1
-            except (OSError, ValueError, Image.DecompressionBombError):
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                # PIL, bozuk PNG'de (PngImagePlugin) OSError değil SyntaxError yükseltir.
                 ctk.CTkLabel(
                     card, text="Görsel önizlemesi açılamadı", text_color=WARNING,
                     font=self._ui_font(11, "normal"), anchor="w",
@@ -1662,96 +2410,85 @@ class OmniUI(ctk.CTk):
             command=lambda: webbrowser.open(path.as_uri()),
         ).grid(row=0, column=2, sticky="e")
         self._artifact_widgets.append(card)
-        self._text.insert("end-1c", f"\n▣ {title} · {path.name}\n", ("summary_meta",))
-        self._text.window_create("end-1c", window=card, padx=22, pady=4)
+        self._text.insert("end-1c", f"\n▣ {title} · {path.name}\n", ("sum_meta",))
+        self._text.window_create("end-1c", window=card, padx=0, pady=4)
         self._text.insert("end-1c", "\n", ("gap",))
 
     def _render_tool(self, view: ToolView) -> None:
-        bullet_tag: str = {"streaming": "bullet_streaming", "running": "bullet_running",
-                           "ok": "bullet_ok", "error": "bullet_error"}[view["status"]]
-        parts: List[Tuple[str, Tuple[str, ...]]] = [("⏺ ", (bullet_tag,)), (tool_label(view["name"]), ("tool_name",))]
-        is_command: bool = view["name"] in ("execute_shell", "execute_js")
-        if not is_command and view["preview"]:
-            parts.append((f"({clip_line(view['preview'].splitlines()[0])})", ("tool_args",)))
-        if view["status"] in ("ok", "error"):
-            parts.append((f" · {view['seconds']:.1f}sn", ("meta",)))
-        parts.append(("\n", ()))
-        if is_command and view["preview"]:
-            command_lines: List[str] = view["preview"].splitlines()
-            shown: List[str] = command_lines[:COMMAND_LINES] + (["…"] if len(command_lines) > COMMAND_LINES else [])
-            for index, command_line in enumerate(shown):
-                prompt: str = ("$ " if view["name"] == "execute_shell" else "› ") if index == 0 else "  "
-                parts.append((prompt, ("command_prompt",)))
-                parts.append((clip_line(command_line) + "\n", ("command",)))
-        if view["status"] == "running":
-            if view["tail"]:
-                hidden: int = view["line_count"] - len(view["tail"])
-                if hidden > 0:
-                    parts.append(("⎿  ", ("gutter",)))
-                    parts.append((f"… {hidden} satır daha\n", ("meta",)))
-                for position, line in enumerate(view["tail"]):
-                    parts.append(("⎿  ", ("gutter",) if position == 0 and hidden <= 0 else ("gutter_hidden",)))
-                    parts.append((clip_line(line) + "\n", ("output",)))
-            else:
-                elapsed: float = time.monotonic() - view["started_at"]
-                parts.append(("⎿  ", ("gutter",)))
-                parts.append((f"çalışıyor… {elapsed:.1f}sn\n", ("meta",)))
-        elif view["status"] in ("ok", "error"):
-            summary: List[str] = summarize_result(view["name"], view["result"], view["head"], view["line_count"], view["status"] == "ok")
-            for position, line in enumerate(summary):
-                parts.append(("⎿  ", ("gutter",) if position == 0 else ("gutter_hidden",)))
-                parts.append((line + "\n", ("output" if view["status"] == "ok" else "output_error",)))
-        self._replace_region(view["region"], parts)
+        """Araç bloğunu (satır + açılır ayrıntı) yeniden çizer; katlama durumu etiketlerde durduğu için korunur."""
+        self._replace_region(
+            view["region"], tool_parts(view, time.monotonic(), SPINNER_FRAMES[self._spinner_index]))
 
     def _render_welcome(self) -> None:
-        self._empty_state.place(relx=0.5, rely=0.5, anchor="center")
+        self._empty_state.place(relx=0.5, rely=0.45, anchor="center")
 
     def _render_goal(self, goal: str) -> None:
+        """
+        Kullanıcı mesajını sağa yaslı yuvarlak kabarcık olarak gösterir. Metnin kendisi gizli
+        (elide) kalır: kopyalama ve kalıcı kayıt ondan yapılır, kabarcık penceresi yüklemede
+        bu metinden yeniden kurulur.
+        """
+        self._new_region([("\n", ("gap_lg",))])
+        region: str = self._new_region([(goal, ("user_msg",)), ("\n", ("user_line",))])
+        bounds: Optional[Tuple[str, str]] = self._region_bounds(region)
+        if bounds is None:
+            raise RuntimeError("Kullanıcı mesajı bölgesi oluşturulamadı.")
+        self._embed_bubble(bounds[0], goal)
         self._new_region([("\n", ("gap",))])
-        self._new_region([("› ", ("goal_prompt",)), (goal + "\n", ("goal",))])
-        self._new_region([("\n", ("gap",))])
+        # Gömülü kabarcığın yüksekliği yerleşimden sonra belli olur; sona kaydırma bu yüzden ertelenir.
+        self.after_idle(self._scroll_to_end)
 
     def _render_summary(self, success: bool, reason: str, metrics: EpisodeMetrics) -> None:
-        if success:
-            head: Tuple[str, Tuple[str, ...]] = ("✓ Tamamlandı", ("summary_ok",))
-        elif reason == "durduruldu":
-            head = ("■ Durduruldu", ("summary_error",))
-        else:
-            head = (f"✗ Tamamlanamadı: {reason}", ("summary_error",))
-        parts: List[Tuple[str, Tuple[str, ...]]] = [("\n", ("gap",)), (head[0] + "\n", head[1])]
-        parts.extend((f"  {line}\n", ("summary_meta",)) for line in format_run_stats(metrics))
-        self._new_region(parts)
+        """Görev bitişini tek satırlık sessiz özet olarak ekler; ayrıntı satırları tıklanınca açılır."""
+        self._new_region(summary_parts(self._new_fold("s", False), success, reason, metrics))
 
     def _typewriter_step(self) -> bool:
-        """Bekleyen akış metnini kare başına birkaç karakter ekleyerek gösterir (daktilo efekti)."""
+        """Bekleyen model metnini geciktirmeden, Tk'yi kilitlemeyecek parçalarda gösterir."""
         changed: bool = False
         for region in list(self._pending_text):
             pending: str = self._pending_text[region]
             if not pending:
                 continue
-            count: int = max(TYPEWRITER_MIN_CHARS, math.ceil(len(pending) / TYPEWRITER_DRAIN_FRAMES))
-            self._append_streaming(region, pending[:count], self._region_text_tag[region])
+            count: int = min(len(pending), STREAM_CHARS_PER_FRAME)
+            # Bekleyen metin ekleme ÖNCESİ ilerletilir: ekleme patlarsa aynı parça sonsuza dek
+            # tekrar edilmez (asistan metni _finish_streaming'de _raw_text'ten yeniden çizilir).
             self._pending_text[region] = pending[count:]
+            self._append_streaming(region, pending[:count], self._region_text_tag[region])
             changed = True
             if not self._pending_text[region] and not self._live_regions.get(region):
                 self._finish_streaming(region)
         return changed
 
     def _set_activity(self, glyph: str, verb: str, meta: str, shine: int) -> None:
-        """Durum satırını kurar: spinner glifi, parıltılı fiil (3 karakterlik açık pencere) ve ölçümler."""
+        """
+        Akış durum satırını kurar: dönen glif (vurgu rengi), ölçümler ve parıltılı fiil (3 karakterlik
+        açık pencere), örn. '✻  6dk 10sn · ~420 token · Düşünüyor…'.
+        """
         self._activity.configure(state="normal")
         self._activity.delete("1.0", "end")
-        self._activity.insert("end", glyph + " ", ("glyph",))
+        self._activity.insert("end", glyph + "  ", ("glyph",))
+        self._activity.insert("end", meta + " · ", ("meta",))
         for position, char in enumerate(verb + "…"):
             self._activity.insert("end", char, ("verb", "shine") if shine - 3 < position <= shine else ("verb",))
-        self._activity.insert("end", "  " + meta, ("meta",))
         self._activity.configure(state="disabled")
 
     def _set_activity_idle(self) -> None:
+        """Görev yokken durum satırı boşalır (görev bitince satır kalkar; özet transkripte iner)."""
         self._activity.configure(state="normal")
         self._activity.delete("1.0", "end")
-        self._activity.insert("end", "✻ hazır", ("meta",))
         self._activity.configure(state="disabled")
+
+    def _spin_tool_glyphs(self) -> None:
+        """Çalışan araç satırlarındaki dönen glifi yerinde günceller (satırı yeniden çizmeden, kaydı kirletmeden)."""
+        ranges: Tuple[object, ...] = self._text.tag_ranges("tool_spin")
+        if not ranges:
+            return
+        glyph: str = SPINNER_FRAMES[self._spinner_index]
+        with self._writable_transcript():
+            for start in [str(item) for item in ranges[0::2]]:
+                tags: Tuple[str, ...] = tuple(tag for tag in self._text.tag_names(start) if tag != "sel")
+                self._text.delete(start, f"{start} + 1 chars")
+                self._text.insert(start, glyph, tags)
 
     def _set_task_status(self, phase: str, seconds: float = 0.0) -> None:
         """Üst sağdaki kısa görev durumunu günceller."""
@@ -1764,6 +2501,7 @@ class OmniUI(ctk.CTk):
             "done": (f"✓ {elapsed} sn", SUCCESS),
             "failed": (f"✕ {elapsed} sn", ERROR),
             "stopped": ("■ Durduruldu", TEXT_FAINT),
+            "keys": ("⏳ Anahtarlar okunuyor", WARNING),
         }
         label, color = labels[phase]
         self.task_status_label.configure(text=label, text_color=color)
@@ -1787,8 +2525,12 @@ class OmniUI(ctk.CTk):
             self._menu_status.hide()
 
     def _toggle_visibility(self) -> None:
-        """Genel kısayol isteğini yalnız Tk thread'inde uygular."""
-        target = not self._visibility_hidden
+        """
+        Genel kısayol isteğini yalnız Tk thread'inde, işletim sisteminin GERÇEK durumuna göre uygular:
+        Dock/⌘Tab ile açılan ya da simge durumuna küçültülen pencere için bayrak eskimiş olsa da ilk
+        kısayol boşa gitmez.
+        """
+        target: bool = not (application_is_hidden(self) or self.state() == "iconic")
         try:
             set_application_hidden(target, self)
         except Exception as error:
@@ -1808,95 +2550,120 @@ class OmniUI(ctk.CTk):
     def _animate(self, now: float) -> None:
         if now - self._last_menu_check >= 0.1:
             self._last_menu_check = now
+            # Bayrak yalnız menü göstergesi içindir ve eskiyebilir (Dock ile açma, ⌘H): gerçeği okur.
+            self._visibility_hidden = application_is_hidden(self)
             self._sync_menu_status()
+            if self._deferred_inputs and not self._visibility_hidden and not self._closing:
+                self._show_deferred_inputs()
         running: bool = self._agent_future is not None and not self._agent_future.done()
+        if running:
+            self._pulse_running_dot(now)
         if running and now - self._last_spinner >= SPINNER_INTERVAL:
             self._last_spinner = now
             self._spinner_index = (self._spinner_index + 1) % len(SPINNER_FRAMES)
             if self._task_status == "running":
                 self._set_task_status("running", now - self._run_started_at)
+            self._spin_tool_glyphs()
         if running and now - self._last_shimmer >= SHIMMER_INTERVAL:
             self._last_shimmer = now
             self._shine_index = (self._shine_index + 1) % (len(self._activity_verb) + 8)
+            # Token sayısı: biten turların gerçek kullanımı + akan metnin karakter tahmini (~ ile belirtilir).
             tokens: int = self._completed_tokens + self._turn_streamed_chars // 4
-            meta: str = f"({now - self._run_started_at:.0f}sn · ↓ {compact_count(tokens)} token · esc ile durdur)"
+            meta: str = activity_meta(now - self._run_started_at, tokens, self._turn_streamed_chars > 0)
             self._set_activity(SPINNER_FRAMES[self._spinner_index], self._activity_verb, meta, self._shine_index)
         if (running or any(self._pending_text.values())) and now - self._last_blink >= BLINK_INTERVAL:
             self._last_blink = now
             self._blink_on = not self._blink_on
-            self._text.tag_configure("bullet_running", foreground=ACCENT if self._blink_on else ACCENT_DIM)
-            self._text.tag_configure("bullet_streaming", foreground=TEXT_DIM if self._blink_on else TEXT_FAINT)
             self._text.tag_configure("cursor", foreground=ACCENT if self._blink_on else BG)
 
     def _tick(self) -> None:
-        """~60 fps kare döngüsü: olayları işle, daktiloyu ilerlet, kirli blokları çiz, animasyonları oynat."""
+        """
+        ~60 fps kare döngüsü sarmalayıcısı: kare istisna verse de sonraki kare kurulur (aksi halde
+        arayüz kalıcı donar). İstisna yutulmaz: finally sonrası Tk'ye yükselir ve
+        report_callback_exception günlüğe yazar. Kapanırken yeniden kurulmaz.
+        """
+        next_delay: int = ERROR_FRAME_MS
+        try:
+            next_delay = self._run_frame()
+        finally:
+            if not self._closing:
+                self.after(next_delay, self._tick)
+
+    def _run_frame(self) -> int:
+        """Tek kare: olayları işle, daktiloyu ilerlet, kirli blokları çiz, animasyonları oynat; sonraki gecikmeyi (ms) döndürür."""
         while True:
             try:
                 self._visibility_requests.get_nowait()
             except Empty:
                 break
             self._toggle_visibility()
+        self._drain_tk_calls()
         now: float = time.monotonic()
         running: bool = self._agent_future is not None and not self._agent_future.done()
         refresh_due: bool = (
             running and now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL
-            and any(view["status"] == "running" and not view["tail"] for view in self._tools_by_call.values())
+            and any(view["status"] == "running" for view in self._tools_by_call.values())
         )
-        if (
+        idle: bool = (
             self._inbox.empty() and self._voice_queue.empty()
-            and not any(self._pending_text.values()) and not self._dirty_tools
-            and not refresh_due
-        ):
-            self._animate(now)
-            self.after(RUNNING_IDLE_FRAME_MS if running else IDLE_FRAME_MS, self._tick)
-            return
-        at_bottom: bool = self._text.yview()[1] >= 0.995
-        self._text.configure(state="normal")
-        processed: int = 0
-        while processed < MAX_EVENTS_PER_FRAME:
-            try:
-                item: UiItem = self._inbox.get_nowait()
-            except Empty:
-                break
-            processed += 1
-            if item["event"] is not None:
-                self._handle_event(item["event"])
-            if item["done"]:
-                self._on_run_done(item["error"], item["report"])
-        # Ses callback'leri Tk thread'inde doğrudan çalışmaz; aynı kare döngüsünde
-        #Queue'dan alınır. Böylece PyObjC callback'i UI'yi yarıda bırakamaz.
-        for _ in range(20):
-            try:
-                voice_kind, voice_value = self._voice_queue.get_nowait()
-            except Empty:
-                break
-            if voice_kind == "text":
-                self._insert_voice_text(voice_value)
-            elif voice_kind == "partial":
-                self._insert_voice_partial(voice_value)
-            else:
-                self._set_voice_state(voice_kind, voice_value)
-            processed += 1
-        changed: bool = self._typewriter_step() or processed > 0
-        if running and now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL:
-            self._last_running_refresh = now
-            for view in self._tools_by_call.values():
-                if view["status"] == "running" and not view["tail"]:
-                    self._mark_dirty(view)
-        for view in self._dirty_tools.values():
-            self._render_tool(view)
-            changed = True
-        self._dirty_tools = {}
-        self._text.configure(state="disabled")
-        if changed and at_bottom:
-            self._text.see("end")
-        if changed:
-            self._save_current_chat()
+            and not any(self._pending_text.values()) and not self._dirty_tools and not refresh_due
+        )
+        if not idle:
+            self._process_frame(now, running)
         self._animate(now)
-        delay: int = FRAME_MS if any(self._pending_text.values()) else (
+        self._autosave_chat(now)
+        return FRAME_MS if any(self._pending_text.values()) else (
             RUNNING_IDLE_FRAME_MS if running else IDLE_FRAME_MS
         )
-        self.after(delay, self._tick)
+
+    def _process_frame(self, now: float, running: bool) -> None:
+        """Kuyruktaki olayları işler, daktiloyu ilerletir, kirli araç bloklarını çizer."""
+        stick: bool = self._stick_to_end
+        changed: bool = False
+        refreshed: bool = False
+        with self._writable_transcript():
+            processed: int = 0
+            while processed < MAX_EVENTS_PER_FRAME:
+                try:
+                    item: UiItem = self._inbox.get_nowait()
+                except Empty:
+                    break
+                processed += 1
+                if item["event"] is not None:
+                    self._handle_event(item["event"])
+                if item["done"]:
+                    self._on_run_done(item["error"], item["report"])
+            # Ses callback'leri Tk thread'inde doğrudan çalışmaz; aynı kare döngüsünde
+            # Queue'dan alınır. Böylece PyObjC callback'i UI'yi yarıda bırakamaz.
+            for _ in range(20):
+                try:
+                    voice_kind, voice_value = self._voice_queue.get_nowait()
+                except Empty:
+                    break
+                if voice_kind == "text":
+                    self._insert_voice_text(voice_value)
+                elif voice_kind == "partial":
+                    self._insert_voice_partial(voice_value)
+                else:
+                    self._set_voice_state(voice_kind, voice_value)
+                processed += 1
+            changed = self._typewriter_step() or processed > 0
+            if running and now - self._last_running_refresh >= RUNNING_REFRESH_INTERVAL:
+                # Çalışan araç satırlarının süresi canlı kalır; bu yenileme kaydı kirletmez.
+                self._last_running_refresh = now
+                for view in self._tools_by_call.values():
+                    if view["status"] == "running" and view["region"] not in self._dirty_tools:
+                        self._render_tool(view)
+                        refreshed = True
+            while self._dirty_tools:
+                _region, view = self._dirty_tools.popitem()  # önce çıkar: zehirli görünüm tekrar denenmez
+                self._render_tool(view)
+                changed = True
+        # Bölge silinip yeniden eklenince Tk görünümü kayabilir: yenileme de sona dönüşü gerektirir.
+        if (changed or refreshed) and stick:
+            self._scroll_to_end()
+        if changed and self._chat_record is not None:
+            self._chat_dirty = True
 
     # --- Ajan tetikleme ---
 
@@ -1905,6 +2672,17 @@ class OmniUI(ctk.CTk):
 
     def _on_primary_button(self) -> None:
         if self._agent_future is not None and not self._agent_future.done():
+            command = self.entry.get().strip()
+            if self._active_run_mode == "continuous" and (
+                command.startswith("/btw ") or command == "/approve"
+            ):
+                self._control_messages.put(command)
+                self.entry.delete(0, "end")
+                self._text.configure(state="normal")
+                self._new_region([(f"Siz: {command}\n", ("notice_info",))])
+                self._text.configure(state="disabled")
+                self._text.see("end")
+                return
             self._request_stop()
             return
         self._send_goal()
@@ -1923,7 +2701,7 @@ class OmniUI(ctk.CTk):
 
     def _copy_transcript(self) -> None:
         """Transkriptte görünen sohbeti tek dokunuşla panoya kopyalar."""
-        transcript: str = self._text.get("1.0", "end-1c")
+        transcript: str = plain_transcript(self._text.get("1.0", "end-1c"))
         if not transcript.strip():
             return
         self.clipboard_clear()
@@ -1988,9 +2766,9 @@ class OmniUI(ctk.CTk):
             self._restore_voice_draft()
         if state in ("error", "recording_timeout"):
             text: str = message or "Sesli giriş tamamlanamadı."
-            self._text.configure(state="normal")
-            self._new_region([(f"🎙 {text}\n", ("notice_warning",))])
-            self._text.configure(state="disabled")
+            # Kare içinde Text'i açıp kapamak aynı karedeki sonraki eklemeleri düşürürdü;
+            # bildirim olay kuyruğundan gelir ve sonraki karede eklenir.
+            self._post({"kind": "notice", "level": "warning", "text": f"🎙 {text}"})
             self.entry.focus_set()
 
     def _insert_voice_partial(self, text: str) -> None:
@@ -2021,49 +2799,54 @@ class OmniUI(ctk.CTk):
             self._stop_event.set()
             self._activity_verb = "Durduruluyor"
             self._set_task_status("stopping")
-            for window in list(self._input_windows.values()):
-                window.destroy()
-            self._input_windows.clear()
+            self._close_input_windows()
 
     def _send_goal(self) -> None:
         """Giriş alanındaki hedefi transkripte ekler ve ajanı kalıcı event loop'ta başlatır."""
         if self._agent_future is not None:
             return
+        if self._startup_pending:
+            # Keychain okuması sürerken başlayan görev anahtarsız istemcilerle çalışırdı.
+            self._show_startup_hint()
+            return
         goal: str = self.entry.get().strip()
         if not goal:
             return
+        inventory_command: bool = goal.casefold() in INVENTORY_COMMANDS
         if not self._ensure_chat(goal):
             return
+        if not inventory_command and self._set_chat_outcome(None):
+            self._save_catalog()  # yeni görev başlıyor: önceki görevin sonucu geçersizdir
         if self._voice.active:
             self._voice.cancel()
             # Eski oturumun idle callback'i yeni görev composer'ına yazmasın.
             self._voice_base_text = ""
             self._voice_partial_text = ""
-        if goal.casefold() in {"/tools", "/yetenekler", "/skills"}:
+        if inventory_command:
             self.entry.delete(0, "end")
-            self._text.configure(state="normal")
-            self._render_goal(goal)
-            try:
-                self._integrations.refresh_local()
-                inventory = format_capability_inventory(
-                    self._integrations.entries, show_skills=goal.casefold() == "/skills"
-                )
-            except Exception as error:
-                inventory = f"Yetenek kataloğu okunamadı: {type(error).__name__}: {error}"
-            self._new_region([(inventory + "\n", ("notice_info",))])
-            self._text.configure(state="disabled")
-            self._text.see("end")
-            self._save_current_chat(force=True)
+            with self._writable_transcript():
+                self._render_goal(goal)
+                try:
+                    self._integrations.refresh_local()
+                    inventory = format_capability_inventory(
+                        self._integrations.entries, show_skills=goal.casefold() == "/skills"
+                    )
+                except Exception as error:
+                    inventory = f"Yetenek kataloğu okunamadı: {type(error).__name__}: {error}"
+                self._new_region([(inventory + "\n", ("notice_info",))])
+            self._stick_to_end = True
+            self._scroll_to_end()
+            self._request_chat_save()
             return
         self._active_goal = goal
         self.entry.delete(0, "end")
-        self._text.configure(state="normal")
-        self._render_goal(goal)
-        self._text.configure(state="disabled")
-        self._text.see("end")
-        self._save_current_chat(force=True)
+        with self._writable_transcript():
+            self._render_goal(goal)
+        self._stick_to_end = True
+        self._scroll_to_end()
         self._turn = None
         self._tools_by_call = {}
+        self._tool_group = None
         self._completed_tokens = 0
         self._turn_streamed_chars = 0
         self._run_started_at = time.monotonic()
@@ -2077,6 +2860,12 @@ class OmniUI(ctk.CTk):
         self.primary_btn.configure(text="■", fg_color=SURFACE_RAISED, hover_color=BORDER, text_color=TEXT)
         selected: str = self.backend_menu.get()
         selected_mode: str = RUN_MODE_KEYS.get(self.mode_menu.get(), "normal")
+        if DEFAULT_BACKEND not in self._clients:
+            # Varsayılan profil (yerel Ollama) uygulama açılırken hazır değildi: görev başında yeniden yoklanır,
+            # Ollama sonradan açıldıysa uygulamayı yeniden başlatmak gerekmez (Telegram köprüsü de görev başında yeniler).
+            self._rebuild_clients()
+        self._active_run_mode = selected_mode
+        self._control_messages = Queue()
         self._stop_event = threading.Event()
         options: RunOptions = {
             "requested_backend": None if selected == "Otomatik" else selected,
@@ -2087,10 +2876,26 @@ class OmniUI(ctk.CTk):
             "answer": self._request_input,
             "run_mode": selected_mode,
         }
+        if selected_mode == "continuous":
+            options["unattended"] = True
+            options["pop_control_messages"] = self._drain_control_messages
         self._agent_future = asyncio.run_coroutine_threadsafe(
             self._run_exclusive(goal, options), self._loop,
         )
         self._agent_future.add_done_callback(self._on_agent_future_done)
+        # Ajan başladıktan SONRA: anlık görüntü ve satır durumu ilk modele gidiş-dönüşle çakışır;
+        # diske yazma arka plandadır, Tk beklemez.
+        self._refresh_chat_list()
+        self._request_chat_save()
+
+    def _drain_control_messages(self) -> List[str]:
+        """Çalışan ajan için yeni kullanıcı komutlarını sırayla ve tek seferde alır."""
+        commands: List[str] = []
+        while True:
+            try:
+                commands.append(self._control_messages.get_nowait())
+            except Empty:
+                return commands
 
     async def _run_exclusive(self, goal: str, options: RunOptions) -> RunReport:
         """Telegram ile aynı makineyi eşzamanlı kullanma çakışmasını önler."""
@@ -2098,7 +2903,10 @@ class OmniUI(ctk.CTk):
             return await run_agent_with_callback(goal, self._post, options, self._clients)
 
     async def _request_input(self, title: str, fields: Dict[str, object]) -> Dict[str, object]:
-        """Model çağırmadan Tk arayüzünden cevap bekler."""
+        """
+        Model çağırmadan Tk arayüzünden cevap bekler. İstek yanıt, zaman aşımı ya da durdurmayla biterse
+        (event loop thread'i) penceresini kapatma işi Tk thread'ine bırakılır: Tk'ye burada dokunulmaz.
+        """
         request_id = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self._input_futures[request_id] = future
@@ -2107,10 +2915,68 @@ class OmniUI(ctk.CTk):
             return await future
         finally:
             self._input_futures.pop(request_id, None)
+            self._call_in_tk(lambda: self._dismiss_input(request_id))
 
-    def _show_input(self, request_id: str, title: str, fields: Dict[str, object]) -> None:
-        """Alanları Tk thread'inde gösterir; cevap yalnız ilgili Future'a teslim edilir."""
-        if self._stop_event.is_set():
+    def _close_input_windows(self) -> None:
+        """Görev durdu ya da bitti: açık yanıt pencereleri kapanır, ertelenmiş istekler düşer."""
+        for window in list(self._input_windows.values()):
+            window.destroy()
+        self._input_windows.clear()
+        self._deferred_inputs.clear()
+
+    def _dismiss_input(self, request_id: str) -> None:
+        """
+        Tk thread'i: yanıt beklenmeden biten (süre doldu, görev durdu) isteğin penceresini kapatır; henüz
+        açılmamış (ertelenmiş) istek de düşer. Kullanıcı istemsiz kalan isteği transkriptte görür.
+        """
+        window: Optional[ctk.CTkToplevel] = self._input_windows.pop(request_id, None)
+        deferred: Optional[DeferredInput] = self._deferred_inputs.pop(request_id, None)
+        if window is None and deferred is None:
+            return  # kullanıcı zaten yanıtladı ya da _request_stop/_on_run_done kapattı
+        if window is not None:
+            window.destroy()
+        self._post({"kind": "notice", "level": "warning",
+                    "text": "Yanıt penceresi kapandı: süre doldu veya görev durduruldu; işlem yapılmadı."})
+
+    def _on_input_required(self, request_id: str, title: str, fields: Dict[str, object]) -> None:
+        """
+        Yanıt bekleyen istek görünmeyen yerde kalmasın (onay zaman aşımı 15 dk). Uygulama gizliyse (⌘⇧X)
+        içerik göstermeyen bildirim ve Dock zıplaması verilir; macOS'ta gizli uygulamada yeni pencere açmak
+        tüm uygulamayı görünür yaptığı için pencere uygulama yeniden görünene dek ertelenir. Görünür ama
+        arka plandaysa pencere açılır ve uygulama öne alınır.
+        """
+        action: str = input_alert_action(
+            application_is_hidden(self),
+            is_backgrounded(self.state(), self.focus_displayof() is not None, app_is_active()),
+        )
+        requested_at: datetime = datetime.now()
+        if action == ALERT_NOTIFY:
+            self._deferred_inputs[request_id] = {"title": title, "fields": fields, "requested_at": requested_at}
+            notify_input_required(subprocess.Popen)
+            request_user_attention()
+            return
+        if action == ALERT_RAISE:
+            # Önce öne alınır (unhide + deiconify + lift + activate): simge durumundaki ana pencerenin geçici
+            # (transient) yanıt penceresi Tk'de olay döngüsünü kilitler (Configure fırtınası).
+            set_application_hidden(False, self)
+        self._show_input(request_id, title, fields, requested_at)
+
+    def _show_deferred_inputs(self) -> None:
+        """
+        Uygulama yeniden görünür olunca ertelenmiş yanıt pencereleri açılır (süre isteğin anından sayılır);
+        ana pencere Dock'tan açılıp simge durumunda kalmış olabilir, bu yüzden önce öne alınır.
+        """
+        set_application_hidden(False, self)
+        for request_id, deferred in list(self._deferred_inputs.items()):
+            del self._deferred_inputs[request_id]
+            self._show_input(request_id, deferred["title"], deferred["fields"], deferred["requested_at"])
+
+    def _show_input(self, request_id: str, title: str, fields: Dict[str, object], requested_at: datetime) -> None:
+        """
+        Alanları Tk thread'inde gösterir; cevap yalnız ilgili Future'a teslim edilir. Görev durdurulmuşsa ya da
+        istek artık yaşamıyorsa (süresi dolmuş) pencere açılmaz.
+        """
+        if self._stop_event.is_set() or request_id not in self._input_futures:
             return
         window = ctk.CTkToplevel(self)
         self._input_windows[request_id] = window
@@ -2122,6 +2988,12 @@ class OmniUI(ctk.CTk):
         ctk.CTkLabel(panel, text=title, wraplength=590, justify="left").pack(anchor="w", pady=8)
         if fields.get("_help"):
             ctk.CTkLabel(panel, text=str(fields["_help"]), wraplength=590, justify="left").pack(anchor="w", pady=8)
+        timeout: object = fields.get(INPUT_TIMEOUT_FIELD)
+        if isinstance(timeout, (int, float)):
+            ctk.CTkLabel(
+                panel, text=format_input_deadline(float(timeout), requested_at), text_color=WARNING,
+                wraplength=590, justify="left",
+            ).pack(anchor="w", pady=(0, 8))
         if fields.get("_url"):
             url = str(fields["_url"])
             ctk.CTkButton(panel, text="Microsoft uygulama kaydını aç",
@@ -2177,14 +3049,14 @@ class OmniUI(ctk.CTk):
         self._history = trim_history(self._history + [exchange])
         self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
         self._agent_future = None
-        if self._clients_stale:
-            # Görev sürerken kaydedilen anahtarlar biter bitmez uygulanır.
-            self._rebuild_clients()
-        for window in list(self._input_windows.values()):
-            window.destroy()
-        self._input_windows.clear()
+        self._active_run_mode = "normal"
+        self._close_input_windows()
         if error:
             self._new_region([(f"⚠ Kritik hata: {error}\n", ("notice_error",))])
+        # Görev bitti: takılı/dönen araç satırları kapanır, son araç grubu başlığa katlanır.
+        self._drop_unstarted_tool_views()
+        self._settle_running_tool_views()
+        self._close_tool_group()
         self._end_live_regions()
         self.backend_menu.configure(state="normal")
         self.mode_menu.configure(state="normal")
@@ -2205,7 +3077,15 @@ class OmniUI(ctk.CTk):
             if not background:
                 self.entry.focus_set()
         self._sync_menu_status()
-        self._save_current_chat(force=True)
+        # Görevin sonucu dizine ve kayda yazılır (kenar çubuğu durum noktası); sohbet diske arka planda gider.
+        self._set_chat_outcome(OUTCOME_STOPPED if stopped else OUTCOME_DONE if success else OUTCOME_FAILED)
+        self._save_catalog()
+        self._refresh_chat_list()
+        self._request_chat_save()
+        if self._clients_stale:
+            # Görev sürerken kaydedilen anahtarlar biter bitmez uygulanır. Patlayabilecek işlem
+            # en sona alındı: arayüz durumu yukarıda zaten geri yüklendi, hata arayüzü kilitlemez.
+            self._rebuild_clients()
 
     def _save_catalog(self) -> bool:
         if not self._chat_catalog_writable:
@@ -2233,37 +3113,146 @@ class OmniUI(ctk.CTk):
             self._chat_record = fresh
             self._active_chat_id = self._chat_record["id"]
         now: str = datetime.now(timezone.utc).isoformat()
-        self._chat_index = [
-            {"id": self._chat_record["id"], "title": self._chat_record["title"], "updated_at": now},
-            *[chat for chat in self._chat_index if chat["id"] != self._chat_record["id"]],
-        ]
+        entry: ChatSummary = {**summary_of(self._chat_record), "updated_at": now}
+        self._chat_index = [entry, *[chat for chat in self._chat_index if chat["id"] != self._chat_record["id"]]]
         if not self._save_catalog():
             return False
         self._refresh_chat_list()
         return True
 
-    def _save_current_chat(self, force: bool = False) -> bool:
-        if self._chat_record is None:
-            return True
-        now: float = time.monotonic()
-        if not force and now - self._chat_last_save < 1.5:
-            return True
-        self._chat_last_save = now
-        self._chat_record["history"] = list(self._history)
-        self._chat_record["spans"] = spans_from_dump(self._text.dump("1.0", "end-1c", text=True, tag=True))
-        self._chat_record["updated_at"] = datetime.now(timezone.utc).isoformat()
-        try:
-            save_chat(self._chat_record)
-        except (OSError, ValueError) as error:
-            self._chat_store_problem = f"Sohbet kaydedilemedi: {error}"
-            self._chat_notice.configure(text=self._chat_store_problem)
-            logging.warning(self._chat_store_problem)
+    def _set_chat_outcome(self, outcome: Optional[str]) -> bool:
+        """
+        Etkin sohbetin son görev sonucunu bellekteki dizine ve kayda yazar (None siler); diske yazmaz. Sonuç
+        kenar çubuğundaki durum noktasını (son görev başarısızsa kırmızı) belirler; sonuç değiştiyse True döner.
+        """
+        if self._active_chat_id is None:
             return False
-        else:
-            if self._chat_store_problem.startswith("Sohbet kaydedilemedi"):
-                self._chat_store_problem = ""
-                self._chat_notice.configure(text="")
+        previous: Optional[str] = next(
+            (chat.get("last_outcome") for chat in self._chat_index if chat["id"] == self._active_chat_id), None)
+        self._chat_index = [
+            with_outcome(chat, outcome) if chat["id"] == self._active_chat_id else chat
+            for chat in self._chat_index
+        ]
+        if self._chat_record is not None:
+            if outcome is None:
+                self._chat_record.pop("last_outcome", None)
+            else:
+                self._chat_record["last_outcome"] = outcome
+        return previous != outcome
+
+    # --- Sohbet kaydı: anlık görüntü Tk'de, yazma arka plandaki sıralı yazıcıda ---
+
+    def _snapshot_chat(self) -> Optional[ChatRecord]:
+        """Tk thread'i: etkin sohbetin DEĞİŞMEZ anlık görüntüsünü çıkarır; Text.dump yalnız burada çalışır."""
+        if self._chat_record is None:
+            return None
+        started: float = time.perf_counter()
+        snapshot: ChatRecord = {
+            **self._chat_record,
+            "history": list(self._history),
+            "spans": spans_from_dump(self._text.dump("1.0", "end-1c", text=True, tag=True)),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._chat_snapshot_seconds = time.perf_counter() - started
+        return snapshot
+
+    def _submit_chat_write(self, snapshot: ChatRecord) -> "Future[None]":
+        """
+        Anlık görüntüyü tek thread'li yazıcıya sıralı verir (son durum kazanır). Kök dizin şimdi sabitlenir:
+        yazıcı thread'i sonradan değişen veri dizinini görmez.
+        """
+        self._chat_last_save = time.monotonic()
+        self._chat_dirty = False
+        future: "Future[None]" = self._chat_executor.submit(save_chat, snapshot, chats_dir())
+        self._chat_write = future
+        return future
+
+    def _request_chat_save(self) -> None:
+        """Sohbeti arka plan yazıcısına verir; diske yazma BEKLENMEZ, sonuç sonraki karede uygulanır."""
+        snapshot: Optional[ChatRecord] = self._snapshot_chat()
+        if snapshot is None:
+            return
+        self._watch_chat_write(self._submit_chat_write(snapshot))
+
+    def _watch_chat_write(self, future: "Future[None]") -> None:
+        """Yazma bitince sonucu (hata bildirimi ya da bildirimin temizlenmesi) Tk thread'ine taşır."""
+        future.add_done_callback(lambda done: self._call_in_tk(lambda: self._apply_chat_write_result(done)))
+
+    def _autosave_chat(self, now: float) -> None:
+        """
+        Değişen sohbeti arka plana verir: aralık en az CHAT_AUTOSAVE_INTERVAL, anlık görüntü pahalıysa daha
+        seyrektir (Text.dump Tk süresinin ~%5'ini aşmasın); önceki yazma sürerken beklenir, son değişiklik yine yazılır.
+        """
+        if not self._chat_dirty or self._chat_record is None:
+            return
+        interval: float = max(CHAT_AUTOSAVE_INTERVAL, CHAT_SNAPSHOT_DUTY * self._chat_snapshot_seconds)
+        if now - self._chat_last_save < interval:
+            return
+        if self._chat_write is not None and not self._chat_write.done():
+            return
+        self._request_chat_save()
+
+    def _apply_chat_write_result(self, done: "Future[None]") -> None:
+        """Tk thread'i: EN SON yazmanın sonucunu uygular; eski yazmaların sonucu yok sayılır."""
+        if done is not self._chat_write or done.cancelled():
+            return
+        error: Optional[BaseException] = done.exception()
+        if error is None:
+            self._clear_chat_store_problem()
+            return
+        self._chat_dirty = True  # sonraki karede yeniden denenir
+        if not isinstance(error, (OSError, ValueError)):
+            raise error  # beklenmeyen tür: report_callback_exception'a gider
+        self._report_chat_store_problem(error)
+
+    def _save_current_chat(self) -> bool:
+        """
+        Sohbeti yazıcıya verip bitmesini bekler (sohbet değiştirme, silme, yeniden adlandırma gibi disk durumuna
+        güvenen eylemlerden önce). JSON ve fsync yazıcı thread'indedir; Tk en çok CHAT_FLUSH_TIMEOUT_SECONDS
+        bekler. Başarısızlıkta uyarı gösterir ve False döner.
+        """
+        snapshot: Optional[ChatRecord] = self._snapshot_chat()
+        if snapshot is None:
             return True
+        future: "Future[None]" = self._submit_chat_write(snapshot)
+        try:
+            future.result(timeout=CHAT_FLUSH_TIMEOUT_SECONDS)
+        except TimeoutError:
+            # Yazma sonradan biterse sonucu yine uygulanır.
+            self._watch_chat_write(future)
+            self._chat_dirty = True
+            self._report_chat_store_problem(TimeoutError(f"yazma {CHAT_FLUSH_TIMEOUT_SECONDS:g} sn içinde bitmedi"))
+            return False
+        except (OSError, ValueError) as error:
+            self._chat_dirty = True
+            self._report_chat_store_problem(error)
+            return False
+        self._clear_chat_store_problem()
+        return True
+
+    def _report_chat_store_problem(self, error: BaseException) -> None:
+        self._chat_store_problem = f"Sohbet kaydedilemedi: {error}"
+        self._chat_notice.configure(text=self._chat_store_problem)
+        logging.warning("Sohbet kaydedilemedi", extra={"error_type": type(error).__name__})
+
+    def _clear_chat_store_problem(self) -> None:
+        if self._chat_store_problem.startswith("Sohbet kaydedilemedi"):
+            self._chat_store_problem = ""
+            self._chat_notice.configure(text="")
+
+    def _insert_spans(self, spans: List[TranscriptSpan]) -> None:
+        """
+        Kayıtlı parçaları TEK Tk çağrısında ekler (Text.insert 'metin etiketler metin etiketler…' biçimi):
+        parça başına Python↔Tcl geçişi ve değişiklik bildirimi olmaz. Bağlantı ve katlama etiketleri önce kurulur.
+        """
+        if not spans:
+            return
+        for tag in {tag for span in spans for tag in span["tags"]}:
+            self._prepare_tag(tag)
+        arguments: List[object] = []
+        for span in spans:
+            arguments.extend((span["text"], tuple(span["tags"])))
+        self._text.insert("end-1c", *arguments)
 
     def _open_chat(self, chat_id: str, save_current: bool = True) -> None:
         if self._agent_future is not None:
@@ -2271,41 +3260,48 @@ class OmniUI(ctk.CTk):
         if save_current and chat_id == self._active_chat_id:
             return
         if save_current:
-            if not self._save_current_chat(force=True):
+            if not self._save_current_chat():
                 return
         try:
             record: ChatRecord = load_chat(chat_id)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             self._chat_store_problem = f"Sohbet açılamadı: {error}"
             self._chat_notice.configure(text=self._chat_store_problem)
+            self._refresh_chat_list()  # silme akışlarında silinen satır listede kalmasın
             return
+        previous_active: Optional[str] = self._active_chat_id
         self._reset_chat_view(show_welcome=False)
         self._chat_record = record
         self._active_chat_id = chat_id
         self._history = list(record["history"])
-        self._text.configure(state="normal")
         legacy_welcome = bool(record["spans"]) and not record["history"] and all(
             set(span["tags"]) <= {"welcome_mark", "welcome_title", "welcome_dim", "welcome_example", "gap"}
             for span in record["spans"]
         )
-        if record["spans"] and not legacy_welcome:
-            self._empty_state.place_forget()
-            for span in record["spans"]:
-                for tag in span["tags"]:
-                    self._bind_link_tag(tag)
-                self._text.insert("end-1c", span["text"], tuple(span["tags"]))
-        else:
-            self._render_welcome()
-        self._text.configure(state="disabled")
+        with self._writable_transcript():
+            if record["spans"] and not legacy_welcome:
+                self._empty_state.place_forget()
+                # Kayıtlı katlama etiketlerinin kimlikleri bu oturumdakilerle çakışmasın diye yenilenir.
+                spans, next_id = remap_fold_tags(record["spans"], self._fold_seq + 1)
+                self._fold_seq = next_id - 1
+                self._insert_spans(spans)
+                self._restore_user_bubbles()
+            else:
+                self._render_welcome()
+        self._chat_dirty = False  # yüklenen içerik diskteki kayıtla aynıdır
+        self._stick_to_end = True
         self._text.see("end")
+        # Uzun sohbetin satır yükseklikleri yerleşimden sonra ölçülür; sona dönüş bu yüzden ertelenir.
+        self.after_idle(self._scroll_to_end)
         self.context_label.configure(text=f"bağlam: {len(self._history)} mesaj")
-        self._save_catalog()
+        if previous_active != chat_id:
+            self._save_catalog()  # etkin sohbet değişti; açılışta (aynı sohbet) gereksiz dizin yazımı olmaz
         self._refresh_chat_list()
 
     def _new_chat(self) -> None:
         if self._agent_future is not None:
             return
-        if not self._save_current_chat(force=True):
+        if not self._save_current_chat():
             return
         self._active_chat_id = None
         self._chat_record = None
@@ -2327,6 +3323,18 @@ class OmniUI(ctk.CTk):
             card.destroy()
         self._artifact_widgets = []
         self._artifact_images = []
+        for bubble in self._bubbles:
+            bubble["frame"].destroy()
+        self._bubbles = []
+        # Bağlantı ve katlama etiketleri (kimlikler oturumda artar) silinir: etiket tablosu şişmesin.
+        for tag in self._prepared_tags:
+            self._text.tag_delete(tag)
+        self._prepared_tags = set()
+        self._open_folds = set()
+        self._manual_folds = set()
+        self._tool_group = None
+        self._tool_groups = {}
+        self._stick_to_end = True
         self._pending_text = {}
         self._raw_text = {}
         self._history = []
@@ -2342,31 +3350,121 @@ class OmniUI(ctk.CTk):
             self._render_welcome()
         self._text.configure(state="disabled")
         self.stats_label.configure(text="")
+        if self._task_status in ("done", "failed", "stopped"):
+            # Önceki sohbetin son görev sonucu (✓/✕ süre) başka bir sohbete taşınmaz; sonuç satırdaki noktada durur.
+            self._set_task_status("idle")
 
     def _on_close(self) -> None:
-        """Pencere kapanırken ses/istemci kaynaklarını kapatıp event loop'u durdurur."""
-        self._save_current_chat(force=True)
+        """
+        Kırmızı düğme, ⌘Q, Dock > Çık ve oturum kapatmada çağrılır. Pencere önce gizlenir, sohbet son kez
+        yazıcıya verilir ve bağlantıları kapatma işi event loop thread'ine bırakılır; Tk thread'i en çok
+        CLOSE_GRACE_SECONDS bekler, işi bitmemişse bloklanmadan bitişi yoklar (_poll_close; eskiden 3 sn ajan +
+        8 sn bağlantı beklemesi Tk'yi kilitliyordu). Her koşulda pencere yok edilir: createcommand ile
+        kayıtlı çağrıda istisna mainloop'u sonlandırırdı, bu yüzden başlangıç adımı patlarsa hemen
+        _finish_close çalışır.
+        """
+        if self._destroyed or self._close_future is not None:
+            return  # kapanış zaten başladı (⌘Q + kırmızı düğme art arda)
+        self._closing = True  # kare döngüsü artık yeniden kurulmaz
+        self.withdraw()
+        started: bool = False
+        try:
+            self._begin_close()
+            started = True
+        finally:
+            if not started:
+                self._finish_close()
+
+    def _begin_close(self) -> None:
+        """Tk thread'inde hızlı adımlar: son anlık görüntü, kısayol/ses/rozet kapatma; ağır iş event loop'a verilir."""
+        snapshot: Optional[ChatRecord] = self._snapshot_chat()
+        final_write: Optional["Future[None]"] = None if snapshot is None else self._submit_chat_write(snapshot)
         if self._visibility_hotkey is not None:
             self._visibility_hotkey.close()
         self._voice.cancel()
         self._stop_event.set()
         set_dock_badge(None)
         self._menu_status.hide()
-        async def close_connections() -> None:
-            if self._agent_future is not None and not self._agent_future.done():
-                try:
-                    await asyncio.wait_for(asyncio.wrap_future(self._agent_future), timeout=3)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-            await self._integrations.close()
-            await close_model_clients(self._clients)
+        # Tk yazı tipi nesnelerinin sonlandırıcısı (Font.__del__) Tcl çağırır; çöp toplama event loop
+        # thread'inde çalışırsa o çağrı Tk thread'ini bekletir. Bekleyen çöp bu yüzden şimdi, Tk thread'inde toplanır.
+        gc.collect()
+        self._close_deadline = time.monotonic() + CLOSE_TIMEOUT_SECONDS
+        self._close_future = asyncio.run_coroutine_threadsafe(self._shutdown(final_write), self._loop)
+        # Kapatma çoğunlukla milisaniyeler sürer: kısa bir bekleme pencereyi hemen yok eder (gizli pencerede
+        # görünmez). Uzun sürerse (çalışan ajan, yavaş bağlantı) Tk bloklanmaz, _poll_close bitişi yoklar.
+        wait([self._close_future], timeout=CLOSE_GRACE_SECONDS)
+        self._poll_close()
+
+    async def _shutdown(self, final_write: Optional["Future[None]"]) -> None:
+        """
+        Event loop thread'i: sohbetin son yazımını ve çalışan ajanı kısa süre bekler, sonra tümleşik araçları ve
+        model bağlantılarını kapatır. Önceki adım patlasa da bağlantılar kapatılır; hata _poll_close'ta günlüğe düşer.
+        """
         try:
-            asyncio.run_coroutine_threadsafe(close_connections(), self._loop).result(timeout=8)
-        except Exception as error:
-            # Kapanış hiçbir durumda pencereyi kapatmayı engellemez.
-            logging.warning("Kapanışta bağlantılar kapatılamadı", extra={"error_type": type(error).__name__})
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self.destroy()
+            if final_write is not None:
+                await self._await_final_chat_write(final_write)
+            await self._stop_running_agent()
+        finally:
+            try:
+                await self._integrations.close()
+            finally:
+                await close_model_clients(self._clients)
+
+    async def _await_final_chat_write(self, final_write: "Future[None]") -> None:
+        """
+        Kapanışta sohbetin son yazımını en çok CLOSE_FLUSH_WAIT_SECONDS bekler. Yazma İPTAL EDİLMEZ: süre dolarsa
+        arka planda sürer (yazıcı thread'i yorumlayıcı çıkışında beklenir), yalnız uyarı yazılır.
+        """
+        wrapped: "asyncio.Future[None]" = asyncio.wrap_future(final_write)
+        await asyncio.wait({wrapped}, timeout=CLOSE_FLUSH_WAIT_SECONDS)
+        if not wrapped.done():
+            logging.warning("Kapanışta sohbetin son kaydı süre içinde bitmedi; yazma arka planda sürüyor",
+                            extra={"timeout_seconds": CLOSE_FLUSH_WAIT_SECONDS})
+        elif wrapped.cancelled():
+            logging.warning("Kapanışta sohbetin son kaydı iptal edilmiş")
+        elif wrapped.exception() is not None:
+            logging.warning("Kapanışta sohbet kaydedilemedi", extra={"error_type": type(wrapped.exception()).__name__})
+
+    async def _stop_running_agent(self) -> None:
+        """Durdurulması istenen ajanı en çok CLOSE_AGENT_WAIT_SECONDS bekler; durmadıysa iptal eder."""
+        agent: Optional["Future[RunReport]"] = self._agent_future
+        if agent is None or agent.done():
+            return
+        wrapped: "asyncio.Future[RunReport]" = asyncio.wrap_future(agent)
+        await asyncio.wait({wrapped}, timeout=CLOSE_AGENT_WAIT_SECONDS)
+        if wrapped.done():
+            if not wrapped.cancelled():
+                wrapped.exception()  # hata _on_agent_future_done'da işlenir; burada yalnız "okundu" diye işaretlenir
+            return
+        logging.warning("Kapanışta çalışan görev süre içinde durmadı; iptal ediliyor",
+                        extra={"timeout_seconds": CLOSE_AGENT_WAIT_SECONDS})
+        agent.cancel()
+
+    def _poll_close(self) -> None:
+        """Tk thread'i: kapatma işi bitince ya da süre dolunca pencereyi yok eder; beklerken Tk'yi bloklamaz."""
+        future: Optional["Future[None]"] = self._close_future
+        if future is None or not future.done():
+            if time.monotonic() < self._close_deadline:
+                self.after(CLOSE_POLL_MS, self._poll_close)
+                return
+            logging.warning("Kapanışta bağlantılar zamanında kapatılamadı",
+                            extra={"timeout_seconds": CLOSE_TIMEOUT_SECONDS})
+        elif not future.cancelled() and future.exception() is not None:
+            logging.warning("Kapanışta bağlantılar kapatılamadı",
+                            extra={"error_type": type(future.exception()).__name__})
+        self._finish_close()
+
+    def _finish_close(self) -> None:
+        """Yazıcıyı ve event loop'u durdurup pencereyi yok eder; ikinci çağrı zararsızdır."""
+        if self._destroyed:
+            return
+        self._destroyed = True
+        try:
+            # Bekleyen son sohbet yazımı İPTAL EDİLMEZ: işçi thread'i işini bitirir (yorumlayıcı çıkışında beklenir).
+            self._chat_executor.shutdown(wait=False, cancel_futures=False)
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        finally:
+            self.destroy()
 
 
 def main() -> None:
@@ -2382,16 +3480,12 @@ def main() -> None:
     if getattr(sys, "frozen", False) and Path.cwd() == Path("/"):
         # Finder'ın / çalışma dizini araçların çıktı yazmasını engeller.
         os.chdir(Path.home())
+    configure_ui_logging(data_root() / LOG_FILE_NAME)  # paketli uygulamada stderr görünmez
     app = OmniUI()
     if not native_macos.install_native_menu_bar("OmniAgent"):
         logging.info("Native menü çubuğu kurulamadı (macOS dışında beklenen).")
-
-    def load_keys() -> None:
-        # Yeni .app kimliği için Keychain izin istemi çıkabilir; önce pencereyi göster.
-        apply_stored_api_keys()
-        app._rebuild_clients()
-
-    app.after(200, load_keys)
+    # Yeni .app kimliği için Keychain izin istemi çıkabilir: okuma ilk boyamadan sonra arka planda yapılır.
+    app.begin_background_startup()
     app.mainloop()
 
 

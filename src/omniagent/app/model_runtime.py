@@ -5,10 +5,11 @@ import asyncio
 import json
 import logging
 import threading
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 from urllib.request import urlopen
 
-from openai import AsyncOpenAI, Timeout
+from openai import AsyncOpenAI, AsyncStream, Timeout
+from openai.types.chat import ChatCompletionChunk
 
 from omniagent.app.types import ModelTurn, ToolCallDraft
 from omniagent.config import API_KEY_VARIABLES, BACKENDS, BackendProfile
@@ -17,6 +18,10 @@ from omniagent.core.events import EventSink, TokenUsage, preview_arguments
 
 MODEL_REQUEST_TIMEOUT_SECONDS: float = 30.0
 MODEL_CONNECT_TIMEOUT_SECONDS: float = 5.0
+# İlk yanıt (HTTP başlığı) ve her akış parçası beklenirken durdurma isteğinin denetlenme aralığı (sn); runtime.wait ile
+# aynı 50 ms.
+STOP_POLL_SECONDS: float = 0.05
+_Awaited = TypeVar("_Awaited")
 ZERO_USAGE: TokenUsage = {
     "prompt_tokens": 0,
     "cached_tokens": 0,
@@ -168,6 +173,34 @@ def token_usage(usage: Any) -> TokenUsage:
     }
 
 
+async def _await_unless_stopped(operation: Awaitable[_Awaited], should_stop: Callable[[], bool]) -> Optional[_Awaited]:
+    """
+    Model akışının bekleyen adımını (istek açma ya da sonraki akış parçası) beklerken should_stop'u STOP_POLL_SECONDS'ta
+    bir denetler: sunucu başlığı ya da bir sonraki parçayı geç gönderirse ya da akış duraksarsa Durdur, istemci zaman
+    aşımı (30 sn) dolana dek etkisiz kalırdı. Durdurulunca iş iptal edilir (bağlantı kapanana dek beklenir) ve None
+    döner; çağıran 'stopped' turu üretir. İşin kendi hatası (akış bittiyse StopAsyncIteration dahil) ve dışarıdan gelen
+    iptal olduğu gibi yükselir.
+    """
+    pending: asyncio.Future[_Awaited] = asyncio.ensure_future(operation)
+    try:
+        while not pending.done():
+            if should_stop():
+                return None
+            await asyncio.wait({pending}, timeout=STOP_POLL_SECONDS)
+        return pending.result()
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+async def _open_stream_unless_stopped(
+    client: AsyncOpenAI, request: Dict[str, Any], should_stop: Callable[[], bool],
+) -> Optional[AsyncStream[ChatCompletionChunk]]:
+    """Akış isteğini açar; ilk yanıt (HTTP başlığı) beklenirken Durdur yoklanır (bkz. _await_unless_stopped). Durdurulursa None."""
+    return await _await_unless_stopped(client.chat.completions.create(**request), should_stop)
+
+
 async def stream_completion(
     client: AsyncOpenAI,
     profile: BackendProfile,
@@ -201,7 +234,10 @@ async def stream_completion(
     if profile["provider"] != "ollama-cloud":
         request["tool_choice"] = "auto"
 
-    stream: Any = await client.chat.completions.create(**request)
+    stream: Optional[AsyncStream[ChatCompletionChunk]] = await _open_stream_unless_stopped(client, request, should_stop)
+    if stream is None:
+        # Kullanıcı ilk yanıt beklenirken durdurdu: agent._stopped_turn ile aynı biçim
+        return {"content": "", "tool_calls": [], "finish_reason": "stopped", "usage": ZERO_USAGE}
     content_parts: List[str] = []
     drafts: List[ToolCallDraft] = []
     previews: Dict[int, str] = {}
@@ -210,8 +246,12 @@ async def stream_completion(
     finish_reason: Optional[str] = None
     usage: TokenUsage = ZERO_USAGE
     try:
-        async for chunk in stream:
-            if should_stop():
+        while True:
+            try:
+                chunk: Optional[ChatCompletionChunk] = await _await_unless_stopped(stream.__anext__(), should_stop)
+            except StopAsyncIteration:
+                break
+            if chunk is None or should_stop():
                 finish_reason = "stopped"
                 break
             if chunk.usage is not None:

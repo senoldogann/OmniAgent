@@ -1,4 +1,7 @@
 """Sesli mesajların yazıya çevrilmesi: OpenAI uç noktası, model düşüşü ve Telegram köprüsü akışı."""
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -7,6 +10,7 @@ import pytest
 from openai import AsyncOpenAI
 
 from omniagent.core.conversation import make_exchange
+from omniagent.fallback_policy import fallback_policy_path
 from omniagent.integrations import telegram, transcription
 
 
@@ -35,7 +39,9 @@ def _model(request: httpx.Request) -> str:
 
 @pytest.fixture
 def with_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenAI anahtarı tanımlı ve openai yedek sağlayıcı izin listesinde (ses OpenAI'a gider)."""
     monkeypatch.setattr(transcription, "load_api_key", lambda variable: "sk-test")
+    monkeypatch.setenv("OMNI_FALLBACK_BACKENDS", "openai")
     monkeypatch.delenv("OMNI_TRANSCRIBE_MODEL", raising=False)
 
 
@@ -79,7 +85,71 @@ async def test_auth_errors_and_silence_are_reported_without_retry(tmp_path: Path
 @pytest.mark.asyncio
 async def test_without_openai_key_nothing_is_sent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(transcription, "load_api_key", lambda variable: None)
+    monkeypatch.setenv("OMNI_FALLBACK_BACKENDS", "openai")
     with pytest.raises(transcription.TranscriptionUnavailable, match="OpenAI API anahtarı"):
+        await transcription.transcribe_audio(_voice(tmp_path), lambda key, url: pytest.fail("istemci kurulmamalı"))
+
+
+class LoopbackSpeech:
+    """/v1/audio/transcriptions'a gelen istekleri sayan yerel OpenAI uyumlu uç nokta (gerçek HTTP)."""
+
+    def __init__(self) -> None:
+        self.requests: List[str] = []
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers["Content-Length"]))
+                owner.requests.append(self.path)
+                payload = json.dumps({"text": "yarın saat dokuzda hatırlat"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def factory(self, api_key: str, base_url: str) -> AsyncOpenAI:
+        return AsyncOpenAI(api_key=api_key, base_url=f"http://127.0.0.1:{self.server.server_port}/v1", max_retries=0)
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed,expected_requests", [("none", 0), ("openrouter", 0), ("openai", 1), ("openrouter,openai", 1)])
+async def test_voice_reaches_openai_only_when_openai_is_in_the_fallback_allow_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, allowed: str, expected_requests: int,
+) -> None:
+    """Ses OpenAI'a gider; izin listesinde değilse telin öbür ucuna HİÇ istek gitmez ve açık hata verilir."""
+    monkeypatch.setattr(transcription, "load_api_key", lambda variable: "sk-test")
+    monkeypatch.setenv("OMNI_FALLBACK_BACKENDS", allowed)
+    speech = LoopbackSpeech()
+    try:
+        if expected_requests:
+            assert await transcription.transcribe_audio(_voice(tmp_path), speech.factory) == "yarın saat dokuzda hatırlat"
+        else:
+            with pytest.raises(transcription.TranscriptionUnavailable, match="OpenAI yedek sağlayıcı izin listesinde değil") as error:
+                await transcription.transcribe_audio(_voice(tmp_path), speech.factory)
+            assert "OMNI_FALLBACK_BACKENDS=openai" in str(error.value)
+            # Telegram köprüsü launchd'de koşar ve kabuk ortamını miras almaz: ileti kayıt dosyası yolunu ve biçimini de söyler
+            assert str(fallback_policy_path()) in str(error.value) and '"backends": ["openai"]' in str(error.value)
+    finally:
+        speech.close()
+    assert len(speech.requests) == expected_requests
+
+
+@pytest.mark.asyncio
+async def test_unreadable_fallback_policy_blocks_voice_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transcription, "load_api_key", lambda variable: "sk-test")
+    monkeypatch.setenv("OMNI_FALLBACK_BACKENDS", "opencode")
+    with pytest.raises(transcription.TranscriptionUnavailable, match="izni okunamadı; ses gönderilmedi"):
         await transcription.transcribe_audio(_voice(tmp_path), lambda key, url: pytest.fail("istemci kurulmamalı"))
 
 
@@ -170,6 +240,25 @@ async def test_voice_without_transcription_path_explains_and_does_not_run(
     await bridge.handle(_voice_message())
     assert bridge.active is None and goals == []
     assert api.sent[-1].startswith("🎙️ OpenAI API anahtarı gerekli.")
+
+
+@pytest.mark.asyncio
+async def test_voice_without_openai_permission_explains_and_does_not_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Gerçek transcribe_audio: openai izin listesinde değilse köprü kısa Türkçe açıklama yazar, görev başlamaz."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(transcription, "load_api_key", lambda variable: "sk-test")
+    monkeypatch.setenv("OMNI_FALLBACK_BACKENDS", "none")
+    goals: List[str] = []
+    monkeypatch.setattr(telegram, "run_agent_with_callback", _recorder(goals))
+    api = VoiceAPI(_voice(tmp_path))
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    await bridge.handle(_voice_message())
+    assert bridge.active is None and goals == []
+    assert api.sent[-1].startswith("🎙️ Sesli mesajı yazıya çevirmek sesi OpenAI'a gönderir")
+    assert "OMNI_FALLBACK_BACKENDS=openai" in api.sent[-1] and "yazı olarak da gönderebilirsiniz" in api.sent[-1]
+    assert str(fallback_policy_path()) in api.sent[-1]  # köprü ortamı miras almaz: kullanıcı dosya yolunu da görür
 
 
 @pytest.mark.asyncio

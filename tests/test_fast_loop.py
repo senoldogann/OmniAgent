@@ -1,7 +1,15 @@
 """Fast Loop phase controller and semantic-progress tests."""
 import json
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from threading import Thread
+from typing import Any, Dict, List, Tuple
 
+import pytest
+
+from omniagent.app import agent as main
 from omniagent.app.progress import novel_read_output_progress
+from omniagent.dev import benchmark
 from omniagent.core.fast_loop import (
     FastLoopPolicy,
     FastLoopState,
@@ -225,3 +233,46 @@ def test_sequence_read_progress_uses_new_content_including_partial_result() -> N
 
     click_only = {**partial, "completed_steps": 1}
     assert not novel_read_output_progress([call], [click_only], frozenset())[1]
+
+
+@pytest.mark.asyncio
+async def test_repeated_identical_poll_stops_at_the_fast_loop_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    Aynı 'pending' yanıtını yoklayan görev Fast Loop tarafından birkaç turda sınırlı durdurulur.
+    Görev defteri olguları tur damgası taşır: damga karşılaştırmaya girerse her tur 'yeni olgu' sayılır,
+    ilerleme hiç durmaz ve görev üst sınıra (100 tur) kadar sürerdi. Gerçek fetch_raw (curl) yerel
+    benchmark sunucusuna gider, model betiklidir.
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), benchmark.BenchmarkHandler)
+    Thread(target=server.serve_forever, daemon=True).start()
+    url: str = f"http://127.0.0.1:{server.server_port}/stagnation/fastloop"
+    polls: List[int] = []
+
+    async def scripted_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str, backend: str,
+        emit: Any, should_stop: Any,
+    ) -> Tuple[Dict[str, Any], str]:
+        polls.append(len(polls) + 1)
+        call: Dict[str, str] = {"id": f"poll-{len(polls)}", "name": "fetch_raw", "arguments": json.dumps({"url": url})}
+        return {"content": "STATE: bekleniyor", "tool_calls": [call], "finish_reason": "tool_calls",
+                "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", scripted_model)
+    try:
+        report = await main.run_agent_with_callback(
+            f"Yalnız fetch_raw kullan. {url} adresindeki status 'ready' olana kadar aynı endpoint'i kontrol etmeye "
+            "devam et. status='pending' iken görevi başarılı bitirme.",
+            [].append,
+            {"requested_backend": "ollama-cloud", "should_stop": lambda: False,
+             "state_file": str(tmp_path / "state.json"), "history": [], "run_mode": "autonomous"},
+            {"ollama-cloud": object()},
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert report["success"] is False
+    assert "ilerleme" in report["reason"]
+    assert report["metrics"]["turns"] <= 15

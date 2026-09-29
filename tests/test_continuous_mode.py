@@ -266,6 +266,89 @@ async def test_ask_user_waits_past_timeout_and_refuses_secret_questions(
 
 
 @pytest.mark.asyncio
+async def test_unattended_question_is_deferred_and_btw_reaches_next_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controls: List[str] = []
+    session = ContinuousRun([
+        tool_turn(call("a1", "ask_user", {"question": "Hangi hesap?", "kind": "text"})),
+        text_turn("Bağımsız adımları sürdürüyorum."),
+    ], [], 0.0)
+    original_model = session.model
+
+    async def model(*args: Any) -> Tuple[Turn, str]:
+        result = await original_model(*args)
+        if len(session.model_inputs) == 1:
+            controls.append("/btw Önce yerel taslağı hazırla")
+        return result
+
+    monkeypatch.setattr(session, "model", model)
+
+    def pop_controls() -> List[str]:
+        ready = list(controls)
+        controls.clear()
+        return ready
+
+    await session.run(tmp_path, monkeypatch, {"unattended": True, "pop_control_messages": pop_controls})
+    assert session.questions == []
+    assert "aynı soruyu yineleme" in tool_messages(session.model_inputs[1])
+    assert any("Önce yerel taslağı hazırla" in str(message.get("content", ""))
+               for message in session.model_inputs[1])
+
+
+@pytest.mark.asyncio
+async def test_unattended_proven_goal_waits_for_approve_without_model_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ContinuousRun([
+        tool_turn(call("w1", "write_file", {"path": str(tmp_path / "plan.md"), "content": "plan"})),
+        tool_turn(call("g1", "report_goal_met", {"summary": "Plan hazır.",
+                                                 "evidence_call_ids": ["w1"]})),
+    ], [], 0.0)
+
+    def pop_controls() -> List[str]:
+        if any(event.get("code") == "GOAL_AWAITING_APPROVAL" for event in session.events):
+            return ["/approve"]
+        return []
+
+    report = await asyncio.wait_for(session.run(
+        tmp_path, monkeypatch, {"unattended": True, "pop_control_messages": pop_controls},
+    ), timeout=5)
+    assert report["success"] and report["outcome"] == "Plan hazır."
+    assert session.questions == []
+    assert len(session.model_inputs) == 2
+
+
+@pytest.mark.asyncio
+async def test_unattended_idle_run_parks_until_btw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ContinuousRun([
+        tool_turn(call("a1", "ask_user", {"question": "Hangi hesap?", "kind": "text"})),
+        text_turn("Rapor 1"), text_turn("Rapor 2"), text_turn("Rapor 3"),
+        text_turn("Yeni yön geldi."),
+    ], [], 0.0)
+    delivered = False
+
+    def pop_controls() -> List[str]:
+        nonlocal delivered
+        parked = any(event["kind"] == "notice" and "Bağımsız adımlar tükendi" in event["text"]
+                     for event in session.events)
+        if parked and not delivered:
+            delivered = True
+            return ["/btw Eksik hesap olmadan plan yap"]
+        return []
+
+    report = await asyncio.wait_for(session.run(
+        tmp_path, monkeypatch, {"unattended": True, "pop_control_messages": pop_controls},
+    ), timeout=5)
+    assert report["reason"] == "durduruldu"
+    assert delivered and session.questions == []
+    assert any("Eksik hesap olmadan plan yap" in str(message.get("content", ""))
+               for message in session.model_inputs[4])
+
+
+@pytest.mark.asyncio
 async def test_token_cap_ends_continuous_run_with_limit_reason(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -12,8 +12,9 @@ import sys
 import time
 from pathlib import Path
 from threading import Thread
-from typing import Callable, Dict, IO, List, Optional, Tuple, Union
+from typing import Awaitable, Callable, Dict, IO, List, Optional, Tuple, Union
 
+from omniagent.approval import ApprovalRequest
 from omniagent.config import API_KEY_VARIABLES, redact
 from .types import (
     PROCESS_POLL_SECONDS, SHELL_MAX_TIMEOUT_SECONDS, SHELL_TIMEOUT_SECONDS,
@@ -26,6 +27,18 @@ _clip = clip_text
 def _call_approved() -> bool:
     runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
     return bool(runtime is not None and runtime.get("approved", False))
+
+
+def approval_gate_blocking() -> Optional[Callable[[ApprovalRequest], None]]:
+    """Eşzamanlı (iş parçacığı) araçlar için host onay kapısı; host bağlamı yoksa None."""
+    runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
+    return None if runtime is None else runtime.get("request_approval_blocking")
+
+
+def approval_gate_async() -> Optional[Callable[[ApprovalRequest], Awaitable[None]]]:
+    """Olay döngüsündeki (async) araçlar için host onay kapısı; host bağlamı yoksa None."""
+    runtime: Optional[ToolRuntime] = TOOL_RUNTIME.get()
+    return None if runtime is None else runtime.get("request_approval")
 
 # Paketlenmiş uygulama Finder/launchd ile açıldığında PATH yalnız /usr/bin:/bin:/usr/sbin:/sbin
 # olur; Homebrew ve kullanıcı araç dizinleri görünmez. Canlı kayıtta execute_js "FileNotFoundError:

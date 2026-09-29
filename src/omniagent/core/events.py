@@ -122,6 +122,21 @@ class BackendChanged(TypedDict):
     reason: str
 
 
+class ProviderFallback(TypedDict):
+    """
+    Model isteği seçili sağlayıcıdan başka bir sağlayıcıya yönlendiriliyor: istek içeriği (geçmiş,
+    araç çıktıları ve image_count kadar ekran görüntüsü) processor tarafından işlenecek. İstek
+    gönderilmeden ÖNCE yayınlanır; yalnız kullanıcının izin listesindeki sağlayıcılara geçilir.
+    """
+    kind: Literal["provider_fallback"]
+    from_backend: str
+    to_backend: str
+    to_model: str
+    processor: str
+    reason: str
+    image_count: int
+
+
 class Notice(TypedDict):
     kind: Literal["notice"]
     level: Literal["info", "warning", "error"]
@@ -153,7 +168,7 @@ class UserInputRequired(TypedDict):
 
 AgentEvent = Union[
     RunStarted, TurnStarted, TextDelta, ReasoningDelta, ToolCallPreview, StreamReset,
-    ModelFinished, ToolStarted, ToolOutput, ToolFinished, ArtifactReady, BackendChanged, Notice, RunFinished, IntegrationStatus, UserInputRequired,
+    ModelFinished, ToolStarted, ToolOutput, ToolFinished, ArtifactReady, BackendChanged, ProviderFallback, Notice, RunFinished, IntegrationStatus, UserInputRequired,
 ]
 # Olayları tüketen hedef; araç çıktısı işçi thread'lerinden de çağrılır (thread-safe olmalı).
 EventSink = Callable[[AgentEvent], None]
@@ -170,6 +185,7 @@ TOOL_LABELS: Dict[str, str] = {
     "cua_type_text": "Yaz", "cua_press_key": "Tuş", "cua_submit_text": "Yaz ve gönder",
     "cua_fill_field": "Alanı doldur", "cua_click_text": "Metne tıkla", "cua_scroll": "Kaydır",
     "cua_read_scrollable": "Baştan sona oku",
+    "cua_snapshot": "Öğe listesi", "cua_click_element": "Öğeye tıkla", "cua_set_text_element": "Öğeyi doldur",
     "smart_click": "Akıllı tıkla", "run_action_sequence": "Eylemler",
     "capture_photo": "Fotoğraf çek", "ask_user": "Kullanıcıya sor", "user_memory": "Hafıza",
     "send_file": "Dosya gönder", "schedule_task": "Planla",
@@ -183,6 +199,7 @@ _PREVIEW_KEYS: Dict[str, str] = {
     "cua_get_app": "app_name", "cua_get_ax_state": "app_name", "cua_click": "app_name",
     "cua_type_text": "text", "cua_press_key": "key", "cua_submit_text": "text",
     "cua_fill_field": "text", "cua_click_text": "text", "cua_scroll": "direction",
+    "cua_snapshot": "app", "cua_set_text_element": "text",
     "smart_click": "app_name", "ask_user": "question", "user_memory": "action", "send_file": "path",
     "schedule_task": "goal",
 }
@@ -261,3 +278,12 @@ def argument_point(name: str, arguments: str) -> Optional[List[int]]:
 def compact_count(value: int) -> str:
     """Token sayısını kısa gösterir (2775 → 2.8k). Saf."""
     return f"{value / 1000:.1f}k" if value >= 1000 else str(value)
+
+
+def provider_fallback_text(event: ProviderFallback) -> str:
+    """Yedek geçişin tek satırlık kullanıcı metni; arayüz, Telegram ve CLI aynı metni kullanır. Saf."""
+    images: str = f"{event['image_count']} ekran görüntüsü dahil " if event["image_count"] else ""
+    return (
+        f"Yedek sağlayıcıya geçildi: {event['from_backend']} → {event['to_backend']} ({event['to_model']}) · "
+        f"neden: {event['reason']} · {images}istek içeriği {event['processor']} tarafından işlenecek"
+    )

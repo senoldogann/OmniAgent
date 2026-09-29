@@ -38,7 +38,7 @@ def test_global_hotkey_registers_callback_and_releases_native_resources() -> Non
     hotkey = GlobalVisibilityHotkey(lambda: pressed.append(True), carbon=library)
     assert hotkey.available
     arguments = library.RegisterEventHotKey.call_args.args
-    assert arguments[0:2] == (0x07, 1 << 8)
+    assert arguments[0:2] == (0x07, (1 << 8) | (1 << 9))
     assert arguments[4] == 1  # Genel kısayol başka uygulamada da geçerli.
     assert hotkey._handler_proc(None, None, None) == 0
     assert pressed == [True]

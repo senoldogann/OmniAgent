@@ -25,6 +25,8 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 from urllib.parse import SplitResult, urlsplit
 
 from omniagent.config import redact
+from omniagent.core.observation_filter import mask_sensitive_text
+from omniagent.core.text_norm import curl_http_statuses
 
 MAX_LESSONS: int = 100
 # Hata anahtarının ve gösterilen çağrıların üst sınırı (karakter)
@@ -48,6 +50,7 @@ REPEAT_WARNING_THRESHOLD: int = 2
 EXCLUDED_TOOLS: frozenset[str] = frozenset({
     "take_screenshot", "cua_get_app", "cua_get_ax_state", "cua_click", "cua_click_point",
     "cua_type_text", "cua_press_key", "cua_submit_text", "smart_click", "run_action_sequence",
+    "cua_snapshot", "cua_click_element", "cua_set_text_element",
     "chrome_active_tab", "capture_photo", "ask_user", "user_memory", "process_list",
     "discover_capabilities", "schedule_task",
 })
@@ -55,17 +58,16 @@ EXCLUDED_TOOLS: frozenset[str] = frozenset({
 _PRIMARY_ARGUMENTS: Tuple[str, ...] = ("command", "code", "url", "path", "query")
 
 _URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+# Sitenin erişim denetimini gösteren HTTP durumları (yetkisiz, yasak, hız sınırı, yasal engel): sınıflandırılamayan
+# engel sayfaları da "aynı adreste başka araç" dersi olarak kalıcı belleğe girip engeli aşmayı öğretmesin. Durum kodu
+# curl'ün 'returned error: <kod>' çıktısından okunur; çapa tools/browser.py ile ortaktır (core/text_norm).
+_ACCESS_DENIED_STATUSES: frozenset[int] = frozenset({401, 403, 429, 451})
 # Yol yalnız sözcük sınırında başlar ("and/or" gibi metinler yol sayılmaz)
 _PATH_PATTERN = re.compile(r"(?<![\w.~])(?:~|\.{1,2})?/[^\s'\"<>:,;|&()]+")
 _UUID_PATTERN = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.IGNORECASE)
 _HEX_PATTERN = re.compile(r"\b(?:0x)?[0-9a-f]{8,}\b", re.IGNORECASE)
 _LONG_NUMBER_PATTERN = re.compile(r"\b\d{4,}\b")
 _TOKEN_SPLIT = re.compile(r"[\s,;|&()\[\]{}\"'=<>]+")
-_SECRET_PATTERNS: Tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)\b(?:sk|pk|rk|ghp|gho|ghs|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}"),
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{12,}=*"),
-    re.compile(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key|apikey|parola|sifre|şifre)\s*[=:]\s*\S+"),
-)
 
 
 class Lesson(TypedDict):
@@ -129,11 +131,17 @@ def new_tracker() -> TaskTracker:
 
 
 def scrub_secrets(text: str) -> str:
-    """Bilinen sır değerlerini ve yaygın token/parola kalıplarını maskeler (ders dosyasına sır yazılmaz)."""
-    cleaned: str = redact(text)
-    for pattern in _SECRET_PATTERNS:
-        cleaned = pattern.sub("[gizli]", cleaned)
-    return cleaned
+    """
+    Bilinen sır değerlerini (config.redact) ve bilinmeyen sır biçimlerini (observation_filter.mask_sensitive_text:
+    komut satırı parolası '--password değer', jeton, URL içi parola, kart/IBAN, hassas adlı atama) maskeler; ders
+    dosyasına sır yazılmaz. Üçüncü, daha zayıf bir maskeleyici tutulmaz: tek süzgeç projedeki ortak olandır.
+    """
+    return mask_sensitive_text(redact(text))
+
+
+def _access_denied(detail: str) -> bool:
+    """Hata metni sitenin erişim denetimini (401/403/429/451) bildiriyor mu? Saf."""
+    return any(status in _ACCESS_DENIED_STATUSES for status in curl_http_statuses(detail))
 
 
 def _basename(raw: str) -> str:
@@ -162,8 +170,11 @@ def normalize_text(text: str) -> str:
 
 
 def error_key(detail: str) -> str:
-    """Araç hata metninin (tip: mesaj) eşleşme anahtarı. Saf."""
-    return normalize_text(detail)[:ERROR_KEY_LIMIT]
+    """
+    Araç hata metninin (tip: mesaj) eşleşme anahtarı. Anahtar ders dosyasına yazılır ve hata metni komutu
+    yankılayabilir ('mysql --password ...'): sırlar normalleştirmeden ÖNCE maskelenir (bkz. scrub_secrets).
+    """
+    return normalize_text(scrub_secrets(detail))[:ERROR_KEY_LIMIT]
 
 
 def _string_values(value: object) -> List[str]:
@@ -386,7 +397,7 @@ def observe_result(
     aynı URL'deki başarısız ham okumayı da aday yapar. Başarısız sonuçta tekrar uyarısı ve eşleşen
     ders notu üretilir; bir ders görev başına en çok bir kez gösterilir. Saf: yeni izleyici döner.
     """
-    if tool in EXCLUDED_TOOLS:
+    if tool in EXCLUDED_TOOLS or (not ok and _access_denied(detail)):
         return tracker, {"notes": [], "lesson_id": None}
     pending: Dict[str, Tuple[str, int]] = dict(tracker["pending"])
     feedback: List[Tuple[str, bool]] = list(tracker["feedback"])

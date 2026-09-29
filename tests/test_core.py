@@ -6,7 +6,7 @@ from datetime import date
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import pytest
@@ -20,7 +20,9 @@ from omniagent import tools
 from PIL import Image
 from omniagent.core.events import AgentEvent, preview_arguments
 from omniagent.app.agent import ToolCallDraft, _trim_old_turns, encode_image, execute_tool, merge_tool_call_delta
-from omniagent.core.state import EpisodeMetrics, load_state, make_step_record, record_episode, save_state
+from omniagent.core.state import (
+    STEP_ARGS_LIMIT, STEP_DETAIL_LIMIT, EpisodeMetrics, load_state, make_step_record, record_episode, save_state,
+)
 from omniagent.tools import ScreenGeometry, ToolError, Toolbox, model_to_points, points_to_model
 
 
@@ -83,6 +85,56 @@ def test_memory_roundtrip(tmp_path: Path) -> None:
     assert loaded["episodic_memory"][-1]["goal"] == "örnek hedef"
     assert loaded["episodic_memory"][-1]["metrics"]["cached_tokens"] == 80
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_step_record_keeps_full_text_and_only_storage_clips() -> None:
+    """Bellek içi adım kaydı kırpılmaz (host kapıları tam metni ayrıştırır); epizot dosyasına kırpılarak yazılır."""
+    detail: str = "d" * 2000
+    args: str = json.dumps({"command": "c" * 800})
+    step = make_step_record("execute_shell", args, True, detail)
+    assert step["detail"] == detail and step["args"] == args
+    metrics: EpisodeMetrics = {
+        "turns": 1, "tool_calls": 1, "elapsed_seconds": 1.0, "backend": "opencode",
+        "prompt_tokens": 1, "cached_tokens": 0, "completion_tokens": 1,
+    }
+    steps = [step]
+    stored = record_episode({"episodic_memory": []}, "hedef", steps, "tamam", True, metrics)["episodic_memory"][-1]["steps"][0]
+    assert len(stored["detail"]) <= STEP_DETAIL_LIMIT + 2 and len(stored["args"]) <= STEP_ARGS_LIMIT + 2
+    assert steps[0]["detail"] == detail and steps[0]["args"] == args
+
+
+def test_episode_file_never_contains_secrets_from_step_arguments_or_details(tmp_path: Path) -> None:
+    """
+    Kalıcı epizot dosyasına (cognitive_memory.json) yazılan adım argümanı ve ayrıntısı önce hassas kalıplardan geçer,
+    sonra kırpılır: alana yazılan metin, komut satırı parolası, jeton ve kırpma sınırında bölünen sır dosyaya girmez.
+    Bellekteki adımlar (host kapıları tam metin ister) değişmez.
+    """
+    typed, token = "hunter2-Zx9", "ghp_" + "A1b2C3d4E5f6G7h8i9J0"
+    steps = [
+        make_step_record("cua_type_text", json.dumps({"text": typed}), True, f"Yazıldı (11 karakter): {typed}"),
+        make_step_record("execute_shell", json.dumps({"command": "mysql --password s3cr3tPass -h db.local"}), True,
+                         "STDOUT: ok\nÇıkış Kodu: 0"),
+        make_step_record("run_action_sequence", json.dumps({"steps": [{"action": "type", "text": "gizliParola9"}]}), True, "tamam"),
+        make_step_record("browse_url", json.dumps({"url": "https://a.b/c", "actions": [{"action": "fill", "selector": "#p", "value": "sifre1234X"}]}),
+                         True, "Sayfa açıldı"),
+        # Jeton kırpma sınırında bölünür: önce kırpılsaydı yarım jeton maskeden kaçardı
+        make_step_record("fetch_raw", "{}", True, "x" * (STEP_DETAIL_LIMIT - 8) + f" {token} sonraki metin"),
+    ]
+    before = [dict(step) for step in steps]
+    metrics: EpisodeMetrics = {
+        "turns": 1, "tool_calls": 5, "elapsed_seconds": 1.0, "backend": "opencode",
+        "prompt_tokens": 1, "cached_tokens": 0, "completion_tokens": 1,
+    }
+    path: Path = tmp_path / "cognitive_memory.json"
+    save_state(str(path), record_episode({"episodic_memory": []}, "hedef", steps, "tamam", True, metrics))
+    stored: str = path.read_text(encoding="utf-8")
+    for secret in (typed, "s3cr3tPass", "gizliParola9", "sifre1234X", token, token[:10]):
+        assert secret not in stored, secret
+    persisted = load_state(str(path))["episodic_memory"][-1]["steps"]
+    assert persisted[1]["args"] == '{"command": "mysql --password [gizli] -h db.local"}'
+    assert persisted[3]["args"].count("[gizli]") == 1 and "https://a.b/c" in persisted[3]["args"]  # adres ve seçici korunur
+    assert len(persisted[4]["detail"]) <= STEP_DETAIL_LIMIT + 2
+    assert steps == before  # girdi değişmedi: bellekteki adımlar tam metin
 
 
 def test_corrupt_memory_is_preserved(tmp_path: Path) -> None:
@@ -386,7 +438,7 @@ def test_explicit_chrome_session_excludes_hidden_browser_and_discovery() -> None
     assert "USER'S OPEN CHROME SESSION" in prompt
     assert "list pane" in prompt
     assert "empty whitespace" in prompt
-    assert "unchanged" in prompt
+    assert "sona ulaşıldı" in prompt
     ordinary = {entry["function"]["name"] for entry in main.build_tool_schemas("Outlook hesabımı incele")}
     assert "browse_url" in ordinary and "discover_capabilities" in ordinary
     assert not main.active_chrome_session_goal("Chrome kullanma")
@@ -427,9 +479,11 @@ async def test_chrome_route_rejects_hidden_browser_at_execution() -> None:
 def test_chrome_active_tab_reuses_front_tab(monkeypatch: pytest.MonkeyPatch) -> None:
     """Chrome denetimi yeni profil açmaz; URL, köken ve yükleme sınırını ayrı argüman olarak iletir."""
     calls = []
+    timeouts = []
 
     def fake_run(args, **kwargs):
         calls.append(args)
+        timeouts.append(kwargs["timeout"])
         return tools.subprocess.CompletedProcess(
             args, 0, "https://outlook.live.com/mail/0/deleteditems\nPoistetut\ntrue\n", "")
 
@@ -441,9 +495,12 @@ def test_chrome_active_tab_reuses_front_tab(monkeypatch: pytest.MonkeyPatch) -> 
     assert "Görünür Chrome" in result and "Poistetut" in result and "hâlâ yükleniyor" in result
     assert calls[0][0] == "osascript"
     assert calls[0][-4:] == [
-        "https://outlook.live.com/mail/0/deleteditems", "https://outlook.live.com/", str(tools.CHROME_LOAD_CHECKS), "false",
+        "https://outlook.live.com/mail/0/deleteditems", "https://outlook.live.com/", str(tools.CHROME_LOAD_WAIT_SECONDS), "false",
     ]
     assert "tab id tabId of targetWindow" in calls[0][2]
+    # Süreç sınırı betiğin kendi bekleme sınırının ÜSTÜNDE olmalı (eskiden betik ≥8 sn beklerken süreç 3 sn'de öldürülüyordu)
+    assert timeouts[0] > tools.CHROME_LOAD_WAIT_SECONDS
+    assert toolbox._input_app == "Google Chrome"
     assert toolbox.browser is None
     with pytest.raises(ToolError) as error:
         toolbox.chrome_active_tab("javascript:alert(1)")
@@ -480,17 +537,22 @@ def test_explicit_chrome_destination_requires_new_tab_and_feed() -> None:
     assert requested_chrome_navigation_gap(goal, correct) is None
 
 
+# Kullanıcı Chrome'a Apple Events iznini kapattığında osascript'in verdiği kalıcı hata
+AUTOMATION_DENIED_STDERR = "execution error: Not authorized to send Apple events to Google Chrome. (-1743)"
+
+
 def test_chrome_new_tab_fallback_uses_new_tab_key(monkeypatch: pytest.MonkeyPatch) -> None:
     keys: List[str] = []
 
     def fake_run(args, **kwargs):
         if args[0] == "osascript":
-            raise tools.subprocess.TimeoutExpired(args, timeout=20)
+            return tools.subprocess.CompletedProcess(args, 1, "", AUTOMATION_DENIED_STDERR)
         return tools.subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
     monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    monkeypatch.setattr(tools, "require_front_app", lambda expected, wait_seconds: None)
     monkeypatch.setattr(tools, "press_key_spec", keys.append)
     monkeypatch.setattr(tools, "type_unicode_text", lambda text: None)
     Toolbox().chrome_active_tab("https://www.linkedin.com/feed/", new_tab=True)
@@ -500,6 +562,7 @@ def test_chrome_new_tab_fallback_uses_new_tab_key(monkeypatch: pytest.MonkeyPatc
 def test_chrome_active_tab_falls_back_to_visible_ui_and_circuit_breaks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Kalıcı otomasyon reddinde görünür UI yoluna düşülür ve sonraki çağrılar AppleScript'i hiç denemez."""
     calls: List[List[str]] = []
     keys: List[str] = []
     typed: List[str] = []
@@ -507,12 +570,13 @@ def test_chrome_active_tab_falls_back_to_visible_ui_and_circuit_breaks(
     def fake_run(args, **kwargs):
         calls.append(args)
         if args[0] == "osascript":
-            raise tools.subprocess.TimeoutExpired(args, timeout=20)
+            return tools.subprocess.CompletedProcess(args, 1, "", AUTOMATION_DENIED_STDERR)
         return tools.subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
     monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    monkeypatch.setattr(tools, "require_front_app", lambda expected, wait_seconds: None)
     monkeypatch.setattr(tools, "press_key_spec", lambda key: keys.append(key) or key)
     monkeypatch.setattr(tools, "type_unicode_text", lambda text: typed.append(text))
 
@@ -528,6 +592,81 @@ def test_chrome_active_tab_falls_back_to_visible_ui_and_circuit_breaks(
     assert target in first and "görünür UI fallback" in first
     assert target + "-2" in second
     assert toolbox._chrome_applescript_available is False
+
+
+def test_chrome_script_timeout_raises_and_keeps_applescript_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Süre aşımı HATADIR: betik gezinmeyi bekleme döngüsünden ÖNCE yaptığı için UI'den yeniden gezinmek çift sekme
+    açardı; yanıtsız Chrome'a tuş da gitmez ve AppleScript kalıcı olarak kapanmaz.
+    """
+    osascript_calls: List[str] = []
+
+    def fake_run(args, **kwargs):
+        osascript_calls.append(args[0])
+        raise tools.subprocess.TimeoutExpired(args, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
+    monkeypatch.setattr(tools, "_require_accessibility", lambda: pytest.fail("UI yoluna düşülmemeli"))
+    monkeypatch.setattr(tools, "press_key_spec", lambda key: pytest.fail("tuş gönderilmemeli"))
+    monkeypatch.setattr(tools, "type_unicode_text", lambda text: pytest.fail("yazılmamalı"))
+    toolbox = Toolbox()
+    for _ in range(2):
+        with pytest.raises(ToolError) as error:
+            toolbox.chrome_active_tab("https://example.com/yavas", new_tab=True)
+        assert error.value.code == "CHROME_SCRIPT_TIMEOUT" and error.value.recoverable
+        assert "TEKRARLAMA" in str(error.value)
+    assert osascript_calls == ["osascript", "osascript"]  # bayrak kapanmadı: ikinci çağrı yine AppleScript dener
+    assert toolbox._chrome_applescript_available is None
+    assert toolbox._input_app is None  # hatada hedef beyanı yapılmaz
+
+
+@pytest.mark.parametrize("failure, flag_after", [
+    (("stderr", "execution error: Not authorized to send Apple events to Google Chrome. (-1743)"), False),
+    (("stderr", "execution error: User consent required. (-1744)"), False),
+    (("oserror", "osascript yok"), False),
+    (("stderr", "execution error: Can't get window 1. (-1728)"), None),
+], ids=["izin-reddi-1743", "izin-istemi-1744", "osascript-calistirilamadi", "gecici-betik-hatasi"])
+def test_chrome_applescript_flag_closes_only_on_permanent_failures(
+    monkeypatch: pytest.MonkeyPatch, failure: Tuple[str, str], flag_after: Optional[bool],
+) -> None:
+    """Kalıcı bayrak yalnız otomasyon reddinde ve osascript çalıştırılamadığında False olur; geçici hata yalnız o çağrıyı düşürür."""
+    kind, detail = failure
+    osascript_calls: List[str] = []
+    keys: List[str] = []
+
+    def fake_run(args, **kwargs):
+        if args[0] == "osascript":
+            osascript_calls.append(args[0])
+            if kind == "oserror":
+                raise FileNotFoundError(detail)
+            return tools.subprocess.CompletedProcess(args, 1, "", detail)
+        return tools.subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(tools.subprocess, "run", fake_run)
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
+    monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
+    monkeypatch.setattr(tools, "require_front_app", lambda expected, wait_seconds: None)
+    monkeypatch.setattr(tools, "press_key_spec", lambda key: keys.append(key) or key)
+    monkeypatch.setattr(tools, "type_unicode_text", lambda text: None)
+    toolbox = Toolbox()
+    first = toolbox.chrome_active_tab("https://example.com/bir")
+    toolbox.chrome_active_tab("https://example.com/iki")
+    assert "görünür UI fallback" in first and keys == ["cmd+l", "enter", "cmd+l", "enter"]
+    assert toolbox._chrome_applescript_available is flag_after
+    # kalıcı hatada ikinci çağrı AppleScript'i hiç denemez; geçici hatada her çağrıda yeniden denenir
+    assert len(osascript_calls) == (1 if flag_after is False else 2)
+
+
+def test_chrome_url_with_control_character_is_rejected_before_any_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Satır sonu adres çubuğuna Enter sızdırırdı, NUL subprocess ValueError'ı verirdi: önceden INVALID_URL."""
+    monkeypatch.setattr(tools.subprocess, "run", lambda *args, **kwargs: pytest.fail("süreç başlatılmamalı"))
+    monkeypatch.setattr(tools, "screen_capture_granted", lambda: False)
+    toolbox = Toolbox()
+    for bad in ("https://example.com/a\nb", "https://example.com/a\x00b", "https://example.com/a\rb"):
+        with pytest.raises(ToolError) as error:
+            toolbox.chrome_active_tab(bad)
+        assert error.value.code == "INVALID_URL"
 
 
 def test_chrome_active_tab_live_matching_tab_in_back_window() -> None:
@@ -656,7 +795,7 @@ async def test_transient_api_fallback_does_not_become_sticky(tmp_path: Path, mon
     try:
         report = await main.run_agent_with_callback(
             "Dosyayı oku ve sonucu söyle", lambda event: None,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "openai", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"openai": object(), "openrouter": object()},
         )
@@ -689,7 +828,7 @@ async def test_truncated_final_answer_gets_one_recovery_turn(tmp_path: Path, mon
     try:
         report = await main.run_agent_with_callback(
             "Kısa bir sonuç üret", lambda event: None,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()},
         )
@@ -738,7 +877,7 @@ async def test_chrome_action_turns_end_with_automatic_observation(tmp_path: Path
     try:
         report = await main.run_agent_with_callback(
             "Açık Chrome oturumunu kullanarak örnek sayfayı aç", events.append,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()})
     finally:
@@ -794,7 +933,7 @@ async def test_failed_final_screenshot_cannot_mark_gui_task_verified(
     try:
         report = await main.run_agent_with_callback(
             "Açık Chrome oturumunda düğmeye tıkla", events.append,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()},
         )
@@ -828,20 +967,27 @@ def test_flat_chrome_actions_use_shared_coordinates(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(tools, "click_model_point", lambda x, y, button, geometry: calls.append((x, y, button)) or "tıklandı")
     monkeypatch.setattr(tools, "type_unicode_text", lambda value: calls.append(("type", value)))
     monkeypatch.setattr(tools, "press_key_spec", lambda key: calls.append(("key", key)) or "basıldı")
+    # Ön plan denetimi olay sırasına yazılır: girdiden ÖNCE, submit/fill'de tıklamadan SONRA ve cmd+a'dan ÖNCE çalışmalı
+    monkeypatch.setattr(tools, "require_no_sensitive_front", lambda wait_seconds: calls.append(("guard", wait_seconds)))
+    guard = ("guard", tools.INPUT_FOREGROUND_WAIT_SECONDS)
     toolbox = Toolbox()
     assert toolbox.cua_click_point([123, 456]) == "tıklandı"
     assert "Yazıldı" in toolbox.cua_type_text("Türkçe")
     assert toolbox.cua_press_key("enter") == "basıldı"
-    assert calls == [(123, 456, "left"), ("type", "Türkçe"), ("key", "enter")]
+    assert calls == [(123, 456, "left"), guard, ("type", "Türkçe"), guard, ("key", "enter")]
     calls.clear()
     assert "Enter" in toolbox.cua_submit_text([10, 20], "senior developer")
-    assert calls == [(10, 20, "left"), ("key", "cmd+a"), ("type", "senior developer"), ("key", "enter")]
+    assert calls == [(10, 20, "left"), guard, ("key", "cmd+a"), ("type", "senior developer"), ("key", "enter")]
+    calls.clear()
+    assert "Alan dolduruldu" in toolbox.cua_fill_field([30, 40], "ad")
+    assert calls == [(30, 40, "left"), guard, ("key", "cmd+a"), ("type", "ad")]
     # Modelin ayrı x/y alanlarında ürettiği bozuk biçim açık hata verir, tıklamaz
+    calls.clear()
     for bad in ([196, 175, 1], [[196, 175]], "196,175", [True, 3]):
         with pytest.raises(ToolError) as error:
             toolbox.cua_click_point(bad)
         assert error.value.code == "INVALID_POINT"
-    assert len(calls) == 4
+    assert calls == []
 
 
 def test_window_scoped_model_coordinates_include_origin() -> None:
@@ -967,7 +1113,7 @@ async def test_successful_but_useless_turns_are_bounded_after_delivery(
     try:
         report = await main.run_agent_with_callback(
             "Probe dosyasını kullan ve sonunda tamam yaz", events.append,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()},
         )
@@ -1022,7 +1168,7 @@ async def test_unverified_model_state_does_not_hide_stagnation(
     try:
         report = await main.run_agent_with_callback(
             "Probe dosyasını iki aşamada kontrol et", lambda event: None,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()},
         )
@@ -1119,7 +1265,7 @@ async def test_duplicate_auto_observation_is_not_reinjected_while_recent(
     try:
         report = await main.run_agent_with_callback(
             "Açık Chrome oturumunu kullan ve örnek sayfayı kontrol et", lambda event: None,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()},
         )

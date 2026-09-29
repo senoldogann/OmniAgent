@@ -12,6 +12,7 @@ from omniagent.app.constants import FULL_DETAIL_TURNS
 from omniagent.app.tool_schema import _GUI_VERIFICATION_TOOLS, _SCREEN_ACTION_TOOLS
 from omniagent.app.types import ToolCallDraft, ToolResult
 from omniagent.core import state as sm
+from omniagent.tools.ax_snapshot import snapshot_element_label
 
 
 # Yayınlama/gönderme hedefleri. Böyle bir kontrole başarıyla tıklandıktan sonra sayfadan
@@ -30,13 +31,15 @@ _NAVIGATION_TARGET_PATTERN: re.Pattern[str] = re.compile(
 )
 # Metin girişi yapan araçlar: gönderim koruması yalnız yazılmış bir taslak varsa kurulur,
 # böylece çıplak bir besteleyici açmak korumayı tetiklemez.
-_TEXT_ENTRY_TOOLS: frozenset[str] = frozenset({"cua_fill_field", "cua_type_text", "cua_submit_text"})
+_TEXT_ENTRY_TOOLS: frozenset[str] = frozenset({
+    "cua_fill_field", "cua_type_text", "cua_submit_text", "cua_set_text_element",
+})
 # Ekran aynı kaldığında aynı state'te yeniden yürütülmesi güvenli biçimde engellenebilen
 # doğrudan GUI girdileri. cua_press_key tekrarlı gezinme için meşru olabilir;
 # run_action_sequence/read_scrollable ise aynı ekrana dönse bile bilgi üretmiş olabilir.
 _NO_EFFECT_GUARD_TOOLS: frozenset[str] = frozenset({
     "cua_click_point", "cua_type_text", "cua_submit_text", "cua_fill_field",
-    "cua_click_text", "cua_scroll", "cua_click", "smart_click",
+    "cua_click_text", "cua_scroll", "cua_click", "smart_click", "cua_click_element",
 })
 
 COMMIT_UNVERIFIED_MESSAGE: str = (
@@ -124,13 +127,28 @@ def text_entry_call(call: ToolCallDraft) -> bool:
     )
 
 
+def _element_click_label(call: ToolCallDraft) -> str:
+    """
+    cua_click_element çağrısının hedef öğe etiketi: çağrıda yalnız (liste kimliği, indeks) vardır, etiketi
+    host'un anlık görüntü kaydı verir (ax_snapshot.snapshot_element_label). Başka araç ya da kayıtta olmayan liste
+    için boş metin. Kayıt salt okunur bir süreç geneli tablodur; bu işlev onu değiştirmez.
+    """
+    if call["name"] != "cua_click_element":
+        return ""
+    arguments: Dict[str, Any] = _call_arguments(call)
+    return snapshot_element_label(str(arguments.get("snapshot", "")), arguments.get("index"))
+
+
 def commit_action_call(call: ToolCallDraft) -> bool:
     """
     Çağrı bir gönderme/yayınlama mı: Enter'a basan tek alanlı gönderim ya da metni gönderim
-    sözcüğü içeren bir hedefe tıklama. Çalıştırmadan önce bakılır. Saf.
+    sözcüğü içeren bir hedefe tıklama (cua_click_element için hedefin etiketi anlık görüntü kaydından
+    okunur). Çalıştırmadan önce bakılır. Saf.
     """
     if call["name"] == "cua_submit_text":
         return True
+    if call["name"] == "cua_click_element":
+        return bool(_COMMIT_TARGET_PATTERN.search(_element_click_label(call)))
     if call["name"] == "run_action_sequence":
         return any(
             step.get("action") == "click_text"
@@ -151,6 +169,8 @@ def commit_navigation_call(call: ToolCallDraft) -> bool:
         return bool(str(_call_arguments(call).get("url") or "").strip())
     if call["name"] == "cua_click_text":
         return bool(_NAVIGATION_TARGET_PATTERN.search(str(_call_arguments(call).get("text", ""))))
+    if call["name"] == "cua_click_element":
+        return bool(_NAVIGATION_TARGET_PATTERN.search(_element_click_label(call)))
     return any(
         step.get("action") == "click_text"
         and bool(_NAVIGATION_TARGET_PATTERN.search(str(step.get("text") or "")))

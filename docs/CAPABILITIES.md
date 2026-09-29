@@ -24,7 +24,7 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 | Dosya | `read_file`, `write_file` | Dosya okuma/yazma; Python sözdizimi denetimi, önceki sürüm yedeği ve yazma doğrulaması |
 | Web | `web_search`, `fetch_raw`, `browse_url` | Arama; hızlı HTTP/HTML/JSON okuma; kalıcı Playwright sekmesinde DOM eylem dizisi |
 | Açık Chrome oturumu | `chrome_active_tab`, `cua_click_point`, `cua_type_text`, `cua_press_key`, `cua_submit_text`, `cua_fill_field` | Aynı siteye ait açık sekmeyi bulup yüklenmesini bekleme veya `new_tab=true` ile yeni sekme açma; tek çağrıda arama kutusuna yazıp gönderme; form alanını Enter'a basmadan doldurma |
-| macOS arayüzü | `cua_get_app`, `cua_get_ax_state`, `cua_click`, `smart_click`, `run_action_sequence`, `take_screenshot` | Uygulama açma/öne getirme; erişilebilirlik ağacı; AX veya görsel şablonla tıklama; fare/klavye dizisi (sağ/çift/üçlü tıklama, sürükle-bırak); ekran görüntüsünü modele verme |
+| macOS arayüzü | `cua_get_app`, `cua_snapshot`, `cua_click_element`, `cua_set_text_element`, `cua_get_ax_state`, `cua_click`, `smart_click`, `run_action_sequence`, `take_screenshot` | Uygulama açma/öne getirme; indeksli görünür öğe listesi (arka planda AXPress/AXValue, etki doğrulaması, gerekirse geçici ön plan tıklaması); eski numaralı erişilebilirlik listesi; AX veya görsel şablonla tıklama; fare/klavye dizisi (sağ/çift/üçlü tıklama, sürükle-bırak); ekran görüntüsünü modele verme |
 | Ekran metni ve kaydırma (her GUI yolunda) | `cua_click_text`, `cua_scroll`, `cua_read_scrollable` | Görünür metni OCR ile bulup tam ortasına tıklama; paneli kaydırıp içeriğin kayıp kaymadığını (liste/sayfa sonu) ölçme; paneli baştan sona kaydırarak tüm metni tek sonuçta okuma |
 | Entegrasyon | `discover_capabilities` | Yerel kataloğu ve gerektiğinde kısa çevrimiçi keşfi kullanıp görev için uygun API/MCP/skill yolunu bulma |
 | Kullanıcı hafızası | `user_memory` | Açıkça istenen tercih, sık yol ve kararı atomik JSON dosyasında saklama, arama ve silme |
@@ -33,9 +33,9 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 
 Çoklu monitörde `take_screenshot(display_index=2)` ikinci ekranı ayrı yakalar. Araç bu ekranı sonraki görüntüler için seçili tutar; ekran görüntüsü, AX merkezleri, OCR kutuları ve tıklama/dizi koordinatları aynı 0-1000 uzaya bağlıdır. Ekran ana monitörün üstünde veya solundaysa negatif global başlangıç hesaba katılır. Ekran yerleşimi değişirse eski koordinatla tıklama reddedilir ve yeni görüntü istenir. Yerel doğrulamada ikinci ekran 1920×1080 olarak yakalandı; gerçek ikinci ekran tıklaması kullanıcı ekranını etkilememek için çalıştırılmadı.
 
-Kabuk koruması bilinen yıkıcı komutları, çözülemeyen kabuk değişkeni hedeflerini ve hassas yollara yazmayı engeller; `fetch_raw` yalnızca http(s) adres kabul eder. Hassas dosya okuması varsayılan olarak kapalıdır. Bu kod seviyesi raylar tam güvenlik yalıtımı değildir. GUI eylemleri macOS erişilebilirlik/ekran kaydı izinlerine bağlıdır. `browse_url` görünmeyen, ayrı bir Chromium oturumu kullanır ve araç sonucu bunu açıkça belirtir. Kullanıcı açık Chrome oturumunu açıkça istediğinde bu araç, entegrasyon keşfi ve CDP araştırmasına yol açan kabuk/Node araçları o görevde kapatılır; `chrome_active_tab` aynı siteye ait açık sekmeyi bulup kullanır. Chrome görevlerinde hataya açık iç içe eylem dizisi yerine düz parametreli tıklama/yazma/tuş araçları kullanılır; bir turda birden çok çağrı model sırasıyla işlenir. Chrome AX ağacı web içeriğini vermediği için bu yolda AX araçları kapalıdır; ekran modele 1000×1000 kare görüntü olarak gider ve noktalar `point: [x, y]` biçiminde verilir. Kaydedilen ve Telegram'a gönderilen ekran görüntüsü ise ekranın gerçek en-boy oranındadır. Ekran görüntüsü, son eylemden sonra sabit bekleme yerine ekranın durulmasını bekler. Takip mesajı ("devam et", "formda eksik alan var") önceki görev açık Chrome yolunda yürüdüyse aynı yolda sürer.
+Kabuk koruması bilinen yıkıcı komutları, çözülemeyen kabuk değişkeni hedeflerini ve hassas yollara yazmayı engeller; `fetch_raw` yalnızca http(s) adres kabul eder. Hassas dosya okuması varsayılan olarak kapalıdır. Bu kod seviyesi raylar tam güvenlik yalıtımı değildir. GUI eylemleri macOS erişilebilirlik/ekran kaydı izinlerine bağlıdır. `browse_url` görünmeyen, ayrı bir Chromium oturumu kullanır ve araç sonucu bunu açıkça belirtir. Kullanıcı açık Chrome oturumunu açıkça istediğinde bu araç, entegrasyon keşfi ve CDP araştırmasına yol açan kabuk/Node araçları o görevde kapatılır; `chrome_active_tab` aynı siteye ait açık sekmeyi bulup kullanır. Chrome görevlerinde hataya açık iç içe eylem dizisi yerine düz parametreli tıklama/yazma/tuş araçları kullanılır; bir turda birden çok çağrı model sırasıyla işlenir. Chrome yolunda öğe tabanlı AX araçları (`cua_snapshot`, `cua_click_element`, `cua_set_text_element`) açıktır (Chrome web erişilebilirliği ilk çağrıda `AXEnhancedUserInterface` ile açılır, Chrome yeniden başlayana kadar kalır); eski numaralı liste araçları (`cua_get_ax_state`, `cua_click`, `smart_click`) bu yolda kapalıdır; ekran modele 1000×1000 kare görüntü olarak gider ve noktalar `point: [x, y]` biçiminde verilir. Kaydedilen ve Telegram'a gönderilen ekran görüntüsü ise ekranın gerçek en-boy oranındadır. Ekran görüntüsü, son eylemden sonra sabit bekleme yerine ekranın durulmasını bekler. Takip mesajı ("devam et", "formda eksik alan var") önceki görev açık Chrome yolunda yürüdüyse aynı yolda sürer.
 
-Görünür metne tıklama (`cua_click_text`) macOS Vision OCR ile tam Retina çözünürlükte çalışır; aynı metin birden çok yerdeyse yakınlık noktası olmadan tıklamaz. Kaydırma aracı içeriğin kayıp kaymadığını ölçer: "KAYMADI" sonucu liste veya sayfanın sonuna gelindiğinin kanıtıdır. `cua_read_scrollable` bir paneli baştan sona kaydırıp tüm metnini tek sonuçta verir ve paneli yeniden başa döndürür. Chrome'un ana penceresinin önüne düşebilen küçük yardımcı pencere ekran kapsamı olarak seçilmez. Gerçek ekran boyutu değişiminde açık hata verir ve görev yeniden deneyebilir. Her GUI yolunda eylem turu ekran durulunca otomatik gözlemle biter; ekranda tıklama/yazma/kaydırma yapılan görev, ilk final yanıtta bir kez güncel ekranla her zorunlu maddeyi doğrulamaya yönlendirilir. Açık yeni sekme ve LinkedIn akışı gibi somut isteklerde araç kanıtı eksikse bitiş engellenir; model içeriği okuyamadığını bildirirse arayüz görevi tamamlandı saymaz.
+Görünür metne tıklama (`cua_click_text`) macOS Vision OCR ile tam Retina çözünürlükte çalışır; aynı metin birden çok yerdeyse yakınlık noktası olmadan tıklamaz. Kaydırma aracı içeriğin kayıp kaymadığını ölçer: "KAYMADI" sonucu ya sona gelindiğini ya da kaydırılamaz/yanlış bir alan seçildiğini gösterir; tam kapsamın kanıtı `cua_read_scrollable` sonucunun kısaltma uyarısız "sona ulaşıldı" ifadesidir. `cua_read_scrollable` bir paneli baştan sona kaydırıp tüm metnini tek sonuçta verir ve paneli yeniden başa döndürür; sayfa OCR'ları kaydırma/durulma sürerken arka planda koşar (birleştirme sayfa sırasıyla, çıktı sıralı okumayla aynı) ve okuma ekranı durulmuş bırakır: sonraki OCR/gözlem ek durulma beklemez. Chrome'un ana penceresinin önüne düşebilen küçük yardımcı pencere ekran kapsamı olarak seçilmez. Gerçek ekran boyutu değişiminde açık hata verir ve görev yeniden deneyebilir. Her GUI yolunda eylem turu ekran durulunca otomatik gözlemle biter; ekranda tıklama/yazma/kaydırma yapılan görev, ilk final yanıtta bir kez güncel ekranla her zorunlu maddeyi doğrulamaya yönlendirilir. Açık yeni sekme ve LinkedIn akışı gibi somut isteklerde araç kanıtı eksikse bitiş engellenir; model içeriği okuyamadığını bildirirse arayüz görevi tamamlandı saymaz.
 
 ## Entegrasyonlar
 
@@ -56,6 +56,20 @@ denemede macOS'un izin istemi bir kez gösterilir (uygulama sisteme ancak böyle
 Ekran kilitliyse GUI araçları kilit ekranına tıklamadan/yazmadan "ekran kilitli" hatasıyla durur; kilitsiz
 ama uyuyan ekran uyandırılır. Telegram köprüsü açıkken prizdeki Mac uyumaz.
 
+Klavye girdisi (`cua_type_text`, `cua_press_key`, `cua_submit_text`, `cua_fill_field`, `run_action_sequence` type/press
+adımları, Chrome'un görünür UI yedeği) olaydan hemen önce sistemin klavye odağındaki uygulamayı doğrular (AX sistem geneli
+`AXFocusedApplication`, `tools/foreground.py`; ölçülen 0,2-5 ms, en çok 1,5 sn beklenir). Hedef `chrome_active_tab`, `cua_get_app`,
+`cua_click`, `smart_click`, `cua_click_element` ya da `cua_set_text_element` ile seçilmişse ön plan o uygulama olmalıdır
+(`FOREGROUND_MISMATCH`); seçilmemişse yalnız hassas ön plan reddedilir: OmniAgent'ın kendisi ya da onu çalıştıran uygulama,
+terminal/IDE, Sistem Ayarları/güvenlik pencereleri, parola yöneticileri. Ön plan okunamıyorsa (yanıtsız uygulama, OmniAgent'ın
+kendi penceresi önde: AX kendi sürecini okuyamaz) girdi gönderilmez (`FOREGROUND_UNKNOWN`). `cua_set_text_element` hassas
+uygulamaya hiç yazmaz (`SENSITIVE_TARGET`). cmd+tab, cmd+shift+tab ve cmd+space denetlenmez ve hedefi bırakır. `cua_get_app`
+uygulamanın öne gelmesini ve penceresini (en çok 5 sn) doğrular; uygulama adı betiğe değil argümana gider. Chrome sekme
+betiği yüklemeyi duvar saatiyle en çok 5 sn bekler; süreç zaman aşımı 13 sn'dir ve aşılırsa `CHROME_SCRIPT_TIMEOUT` hatasıdır
+(betik gezinmeyi bekleme döngüsünden önce yaptığı için görünür UI yedeğiyle yeniden gezinmek çift sekme açardı). AppleScript
+yalnız otomasyon izni reddinde (`-1743`/`-1744`) ya da `osascript` çalıştırılamadığında oturum boyu kapanır ve görünür UI yoluna
+geçilir; diğer betik hataları yalnız o çağrıyı UI yoluna düşürür.
+
 Kurulum ve sınırlar [TELEGRAM.md](TELEGRAM.md) içindedir. Bu değişiklikte canlı
 Telegram mesajı gönderilmedi; yerel hizmetin çalıştığı doğrulandı.
 
@@ -63,7 +77,7 @@ Hazır katalog çözümü ağ beklemesi gerektirmez. Yeni hizmette çevrimiçi k
 
 ## Model ve hız davranışı
 
-Varsayılan profil `ollama-cloud` (`gemma4:cloud`, yerel Ollama API'si); bu makinede Ollama oturumu ve model doğrulandı. `OMNI_OLLAMA_CLOUD_MODEL` ile `ollama list` içinde bulunan başka bir bulut modeli seçilebilir. Araç başarısızlıkları sürerse API anahtarıyla çağrılan `openai` (OpenAI API, GPT-6-Luna), ardından `openrouter` (`anthropic/claude-sonnet-5`) kullanılır; `opencode` ve `opencode-think` (Opencode Go, `qwen3.8-flash`) elle seçilebilir. Bilgisayardaki Codex/OpenCode oturumuna dayanan CLI bağlayıcıları kaldırıldı: her tur ayrı süreç başlatıyordu. Anahtarlar `OPENAI_API_KEY`, `OPENCODE_API_KEY` ve `OPENROUTER_API_KEY` değişken adlarıyla süreç-içi depodan okunur (kayıt yoksa kabuk ortam değişkeni yedektir); anahtarı tanımlı olmayan profil o görevde kullanılamaz. Arayüzün sağ üstündeki **Ayarlar** (⚙) sayfasından girilen anahtarlar macOS Keychain'de saklanır, kaydedildikleri anda süreç-içi depoya ve model istemcilerine uygulanır (görev sürüyorsa görev bitince), sonraki açılışlarda da yüklenir. Kayıtlı anahtar kabuk değişkenini geçersiz kılar, çünkü kabuk değişkeni ajanın başlattığı alt süreçlere miras kalır: anahtarlar `os.environ`'a bilinçli olarak yazılmaz, alt süreçlere anahtar değişkenleri çıkarılmış ortam verilir ve araç çıktısı modele/transkripte gitmeden önce maskelenir. Tüm API bağlantıları görevler arasında sıcak tutulur. Eski büyük araç sonuçları bağlamdan budanır, son tur tam korunur. Sabit GUI beklemesi yerine uygun olduğunda öğe/durum beklenir. Uygulama belirtilmeyen tek fotoğraf hedefinde doğrudan kamera yakalama yolu tercih edilir; Photo Booth gerektiğinde yedektir.
+Varsayılan profil `ollama-cloud` (`gemma4:cloud`, yerel Ollama API'si); bu makinede Ollama oturumu ve model doğrulandı. `OMNI_OLLAMA_CLOUD_MODEL` ile `ollama list` içinde bulunan başka bir bulut modeli seçilebilir. API anahtarıyla çağrılan `openai` (OpenAI API, GPT-6-Luna) ve `openrouter` (`anthropic/claude-sonnet-5`) elle seçilebilir; model çağrısı hata verdiğinde yalnız kullanıcı açıkça izin verdiyse yedek olur (aşağıya bakın), araç başarısızlıkları model değiştirmez; `opencode` ve `opencode-think` (Opencode Go, `qwen3.8-flash`) elle seçilebilir. Bilgisayardaki Codex/OpenCode oturumuna dayanan CLI bağlayıcıları kaldırıldı: her tur ayrı süreç başlatıyordu. Anahtarlar `OPENAI_API_KEY`, `OPENCODE_API_KEY` ve `OPENROUTER_API_KEY` değişken adlarıyla süreç-içi depodan okunur (kayıt yoksa kabuk ortam değişkeni yedektir); anahtarı tanımlı olmayan profil o görevde kullanılamaz. Arayüzün sağ üstündeki **Ayarlar** (⚙) sayfasından girilen anahtarlar macOS Keychain'de saklanır, kaydedildikleri anda süreç-içi depoya ve model istemcilerine uygulanır (görev sürüyorsa görev bitince), sonraki açılışlarda da yüklenir. Kayıtlı anahtar kabuk değişkenini geçersiz kılar, çünkü kabuk değişkeni ajanın başlattığı alt süreçlere miras kalır: anahtarlar `os.environ`'a bilinçli olarak yazılmaz, alt süreçlere anahtar değişkenleri çıkarılmış ortam verilir ve araç çıktısı modele/transkripte gitmeden önce maskelenir. Tüm API bağlantıları görevler arasında sıcak tutulur. Eski büyük araç sonuçları bağlamdan budanır, son tur tam korunur. Sabit GUI beklemesi yerine uygun olduğunda öğe/durum beklenir. Uygulama belirtilmeyen tek fotoğraf hedefinde doğrudan kamera yakalama yolu tercih edilir; Photo Booth gerektiğinde yedektir.
 
 `gpt-oss:20b-cloud` da bu makinede kurulu ve metin/araçlı görevde canlı doğrulandı;
 `OMNI_OLLAMA_CLOUD_MODEL=gpt-oss:20b-cloud` ile seçilebilir. Görsel görevler için doğrulanan
@@ -82,10 +96,28 @@ Tekrarlanan başarısızlıkları ve araçsız raporları kullanıcıya otomatik
 bounded-failure, 7 tur ve 5,4 saniye medyan verdi. Önceki stagnation politikası 10 tur
 harcıyordu. Koşularda ev dizininde istenmeyen dosya oluşmadı.
 
-401/402/403 erişim veya alternatif varken 429 hız sınırı veren model profili yalnız o
-görevde karantinaya alınır; sonraki turda aynı başarısız profile geri dönülmez. 429
-Retry-After sırasında uygun başka model varsa ona hemen geçilir; tek model varsa sağlayıcının
-bildirdiği kısa bekleme uygulanır. Geçici 5xx/ağ hatası ise sınırlı yeniden denemeye tabidir.
+401/402/403 erişim veya bakiye hatası veren model profili (izinli alternatif varsa) yalnız o
+görevde karantinaya alınır; sonraki turda aynı başarısız profile geri dönülmez. 429 hız sınırı
+veren profil Retry-After (yoksa 30 sn) kadar atlanır; alternatif yoksa Retry-After'a uyularak
+beklenir. Geçici 5xx/ağ hatası, zaman aşımı ve akış içi hata olayı üstel geri çekilmeyle yeniden
+denenir: çağrı başına bütçe arayüzde ve CLI'de 60 sn, Telegram'da 300 sn, sürekli veya gözetimsiz
+görevde kalan görev süresidir (en çok 30 dk). Bütçe aşılırsa görev "model çağrısı başarısız" ile
+biter; bekleme Durdur'a duyarlıdır.
+
+**Yedek sağlayıcı izni.** Model isteği (ekran görüntüleri, AX/OCR metni, geçmiş ve hafıza dahil)
+varsayılan olarak yalnız seçili sağlayıcıya gider; aynı sağlayıcıda yeniden deneme serbesttir.
+Başka sağlayıcıya geçiş `OMNI_FALLBACK_BACKENDS=openai,openrouter` (ya da veri dizinindeki
+`provider_fallback.json`) ile açıkça izin verilmedikçe yapılmaz; ekran görüntülü istekler ayrıca
+`OMNI_FALLBACK_IMAGES=1` ister. Otomatik seçim de bu izne tabidir: Otomatik varsayılan profildir
+(`ollama-cloud`); o hazır değilse (Ollama kapalı) yalnız `openai` hazır diye görev başka sağlayıcıya
+taşınmaz, izin yoksa açık hatayla başlamaz. Ollama'sız kullanıcı için tek seferlik yol
+`OMNI_FALLBACK_BACKENDS=openai` (görsel ek ve ekran görüntüsü için ayrıca `OMNI_FALLBACK_IMAGES=1`)
+ya da hazır profili açıkça seçmektir; hazır bir profilin açık seçimi izin gerektirmez. Her geçiş,
+istek gönderilmeden önce `provider_fallback` olarak yayınlanır (Telegram ve CLI gösterir) ve
+`audit.jsonl`'a yazılır; kalıcı yedeğe geçilmiş görevde her yeni görüntü seviyesi (metin, ekran
+görüntüsü) ayrıca kaydedilir. Telegram sesli komutunun yazıya çevrilmesi sesi OpenAI'a gönderir:
+`openai` izin listesinde değilse ses gönderilmez. Öncelik sırası, dosya şeması ve sınırlar
+`omniagent/fallback_policy.py` modül açıklamasındadır.
 
 Son sekiz sohbet alışverişi sınırlı uzunlukta bağlam olarak taşınır. Son 30 görevin ölçüm ve araç adımları yerel epizodik kayıtta tutulur, modele otomatik ders olarak enjekte edilmez. `user_memory.json` kullanıcının açıkça istediği tercih/yol/karar kayıtlarını tutar; kısa kayıtlar her görev başında sistem bağlamına eklenir, gizli bilgiler reddedilir ve dosya atomik yazılır. Council, StateTree/time-travel, kendi kendine Python araç üretimi ve AST öngörülü worker bu sürümde bulunmaz.
 
@@ -146,8 +178,26 @@ araç verdi; üç beklenen ilan kodunun tamamı iki koşuda da doğru okundu.
 ulaşıp görev de başarılı biterse ders saklar. Ders görev başında enjekte edilmez; aynı
 araç/hata imzası tekrarlandığında hatırlatılır ve işe yaramayan dersler budanır. 24 Eylül
 canlı `self_repair` ölçümünde 3/3 başarı: ilk koşu 5 tur/4 araç/4,5 sn; öğrenilmiş iki koşu
-3 tur/2 araç ve 3,6/2,1 sn. Finansal para hareketleri ile kullanıcının istemediği kalıcı
-hafıza mutasyonları `approval.py` host kapısından geçer; onay yoksa araç çalıştırılmaz.
+3 tur/2 araç ve 3,6/2,1 sn. Finansal para hareketleri, ödeme kartı numarası yazma, ekranda/tarayıcıda
+okunan ödeme/sipariş onayı düğmelerine tıklama (OCR, erişilebilirlik adı, DOM), entegrasyon araçlarıyla geri
+alınamaz dış iletişim ve kullanıcının istemediği kalıcı hafıza mutasyonları `approval.py` host kapısından
+geçer; onay yoksa (kanal yok, ret, zaman aşımı) ilgili çağrı çalıştırılmaz. İki otomatik onay yolu vardır ve
+her ikisi de varsayılan olarak izlenebilir kalır: güvenli host listesi/tutar limiti (`AUTO_APPROVE_HOSTS`,
+`AUTO_APPROVE_LIMIT`; ikisi de boş/0 iken kapalı) ve sürekli mod (`AUTO_APPROVE_IN_CONTINUOUS_MODE`).
+Otomatik onayda denetim kaydına `auto_approved` yazılır; kapatmak için ilgili ayar `False` yapılır.
+Kapsam ve sınırlar (Enter ile gönderim, ikon-only düğme gibi denetlenmeyen yollar) `approval.py` başlığındadır.
+
+Bot doğrulaması ve erişim engeli sayfaları (Cloudflare ara sayfası, reCAPTCHA/hCaptcha/Turnstile, hız sınırı)
+**varsayılan olarak aşılır** (`tools/bot_wall.py`; kapatmak için `BYPASS_ENABLED = False`): sayfa içerik olarak
+okunur, `fetch_raw` hata metnine ve tarayıcı sonucuna uygulanacak strateji (`get_bypass_strategy`) ile tıklanacak
+seçiciler (`get_bypass_selectors`) eklenir; engel sayfasındaki bağlantı/kutu tıklanabilir. Sıkı modda eski
+davranış geçerlidir: içeriğin yerini alan sayfa kurtarılamaz `BOT_WALL_DETECTED` hatası olur ve engelli ana
+makineye görev boyunca yeniden gidilmez. Ana makinenin gerçek erişim-reddi yanıtı (loopback, 'Access denied')
+her iki modda da bot duvarı sayılmaz. Tarayıcı bot duvarlarına karşı normal bir Chrome gibi görünür: standart
+Chrome User-Agent (`AGENT_PRODUCT_TOKEN` boş), stealth init script'i (`navigator.webdriver`, plugin/dil/WebGL
+parmak izleri) ve ajanın KENDİ kopyası olan kalıcı Chrome profili; kullanıcının gerçek profili açılmaz, ilk
+çalıştırmada çerez/giriş dosyaları oradan kopyalanır (`seed_chrome_profile`, `OMNI_SEED_CHROME_PROFILE=0` ile
+kapatılır).
 Alternatif web okuma yolu da öğrenilir: `fetch_raw` hatasından sonra aynı tam URL'yi
 `browse_url(actions=[])` içerikle okur ve görev başarıyla biterse, bir sonraki aynı hatada
 tarayıcı yolu önerilir. Kalıcı derste URL veya hata metni değil özetleri tutulur; farklı

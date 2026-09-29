@@ -7,12 +7,16 @@ from typing import Any
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
 
 from omniagent.integrations import telegram
 from omniagent.app import agent as main
+from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
 from omniagent.core.conversation import make_exchange
 from omniagent.integrations.capabilities import CapabilityService
+from omniagent.paths import workspace_dir
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
+from tests.test_fallback_egress import FakeProvider
 
 
 class FakeAPI:
@@ -71,7 +75,7 @@ async def test_bridge_delivers_host_rejection_without_model_success_claim(
     monkeypatch.setattr(telegram, "STATE_FILE", str(tmp_path / "memory.json"))
     api = FakeAPI()
     bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
-    bridge.clients = {"ollama-cloud": object()}
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {"ollama-cloud": object()})
     bridge.integrations = CapabilityService(tmp_path)
     target = tmp_path / "hedef.txt"
     target.write_text("koru", encoding="utf-8")
@@ -248,6 +252,157 @@ async def test_bridge_streams_real_event_contract_and_stop(monkeypatch: pytest.M
 
 
 @pytest.mark.asyncio
+async def test_btw_and_approve_reach_only_active_continuous_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.active = asyncio.create_task(asyncio.sleep(10))
+    bridge.active_run_mode = "continuous"
+
+    def message(user: int, content: str) -> dict[str, Any]:
+        return {"message": {"chat": {"id": 123, "type": "private"},
+                            "from": {"id": user}, "text": content}}
+
+    try:
+        await bridge.handle(message(999, "/btw Yetkisiz"))
+        await bridge.handle(message(456, "/btw Önce taslak"))
+        await bridge.handle(message(456, "/approve"))
+        assert bridge._drain_control_messages() == ["/btw Önce taslak", "/approve"]
+        assert not any("Yetkisiz" in text for text in api.sent)
+    finally:
+        bridge.active.cancel()
+        await asyncio.gather(bridge.active, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_btw_sent_immediately_after_start_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.run_mode = "continuous"
+    received: list[str] = []
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        received.extend(options["pop_control_messages"]())
+        return {"outcome": "bitti", "success": True, "reason": "", "metrics": {
+            "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+            "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
+        }, "exchange": make_exchange(goal, "bitti", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+
+    def message(text: str) -> dict[str, Any]:
+        return {"message": {"chat": {"id": 123, "type": "private"},
+                            "from": {"id": 456}, "text": text}}
+
+    await bridge.handle(message("Bir plan oluştur"))
+    task = bridge.active
+    assert task is not None
+    await bridge.handle(message("/btw Önce taslak"))
+    await task
+    assert received == ["/btw Önce taslak"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_rebuilds_model_clients_at_every_task_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hazır profiller görevler arasında değişir (Ollama sonradan açılıp kapanabilir): istemciler her görev başında yenilenir."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    ollama = {"ready": True}
+    monkeypatch.setattr(main, "ollama_cloud_ready", lambda: ollama["ready"])
+    # Anahtarsız profiller: hazır küme yalnız Ollama'nın durumuna bağlı kalır.
+    monkeypatch.setattr(main, "BACKENDS", {name: {**profile, "api_key": None} for name, profile in main.BACKENDS.items()})
+    # Gerçek fabrika: dosya düzeyindeki yalıtım fixture'ını bu testte geçersiz kılar.
+    monkeypatch.setattr(telegram, "create_model_clients", main.create_model_clients)
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    seen: list[dict[str, Any]] = []
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        seen.append(clients)
+        return {"outcome": "bitti", "success": True, "reason": "", "metrics": {
+            "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+            "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
+        }, "exchange": make_exchange(goal, "bitti", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    for ready in (True, False):
+        ollama["ready"] = ready
+        await bridge.handle({"message": {"chat": {"id": 123, "type": "private"},
+                                         "from": {"id": 456}, "text": "Merhaba de"}})
+        assert bridge.active is not None
+        await bridge.active
+    assert [sorted(clients) for clients in seen] == [["ollama-cloud"], []]
+    assert seen[0]["ollama-cloud"].is_closed() and bridge.clients is seen[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backends,request_count", [("none", 0), ("openai", 1)])
+async def test_telegram_auto_task_reaches_openai_only_with_permission_when_ollama_is_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backends: str, request_count: int,
+) -> None:
+    """
+    Gerçek ajan + gerçek SDK + yerel HTTP: köprü Ollama hazır değilken /model auto (varsayılan) ile görev alırsa
+    yalnız openai hazır diye veri OpenAI'a gitmez; izin verilmişse tam bir istek gider ve kullanıcı bilgilendirilir.
+    """
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "STATE_FILE", str(tmp_path / "memory.json"))
+    monkeypatch.setenv("OMNI_FALLBACK_BACKENDS", backends)
+    provider = FakeProvider(200)
+    monkeypatch.setattr(
+        telegram, "create_model_clients",
+        lambda: {"openai": AsyncOpenAI(base_url=provider.url, api_key="x", max_retries=0)},
+    )
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.integrations = CapabilityService(tmp_path)
+    try:
+        await bridge.handle({"message": {"chat": {"id": 123, "type": "private"},
+                                         "from": {"id": 456}, "text": "Merhaba de"}})
+        assert bridge.active is not None
+        await bridge.active
+    finally:
+        await bridge.integrations.close()
+        await main.close_model_clients(bridge.clients)
+        provider.close()
+    assert len(provider.bodies) == request_count
+    transcript = "\n".join(api.sent + api.edited + api.html_sent + api.html_edited)
+    if request_count:
+        assert "Yedek sağlayıcıya geçildi: ollama-cloud → openai" in transcript
+    else:
+        assert "yedek sağlayıcı izni yok" in transcript and "Yedek sağlayıcıya geçildi" not in transcript
+
+
+@pytest.mark.asyncio
+async def test_telegram_tasks_get_the_remote_model_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kullanıcı makinenin başında değil: Telegram görevi kısa ağ kopmasında model çağrısında uzak bütçeyle bekler."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    budgets: list[float] = []
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        budgets.append(options["model_retry_seconds"])
+        return {"outcome": "bitti", "success": True, "reason": "", "metrics": {
+            "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+            "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
+        }, "exchange": make_exchange(goal, "bitti", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle({"message": {"chat": {"id": 123, "type": "private"},
+                                     "from": {"id": 456}, "text": "Merhaba de"}})
+    task = bridge.active
+    assert task is not None
+    await task
+    assert budgets == [REMOTE_MODEL_RETRY_SECONDS] and REMOTE_MODEL_RETRY_SECONDS > 60.0
+
+
+@pytest.mark.asyncio
 async def test_compact_reply_uses_one_message_without_debug_details(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -364,6 +519,81 @@ async def test_waiting_user_status_is_readable_and_reply_resumes(
     }
     await presenter.event(resumed)
     assert "Göreve devam ediliyor" in api.drafts[-1][1]["html"]
+
+
+PROVIDER_SWITCH: dict[str, Any] = {
+    "kind": "provider_fallback", "from_backend": "ollama-cloud", "to_backend": "openai",
+    "to_model": "gpt-6-luna", "processor": "OpenAI", "reason": "hız sınırı (HTTP 429)", "image_count": 2,
+}
+
+
+@pytest.mark.asyncio
+async def test_provider_fallback_is_one_persistent_message_per_target_in_compact_view() -> None:
+    """Kısa görünümde gizlilik olayı taslakta kaybolmaz: görev başına hedef sağlayıcı başına tek kalıcı ileti."""
+    api = FakeAPI()
+    live = telegram.TelegramDraftStream(api, 123, telegram.TelegramStream(api, 123))
+    presenter = telegram.CompactPresenter(live)
+    await presenter.event(PROVIDER_SWITCH)
+    await presenter.event(PROVIDER_SWITCH)
+    assert len(api.sent) == 1
+    assert "2 ekran görüntüsü" in api.sent[0] and "OpenAI" in api.sent[0] and "hız sınırı" in api.sent[0]
+    await presenter.event({**PROVIDER_SWITCH, "to_backend": "openrouter", "processor": "OpenRouter"})
+    assert len(api.sent) == 2 and "openrouter" in api.sent[1]
+    # Aynı hedefe farklı görüntü seviyesi (metin ↔ ekran görüntüsü) yeni kalıcı ileti üretir; aynı seviye
+    # (ekran görüntülü olan zaten bildirildi) tekrarlanmaz.
+    await presenter.event({**PROVIDER_SWITCH, "image_count": 0})
+    await presenter.event({**PROVIDER_SWITCH, "image_count": 5})
+    assert len(api.sent) == 3 and "ekran görüntüsü dahil" not in api.sent[2]
+    # Ayrıntılı görünüm aynı olayı satır içi gösterir.
+    assert "Yedek sağlayıcıya geçildi" in telegram.event_text(PROVIDER_SWITCH)
+
+
+@pytest.mark.asyncio
+async def test_provider_fallback_notice_failure_does_not_abort_the_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    api = FakeAPI()
+
+    async def failing_send(chat_id: int, text: str) -> int:
+        raise telegram.TelegramError("sendMessage: ağ hatası", None)
+
+    api.send = failing_send
+    live = telegram.TelegramDraftStream(api, 123, telegram.TelegramStream(api, 123))
+    presenter = telegram.CompactPresenter(live)
+    with caplog.at_level("WARNING"):
+        await presenter.event(PROVIDER_SWITCH)
+    assert any(record.getMessage() == "Yedek sağlayıcı bildirimi gönderilemedi" for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_provider_fallback_notice_is_retried_after_a_failed_send(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Gönderim düşerse hedef 'bildirildi' sayılmaz: gizlilik olayı sonraki olayda yeniden denenir, ulaşınca tekrarlanmaz."""
+    api = FakeAPI()
+    deliver = api.send
+    attempts = 0
+
+    async def flaky_send(chat_id: int, text: str) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise telegram.TelegramError("sendMessage: ağ hatası", None)
+        return await deliver(chat_id, text)
+
+    api.send = flaky_send
+    live = telegram.TelegramDraftStream(api, 123, telegram.TelegramStream(api, 123))
+    presenter = telegram.CompactPresenter(live)
+    with caplog.at_level("WARNING"):
+        await presenter.event(PROVIDER_SWITCH)
+    assert api.sent == []
+    warning = next(
+        record for record in caplog.records if record.getMessage() == "Yedek sağlayıcı bildirimi gönderilemedi"
+    )
+    assert warning.to_backend == "openai"
+    await presenter.event(PROVIDER_SWITCH)
+    await presenter.event(PROVIDER_SWITCH)
+    assert len(api.sent) == 1 and "OpenAI" in api.sent[0] and attempts == 2
 
 
 @pytest.mark.asyncio
@@ -665,3 +895,138 @@ async def test_compact_sends_only_requested_final_screenshot(
     assert task is not None
     await task
     assert [path.name for path in api.photos] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("goal", "written_in_workspace"), [
+    ("Ekran görüntüsü alıp gönderir misin", True),
+    ("Projedeki kodu düzelt ve ekran görüntüsü gönder", False),
+])
+async def test_bridge_reads_relative_screenshot_where_the_tool_wrote_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, goal: str, written_in_workspace: bool,
+) -> None:
+    """
+    Araç göreli ekran görüntüsü adını kaynak görevi değilse workspace'e, kaynak görevinde süreç
+    dizinine yazar; köprü fotoğrafı aynı yerden okumalı. Ajanın kendi otomatik gözlemi ve bitiş
+    doğrulaması da take_screenshot olayıdır ama önizlemesi dosya adı değil etiket taşır: köprü
+    onları kullanıcı görüntüsü sanıp gerçek fotoğrafı ezmemeli, sahte "bulunamadı" uyarısı yazmamalı.
+    """
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path / "data"))
+    process_dir = tmp_path / "proje"
+    process_dir.mkdir()
+    monkeypatch.chdir(process_dir)
+    written = (workspace_dir() if written_in_workspace else process_dir) / "screen_view.png"
+    written.parent.mkdir(parents=True, exist_ok=True)
+    written.write_bytes(b"PNG")
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        emit({"kind": "tool_started", "call_id": "ekran", "index": 0,
+              "name": "take_screenshot", "preview": "screen_view.png"})
+        emit({"kind": "tool_finished", "call_id": "ekran", "ok": True,
+              "text": "Ekran alındı", "seconds": 0.1})
+        for index, label in enumerate(
+            (main.AUTO_OBSERVATION_PREVIEW, main.VERIFICATION_OBSERVATION_PREVIEW), start=1,
+        ):
+            emit({"kind": "tool_started", "call_id": f"gozlem{index}", "index": index,
+                  "name": "take_screenshot", "preview": label})
+            emit({"kind": "tool_finished", "call_id": f"gozlem{index}", "ok": True,
+                  "text": "Ekran alındı", "seconds": 0.1})
+        metrics = {
+            "turns": 2, "tool_calls": 1, "elapsed_seconds": 1.0, "backend": "ollama-cloud",
+            "prompt_tokens": 100, "cached_tokens": 0, "completion_tokens": 10,
+        }
+        emit({"kind": "run_finished", "success": True, "outcome": "Tamam.", "reason": "", "metrics": metrics})
+        return {"outcome": "Tamam.", "success": True, "reason": "",
+                "metrics": metrics, "exchange": make_exchange(goal, "Tamam.", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": goal,
+    }})
+    task = bridge.active
+    assert task is not None
+    await task
+    assert [path.resolve() for path in api.photos] == [written.resolve()]
+    posted: list[str] = [*api.sent, *api.edited, *api.html_sent, *api.html_edited]
+    assert not any("bulunamadı" in text for text in posted)
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_screenshot_path_does_not_abort_the_task(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Model '~olmayan_kullanici/a.png' gibi çözülemeyen bir ekran görüntüsü yolu verirse araç tarafında bu
+    kurtarılabilir bir hatadır; olay döngüsündeki RuntimeError Telegram görevini iptal etmemeli.
+    """
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        emit({"kind": "tool_started", "call_id": "ekran", "index": 0,
+              "name": "take_screenshot", "preview": "~olmayan_kullanici_xyz/a.png"})
+        emit({"kind": "tool_finished", "call_id": "ekran", "ok": False,
+              "text": "Yol çözülemedi", "seconds": 0.1})
+        metrics = {
+            "turns": 2, "tool_calls": 1, "elapsed_seconds": 1.0, "backend": "ollama-cloud",
+            "prompt_tokens": 100, "cached_tokens": 0, "completion_tokens": 10,
+        }
+        emit({"kind": "run_finished", "success": True, "outcome": "Tamam.", "reason": "", "metrics": metrics})
+        return {"outcome": "Tamam.", "success": True, "reason": "",
+                "metrics": metrics, "exchange": make_exchange(goal, "Tamam.", [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    with caplog.at_level("WARNING"):
+        await bridge.handle({"message": {
+            "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "Ekran görüntüsü alıp gönderir misin",
+        }})
+        task = bridge.active
+        assert task is not None
+        await task
+    posted: list[str] = [*api.sent, *api.edited, *api.html_sent, *api.html_edited]
+    assert "Tamam." in posted and not any("Görev hatası" in text for text in posted)
+    warning = next(
+        record for record in caplog.records if record.getMessage() == "Ekran görüntüsü yolu çözülemedi"
+    )
+    assert warning.error_type == "RuntimeError" and warning.call_id == "ekran"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verbose", [False, True], ids=["kompakt", "ayrıntılı"])
+async def test_partial_report_notice_and_run_finished_show_the_report_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, verbose: bool,
+) -> None:
+    """
+    Ajan, boş çıktılı başarısız görevin kısmi raporunu hem uyarı (masaüstü ve CLI run_finished çıktısını
+    göstermez) hem run_finished çıktısı olarak yayınlar: Telegram iki görünümde de raporu tek kez göstermeli.
+    """
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.verbose = verbose
+    marker = "RAPOR7431"
+    report = f"Görev tamamlanamadı.\nBulgu: {marker}\nBulgular araç çıktılarından otomatik alındı."
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        metrics = {
+            "turns": 3, "tool_calls": 2, "elapsed_seconds": 1.0, "backend": "ollama-cloud",
+            "prompt_tokens": 100, "cached_tokens": 0, "completion_tokens": 10,
+        }
+        emit({"kind": "notice", "level": "warning", "text": report})
+        emit({"kind": "run_finished", "success": False, "outcome": report, "reason": "ilerleme yok", "metrics": metrics})
+        return {"outcome": report, "success": False, "reason": "ilerleme yok",
+                "metrics": metrics, "exchange": make_exchange(goal, report, [])}
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "Bir şey araştır",
+    }})
+    task = bridge.active
+    assert task is not None
+    await task
+    # Kullanıcının sohbette gördüğü son hâl: ara düzenlemeler değil, her iletinin son metni
+    final_pages = [*api.html_sent, *(api.edited[-1:] or api.sent[-1:])]
+    assert sum(page.count(marker) for page in final_pages) == 1, final_pages

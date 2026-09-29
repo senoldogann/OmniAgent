@@ -277,6 +277,24 @@ def test_read_only_shell_probe_is_not_deletion_evidence() -> None:
     assert not main._obviously_read_only_shell(redirected)
 
 
+def test_long_read_only_shell_is_not_deletion_evidence() -> None:
+    """300 karakteri aşan salt-okur komut argümanı kırpılıp ayrışamaz hâle gelmez; gözlem silme kanıtı sayılmaz."""
+    arguments = json.dumps({"command": "ls -la " + " ".join(f"/tmp/klasor-{index:02d}/dosya.txt" for index in range(40))})
+    assert len(arguments) > 300
+    steps = [sm.make_step_record("execute_shell", arguments, True, "Çıkış Kodu: 0")]
+    assert main._obviously_read_only_shell(arguments)
+    assert not main.has_action_evidence("Bu dosyayı sil", steps)
+
+
+def test_multi_click_browse_url_counts_as_click_evidence() -> None:
+    """Çok tıklamalı browse_url argümanı (300 karakteri aşar) kırpılıp çözülemez hâle gelmez; tıklama kanıtı sayılır."""
+    actions = [{"action": "click", "selector": f"#dugme-{index}"} for index in range(12)]
+    arguments = json.dumps({"url": "https://ornek.test/form", "actions": actions})
+    assert len(arguments) > 300
+    steps = [sm.make_step_record("browse_url", arguments, True, "Okundu")]
+    assert main.has_action_evidence("Formu doldur ve gönder", steps)
+
+
 def test_git_status_is_observation_not_mutation_evidence() -> None:
     status = json.dumps({"command": "git status --short"})
     steps = [sm.make_step_record("execute_shell", status, True, "Çıkış Kodu: 0")]

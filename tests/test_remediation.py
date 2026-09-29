@@ -108,7 +108,7 @@ async def test_cleanup_failures_still_publish_finished(tmp_path: Path, monkeypat
     monkeypatch.setattr(main, "CapabilityService", Service)
     result = await main.run_agent_with_callback(
         "deneme", events.append,
-        {"requested_backend": None, "should_stop": lambda: False,
+        {"requested_backend": "opencode", "should_stop": lambda: False,
          "state_file": str(tmp_path / "memory.json"), "history": []},
         {"opencode": object()})
     assert result["success"]
@@ -125,7 +125,7 @@ async def test_broken_state_still_finishes(tmp_path: Path):
     events = []
     result = await main.run_agent_with_callback(
         "deneme", events.append,
-        {"requested_backend": None, "should_stop": lambda: False,
+        {"requested_backend": "opencode", "should_stop": lambda: False,
          "state_file": str(state), "history": []},
         {"opencode": object()})
     assert not result["success"]

@@ -9,7 +9,9 @@ import pytest
 from omniagent.memory import experience
 from omniagent.app import agent as main
 from omniagent.integrations.capabilities import CapabilityService
+from omniagent.core import text_norm
 from omniagent.core.events import AgentEvent
+from omniagent.tools import browser
 
 TOOL_SCRIPT: str = """#!/bin/sh
 case "$*" in
@@ -68,7 +70,7 @@ async def _run(goal: str, script: List[Dict[str, Any]], seen: List[str], tmp_pat
             patch.setattr(main, "_call_model_with_retries", fake_model)
             return await main.run_agent_with_callback(
                 goal, events.append,
-                {"requested_backend": None, "should_stop": lambda: False,
+                {"requested_backend": "opencode", "should_stop": lambda: False,
                  "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service,
                  "experience_file": str(tmp_path / "deneyim.json")},
                 {"opencode": object()},
@@ -304,3 +306,61 @@ def test_same_tool_and_cross_tool_lessons_do_not_overwrite_each_other() -> None:
     assert len(state["lessons"]) == 2
     assert len({item["id"] for item in state["lessons"]}) == 2
     assert {item["fixed_tool"] for item in state["lessons"]} == {"fetch_raw", "browse_url"}
+
+
+@pytest.mark.parametrize("command, secret", [
+    ("mysql --password hunter2Zx9 -h db.example.com", "hunter2Zx9"),
+    ("curl -u admin:s3cr3tPass https://api.example.com/v1/items", "s3cr3tPass"),
+    ("deploy --token=ghp_A1b2C3d4E5f6G7h8i9J0 --env prod", "ghp_A1b2C3d4E5f6G7h8i9J0"),
+    ("psql postgres://kullanici:gizliSifre99@db.example.com/uygulama", "gizliSifre99"),
+    ("export DB_PASSWORD=Xk29qLm0pQ && ./calistir", "Xk29qLm0pQ"),
+])
+def test_command_line_secrets_reach_neither_the_tokens_nor_the_lesson_file(command: str, secret: str, tmp_path: Path) -> None:
+    """
+    Ders dosyasına sır yazılmaz: scrub_secrets projedeki ortak süzgeci (mask_sensitive_text) kullanır. Eskiden ayrı, daha zayıf
+    üçüncü bir maskeleyici vardı ve 'mysql --password hunter2Zx9' belirteç olarak ders dosyasına sızıyordu.
+    """
+    failed = json.dumps({"command": command, "use_sudo": False, "timeout_seconds": None})
+    fixed = json.dumps({"command": command + " --fail", "use_sudo": False, "timeout_seconds": None})
+    assert secret.casefold() not in " ".join(experience.argument_tokens(failed))
+    assert secret not in experience.display_call(failed) and secret not in experience.scrub_secrets(command)
+    candidate = experience.pair_candidate("execute_shell", failed, f"ToolError: {command} başarısız", fixed)
+    assert candidate is not None
+    path: Path = tmp_path / "deneyim.json"
+    experience.save_experience(str(path), experience.merge_candidates(experience.empty_state(), [candidate], "t"))
+    assert secret not in path.read_text(encoding="utf-8") and secret.casefold() not in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status, skipped", [
+    (401, True), (403, True), (429, True), (451, True), (404, False), (500, False), (503, False),
+])
+def test_only_access_control_statuses_are_excluded_from_learning(status: int, skipped: bool) -> None:
+    """Durum kodu tools/browser.py ile ORTAK çapadan ('returned error: <kod>') okunur; erişim denetimi olmayan durumlar öğrenilir."""
+    url = "https://example.com/items"
+    failure = f"HTTP başarısız: url={url}, çıkış=22, stderr=curl: (22) The requested URL returned error: {status}"
+    tracker, observed = experience.observe_result(
+        experience.empty_state(), experience.new_tracker(), "fetch_raw", json.dumps({"url": url}), False, failure, 1,
+    )
+    assert observed == {"notes": [], "lesson_id": None}
+    assert (tracker["open_failures"].get("fetch_raw", []) == []) is skipped
+    assert browser._curl_http_status(failure) == status
+    assert text_norm.curl_http_statuses(f"{failure} sonra returned error: 4031 ve returned error: 500") == [status, 500]
+
+
+def test_access_denied_status_never_teaches_a_route_around_it() -> None:
+    """
+    403/429 gibi erişim denetimi hatası, aynı adreste sonradan tarayıcı okuması başarılı olsa da "başka araç dene"
+    dersine dönüşmez: sınıflandırılamayan engel sayfası da engeli aşmayı kalıcı belleğe öğretmemeli.
+    """
+    url = "https://example.com/items"
+    failure = f"HTTP başarısız: url={url}, çıkış=22, stderr=curl: (22) The requested URL returned error: 403"
+    tracker = experience.new_tracker()
+    tracker, observed = experience.observe_result(
+        experience.empty_state(), tracker, "fetch_raw", json.dumps({"url": url}), False, failure, 1,
+    )
+    assert observed == {"notes": [], "lesson_id": None}
+    tracker, _ = experience.observe_result(
+        experience.empty_state(), tracker, "browse_url", json.dumps({"url": url, "actions": []}), True,
+        _browser_read(url), 2,
+    )
+    assert experience.finish_task(experience.empty_state(), tracker, True, "t0")["lessons"] == []

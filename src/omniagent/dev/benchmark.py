@@ -11,6 +11,11 @@ Kullanım:
   .venv/bin/omniagent-benchmark --runs 2 --concurrency 1 --only chrome_maas,chrome_form   # kaydırma + form doğrulaması
   .venv/bin/omniagent-benchmark --runs 2 --concurrency 1 --only chrome_maas,chrome_form --headless  # görünmez Chromium
   .venv/bin/omniagent-benchmark --runs 4 --concurrency 1 --only ogrenme,ogrenme_bos,hafiza
+  .venv/bin/omniagent-benchmark --no-keychain --backend ollama-cloud --seed bg-1 --runs 3 --concurrency 2   # Keychain'e dokunmaz
+
+`--headless` yalnız Chrome-oturumu GUI senaryoları (chrome_*) içindir; AX eylemleri ve kabuk aracı
+bu bayrakla kapatılmaz. Chrome oturumu senaryolarında bunlar hedef metnine bağlı araç şemasından çıkarılıp
+reddedilir; Chrome dışı bir hedefte gerçek uygulamalara ve kabuğa ulaşabilirler.
 """
 from __future__ import annotations
 
@@ -39,7 +44,7 @@ from urllib.parse import parse_qs, urlsplit
 from openai import AsyncOpenAI
 
 from omniagent.memory import user as user_memory
-from omniagent.config import apply_stored_api_keys
+from omniagent.config import apply_model_preferences, apply_stored_api_keys, refresh_api_keys
 from omniagent.integrations.runtime import IntegrationMetrics
 from omniagent.app.agent import RunOptions, RunReport, close_model_clients, create_model_clients, run_agent_with_callback
 from omniagent.app.tool_schema import AUTO_OBSERVATION_PREVIEW, VERIFICATION_OBSERVATION_PREVIEW
@@ -373,6 +378,40 @@ class Scenario(TypedDict):
     experience_file: NotRequired[str]
 
 
+class BackendChange(TypedDict):
+    """Koşu sırasında sağlayıcı değişimi (yedeğe geçiş); içerik taşımaz."""
+    turn: int
+    backend: str
+    model: str
+    reason: str
+
+
+class ProviderFallbackRecord(TypedDict):
+    """İzinli yedek sağlayıcıya yönlendirme (provider_fallback olayı); istek içeriği taşımaz."""
+    turn: int
+    from_backend: str
+    to_backend: str
+    to_model: str
+    reason: str
+
+
+class RunProvenance(TypedDict):
+    """
+    Koşunun hangi sağlayıcı/modelle başladığı ve sırasında yedeğe geçilip geçilmediği. Sonuçtaki
+    `backend` alanı yalnız KALICI yedek geçişini gösterir; tek turluk geçici yedek yalnız
+    `backend_changes` içinde görünür. Koşu `run_started` yayınlamadan bittiyse (başlangıç hatası)
+    started_backend ve started_model boş metindir. model_retry_waits, 2 sn ve üstü model yeniden
+    deneme beklemelerinin sayısıdır: bekleme süresi ölçülen süreye karışır, bu yüzden süre
+    karşılaştırmasında bu koşular dışlanmalıdır. provider_fallbacks izinli yedeğe yönlendirmelerdir.
+    """
+    started_backend: str
+    started_model: str
+    backend_changes: List[BackendChange]
+    stream_resets: int
+    model_retry_waits: int
+    provider_fallbacks: List[ProviderFallbackRecord]
+
+
 class RunResult(TypedDict):
     name: str
     case_id: str
@@ -403,8 +442,13 @@ class RunResult(TypedDict):
     gui_trace: List[Dict[str, object]]
     gui_actions: List[Dict[str, object]]
     gui_metrics: Dict[str, object]
+    provenance: RunProvenance
     trace: NotRequired[List[Dict[str, Any]]]
     trace_summary: NotRequired[Dict[str, Any]]
+    # Nihai yanıt doğrulaması (bkz. app/answer_fidelity): düzeltilen, belirsiz ve gözlemsiz kod-benzeri belirteçler
+    answer_tokens_corrected: NotRequired[int]
+    answer_tokens_unverified: NotRequired[int]
+    answer_tokens_unobserved: NotRequired[int]
 
 
 class GuiTrace:
@@ -471,7 +515,8 @@ class GuiTrace:
 
 def gui_tool_path(name: str) -> str:
     """Görsel hedef seçimi yolunu araç adından sınıflandırır."""
-    if name in ("cua_get_ax_state", "cua_click", "smart_click"):
+    if name in ("cua_get_ax_state", "cua_click", "smart_click", "cua_snapshot", "cua_click_element",
+                "cua_set_text_element"):
         return "ax"
     if name == "cua_click_text":
         return "ocr"
@@ -484,7 +529,7 @@ def gui_tool_path(name: str) -> str:
 
 def gui_tool_route(name: str) -> str:
     """Hassas hedef metnini kaydetmeden GUI aracının gözlem/eylem yolunu sınıflandırır."""
-    if name in {"cua_get_ax_state", "cua_click"}:
+    if name in {"cua_get_ax_state", "cua_click", "cua_snapshot", "cua_click_element", "cua_set_text_element"}:
         return "ax"
     if name in {"cua_read_visible_text", "cua_click_text", "cua_read_scrollable"}:
         return "ocr"
@@ -497,11 +542,55 @@ def gui_tool_route(name: str) -> str:
     return "other"
 
 
+# Ajan döngüsü, sağlayıcı kesintisi ya da kotası yüzünden model yanıt alamazsa görevi
+# "model çağrısı başarısız (<tür>)" nedeniyle bitirir (bkz. app/agent.py ModelCallFailed ve
+# app/model_retry.py MODEL_ERROR_KIND_LABELS; her tür için bir satır olmalı, testle denetlenir). ModelCallFailed her
+# APIError/ssl.SSLError'ı sardığı için sağlayıcı hatası 'Kritik hata' metni olarak gelmez: o metindeki durum
+# kodu/sözcük iğneleri yalnız kod hatalarını (ör. KeyError 'rate_limit') yanlış sınıflıyordu ve kaldırıldı.
+# "geçersiz istek" (kalıcı 4xx) BİLEREK yok: kod gerilemesidir.
+_MODEL_CALL_FAILED_PREFIX: str = "model çağrısı başarısız ("
+_MODEL_CALL_FAILED_CATEGORIES: Dict[str, str] = {
+    "geçici hata": "provider_unavailable", "zaman aşımı": "provider_timeout",
+    "hız sınırı": "provider_rate_limited", "erişim veya bakiye hatası": "provider_auth",
+    "sunucu yeniden denemeyi reddetti": "provider_unavailable",
+    "tls sertifika doğrulaması başarısız": "provider_unavailable",
+}
+# Model istemcisi hiç kurulamadığında (Ollama Cloud modeli de API anahtarı da yok) görev başlamadan bu metinle
+# biter (bkz. app/agent.py run_agent_with_callback): sağlayıcı kesintisi değil, yapılandırma eksiğidir.
+_CONFIG_MISSING_PREFIX: str = "kritik hata: kullanılabilir model yok"
+# İki izin/yapılandırma sonucu da sağlayıcı kesintisi değildir: (1) görev sürerken istek yedek izni olmadığı için hiç
+# gönderilmedi (app/agent.py FallbackNotPermitted; nedenin kendisi bu metindir), (2) görev başında seçilen profil hazır
+# değil ve yedeğe izin yok (startup_failure: "Kritik hata: '<profil>' profili hazır değil ...", bkz.
+# fallback_policy.startup_substitution_problem). İkisi de eskiden other_failure/critical_error sayılıyordu.
+_FALLBACK_DENIED_REASON: str = "yedek sağlayıcı izni yok"
+_PROFILE_NOT_READY: re.Pattern[str] = re.compile(r"kritik hata: '[^']+' profili hazır değil")
+
+
+def provider_failure_category(reason: str) -> Optional[str]:
+    """
+    Görevin sağlayıcı/altyapı yüzünden bitme nedenini (ajan döngüsünün 'model çağrısı başarısız (<tür>)'
+    nedeni) içerik taşımayan sınıfa indirger; sağlayıcı kesintisi değilse None. 'Kritik hata' metni ne
+    içerirse içersin sınıflanmaz (kod hatasıdır); 400/404/422 gibi istek biçimi hataları ('geçersiz istek')
+    da BİLEREK sınıflanmaz: kod gerilemesidir, altyapı sorunu değildir. Saf.
+    """
+    value = reason.casefold()
+    if value.startswith(_MODEL_CALL_FAILED_PREFIX):
+        return _MODEL_CALL_FAILED_CATEGORIES.get(value.removeprefix(_MODEL_CALL_FAILED_PREFIX).removesuffix(")"))
+    return None
+
+
 def failure_reason_category(reason: str) -> str:
     """Serbest hata metnini gizli ekran içeriği taşımayan teşhis sınıfına indirger."""
     value = reason.casefold()
     if not value:
         return "completed"
+    # Sağlayıcı kesintisi ve eksik yapılandırma zincirin başında ayrılır: aşağıdaki dallar (ör. "timeout")
+    # bu nedenleri yanlış sınıfa çalmasın.
+    provider = provider_failure_category(reason)
+    if provider is not None:
+        return provider
+    if value.startswith(_CONFIG_MISSING_PREFIX) or value == _FALLBACK_DENIED_REASON or _PROFILE_NOT_READY.match(value):
+        return "config_missing"
     if "model boş yanıt" in value:
         return "empty_model_answer"
     if "max_tokens" in value or "token sınır" in value:
@@ -512,7 +601,7 @@ def failure_reason_category(reason: str) -> str:
         return "iteration_limit"
     if "ilerleme yok" in value or "fast loop" in value:
         return "stagnation"
-    if "zaman sınır" in value or "timeout" in value:
+    if "zaman sınır" in value or "zaman bütçesi" in value or "timeout" in value:
         return "time_limit"
     # "Kritik hata: … doğrulanmadı" ifadesi önce eşleşmeli; eskiden doğrulan/kanıt kontrolü
     # kritik hata kontrolünden önce geldiği için yanlış sınıflanıyordu.
@@ -605,6 +694,44 @@ def gui_trace_summary(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
             for route in routes
         },
     }
+
+
+def provenance_recorder() -> Tuple[RunProvenance, Callable[[AgentEvent], None]]:
+    """
+    run_started/turn_started/backend_changed/provider_fallback/stream_reset olaylarından ve model_retry
+    aşamalı durum olaylarından sağlayıcı izini çıkarır; hedef, yanıt ve araç metni gibi içerik saklamaz.
+    Yalnız olay döngüsünden gelen olay türlerine dokunur (işçi iş parçacıklarından gelen araç olayları
+    ve diğer aşamalı durum olayları yok sayılır), bu yüzden kilit gerekmez.
+    """
+    provenance: RunProvenance = {
+        "started_backend": "", "started_model": "", "backend_changes": [], "stream_resets": 0,
+        "model_retry_waits": 0, "provider_fallbacks": [],
+    }
+    active_turn: int = 0
+
+    def record_event(event: AgentEvent) -> None:
+        nonlocal active_turn
+        if event["kind"] == "run_started":
+            provenance["started_backend"] = event["backend"]
+            provenance["started_model"] = event["model"]
+        elif event["kind"] == "turn_started":
+            active_turn = event["turn"]
+        elif event["kind"] == "backend_changed":
+            provenance["backend_changes"].append({
+                "turn": active_turn, "backend": event["backend"],
+                "model": event["model"], "reason": event["reason"],
+            })
+        elif event["kind"] == "provider_fallback":
+            provenance["provider_fallbacks"].append({
+                "turn": active_turn, "from_backend": event["from_backend"], "to_backend": event["to_backend"],
+                "to_model": event["to_model"], "reason": event["reason"],
+            })
+        elif event["kind"] == "integration_status" and event["stage"] == "model_retry":
+            provenance["model_retry_waits"] += 1
+        elif event["kind"] == "stream_reset":
+            provenance["stream_resets"] += 1
+
+    return provenance, record_event
 
 
 def job_code(run_id: str, query: str, index: int) -> str:
@@ -1050,19 +1177,30 @@ async def run_one(
             options["run_mode"] = scenario["run_mode"]
         if scenario.get("experience_file"):
             options["experience_file"] = scenario["experience_file"]
+        # Sağlayıcı izi (yedeğe geçiş, model bekleme, akış sıfırlama) takip senaryolarında ilk koşuyu da kapsar: aynı
+        # provenance nesnesi iki koşunun olaylarını sırayla biriktirir (tur numaraları her koşuda 1'den başlar).
+        # GUI izleyicileri yalnız asıl (ikinci) koşuya bağlanır.
+        provenance, record_provenance = provenance_recorder()
         first_ok = True
+        first_failure = ""
         if name in ("takip", "takip_bos"):
-            first = await run_agent_with_callback(scenario["first_goal"], lambda event: None, options, clients)
-            first_ok = first["success"] and f"veri-{run_id}.txt" in first["outcome"]
+            first = await run_agent_with_callback(scenario["first_goal"], record_provenance, options, clients)
+            named_file: str = f"veri-{run_id}.txt"
+            first_ok = first["success"] and named_file in first["outcome"]
+            if not first_ok:
+                first_failure = (f"ilk koşu başarısız: başarı={first['success']}, "
+                                 f"dosya adı çıktıda={named_file in first['outcome']}, neden={first['reason'][:120]!r}")
             if name == "takip":
                 options["history"] = [first["exchange"]]
         test_origin: str = f"http://127.0.0.1:{port}/"
         if name in GUI_SCENARIOS:
             await asyncio.to_thread(gui_stage["open_page"], test_origin + "hazir")
         page = gui_stage.get("page") if name in GUI_SCENARIOS else None
-        # İki bağımsız izleyici birlikte çalışır: gui_trace_obj hedef/decoy tıklama doğruluğunu
-        # (chrome_benzer'ın asıl geçme koşulu), gui_trace_recorder() ise tur/model/araç düzeyinde
-        # arıza teşhisini (trace_summary) besler. combined_sink ikisine de aynı olayı iletir.
+        # Üç bağımsız izleyici birlikte çalışır: gui_trace_obj hedef/decoy tıklama doğruluğunu
+        # (chrome_benzer'ın asıl geçme koşulu), gui_trace_recorder() tur/model/araç düzeyinde arıza
+        # teşhisini (trace_summary), provenance_recorder() koşunun hangi sağlayıcı/modelle yürüdüğünü
+        # (provenance) besler. combined_sink hepsine aynı olayı iletir ve TÜM senaryolara uygulanır:
+        # tek turluk geçici yedek geçişi yalnız olaylarda görünür, sonuçtaki backend alanında görünmez.
         gui_trace_obj = GuiTrace(page)
         if page is not None:
             page.start_run()
@@ -1071,18 +1209,18 @@ async def run_one(
         def combined_sink(event: AgentEvent) -> None:
             gui_trace_obj.record(event)
             record_event(event)
+            record_provenance(event)
 
         started: float = time.monotonic()
         try:
-            report: RunReport = await run_agent_with_callback(
-                scenario["goal"], combined_sink if name in GUI_SCENARIOS else lambda event: None,
-                options, clients,
-            )
+            report: RunReport = await run_agent_with_callback(scenario["goal"], combined_sink, options, clients)
             elapsed: float = round(time.monotonic() - started, 2)
         finally:
             if name in GUI_SCENARIOS:
                 await asyncio.to_thread(gui_stage["close_pages"], test_origin)
         ok, detail = scenario["check"](report["outcome"])
+        if first_failure:
+            detail = f"{first_failure}; {detail}"
         expected_success: bool = scenario.get("expect_success", True)
         expected_reason: Optional[str] = scenario.get("reason_contains")
         reason_ok: bool = expected_reason is None or expected_reason.casefold() in report["reason"].casefold()
@@ -1115,6 +1253,10 @@ async def run_one(
             "gui_trace": gui_trace_obj.rows if name in GUI_SCENARIOS else [],
             "gui_actions": page.actions() if page is not None else [],
             "gui_metrics": gui_metrics if name in GUI_SCENARIOS else {},
+            "provenance": provenance,
+            "answer_tokens_corrected": metrics.get("answer_tokens_corrected", 0),
+            "answer_tokens_unverified": metrics.get("answer_tokens_unverified", 0),
+            "answer_tokens_unobserved": metrics.get("answer_tokens_unobserved", 0),
         }
         if gui_run:
             result["trace"] = trace
@@ -1230,8 +1372,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--only", default=",".join(CORE_SCENARIOS), help="Virgülle ayrılmış senaryo adları")
     parser.add_argument("--json", default=None, help="Ham sonuçların yazılacağı JSON dosyası")
     parser.add_argument("--seed", default=None, help="Karşılaştırma için aynı senaryo kimliklerini üretir")
+    parser.add_argument("--no-keychain", action="store_true",
+                        help="macOS Keychain'e dokunma (erişim istemi ve askıda kalma riski yok); anahtarlar yalnız "
+                             "ortam değişkeninden gelir, kayıtlı model tercihleri yine uygulanır")
     parser.add_argument("--headless", action="store_true",
-                        help="GUI senaryolarını kullanıcının ekranı yerine görünmez Chromium'da koş (headless_screen.py)")
+                        help="GUI senaryolarını kullanıcının ekranı yerine görünmez Chromium'da koş (headless_screen.py). "
+                             "Yalnız Chrome-oturumu GUI senaryoları içindir; AX eylemleri ve kabuk aracı kapatılmaz")
     arguments: argparse.Namespace = parser.parse_args(argv)
     selected: List[str] = [name for name in arguments.only.split(",") if name]
     unknown: List[str] = [name for name in selected if name not in SCENARIO_NAMES]
@@ -1241,8 +1387,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         parser.error(f"GUI senaryoları ({', '.join(GUI_SCENARIOS)}) tek ekranı paylaşır: --concurrency 1 kullan.")
     if set(selected) & set(SEQUENTIAL_SCENARIOS) and arguments.concurrency != 1:
         parser.error(f"Öğrenme senaryoları ({', '.join(SEQUENTIAL_SCENARIOS)}) ardışık koşmalı: --concurrency 1 kullan.")
-    # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
-    apply_stored_api_keys()
+    if arguments.no_keychain:
+        # Yalnız model tercihleri ve ortamdaki anahtarlar: Keychain hiç okunmaz (erişim istemi çıkmaz).
+        apply_model_preferences()
+        refresh_api_keys()
+    else:
+        # Ayarlar sayfasında kaydedilen anahtarlar yalnız eksikse ortama uygulanır.
+        apply_stored_api_keys()
     if not arguments.headless:
         asyncio.run(run_benchmark(arguments.runs, arguments.concurrency, arguments.backend, selected, arguments.json,
                                   CHROME_STAGE, arguments.seed))

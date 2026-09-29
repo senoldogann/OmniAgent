@@ -8,6 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omniagent.app.tool_execution import approval_request_for_call
 from omniagent.integrations import mcp as mcp_bridge
 from omniagent.integrations.runtime import IntegrationRuntime
 from omniagent.integrations.mcp import MCPBridge, install_package, load_skill, run_install
@@ -157,5 +158,75 @@ async def test_catalog_operation_maps_to_only_named_mcp_tool(tmp_path: Path):
             assert "toplam" in next(iter(tools.values()))["schema"]["function"]["description"]
             with pytest.raises(ValueError, match="İstenen işlemler"):
                 await bridge.tools(configured, runtime(), ["unknown"])
+        finally:
+            await bridge.close()
+
+
+COMMUNICATION_SERVER: str = '''
+from mcp.server.fastmcp import FastMCP
+
+server = FastMCP("omni-iletisim")
+
+
+@server.tool()
+def send_message(to: str, body: str) -> str:
+    """Bir alıcıya mesaj gönderir (deneme sunucusu: gerçekte göndermez)."""
+    return f"gönderildi: {to}"
+
+
+@server.tool()
+def get_message(message_id: str) -> str:
+    """Bir mesajı okur."""
+    return "merhaba"
+
+
+@server.tool()
+def send_report(to: str) -> str:
+    """Bir alıcıya rapor gönderir (adında okuma sözcüğü 'report' geçer; deneme sunucusu: gerçekte göndermez)."""
+    return f"rapor gönderildi: {to}"
+
+
+@server.tool()
+def withdraw_balance(account: str) -> str:
+    """Bakiyeyi çeker (adında okuma sözcüğü 'balance' geçer; deneme sunucusu: gerçekte para çekmez)."""
+    return f"çekildi: {account}"
+
+
+server.run(transport="stdio")
+'''
+
+
+@pytest.mark.asyncio
+async def test_outbound_tool_needs_approval_and_readonly_conflict_is_rejected(tmp_path: Path):
+    """Gerçek SDK + gerçek süreç: send_message dış iletişim sayılır ve onay ister; salt okunur işaretlenirse kayıt anında açık hata."""
+    script = tmp_path / "iletisim_server.py"
+    script.write_text(COMMUNICATION_SERVER, encoding="utf-8")
+    configured = dict(entry(), id="iletisim", args=[str(script)], readonly_tools=["get_message"],
+                      operation_tools={"say": ["send_message", "send_report"], "read": ["get_message"],
+                                       "money": ["withdraw_balance"]})
+    arguments = {"to": "ali@example.com", "body": "merhaba"}
+    async with httpx.AsyncClient() as http:
+        bridge = MCPBridge(tmp_path, http)
+        try:
+            tools = await bridge.tools(configured, runtime(), ["say", "read", "money"])
+            by_label = {tool["label"]: (local, tool) for local, tool in tools.items()}
+            local, send = by_label["send_message"]
+            assert send["readonly"] is False and not send["financial"]
+            request = approval_request_for_call(local, arguments, send, False)
+            assert request is not None and request["category"] == "communication"
+            assert "ali@example.com" in request["summary"] and "DIŞ İLETİŞİM ONAYI" in request["title"]
+            local_read, read = by_label["get_message"]
+            assert read["readonly"] is True and approval_request_for_call(local_read, {}, read, False) is None
+            # Nesne adı okuma sözcüğü olan araçlar da onaydan geçer: 'send_report' dış iletişim, 'withdraw_balance' para hareketi
+            local_report, report = by_label["send_report"]
+            report_request = approval_request_for_call(local_report, {"to": "ali@example.com"}, report, False)
+            assert report["readonly"] is False and report_request is not None and report_request["category"] == "communication"
+            local_money, money = by_label["withdraw_balance"]
+            money_request = approval_request_for_call(local_money, {"account": "TR00"}, money, False)
+            assert money["financial"] and money_request is not None and money_request["category"] == "financial"
+            for wrongly_readonly in ("send_message", "send_report", "withdraw_balance"):
+                wrong = dict(configured, readonly_tools=["get_message", wrongly_readonly])
+                with pytest.raises(ValueError, match="salt okunur"):
+                    await bridge.tools(wrong, runtime(), ["say", "read", "money"])
         finally:
             await bridge.close()

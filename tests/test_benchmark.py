@@ -1,7 +1,17 @@
 """Deterministic benchmark scenario contracts without model/API execution."""
+import asyncio
+import json
 import subprocess
 from pathlib import Path
+from typing import Dict
 
+import pytest
+from openai import AsyncOpenAI
+
+from omniagent.app.agent import RunOptions, RunReport
+from omniagent.core.conversation import make_exchange
+from omniagent.core.events import EventSink
+from omniagent.core.state import EpisodeMetrics
 from omniagent.dev import benchmark, headless_screen
 from omniagent.memory import user as user_memory
 
@@ -191,8 +201,6 @@ def test_close_chrome_test_tabs_falls_back_to_active_test_tab(monkeypatch) -> No
 
 def test_command_line_entry_point_validates_and_runs_selected_scenarios(monkeypatch) -> None:
     """`omniagent-benchmark` betiği argümansız çağrılan senkron main'i çalıştırır."""
-    import pytest
-
     runs: list[tuple] = []
     applied: list[bool] = []
 
@@ -224,3 +232,145 @@ def test_command_line_entry_point_validates_and_runs_selected_scenarios(monkeypa
     monkeypatch.setattr(benchmark, "headless_stage", lambda page: "görünmez sahne")
     benchmark.main(["--runs", "1", "--concurrency", "1", "--only", "chrome_maas", "--headless"])
     assert runs[-1][-2:] == ("görünmez sahne", None) and closed == [True]
+
+
+def test_no_keychain_flag_skips_keychain_hydration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`--no-keychain` yalnız model tercihlerini ve ortamdaki anahtarları uygular; bayrak yokken Keychain yolu aynı kalır."""
+    calls: list[str] = []
+
+    async def fake_run(*arguments: object) -> None:
+        calls.append("run")
+
+    monkeypatch.setattr(benchmark, "run_benchmark", fake_run)
+    monkeypatch.setattr(benchmark, "apply_stored_api_keys", lambda: calls.append("keychain"))
+    monkeypatch.setattr(benchmark, "apply_model_preferences", lambda: calls.append("prefs"))
+    monkeypatch.setattr(benchmark, "refresh_api_keys", lambda: calls.append("refresh"))
+
+    benchmark.main(["--runs", "1", "--concurrency", "1", "--only", "gun", "--no-keychain"])
+    assert calls == ["prefs", "refresh", "run"]
+
+    calls.clear()
+    benchmark.main(["--runs", "1", "--concurrency", "1", "--only", "gun"])
+    assert calls == ["keychain", "run"]
+
+
+@pytest.mark.asyncio
+async def test_run_one_records_backend_switch_provenance_for_core_scenarios(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Çekirdek (GUI dışı) koşular da olay izler: tek turluk geçici yedek geçişi sonuçtaki `backend`
+    alanında görünmez ama `provenance` içinde görünür. Sonuç JSON'a yazılabilir, GUI alanları
+    çekirdek koşuda boş kalır ve iz hedef metnini taşımaz.
+    """
+    async def scripted_loop(
+        goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
+    ) -> RunReport:
+        emit({"kind": "run_started", "goal": goal, "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "turn_started", "turn": 1, "max_turns": 25, "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "stream_reset", "reason": "APIConnectionError (ollama-cloud), yeniden deneniyor"})
+        emit({"kind": "backend_changed", "backend": "openai", "model": "o3",
+              "reason": "geçici hata; yalnız bu tur için fallback, sonraki tur ollama-cloud yeniden denenecek"})
+        metrics: EpisodeMetrics = {
+            "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+            "prompt_tokens": 10, "cached_tokens": 0, "completion_tokens": 2,
+        }
+        return {"outcome": "GUN: Salı", "success": True, "reason": "", "metrics": metrics,
+                "exchange": make_exchange(goal, "GUN: Salı", [])}
+
+    monkeypatch.setattr(benchmark, "run_agent_with_callback", scripted_loop)
+
+    result = await benchmark.run_one(
+        "gun", tmp_path, 0, "ollama-cloud", {}, asyncio.Semaphore(1), benchmark.CHROME_STAGE, 0, "provenance",
+    )
+
+    assert result["ok"] is True
+    assert result["backend"] == "ollama-cloud"
+    assert result["provenance"] == {
+        "started_backend": "ollama-cloud", "started_model": "gemma4:cloud",
+        "backend_changes": [{
+            "turn": 1, "backend": "openai", "model": "o3",
+            "reason": "geçici hata; yalnız bu tur için fallback, sonraki tur ollama-cloud yeniden denenecek",
+        }],
+        "stream_resets": 1,
+        "model_retry_waits": 0,
+        "provider_fallbacks": [],
+    }
+    assert "hangi gün" not in json.dumps(result["provenance"], ensure_ascii=False)
+    assert result["gui_trace"] == [] and result["gui_metrics"] == {} and "trace" not in result
+    json.dumps(result, ensure_ascii=False)
+
+
+def _follow_up_metrics() -> EpisodeMetrics:
+    return {
+        "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+        "prompt_tokens": 10, "cached_tokens": 0, "completion_tokens": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_one_follow_up_scenario_records_first_run_provider_trace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    takip senaryosunun ilk koşusu da sağlayıcı izini bırakır: yedeğe geçiş, model bekleme ve akış sıfırlama aynı
+    `provenance` nesnesine birikir (eskiden ilk koşu `lambda event: None` ile çalışıp izi atıyordu).
+    """
+    run_id = benchmark.benchmark_run_id("takip", 0, "iz")
+
+    async def scripted_loop(
+        goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
+    ) -> RunReport:
+        emit({"kind": "run_started", "goal": goal, "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        emit({"kind": "turn_started", "turn": 1, "max_turns": 25, "backend": "ollama-cloud", "model": "gemma4:cloud"})
+        if "satır sayısını" in goal:
+            outcome = "SATIR: 137"
+        else:
+            emit({"kind": "stream_reset", "reason": "APIConnectionError (ollama-cloud), yeniden deneniyor"})
+            emit({"kind": "integration_status", "stage": "model_retry", "text": "gizli durum", "completed": 1, "total": 0})
+            emit({"kind": "provider_fallback", "from_backend": "ollama-cloud", "to_backend": "openai",
+                  "to_model": "o3", "processor": "gizli işleyici", "reason": "hız sınırı (HTTP 429)",
+                  "image_count": 0})
+            outcome = f"En büyük dosya: veri-{run_id}.txt"
+        return {"outcome": outcome, "success": True, "reason": "", "metrics": _follow_up_metrics(),
+                "exchange": make_exchange(goal, outcome, [])}
+
+    monkeypatch.setattr(benchmark, "run_agent_with_callback", scripted_loop)
+
+    result = await benchmark.run_one(
+        "takip", tmp_path, 0, "ollama-cloud", {}, asyncio.Semaphore(1), benchmark.CHROME_STAGE, 0, "iz",
+    )
+
+    assert result["ok"] is True
+    assert result["provenance"]["stream_resets"] == 1
+    assert result["provenance"]["model_retry_waits"] == 1
+    assert result["provenance"]["provider_fallbacks"] == [{
+        "turn": 1, "from_backend": "ollama-cloud", "to_backend": "openai", "to_model": "o3",
+        "reason": "hız sınırı (HTTP 429)",
+    }]
+    assert "gizli" not in json.dumps(result["provenance"], ensure_ascii=False)
+
+
+@pytest.mark.asyncio
+async def test_run_one_follow_up_scenario_reports_first_run_failure_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """İlk koşu sağlayıcı yüzünden başarısız olursa sonuç bunu söyler; yalnız ikinci koşunun denetimi görünmez."""
+    async def scripted_loop(
+        goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
+    ) -> RunReport:
+        if "satır sayısını" in goal:
+            outcome, success, reason = "SATIR: 137", True, ""
+        else:
+            outcome, success, reason = "", False, "model çağrısı başarısız (hız sınırı)"
+        return {"outcome": outcome, "success": success, "reason": reason, "metrics": _follow_up_metrics(),
+                "exchange": make_exchange(goal, outcome, [])}
+
+    monkeypatch.setattr(benchmark, "run_agent_with_callback", scripted_loop)
+
+    result = await benchmark.run_one(
+        "takip_bos", tmp_path, 0, "ollama-cloud", {}, asyncio.Semaphore(1), benchmark.CHROME_STAGE, 0, "iz",
+    )
+
+    assert result["ok"] is False
+    assert "ilk koşu başarısız" in result["detail"] and "model çağrısı başarısız (hız sınırı)" in result["detail"]

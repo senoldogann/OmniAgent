@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from omniagent.ui import app as ui
+from tests.test_ui_conversation import close_window
 
 
 class FakeText:
@@ -128,4 +129,4 @@ def test_svg_icons_are_used_by_real_controls(monkeypatch: pytest.MonkeyPatch, tm
         assert window.voice_btn.cget("image") is not None
         assert window.copy_btn.cget("image") is not None
     finally:
-        window._on_close()
+        close_window(window)

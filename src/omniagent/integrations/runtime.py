@@ -6,7 +6,7 @@ import tempfile
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional, TypeVar, TypedDict
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar, TypedDict
 
 from omniagent.approval import APPROVAL_TIMEOUT_SECONDS
 from omniagent.core.events import EventSink
@@ -14,6 +14,9 @@ from omniagent.paths import data_root
 
 T = TypeVar("T")
 AnswerSink = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+# ask() süre sınırı verilmişse alanlara bu üst veri (saniye) eklenir: arayüz son saati gösterir ve
+# süre dolunca pencereyi kapatır. '_' ile başlayan alanlar yanıt alanı değildir (Telegram da yok sayar).
+INPUT_TIMEOUT_FIELD: str = "_timeout_seconds"
 # Dosyayı kullanıcının kanalına (Telegram sohbeti) teslim eder: (yol, başlık)
 DeliverSink = Callable[[Path, str], Awaitable[None]]
 
@@ -77,12 +80,28 @@ class IntegrationRuntime:
         }
         self.discovery_remaining = 8.0
         self.install_attempts: set[str] = set()
+        # Erişim/bakiye hatası (401/402/403, insufficient_quota) alan profiller görev boyu engellenir.
         self.blocked_backends: set[str] = set()
+        # Hız sınırına (429) takılan profil -> serinleme bitişi (time.monotonic); süre dolunca profil yeniden denenir.
+        self.backend_cooldowns: Dict[str, float] = {}
+        # Bu turdaki model çağrısının yeniden denemeden vazgeçeceği an (time.monotonic). Agent her turda atar;
+        # None ise (agent dışı çağrı: CLI, test) etkileşimli bütçe kullanılır.
+        self.model_retry_until: Optional[float] = None
+        # Yedek sağlayıcı izni (bkz. omniagent.fallback_policy): görev başında run_agent_with_callback atar.
+        # Varsayılanlar KAPALI'dır; doğrudan kurulan runtime hiçbir yedeğe izin vermez.
+        self.primary_backend: Optional[str] = None
+        self.fallback_backends: frozenset[str] = frozenset()
+        self.fallback_images: bool = False
+        # Bu görevde ProviderFallback ile bildirilip denetim kaydına yazılan (hedef profil, görüntülü mü) çiftleri:
+        # aynı çift görev boyunca bir kez duyurulur, yeni görüntü seviyesi (metinden ekran görüntüsüne) yeni kayıt üretir.
+        self.announced_fallbacks: set[Tuple[str, bool]] = set()
         self.published: Dict[str, Any] = {}
         self.selected: Dict[str, Any] = {}
         self.allowed_tools: Optional[frozenset[str]] = None
         # ask_user'ın yanıt bekleme sınırı; sürekli görevde None: kullanıcı yanıtlayana dek bekler.
         self.user_input_timeout: Optional[float] = APPROVAL_TIMEOUT_SECONDS
+        self.unattended: bool = False
+        self.deferred_questions: set[str] = set()
 
     def check(self) -> None:
         if self.should_stop():
@@ -123,12 +142,13 @@ class IntegrationRuntime:
         düşülür. timeout verilirse süre dolunca TimeoutError yükselir (onay/soru görevi
         sonsuza dek kilitlemesin); None kurulum akışlarında sınırsız bekler.
         """
-        if self.answer is None:
+        if self.answer is None or self.unattended:
             raise InteractionRequired(title)
         start = time.monotonic()
         self.status("waiting_user", title)
+        shown: Dict[str, Any] = fields if timeout is None else {**fields, INPUT_TIMEOUT_FIELD: timeout}
         try:
-            return await self.wait(self.answer(title, fields), timeout=timeout)
+            return await self.wait(self.answer(title, shown), timeout=timeout)
         finally:
             self.metrics["user_wait_seconds"] += time.monotonic() - start
             self.status("resumed", "Göreve devam ediliyor")

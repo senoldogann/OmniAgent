@@ -236,6 +236,74 @@ def recognize_text(image: object) -> List[TextLine]:
     return reading_order(lines)
 
 
+def region_around(center: Tuple[int, int], radius_x: int, radius_y: int) -> TextBox:
+    """Merkez etrafında 0-1000 uzayına sıkıştırılmış dikdörtgen bölge. Saf."""
+    left: int = max(0, center[0] - radius_x)
+    top: int = max(0, center[1] - radius_y)
+    right: int = min(NORMALIZED_SPACE, center[0] + radius_x)
+    bottom: int = min(NORMALIZED_SPACE, center[1] + radius_y)
+    return {"left": float(left), "top": float(top), "width": float(right - left), "height": float(bottom - top)}
+
+
+def _remap_box(box: TextBox, origin: TextBox) -> TextBox:
+    """Kırpım uzayındaki (0-1000) kutuyu, kırpımın tam görüntüdeki konumuna göre tam uzaya taşır. Saf."""
+    scale_x: float = origin["width"] / NORMALIZED_SPACE
+    scale_y: float = origin["height"] / NORMALIZED_SPACE
+    return {
+        "left": origin["left"] + box["left"] * scale_x, "top": origin["top"] + box["top"] * scale_y,
+        "width": box["width"] * scale_x, "height": box["height"] * scale_y,
+    }
+
+
+def recognize_region(image: object, region: TextBox) -> List[TextLine]:
+    """
+    Görüntünün 0-1000 model uzayındaki bölgesini kırpıp tanır. Dönen satır ve kelime kutuları kırpımın değil
+    TAM görüntünün uzayındadır: find_text_matches/select_text_match/box_center doğrudan kullanılır. Yalnız bölge
+    kadar alan okunur (tam ekran OCR'dan orantılı ucuz). Bölge boşsa ya da kırpım alınamazsa TextRecognitionError.
+    """
+    width: int = int(Quartz.CGImageGetWidth(image))
+    height: int = int(Quartz.CGImageGetHeight(image))
+    left: int = max(0, round(region["left"] * width / NORMALIZED_SPACE))
+    top: int = max(0, round(region["top"] * height / NORMALIZED_SPACE))
+    right: int = min(width, round((region["left"] + region["width"]) * width / NORMALIZED_SPACE))
+    bottom: int = min(height, round((region["top"] + region["height"]) * height / NORMALIZED_SPACE))
+    if right <= left or bottom <= top:
+        raise TextRecognitionError(f"OCR bölgesi boş: {region}")
+    crop = Quartz.CGImageCreateWithImageInRect(image, Quartz.CGRectMake(left, top, right - left, bottom - top))
+    if crop is None:
+        raise TextRecognitionError(f"OCR bölgesi görüntüden kırpılamadı: {region}")
+    origin: TextBox = {
+        "left": left * NORMALIZED_SPACE / width, "top": top * NORMALIZED_SPACE / height,
+        "width": (right - left) * NORMALIZED_SPACE / width, "height": (bottom - top) * NORMALIZED_SPACE / height,
+    }
+    return [
+        {**line, "box": _remap_box(line["box"], origin),
+         "words": [{"text": word["text"], "box": _remap_box(word["box"], origin)} for word in line["words"]]}
+        for line in recognize_text(crop)
+    ]
+
+
+def line_at_point(
+    lines: List[TextLine], point: Tuple[int, int], tolerance_x: float, tolerance_y: float,
+) -> Optional[TextLine]:
+    """
+    Noktayı (tolerans payıyla) kapsayan satırlardan noktaya en yakın olanı döner; yoksa None. Yalnız en yakın
+    satır seçilir: komşu düğmenin etiketi tıklanan düğmeye yazılmasın. Saf.
+    """
+    def gap(line: TextLine) -> Tuple[float, float]:
+        box: TextBox = line["box"]
+        return (
+            max(box["left"] - point[0], 0.0, point[0] - (box["left"] + box["width"])),
+            max(box["top"] - point[1], 0.0, point[1] - (box["top"] + box["height"])),
+        )
+
+    gaps: List[Tuple[Tuple[float, float], TextLine]] = [(gap(line), line) for line in lines]
+    near: List[Tuple[float, TextLine]] = [
+        (math.hypot(dx, dy), line) for (dx, dy), line in gaps if dx <= tolerance_x and dy <= tolerance_y
+    ]
+    return min(near, key=lambda item: item[0])[1] if near else None
+
+
 def normalize_text(text: str) -> str:
     """Eşleştirme anahtarı: küçük harf, aksansız, tek boşluklu. 'Lähetä' ile 'lahetä' eşleşir. Saf."""
     decomposed: str = unicodedata.normalize("NFKD", text.casefold().translate(_CHARACTER_MAP))
@@ -441,3 +509,47 @@ def merge_page_lines(accumulated: List[str], page: List[str]) -> Tuple[List[str]
         if equal >= max(1, math.ceil(size * OVERLAP_MIN_SHARE)):
             return accumulated + page[size:], size
     return accumulated + page, 0
+
+
+class ReadProgress(TypedDict):
+    """Kaydırılan panelin o ana dek birleşmiş metni ve bir sonraki kaydırma adımı için gereken durum."""
+    text_lines: List[str]
+    cut_tail: List[str]
+    gaps: int
+    step_points: float
+
+
+def first_pages_progress(
+    top_lines: List[TextLine], probe_lines: List[TextLine], region: TextBox, edge: float, step_points: float,
+) -> ReadProgress:
+    """
+    İlk iki okumayı (tepe sayfa ve ilk küçük kaydırmadan sonraki sayfa) birleştirir: bölgeyi bulmak için yapılan ilk
+    kaydırmanın metni de katılır, böylece ilk tam kaydırma adımı arada satır atlamaz. Saf.
+    """
+    top_body, _top_cut = split_bottom_cut(lines_within(top_lines, region), region, edge)
+    probe_body, cut_tail = split_bottom_cut(
+        without_top_cut(lines_within(probe_lines, region), region, edge), region, edge,
+    )
+    merged, _overlap = merge_page_lines(top_body, probe_body)
+    return {"text_lines": merged, "cut_tail": cut_tail, "gaps": 0, "step_points": step_points}
+
+
+def absorb_page(
+    progress: ReadProgress, page_lines: List[TextLine], region: TextBox, edge: float, gap_marker: str,
+) -> ReadProgress:
+    """
+    Sonraki kaydırma sayfasını birikmiş metne ekler. Örtüşme bulunamazsa araya boşluk işareti konur ve kaydırma adımı
+    yarılanır (arada satır atlanmış olabilir). Girdiyi değiştirmez. Saf.
+    """
+    page, cut_tail = split_bottom_cut(
+        without_top_cut(lines_within(page_lines, region), region, edge), region, edge,
+    )
+    merged, overlap = merge_page_lines(progress["text_lines"], page)
+    if overlap == 0 and progress["text_lines"] and page:
+        return {
+            "text_lines": progress["text_lines"] + [gap_marker] + page, "cut_tail": cut_tail,
+            "gaps": progress["gaps"] + 1, "step_points": progress["step_points"] / 2,
+        }
+    return {
+        "text_lines": merged, "cut_tail": cut_tail, "gaps": progress["gaps"], "step_points": progress["step_points"],
+    }

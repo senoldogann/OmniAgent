@@ -13,40 +13,13 @@ from pathlib import Path
 from threading import Thread
 from typing import Any, Dict, List, Tuple
 
+import pyautogui
 import pytest
+import Quartz
 
 from omniagent import tools
 from omniagent.app import agent as main
 from omniagent.dev import benchmark, headless_screen
-
-# headless_screen.install() bu modül seviyesindeki adları kalıcı olarak değiştirir
-# (bkz. dev/headless_screen.py:236-244); testten sonra geri almazsak sonraki testler
-# (gerçek macOS araçlarını bekleyenler dahil) sahte Toolbox ile çalışmaya devam eder.
-_PATCHED_TOOLS_ATTRS: Tuple[str, ...] = (
-    "screen_capture_granted", "_require_screen_capture", "_require_accessibility",
-    "click_model_point", "move_model_point", "type_unicode_text", "press_key_spec", "post_scroll",
-)
-
-
-@pytest.fixture
-def headless_page():
-    saved_tools: Dict[str, object] = {name: getattr(tools, name) for name in _PATCHED_TOOLS_ATTRS}
-    saved_toolbox = main.Toolbox
-    try:
-        page = headless_screen.HeadlessPage()
-    except Exception as error:  # noqa: BLE001 - Playwright'ın kendi hata tipi burada önemli değil
-        # CI/geliştirme makinesinde `playwright install` hiç çalıştırılmamış olabilir
-        # (repo bunu hiçbir yerde çağırmıyor); bu test o zaman diğer ortam-bağımlı testler
-        # gibi (macOS Keychain, gerçek Tk...) açık gerekçeyle atlanır, sessizce geçmez.
-        pytest.skip(f"Headless Chromium başlatılamadı (playwright install gerekebilir): {error}")
-    headless_screen.install(page)
-    try:
-        yield page
-    finally:
-        page.close()
-        for name, value in saved_tools.items():
-            setattr(tools, name, value)
-        main.Toolbox = saved_toolbox
 
 
 def _model_point_for(page: headless_screen.HeadlessPage, selector: str) -> List[int]:
@@ -110,3 +83,33 @@ async def test_chrome_benzer_gate_rejects_click_on_decoy_even_with_correct_text(
     assert any(action["target"] == "decoy" for action in result["gui_actions"] if action["action"] == "click")
     assert result["gui_metrics"]["wrong_target_clicks"] == 1
     assert result["ok"] is False
+
+
+_MULTI_CLICK_PAGE: str = (
+    "<body style='margin:0'><div id='t' style='position:absolute;left:100px;top:100px;"
+    "width:300px;height:200px' ondblclick=\"document.title='cift'\"></div>"
+    "<script>window.__log = [];"
+    "for (const name of ['mousedown', 'mouseup']) document.addEventListener(name, () => window.__log.push(name));"
+    "</script></body>"
+)
+
+
+def test_headless_multi_click_and_drag_reach_page_and_real_input_is_blocked(
+    headless_page: headless_screen.HeadlessPage,
+) -> None:
+    """Görünmez modda çift tıklama ve sürükleme sayfaya gider; yamasız gerçek girdi açıkça engellenir."""
+    headless_page._run(lambda page: page.set_content(_MULTI_CLICK_PAGE))
+    start = _model_point_for(headless_page, "#t")
+    message = tools.multi_click_model_point(start[0], start[1], "left", 2, headless_screen.GEOMETRY)
+    assert message.startswith("Çift tıklandı")
+    assert headless_page._run(lambda page: page.title()) == "cift"
+
+    headless_page._run(lambda page: page.evaluate("window.__log.length = 0"))
+    end = (start[0] + 40, start[1] + 40)
+    tools.drag_model_points((start[0], start[1]), end, "left", headless_screen.GEOMETRY)
+    assert headless_page._run(lambda page: page.evaluate("window.__log")) == ["mousedown", "mouseup"]
+
+    with pytest.raises(headless_screen.HeadlessInputBlocked):
+        pyautogui.click(1, 1)
+    with pytest.raises(headless_screen.HeadlessInputBlocked):
+        Quartz.CGEventPost(0, None)

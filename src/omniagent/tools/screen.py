@@ -19,6 +19,7 @@ from .system import child_environment, parent_process_name
 from .types import (
     ACCESSIBILITY_SETTINGS_URL,
     DISPLAY_WAKE_SECONDS,
+    INPUT_PAUSE_SECONDS,
     MODEL_SCREEN_SIZE,
     MOUSE_DRAG_HOLD_SECONDS,
     MOUSE_DRAG_STEP_SECONDS,
@@ -39,6 +40,11 @@ from .types import (
     ToolError,
     ToolRuntime,
 )
+
+# pyautogui her genel çağrıdan sonra PAUSE (varsayılan 0,1 sn) uyur; fare/klavye olayları işletim sisteminde sıralı işlenir ve
+# eylemin ekrandaki etkisini durulma beklemesi (wait_for_screen_settle) karşılar. Köşe acil durdurması (FAILSAFE) bilerek AÇIK
+# bırakılır: kullanıcı fareyi köşeye götürerek eylem dizisini kesebilir. Tek seferlik kütüphane yapılandırmasıdır.
+pyautogui.PAUSE = INPUT_PAUSE_SECONDS
 
 BUNDLE_APP_NAMES: Dict[str, str] = {
     "com.apple.Terminal": "Terminal",
@@ -476,7 +482,10 @@ def drag_model_points(start: Tuple[int, int], end: Tuple[int, int], button: str,
     return f"Sürüklendi: ({start[0]}, {start[1]}) -> ({end[0]}, {end[1]})"
 
 def post_scroll(dx: float, dy: float) -> None:
-    event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, round(-dy * 10), round(-dx * 10))
+    # dx/dy ekran noktası (piksel birimi); önceki '* 10' çarpanı canlı ölçümde (geçici Chrome ve yerel NSScrollView)
+    # istenen kaydırmayı tam 10 katına çıkarıyordu: cua_scroll 'amount' panelin ~%80'i yerine ~8 ekran kaydırıyor,
+    # cua_read_scrollable her adımda örtüşmeyi kaçırıp adım yarılıyordu.
+    event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, round(-dy), round(-dx))
     Quartz.CGEventSetIntegerValueField(event, Quartz.kCGScrollWheelEventIsContinuous, 1)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 

@@ -31,9 +31,8 @@ def screen_reading_schemas() -> List[Dict[str, Any]]:
         ),
         _function_schema(
             "cua_click_text",
-            "Görünür metne (bağlantı, düğme, sekme, liste/ilan başlığı, menü öğesi, onay kutusu etiketi) "
-            "OCR ile bulup tam ortasına tıklar; nokta tahmininden kesindir. Metin birden çok yerdeyse "
-            "near ile hedefin yaklaşık noktasını ver.",
+            "Görünür metni OCR ile bulup tam ortasına tıklar; nokta tahmininden kesindir. Metin birden "
+            "çok yerdeyse near ile hedefin yaklaşık noktasını ver.",
             {
                 "text": {"type": "string", "description": "Ekranda görünen metin (tamamı veya ayırt edici parçası)."},
                 "near": {
@@ -326,9 +325,36 @@ def route_tool_schemas(
             "app_name": {"type": "string", "description": "Uygulama adı (örn. Safari, Notes)."},
         }),
         _function_schema(
+            "cua_snapshot",
+            "Uygulamanın öndeki penceresindeki görünür etkileşimli öğeleri (düğme, alan, bağlantı, onay kutusu…) "
+            "'[N] rol \"ad\" değer @merkez boyut' satırlarıyla indeksli listeler; liste kimliği (s3) başlıktadır. "
+            "Öğelerle cua_click_element/cua_set_text_element çalışır.",
+            {"app": {"type": ["string", "null"], "description": "Uygulama adı; null: açık Chrome yolunda Chrome, aksi halde öndeki uygulama."}},
+        ),
+        _function_schema(
+            "cua_click_element",
+            "cua_snapshot listesindeki [N] öğeye tıklar: önce arka planda erişilebilirlik eylemi ve etki doğrulaması, "
+            "etkisizse uygulamayı geçici öne alıp fare tıklaması. Sonuç hangi yolun çalıştığını söyler.",
+            {
+                "snapshot": {"type": "string", "description": "Listenin kimliği (örn. s3); en son listeninkini ver."},
+                "index": {"type": "integer", "description": "Listedeki öğe numarası [N]."},
+            },
+        ),
+        _function_schema(
+            "cua_set_text_element",
+            "cua_snapshot listesindeki metin alanının içeriğini text ile DEĞİŞTİRİR (Enter'a basmaz) ve geri okuyup "
+            "doğrular; parola alanında doğrulama yoktur.",
+            {
+                "snapshot": {"type": "string", "description": "Listenin kimliği (örn. s3); en son listeninkini ver."},
+                "index": {"type": "integer", "description": "Listedeki alanın numarası [N]."},
+                "text": {"type": "string", "description": "Alanın yeni içeriği."},
+            },
+        ),
+        _function_schema(
             "cua_get_ax_state",
             "Uygulamanın öndeki penceresindeki etkileşimli öğeleri (buton, alan, bağlantı, satır…) numara, "
-            "tür, etiket ve merkez koordinatıyla listeler. Ekran görüntüsünden çok daha hızlıdır.",
+            "tür, etiket ve merkez koordinatıyla listeler. Ekran görüntüsünden çok daha hızlıdır. "
+            "(Bayat koruması ve etki doğrulaması olan cua_snapshot tercih edilir.)",
             {"app_name": {"type": "string", "description": "Uygulama adı."}},
         ),
         _function_schema(
@@ -400,8 +426,13 @@ def route_tool_schemas(
     if chrome_session:
         # Kullanıcının açık oturumu istendiğinde gizli Playwright/API yolu ve CDP
         # araştırmasına yol açan kabuk/Node araçları bu görevden çıkarılır.
-        # Chrome AX ağacı sayfa içeriğini değil yalnız tarayıcı çubuğunu gösterdiği için AX
-        # araçları canlı ölçümde yalnız boşa tur harcattı; öne getirme chrome_active_tab'dadır.
+        # Öğe tabanlı AX araçları (cua_snapshot, cua_click_element, cua_set_text_element) BU YOLDA AÇIKTIR. Eski
+        # "Chrome AX ağacı web içeriğini vermiyor" varsayımı yanlıştı: web erişilebilirliği kapalı başlar (ağaçta
+        # yalnız tarayıcı çubuğu görünür), uygulama düzeyi AXEnhancedUserInterface açılınca sayfa içeriği ~2 sn
+        # içinde gelir ve öğe eylemleri arka planda da çalışır (Chrome 154'te ölçüldü); araçlar bunu ilk
+        # çağrıda kendileri açar. Eski numaralı liste araçları (cua_get_ax_state, cua_click, smart_click) bu yolda
+        # KAPALI kalır: bayat koruması ve etki doğrulaması yoktur, web erişilebilirliğini açmazlar ve yeni araçlarla
+        # çakışır (araç listesi kısa tutulur). cua_get_app de dışarıdadır: öne getirme chrome_active_tab'dadır.
         excluded = {
             "browse_url", "discover_capabilities", "fetch_raw", "web_search",
             "execute_shell", "execute_js", "process_list",
@@ -509,6 +540,7 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
     "cua_fill_field", "cua_click_text", "cua_scroll", "cua_read_scrollable",
+    "cua_click_element", "cua_set_text_element",
     "user_memory", "ask_user", "send_file", "schedule_task",
 })
 
@@ -519,7 +551,7 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
 _SCREEN_ACTION_TOOLS: frozenset[str] = frozenset({
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
     "cua_fill_field", "cua_click_text", "cua_scroll", "cua_read_scrollable",
-    "cua_click", "smart_click", "run_action_sequence",
+    "cua_click", "smart_click", "run_action_sequence", "cua_click_element", "cua_set_text_element",
 })
 # Bitişte doğrulama isteyen gerçek ekran eylemleri: yalnız sayfaya gitmek (chrome_active_tab) sayılmaz
 _GUI_VERIFICATION_TOOLS: frozenset[str] = _SCREEN_ACTION_TOOLS - frozenset({"chrome_active_tab"})
@@ -533,3 +565,15 @@ _READ_PROGRESS_TOOLS: frozenset[str] = frozenset({
 })
 AUTO_OBSERVATION_PREVIEW: str = "otomatik gözlem"
 VERIFICATION_OBSERVATION_PREVIEW: str = "bitiş doğrulaması"
+
+# Gerçek masaüstünün erişilebilirlik (AX) ağacını okuyan/etkileyen araçlar. Görünmez modda (dev/headless_screen.py)
+# şemadan çıkarılır ve HeadlessToolbox'ta açık hatayla kapatılır: benchmark kullanıcının ekranına dokunmamalı.
+# Öğe tabanlı yeni AX araçları: sistem istemindeki öğe rehberi yalnız bunlar modele sunulduğunda eklenir
+# (bkz. agent.route_system_prompt); görünmez modda şemadan çıkınca rehber de çıkar, model olmayan araca yönlenmez.
+ELEMENT_TOOL_NAMES: frozenset[str] = frozenset({"cua_snapshot", "cua_click_element", "cua_set_text_element"})
+AX_TOOL_NAMES: frozenset[str] = ELEMENT_TOOL_NAMES | frozenset({"cua_get_ax_state", "cua_click", "smart_click"})
+
+
+def without_tools(schemas: List[Dict[str, Any]], names: frozenset[str]) -> List[Dict[str, Any]]:
+    """Şema listesinden adı verilen araçları çıkarır. Saf."""
+    return [entry for entry in schemas if entry["function"]["name"] not in names]

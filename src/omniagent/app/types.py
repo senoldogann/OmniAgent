@@ -61,6 +61,12 @@ class RunOptions(TypedDict):
     max_iterations: NotRequired[int]
     max_wall_clock_seconds: NotRequired[float]
     max_total_tokens: NotRequired[int]
+    unattended: NotRequired[bool]
+    pop_control_messages: NotRequired[Callable[[], List[str]]]
+    # Model çağrısı yeniden deneme bütçesi (sn). Sürekli/gözetimsiz görevde kalan görev süresi (çağrı başına
+    # en çok 30 dk) kullanılır ve bu değer yok sayılır; verilmezse etkileşimli 60 sn
+    # (bkz. model_retry.interactive_model_retry_seconds ve unattended_model_retry_seconds).
+    model_retry_seconds: NotRequired[float]
 
 
 class RunReport(TypedDict):

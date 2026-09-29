@@ -68,6 +68,21 @@ def workspace_dir() -> Path:
     return data_root() / "workspace"
 
 
+def resolve_output_path(filename: str, allow_source_relative: bool) -> Path:
+    """
+    Modelin verdiği çıktı dosya adını (ekran görüntüsü, yazılan dosya) gerçek yola çözer.
+    Aracın yazdığı yer ile ekin ve sohbet kartının okuduğu yer aynı kuraldan çıkar. "~"
+    önce genişler; mutlak yol olduğu gibi kalır. Göreli adda allow_source_relative
+    (görev kaynak deposunu hedefliyor) ise yol göreli kalır ve çağıran süreç çalışma
+    dizinine bağlar; değilse ad workspace_dir() altına bağlanır. Girdiyi değiştirmez;
+    dosya sistemine yalnız workspace_dir() üzerinden veri kökünü oluşturarak dokunur.
+    """
+    expanded: Path = Path(filename).expanduser()
+    if expanded.is_absolute() or allow_source_relative:
+        return expanded
+    return workspace_dir() / expanded
+
+
 def project_root() -> Path:
     """Kaynak deposunun kökü (düzenlenebilir kurulumda git çalışma ağacı)."""
     return Path(__file__).resolve().parents[2]

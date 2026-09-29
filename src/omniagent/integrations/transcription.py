@@ -3,7 +3,8 @@ Telegram sesli mesajlarını yazıya çevirir (OpenAI Speech-to-Text, kullanıc�
 
 macOS konuşma tanıması launchd altında çalışan Python sürecinde güvenilir izin alamıyor
 (Info.plist kullanım açıklaması ve TCC onayı gerekir); OpenAI uç noktası Telegram'ın OGG/Opus
-sesini dönüştürmeden kabul eder. Ses OpenAI'a gönderilir; anahtar yoksa hiçbir şey gönderilmez.
+sesini dönüştürmeden kabul eder. Ses OpenAI'a gönderilir; anahtar yoksa ya da openai yedek sağlayıcı izin
+listesinde değilse (bkz. fallback_policy) hiçbir şey gönderilmez.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from httpx import Timeout
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, BadRequestError, NotFoundError
 
 from omniagent.config import API_KEY_VARIABLES, BACKENDS, load_api_key
+from omniagent.fallback_policy import load_fallback_policy, voice_transcription_problem
 
 # Belgelerin önerdiği model; hesapta yoksa whisper-1 denenir. OMNI_TRANSCRIBE_MODEL ile değiştirilebilir.
 DEFAULT_TRANSCRIBE_MODEL: str = "gpt-transcribe"
@@ -54,9 +56,16 @@ def _default_client(api_key: str, base_url: str) -> AsyncOpenAI:
 
 async def transcribe_audio(path: Path, client_factory: Optional[ClientFactory] = None) -> str:
     """
-    Ses dosyasını yazıya çevirir. Önerilen model hesapta yoksa (404/400) whisper-1 denenir;
-    yetki, hız sınırı ve ağ hataları yeniden denemeden bildirilir.
+    Ses dosyasını yazıya çevirir. Ses OpenAI'a gider: openai yedek sağlayıcı izin listesinde değilse
+    (ya da izin okunamıyorsa) hiçbir şey gönderilmeden TranscriptionUnavailable yükselir. Önerilen model
+    hesapta yoksa (404/400) whisper-1 denenir; yetki, hız sınırı ve ağ hataları yeniden denemeden bildirilir.
     """
+    try:
+        problem = voice_transcription_problem(frozenset(load_fallback_policy()["backends"]))
+    except (OSError, ValueError) as error:
+        raise TranscriptionUnavailable(f"Yedek sağlayıcı izni okunamadı; ses gönderilmedi: {error}") from error
+    if problem is not None:
+        raise TranscriptionUnavailable(problem)
     api_key = load_api_key(API_KEY_VARIABLES["openai"])
     if not api_key:
         raise TranscriptionUnavailable(

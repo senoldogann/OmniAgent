@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from omniagent import paths
+
 
 def test_default_data_paths_live_outside_source_tree(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path / "Application Support" / "OmniAgent"))
@@ -13,6 +15,45 @@ def test_default_data_paths_live_outside_source_tree(monkeypatch: pytest.MonkeyP
     assert paths.data_root() == tmp_path / "Application Support" / "OmniAgent"
     assert paths.state_file().parent == paths.data_root()
     assert paths.checkpoints_dir().parent == paths.data_root()
+
+
+def test_resolve_output_path_binds_relative_names_to_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path / "Application Support" / "OmniAgent"))
+    workspace = tmp_path / "Application Support" / "OmniAgent" / "workspace"
+
+    assert paths.resolve_output_path("screen_view.png", allow_source_relative=False) == workspace / "screen_view.png"
+    assert paths.resolve_output_path("raporlar/ekran.png", allow_source_relative=False) == (
+        workspace / "raporlar" / "ekran.png"
+    )
+
+
+@pytest.mark.parametrize("allow_source_relative", [False, True])
+def test_resolve_output_path_keeps_absolute_and_home_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, allow_source_relative: bool,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path / "Application Support" / "OmniAgent"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    absolute = tmp_path / "baska" / "ekran.png"
+
+    assert paths.resolve_output_path(str(absolute), allow_source_relative=allow_source_relative) == absolute
+    # "~" önce genişler; sonuç mutlak olduğu için workspace'e bağlanmaz.
+    assert paths.resolve_output_path("~/ekran.png", allow_source_relative=allow_source_relative) == (
+        tmp_path / "home" / "ekran.png"
+    )
+
+
+def test_resolve_output_path_keeps_relative_names_for_source_tasks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path / "Application Support" / "OmniAgent"))
+
+    resolved = paths.resolve_output_path("src/ekran.png", allow_source_relative=True)
+
+    # Göreli kalır: çağıran süreç çalışma dizinine (kaynak deposu) bağlar.
+    assert resolved == Path("src/ekran.png")
+    assert not resolved.is_absolute()
 
 
 def test_state_save_creates_missing_parent(tmp_path: Path) -> None:

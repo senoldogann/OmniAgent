@@ -27,12 +27,37 @@ MAX_GOAL_REPORTS: int = 5
 WINDOW_MARKER: str = "HOST — BAĞLAM PENCERESİ:"
 CONTINUE_PROMPT: str = (
     "HOST — SÜREKLİ MOD: Görev bitmedi; son yanıtın kullanıcıya ilerleme raporu olarak gösterildi.\n"
-    "- Kullanıcıdan bilgi, hesap, seçim veya onay gerekiyorsa şimdi ask_user çağır ve yanıtı bekle. "
+    "- Kullanıcı çevrimdışı olabilir. Eksik bilgiyi bir kez sor; yanıt ertelendiyse aynı soruyu "
+    "yineleme, bağımlılığı çalışma kaydına yaz ve bağımsız somut adımları sürdür. "
     "API anahtarı, parola veya token'ı sohbetle isteme; kullanıcıdan ⚙ Ayarlar'a girmesini iste ve "
     "kind=confirm ile doğrulat.\n"
     "- Aksi hâlde hedefe yaklaştıran sıradaki somut adımı gerçek bir araçla uygula.\n"
     "- Hedefe ulaştığını önceki araç çıktılarıyla kanıtlayabiliyorsan report_goal_met çağır; "
     "kanıtsız başarı iddia etme."
+)
+# Durgun sürekli görevde host'un yeniden planlama yönergesi ("HOST — YENİDEN PLANLA: <neden>. " önekiyle gider).
+REPLAN_GUIDANCE: str = (
+    "Aynı başarısız çağrıyı aynı argümanlarla yineleme. Hatanın nedenini kullanarak farklı bir araç, "
+    "argüman veya yöntem seç ve somut bir adım uygula. Gerçekten eksik kullanıcı bilgisi varsa ask_user çağır."
+)
+# Görevde bir site doğrulama/erişim engeli gösterdiyse yukarıdaki iki yönerge yerine bunlar gider: 'farklı araç/yöntem
+# seç' ve 'sıradaki somut adımı uygula' cümleleri engeli aşmaya iterdi. Engelli adres aşılmaz; kullanıcıya bildirilir,
+# yön ask_user ile istenir ve engelden bağımsız iş yoksa yanıt beklenir.
+WALL_CONTINUE_PROMPT: str = (
+    "HOST — SÜREKLİ MOD: Görev bitmedi; son yanıtın kullanıcıya ilerleme raporu olarak gösterildi.\n"
+    "- Bu görevde bir site doğrulama veya erişim engeli gösterdi. Engelli adresi aşmaya çalışma: başka araç, "
+    "kimlik, proxy, adres değişikliği veya yeniden deneme yok. Engeli çalışma kaydına yaz, kullanıcıya bildir; "
+    "yön gerekiyorsa ask_user (kind=confirm) ile iste ve yanıt gelene dek bekle.\n"
+    "- Engelle ilgisiz, bağımsız somut bir adım kaldıysa yalnız onu gerçek bir araçla sürdür; kalmadıysa yeni "
+    "araç çağrısı yapma.\n"
+    "- Hedefe ulaştığını önceki araç çıktılarıyla kanıtlayabiliyorsan report_goal_met çağır; "
+    "kanıtsız başarı iddia etme."
+)
+WALL_REPLAN_GUIDANCE: str = (
+    "Bu görevde bir site doğrulama veya erişim engeli gösterdi; engelli adresi başka araç, kimlik, proxy, adres "
+    "değişikliği veya yeniden denemeyle aşmaya ÇALIŞMA. Engeli çalışma kaydına yaz, kullanıcıya bildir ve yön için "
+    "ask_user (kind=confirm) çağır; engelle ilgisiz somut bir adım kaldıysa yalnız onu sürdür, kalmadıysa yanıt "
+    "gelene dek bekle."
 )
 
 

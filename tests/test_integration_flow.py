@@ -60,7 +60,7 @@ async def test_discovery_to_outlook_batch_without_browser(tmp_path: Path, monkey
         save_json(service.outlook.account_root() / "rule.json", RULE)
         report = await main.run_agent_with_callback(
             "Outlook hesabımdaki gereksiz postaları temizle", lambda event: None,
-            {"requested_backend": None, "should_stop": lambda: False,
+            {"requested_backend": "opencode", "should_stop": lambda: False,
              "state_file": str(tmp_path / "memory.json"), "history": [], "integrations": service},
             {"opencode": object()})
         assert report["success"]

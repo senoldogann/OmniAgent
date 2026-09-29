@@ -17,6 +17,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Any, Dict, List, Optional, TypedDict
 
 import httpx
@@ -31,17 +32,19 @@ from omniagent.config import (
 )
 from omniagent.core import schedule
 from omniagent.core.conversation import Exchange, trim_history
-from omniagent.core.events import AgentEvent, tool_label
+from omniagent.core.events import AgentEvent, provider_fallback_text, tool_label
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 from omniagent.platform.macos.permissions import accessibility_granted
 from omniagent.platform.macos.power import start_keep_awake, stop_keep_awake
-from omniagent.paths import project_root, schedules_file, telegram_settings_file
+from omniagent.paths import project_root, resolve_output_path, schedules_file, telegram_settings_file
 from omniagent.tools.screen import screen_capture_granted, screen_session
 from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, source_version, sync_dependencies
 from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
 from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
-from omniagent.app.policy import screenshot_requested
+from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
+from omniagent.app.policy import screenshot_requested, source_change_expected
+from omniagent.app.tool_schema import AUTO_OBSERVATION_PREVIEW, VERIFICATION_OBSERVATION_PREVIEW
 
 
 TOKEN_SERVICE = "OmniAgent Telegram"
@@ -225,6 +228,8 @@ def event_text(event: AgentEvent) -> str:
         return f"\n{mark} {event['seconds']:.1f} sn · {event['text'][:800]}\n"
     if kind == "backend_changed":
         return f"\n↻ Model değişti: {event['backend']} · {event['reason'][:220]}\n"
+    if event["kind"] == "provider_fallback":
+        return f"\n⚠ {provider_fallback_text(event)}\n"
     if kind == "notice":
         return f"\n! {event['text'][:500]}\n"
     if kind == "integration_status":
@@ -659,6 +664,7 @@ class CompactPresenter:
         self.finished = False
         self.active_tool: Optional[tuple[str, str, str, str]] = None
         self.last_status_stage: Optional[str] = None
+        self.announced_fallbacks: set[tuple[str, bool]] = set()
 
     async def event(self, event: AgentEvent) -> None:
         kind = event["kind"]
@@ -706,6 +712,25 @@ class CompactPresenter:
                     ("✓ " if event["ok"] else "⚠️ ") + label + " · düşünüyor…",
                     rich_message={"html": "<tg-thinking>" + label + "</tg-thinking>"},
                 )
+        elif event["kind"] == "provider_fallback":
+            # Gizlilik olayı geçici taslakta kaybolmasın: (hedef sağlayıcı, ekran görüntülü mü) başına görev
+            # başına bir kalıcı ileti; metinden ekran görüntüsüne geçiş yeni ileti üretir.
+            # Gönderim hatası ajan görevini iptal etmesin diye yakalanıp loglanır (kayıt audit.jsonl'dadır).
+            announcement: tuple[str, bool] = (event["to_backend"], event["image_count"] > 0)
+            if announcement not in self.announced_fallbacks:
+                try:
+                    await self.stream.api.send(self.stream.chat_id, event_text(event).strip())
+                except TelegramError as error:
+                    # Başarısız bildirim yeniden DENENMEZ: ajan her çifti görev boyunca bir kez yayınlar
+                    # (runtime.announced_fallbacks), aynı çift için ikinci olay gelmez; yani kullanıcı bu geçişi
+                    # Telegram'da görmeyebilir. Yalnızca loglanır; kalıcı kayıt audit.jsonl'dadır. Çift ancak gönderim
+                    # başarılıysa bu sunumcunun kümesine girer (olası yinelenen olay o durumda bir kez daha denenir).
+                    logging.warning(
+                        "Yedek sağlayıcı bildirimi gönderilemedi",
+                        extra={"to_backend": event["to_backend"], "error": str(error)[:200]},
+                    )
+                else:
+                    self.announced_fallbacks.add(announcement)
         elif kind == "integration_status":
             stage = event["stage"]
             label = integration_status_label(
@@ -756,6 +781,8 @@ class TelegramBridge:
         self.pending_fields: Dict[str, Any] = {}
         self.backend: Optional[str] = None
         self.run_mode = "normal"
+        self.active_run_mode = "normal"
+        self.control_messages: Queue[str] = Queue()
         self.verbose = False
         self.goal = ""
         # Çalışan kodun commit'i (run() başında okunur); /update ve /doctor diskteki kodla karşılaştırır
@@ -802,6 +829,25 @@ class TelegramBridge:
         except TelegramError as error:
             raise DeliveryFailed(str(error)) from None
 
+    def _drain_control_messages(self) -> List[str]:
+        """Telegram komutlarını çalışan ajan turuna bir kez aktarır."""
+        commands: List[str] = []
+        while True:
+            try:
+                commands.append(self.control_messages.get_nowait())
+            except Empty:
+                return commands
+
+    async def _refresh_clients(self) -> None:
+        """
+        Model istemcilerini güncel hazır profillerle yeniden kurar ve eskileri kapatır. Hazırlık yoklaması
+        (yerel Ollama) engelleyici olduğu için ayrı iş parçacığında çalışır; görevler sıralı olduğundan
+        kapatılan istemciyi kullanan çalışan görev yoktur.
+        """
+        previous: Dict[str, AsyncOpenAI] = self.clients
+        self.clients = await asyncio.to_thread(create_model_clients)
+        await close_model_clients(previous)
+
     async def _send_screenshot(self, stream: TelegramStream, image: Path) -> None:
         """Ekran görüntüsünü fotoğraf olarak gönderir; dosya kaybolduysa ya da gönderim düştüyse akışa yazar."""
         if not image.is_file():
@@ -825,9 +871,22 @@ class TelegramBridge:
         apply_model_preferences()
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         loop = asyncio.get_running_loop()
+        # Ajan, boş çıktılı başarısız görevin kısmi raporunu run_finished çıktısı olarak yayınlamadan hemen önce
+        # ayrıca uyarı olarak da yayınlar (masaüstü ve CLI run_finished çıktısını göstermez). İki olay aynı eşzamanlı
+        # blokta yayınlandığı için uyarı tüketilmeden önce çıktı buraya girer; ayrıntılı görünümde aynı metin
+        # ikinci kez basılmaz. Kısa görünüm uyarıları zaten göstermez.
+        finished_outcomes: set[str] = set()
 
         def emit(event: AgentEvent) -> None:
+            if event["kind"] == "run_finished":
+                finished_outcomes.add(event["outcome"])
             loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        def verbose_text(event: AgentEvent) -> str:
+            """Ayrıntılı görünüm metni; run_finished çıktısının birebir tekrarı olan uyarı atlanır."""
+            if event["kind"] == "notice" and event["text"] in finished_outcomes:
+                return ""
+            return event_text(event)
 
         if self.integrations is None:
             self.integrations = CapabilityService()
@@ -840,13 +899,21 @@ class TelegramBridge:
             "answer": self.answer,
             "deliver": self.deliver,
             "run_mode": self.run_mode,
+            # Kullanıcı makinenin başında değil: kısa ağ kopmalarında görev düşmez, model çağrısı bekler.
+            "model_retry_seconds": REMOTE_MODEL_RETRY_SECONDS,
         }
+        if self.active_run_mode == "continuous":
+            options["unattended"] = True
+            options["pop_control_messages"] = self._drain_control_messages
         if images:
             options["images"] = images
         if scheduled_id is not None:
             options["scheduled_run"] = True
 
         async def work() -> RunReport:
+            # Hazır profiller görevler arasında değişebilir (Ollama sonradan açılıp kapanabilir): Otomatik seçim
+            # köprü açılışındaki bayat listeye dayanmasın diye istemciler her görev başında yeniden kurulur.
+            await self._refresh_clients()
             with host_task_lock():
                 return await run_agent_with_callback(goal, emit, options, self.clients)
 
@@ -859,6 +926,11 @@ class TelegramBridge:
         # dolduruyordu. Ayrıntılı görünüm hepsini anında gönderir; kısa görünüm yalnız kullanıcı
         # görüntü istediyse ve görev sonunda son görüntüyü tek kez gönderir.
         send_final_screenshot = not verbose and screenshot_requested(goal)
+        # Araç göreli ekran görüntüsü adını ajanla aynı kuralla yazar (bkz. resolve_output_path);
+        # köprü de fotoğrafı aynı yerden okur. Bayrak ajanın kullandığı hedef ve geçmişten türer.
+        # Ajanın kendi gözlemleri (otomatik gözlem, bitiş doğrulaması) de take_screenshot olayıdır ama
+        # önizlemesi dosya adı değil etiket taşır; kullanıcı görüntüsü sayılmaz.
+        allow_source_relative: bool = source_change_expected(goal, options["history"])
         screenshot_paths: Dict[str, Path] = {}
         final_screenshot: Optional[Path] = None
         saw_finished = False
@@ -873,10 +945,25 @@ class TelegramBridge:
                         await live.tick()
                     continue
                 saw_finished = saw_finished or event["kind"] == "run_finished"
-                if event["kind"] == "tool_started" and event["name"] == "take_screenshot":
-                    screenshot_paths[event["call_id"]] = Path(event["preview"]).expanduser()
+                if (
+                    event["kind"] == "tool_started" and event["name"] == "take_screenshot"
+                    and event["preview"] not in (AUTO_OBSERVATION_PREVIEW, VERIFICATION_OBSERVATION_PREVIEW)
+                ):
+                    try:
+                        screenshot_paths[event["call_id"]] = resolve_output_path(
+                            event["preview"], allow_source_relative=allow_source_relative,
+                        )
+                    except (RuntimeError, OSError) as error:
+                        # Araç tarafında aynı hata kurtarılabilir ToolError'dur ("~kullanici" çözülemez); tool_started
+                        # olayı araçtan önce geldiği için burada yükselen istisna Telegram görevini iptal ederdi.
+                        # Bu olay için fotoğraf yolu kaydedilmez.
+                        logging.warning(
+                            "Ekran görüntüsü yolu çözülemedi",
+                            extra={"call_id": event["call_id"], "preview": event["preview"][:200],
+                                   "error_type": type(error).__name__, "error": str(error)[:200]},
+                        )
                 if verbose:
-                    rendered = event_text(event)
+                    rendered = verbose_text(event)
                     if rendered:
                         await stream.append(rendered)
                 else:
@@ -894,7 +981,7 @@ class TelegramBridge:
                 event = queue.get_nowait()
                 saw_finished = saw_finished or event["kind"] == "run_finished"
                 if verbose:
-                    rendered = event_text(event)
+                    rendered = verbose_text(event)
                     if rendered:
                         await stream.append(rendered)
                 else:
@@ -935,6 +1022,7 @@ class TelegramBridge:
             self.stop_event.clear()
             self.goal = ""
             self.active = None
+            self.active_run_mode = "normal"
             try:
                 await stream.flush(force=True)
             except TelegramError:
@@ -996,6 +1084,8 @@ class TelegramBridge:
             return
         self.goal = record["goal"]
         self.stop_event.clear()
+        self.active_run_mode = self.run_mode
+        self.control_messages = Queue()
         self.active = asyncio.create_task(self._execute(record["goal"], scheduled_id=record["id"]))
 
     async def _scheduler_loop(self) -> None:
@@ -1142,6 +1232,8 @@ class TelegramBridge:
             return
         self.goal = goal
         self.stop_event.clear()
+        self.active_run_mode = self.run_mode
+        self.control_messages = Queue()
         self.active = asyncio.create_task(self._execute(goal, [str(path)] if attachment["image"] else None))
 
     async def handle(self, update: Dict[str, Any]) -> None:
@@ -1166,6 +1258,14 @@ class TelegramBridge:
                     self.pending_answer.set_exception(IntegrationStopped("Kullanıcı tarafından durduruldu."))
                 await self.api.send(chat_id, "Durdurma istendi; çalışan işlem iptal ediliyor.")
             return
+        if text.startswith("/btw ") or text == "/approve":
+            if self.active is None or self.active_run_mode != "continuous":
+                await self.api.send(chat_id, "Bu komut çalışan Sürekli oturumda kullanılabilir.")
+            else:
+                self.control_messages.put(text)
+                await self.api.send(chat_id, "Yönlendirme oturuma eklendi." if text.startswith("/btw ")
+                                    else "Onay isteği oturuma iletildi; kanıt bekliyorsa kapanacak.")
+            return
         if text == "/schedules" or text.startswith("/unschedule"):
             await self._schedule_command(text)
             return
@@ -1182,7 +1282,8 @@ class TelegramBridge:
                 "Hedefinizi yazın. /stop durdurur, /status durumu gösterir. "
                 "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
                 "/model <profil> ve /mode <normal|long|autonomous|surekli> sonraki görevi ayarlar; "
-                "surekli, siz durdurana veya hedefi onaylayana kadar çalışır ve gerekince size sorar. "
+                "surekli, siz durdurana veya hedefi /approve ile onaylayana kadar çalışır; "
+                "çalışırken /btw <mesaj> ile yön verebilirsiniz. "
                 "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
                 "ajan istediğiniz dosyaları size buradan geri gönderebilir. "
                 "\"Her sabah 9'da …\" gibi görevler planlanır; /schedules listeler, /unschedule <kimlik> siler. "
@@ -1219,6 +1320,8 @@ class TelegramBridge:
             return
         self.goal = text
         self.stop_event.clear()
+        self.active_run_mode = self.run_mode
+        self.control_messages = Queue()
         self.active = asyncio.create_task(self._execute(text))
 
     async def run(self, announce: bool = False) -> None:
