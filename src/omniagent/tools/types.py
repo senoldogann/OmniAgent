@@ -186,7 +186,18 @@ ACCESSIBILITY_SETTINGS_URL: str = "x-apple.systempreferences:com.apple.preferenc
 
 
 class ToolError(Exception):
-    """Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı."""
+    """
+    Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı.
+
+    `recoverable` her raise yerinde zorunlu olarak verilir: "bu hatadan sonra aynı yol/yöntem yeniden
+    denenebilir mi". TODO(recoverable): alan bugün src/ içinde hiç OKUNMUYOR; yalnız ToolResult yüküne ve
+    tool_finished olayına taşınır, modele giden araç mesajına girmez (bkz. app/tool_execution._tool_result_to_message:
+    yalnız "HATA <error_type>: <error>" kurar). Sıkı moddaki "bu engeli aşmaya çalışma" kuralı bu yüzden
+    `recoverable`a değil `code`a ve metin işaretine dayanır (bot_wall.ACCESS_CHALLENGE_MARKER; app/answer_fidelity,
+    app/partial_report). Karar bekliyor: ya alan bir kurala bağlanmalı (ör. kurtarılamaz hatada yeniden deneme /
+    alternatif yol önerisini bastırmak) ve metin işareti bağımlılığı kalkmalı, ya da ToolResult yükünden
+    çıkarılmalı. Parametrenin kendisini silmek ucuz DEĞİLDİR: her raise yerinde mecburen veriliyor.
+    """
     def __init__(self, message: str, code: str, recoverable: bool, completed_steps: int = 0) -> None:
         super().__init__(message)
         self.code: str = code
