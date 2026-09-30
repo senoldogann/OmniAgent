@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import date, datetime, timezone
 from io import BytesIO
 from itertools import count
@@ -26,6 +27,8 @@ from omniagent.config import (
     FILE_EXCHANGE_GUIDANCE, INTEGRATIONS_GUIDANCE, SCHEDULING_GUIDANCE, SYSTEM_PROMPT, BackendProfile,
     apply_stored_api_keys, redact,
 )
+from omniagent.core.conversation_policy import derive_request_contract
+from omniagent.core.evidence import EvidenceBundle, EvidenceStore, mark_incomplete, new_evidence_bundle, sanitize_text
 from omniagent.core.events import (
     AWAITING_APPROVAL_CODE, AWAITING_DIRECTION_CODE, AgentEvent, ArtifactReady, EventSink, ProviderFallback,
     TokenUsage, argument_point, argument_tag, compact_count, preview_arguments, provider_fallback_text, tool_label,
@@ -926,6 +929,11 @@ async def _requested_screenshot_observation(
         }, None
 
 
+_EVIDENCE_CAPTURE: ContextVar[Optional[Callable[[ToolCallDraft, ToolResult], None]]] = ContextVar(
+    "source_evidence_capture", default=None,
+)
+
+
 async def _observe_after_actions(
     call_id: str, index: int, preview: str, toolbox: Toolbox, cache: Dict[str, ToolResult], emit: EventSink,
     should_stop: Callable[[], bool],
@@ -944,16 +952,19 @@ async def _observe_after_actions(
     }
     result: ToolResult = await _run_tool_with_events(
         index, call, preview, toolbox, cache, emit, should_stop)
-    step: sm.StepRecord = sm.make_step_record(call["name"], call["arguments"], bool(result.get("ok")), result_text(result))
+    capture = _EVIDENCE_CAPTURE.get()
+    if capture is not None:
+        capture(call, result)
+    step: sm.StepRecord = sm.make_step_record(call["name"], call["arguments"], bool(result.get("ok")), sanitize_text(result_text(result)))
     if not result.get("ok"):
-        return {"role": "user", "content": f"Otomatik gözlem alınamadı: {result_text(result)}"}, step, None
+        return {"role": "user", "content": f"Otomatik gözlem alınamadı: {sanitize_text(result_text(result))}"}, step, None
     try:
         # Yol mutlak geçici dosyadır: çözümleme kuralı devreye girmez, bayrak sonucu değiştirmez.
         observation, digest = await _screenshot_observation_with_digest(call, allow_source_relative=False)
         return observation, step, digest
     except (OSError, ValueError) as error:
         logging.warning("Otomatik gözlem modele eklenemedi", extra={"error_type": type(error).__name__})
-        return {"role": "user", "content": f"Otomatik gözlem modele eklenemedi: {type(error).__name__}: {error}"}, step, None
+        return {"role": "user", "content": sanitize_text(f"Otomatik gözlem modele eklenemedi: {type(error).__name__}: {error}")}, step, None
     finally:
         path.unlink(missing_ok=True)
 def is_resume_goal(goal: str) -> bool:
@@ -1166,9 +1177,57 @@ async def run_agent_with_callback(
     İstemciler çağırana aittir (kapatılmaz), böylece arayüz görevler arasında sıcak
     bağlantıları yeniden kullanır.
     """
+    # Contract exists before any model/tool call. A failed store never aborts cleanup.
+    contract = options.get("request_contract") or derive_request_contract(goal)
+    evidence: EvidenceBundle = new_evidence_bundle(contract, options.get("evidence_run_id"))
+    evidence_store: Optional[EvidenceStore] = None
+    try:
+        evidence_store = EvidenceStore(options["state_file"])
+        if options.get("evidence_run_id"):
+            try:
+                existing = evidence_store.load(evidence["run_id"])
+            except FileNotFoundError:
+                evidence_store.save(evidence, create_only=True)
+            else:
+                if existing["delivery_status"] != "pending" or existing["contract"] != contract:
+                    # Never modify a delivered or uncertain report during a new run.
+                    evidence = new_evidence_bundle(contract)
+                    mark_incomplete(evidence, "Önceki kaynak kaydı bu çalışmaya eklenemedi; yeni bir kayıt açıldı.")
+                    evidence_store.save(evidence, create_only=True)
+                else:
+                    evidence = existing
+        else:
+            evidence_store.save(evidence, create_only=True)
+    except (OSError, ValueError):
+        mark_incomplete(evidence, "Kaynak kaydı diske yazılamadı; bu yanıtın kaynakları yeniden yüklenemeyebilir.")
+
+    def capture_source(call: ToolCallDraft, result: ToolResult) -> None:
+        if evidence_store is None:
+            mark_incomplete(evidence, "Kaynak deposu kullanılamadığı için gözlem kaydedilemedi; daha dar bir istekle devam edin.")
+            return
+        try:
+            captured = evidence_store.capture(evidence, call["name"], result, arguments=call["arguments"])
+            if call["name"] == "take_screenshot":
+                mark_incomplete(evidence, "Ekran görüntüsünün işlem kaydı korundu; geçici görüntü içeriği bu kaynak kaydında tutulmuyor.")
+                if captured is not None:
+                    captured["complete"] = False
+                    captured["completeness"] = "image_receipt"
+                evidence_store.save(evidence)
+        except (OSError, ValueError):
+            mark_incomplete(evidence, "Kaynak kaydı bütçe veya dosya hatası nedeniyle eksik; daha dar bir istekle devam edin.")
+
+    def persist_evidence() -> None:
+        if evidence_store is not None:
+            try:
+                evidence_store.save(evidence)
+            except (OSError, ValueError):
+                mark_incomplete(evidence, "Kaynak kaydının son durumu diske yazılamadı.")
+
     def startup_failure(error: Exception, backend: str) -> RunReport:
         """Başlangıç hatasında bile arayüze terminal olayını teslim eder."""
-        failure = f"Kritik hata: {error}"
+        failure = sanitize_text(f"Kritik hata: {error}")
+        mark_incomplete(evidence, failure)
+        persist_evidence()
         initial_metrics: sm.EpisodeMetrics = {
             "turns": 0, "tool_calls": 0, "elapsed_seconds": 0.0, "backend": backend,
             "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
@@ -1178,7 +1237,7 @@ async def run_agent_with_callback(
         emit({"kind": "run_finished", "success": False, "outcome": failure,
               "reason": failure, "metrics": initial_metrics})
         return {"outcome": failure, "success": False, "reason": failure,
-                "metrics": initial_metrics, "exchange": make_exchange(goal, failure, [])}
+                "metrics": initial_metrics, "exchange": make_exchange(goal, failure, []), "evidence": evidence}
 
     try:
         if options.get("run_mode") == CONTINUOUS_MODE:
@@ -1335,6 +1394,7 @@ async def run_agent_with_callback(
     if startup_announced is not None:
         # Başlangıçta duyurulan ve kaydedilen ikame ilk model çağrısında yeniden duyurulmaz.
         runtime.announced_fallbacks.add(startup_announced)
+    evidence_token = _EVIDENCE_CAPTURE.set(capture_source)
     runtime_token = CURRENT_RUNTIME.set(runtime)
     service_token = CURRENT_SERVICE.set(service)
     steps: List[sm.StepRecord] = []
@@ -1873,6 +1933,7 @@ async def run_agent_with_callback(
                           "text": "Bitiş doğrulaması: güncel ekranla her zorunlu madde kontrol ediliyor."})
                     finish_guarded_turn()
                     verification_started: float = time.monotonic()
+                    captured_before = len(evidence["observations"]) + evidence["omitted_observations"]
                     try:
                         observation, observation_step, _digest = await _observe_after_actions(
                             f"dogrulama-{session_id[:8]}-{iteration}", 0, VERIFICATION_OBSERVATION_PREVIEW,
@@ -1880,6 +1941,8 @@ async def run_agent_with_callback(
                         )
                     finally:
                         tool_seconds += time.monotonic() - verification_started
+                    if len(evidence["observations"]) + evidence["omitted_observations"] == captured_before:
+                        mark_incomplete(evidence, "Otomatik ekran gözleminin ham işlem kaydı alınamadı.")
                     steps.append(observation_step)
                     observations += 1
                     verification_ok = bool(observation_step["ok"] and _digest is not None)
@@ -2092,7 +2155,8 @@ async def run_agent_with_callback(
             duplicate_navigation_notes: List[str] = []
             for call, result in zip(turn["tool_calls"], results, strict=True):
                 ok: bool = bool(result.get("ok"))
-                detail: str = result_text(result)
+                capture_source(call, result)
+                detail: str = sanitize_text(result_text(result))
                 steps.append(sm.make_step_record(
                     call["name"], call["arguments"], ok, detail,
                     partial_steps=int(result.get("completed_steps") or 0),
@@ -2112,7 +2176,7 @@ async def run_agent_with_callback(
                 if not ok:
                     failures_in_turn += 1
                 if ok and call["name"] not in _ACTION_RECEIPT_TOOLS:
-                    host_task_ledger = record_tool_result(host_task_ledger, call["name"], detail, iteration)
+                    host_task_ledger = record_tool_result(host_task_ledger, call["name"], result_text(result), iteration)
                 # Deneyim belleği yalnız hata anında konuşur: aynı hata imzası için doğrulanmış
                 # önceki çözüm ve görev içi tekrar uyarısı araç sonucunun altına eklenir.
                 if result.get("code") in (
@@ -2130,7 +2194,11 @@ async def run_agent_with_callback(
                     experience_tracker, observed = experience.observe_result(
                         experience_state, experience_tracker, call["name"], call["arguments"], ok, detail, iteration,
                     )
-                tool_message: Dict[str, Any] = _tool_result_to_message(call, result)
+                sanitized_result: ToolResult = dict(result)
+                for field in ("result", "error"):
+                    if field in sanitized_result:
+                        sanitized_result[field] = sanitize_text(str(sanitized_result[field]))
+                tool_message: Dict[str, Any] = _tool_result_to_message(call, sanitized_result)
                 if observed["notes"]:
                     tool_message = {**tool_message, "content": tool_message["content"] + "\n\n" + "\n\n".join(observed["notes"])}
                 if observed["lesson_id"] is not None:
@@ -2186,6 +2254,7 @@ async def run_agent_with_callback(
             # görüntüsü al" turu harcamaz. Genel GUI yolunda da geçerlidir.
             if needs_action_observation(turn["tool_calls"], results):
                 observation_started: float = time.monotonic()
+                captured_before = len(evidence["observations"]) + evidence["omitted_observations"]
                 try:
                     observation, observation_step, observation_digest = await _observe_after_actions(
                         f"otomatik-gozlem-{session_id[:8]}-{iteration}", len(turn["tool_calls"]),
@@ -2193,6 +2262,8 @@ async def run_agent_with_callback(
                     )
                 finally:
                     tool_seconds += time.monotonic() - observation_started
+                if len(evidence["observations"]) + evidence["omitted_observations"] == captured_before:
+                    mark_incomplete(evidence, "Otomatik ekran gözleminin ham işlem kaydı alınamadı.")
                 steps.append(observation_step)
                 observations += 1
                 if observation_digest is not None:
@@ -2548,6 +2619,8 @@ async def run_agent_with_callback(
                 await service.close()
         except Exception as error:
             cleanup_errors.append(f"Entegrasyon kapanışı: {type(error).__name__}: {error}")
+        persist_evidence()
+        _EVIDENCE_CAPTURE.reset(evidence_token)
         CURRENT_RUNTIME.reset(runtime_token)
         CURRENT_SERVICE.reset(service_token)
         for detail in cleanup_errors:
@@ -2563,7 +2636,7 @@ async def run_agent_with_callback(
         emit_existing_artifacts(artifacts, emit)
         emit({"kind": "run_finished", "success": success, "outcome": outcome, "reason": reason, "metrics": metrics})
     return {"outcome": outcome, "success": success, "reason": reason,
-            "metrics": metrics, "exchange": exchange}
+            "metrics": metrics, "exchange": exchange, "evidence": evidence}
 
 
 def print_event(event: AgentEvent) -> None:

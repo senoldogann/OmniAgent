@@ -7,6 +7,7 @@ from typing import Awaitable, Callable, List, NotRequired, Optional, TypedDict
 from omniagent.core import state as sm
 from omniagent.core.conversation import Exchange
 from omniagent.core.events import TokenUsage
+from omniagent.core.evidence import EvidenceBundle, RequestContract
 from omniagent.integrations.capabilities import CapabilityService
 from omniagent.integrations.runtime import AnswerSink, DeliverSink
 
@@ -57,6 +58,8 @@ class AutonomyGuards(TypedDict):
 
 class RunOptions(TypedDict):
     requested_backend: Optional[str]
+    request_contract: NotRequired[RequestContract]
+    evidence_run_id: NotRequired[str]
     should_stop: Callable[[], bool]
     state_file: str
     memory_file: NotRequired[str]
@@ -88,3 +91,4 @@ class RunReport(TypedDict):
     reason: str
     metrics: sm.EpisodeMetrics
     exchange: Exchange
+    evidence: NotRequired[EvidenceBundle]

@@ -278,3 +278,25 @@ def test_loading_rejects_artifact_symlink_and_wrong_identity(tmp_path):
     store.path_for(bundle["run_id"]).write_text(json.dumps({**bundle, "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}))
     with pytest.raises(ValueError):
         store.load(bundle["run_id"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_status", ["pending", "unknown", "delivered"])
+async def test_agent_handoff_appends_only_pending_matching_run(tmp_path, delivery_status):
+    from omniagent.app import agent
+    store, bundle = make_bundle(tmp_path)
+    store.capture(bundle, "execute_shell", {"ok": True, "result": "Projects/"})
+    bundle["delivery_status"] = delivery_status
+    if delivery_status == "delivered":
+        bundle["delivered_at"] = datetime.now(timezone.utc).isoformat()
+    store.save(bundle)
+    original = store.path_for(bundle["run_id"]).read_bytes()
+    report = await agent.run_agent_with_callback(bundle["contract"]["subject"], lambda event: None,
+        {"requested_backend": "openai", "should_stop": lambda: False, "state_file": str(tmp_path / "state.json"), "history": [],
+         "request_contract": bundle["contract"], "evidence_run_id": bundle["run_id"]}, {})
+    if delivery_status == "pending":
+        assert report["evidence"]["run_id"] == bundle["run_id"]
+        assert report["evidence"]["observations"][0]["text"] == "Projects/"
+    else:
+        assert report["evidence"]["run_id"] != bundle["run_id"]
+        assert store.path_for(bundle["run_id"]).read_bytes() == original
