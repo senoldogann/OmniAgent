@@ -171,6 +171,65 @@ async def test_mistaken_chat_read_path_uses_real_receipt(coordinator, scripted, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["length", "content_filter"])
+async def test_read_generation_truncation_retains_real_sources_without_draft(coordinator, scripted, tmp_path, finish):
+    scripts, requests = scripted
+    target = tmp_path / "report.txt"
+    target.write_text("ACTUAL observed file")
+    cutoff = turn("UNVERIFIED truncated read answer")
+    cutoff["finish_reason"] = finish
+    scripts.extend([route("investigate"), turn(calls=[call("read_file", path=str(target))]), cutoff])
+    report, events = await run(coordinator, tmp_path, f"Read {target}", {"max_total_tokens": 12000})
+    assert not report["success"] and report["metrics"]["tool_calls"] == 1
+    assert len(requests) == report["metrics"]["turns"] == 3
+    assert "ACTUAL observed file" in report["outcome"] and "UNVERIFIED" not in json.dumps(events)
+    assert EvidenceStore(options(tmp_path)["state_file"]).load(report["evidence"]["run_id"])["observations"]
+
+
+@pytest.mark.asyncio
+async def test_forced_continuous_keeps_selected_limits_and_failed_engine_status(coordinator, scripted, tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(agent, "load_continuous_limits", lambda path: {"max_hours": .25, "max_total_tokens": 50000})
+    @asynccontextmanager
+    async def lock():
+        yield
+    async def engine(goal, emit, opts, clients):
+        seen.append(opts)
+        return failed_report(opts)
+    monkeypatch.setattr(coordinator, "run_agent_with_callback", engine)
+    report, _ = await run(coordinator, tmp_path, "task", {"run_mode": "continuous", "task_context": lock})
+    assert not scripted[1] and 120 < seen[0]["max_wall_clock_seconds"] <= 900
+    assert seen[0]["run_mode"] == "continuous" and seen[0]["max_total_tokens"] == 50000
+    assert not report["success"] and report["reason"] == "effect failed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_full_task_keeps_captured_receipts_and_releases_context(coordinator, scripted, tmp_path, monkeypatch):
+    stopped, released = asyncio.Event(), []
+    @asynccontextmanager
+    async def lock():
+        try:
+            yield
+        finally:
+            released.append(True)
+    async def engine(goal, emit, opts, clients):
+        store = EvidenceStore(opts["state_file"])
+        bundle = store.load(opts["evidence_run_id"])
+        store.capture(bundle, "read_file", {"ok": True, "result": "CAPTURED before stop"})
+        stopped.set()
+        await asyncio.sleep(10)
+    monkeypatch.setattr(coordinator, "run_agent_with_callback", engine)
+    report, events = await run(coordinator, tmp_path, "task", {"run_mode": "extended", "task_context": lock,
+                                                            "should_stop": stopped.is_set})
+    assert released and not report["success"]
+    assert "CAPTURED before stop" in report["outcome"]
+    saved = EvidenceStore(options(tmp_path)["state_file"]).load(report["evidence"]["run_id"])
+    assert saved["observations"] == report["evidence"]["observations"]
+    assert len(saved["observations"]) == 1 and not saved["complete"]
+    assert len([e for e in events if e["kind"] == "run_finished"]) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     coordinator, scripted, tmp_path, monkeypatch, verbose,
@@ -185,6 +244,12 @@ async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     scripts, _ = scripted
     scripts.extend([route("task"), verified()])
     consumer_events = []
+    tracked_events = []
+    original_track = bridge._track
+    def track(event):
+        tracked_events.append(event)
+        original_track(event)
+    monkeypatch.setattr(bridge, "_track", track)
     original_compact = telegram.CompactPresenter.event
     original_verbose = telegram.event_text
     async def compact(self, event):
@@ -231,6 +296,8 @@ async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     assert len([e for e in consumer_events if e["kind"] == "run_started"]) == 1
     assert len([e for e in consumer_events if e["kind"] == "text_delta"]) == 1
     assert len([e for e in consumer_events if e["kind"] == "run_finished"]) == 1
+    terminal = [e for e in tracked_events if e["kind"] == "run_finished"]
+    assert len(terminal) == 1 and terminal[0]["success"] and terminal[0]["outcome"] == "GROUNDED_FINAL_7431"
     assert {"tool_started", "tool_finished", "integration_status", "provider_fallback"} <= {e["kind"] for e in consumer_events}
     assert api.buttons and api.buttons[0][0] == "real approval"
     final_pages = [*api.html_sent, *(api.edited[-1:] or api.sent[-1:])]
