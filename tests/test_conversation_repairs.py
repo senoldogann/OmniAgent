@@ -319,6 +319,7 @@ async def test_quick_read_timeout_keeps_receipt_and_full_subject_continuation(co
 async def test_real_engine_interruption_keeps_tool_and_timing_accounting_once(
     coordinator, scripted, tmp_path, monkeypatch, cancel,
 ):
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     scripts, requests = scripted
     target = tmp_path / "source.txt"
     target.write_text("REAL observed receipt")
