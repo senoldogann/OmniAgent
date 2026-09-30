@@ -24,6 +24,7 @@ from omniagent.approval import (
     communication_click_label, gui_communication_request,
 )
 from omniagent.core.text_norm import curl_http_statuses
+from .process import run_preemptible_process
 
 from .bot_wall import (
     AccessChallenge, access_challenge_error, bypass_note, classify_access_challenge, is_bypass_enabled,
@@ -215,7 +216,7 @@ FETCH_RETRY_WAIT_SECONDS: float = 1.0
 
 def _run_curl(url: str) -> subprocess.CompletedProcess[bytes]:
     """curl'ü tek deneme olarak çalıştırır; çıktı ham baytlardır."""
-    return subprocess.run(
+    return run_preemptible_process(
         [
             "curl", "--fail-with-body", "--show-error", "--silent", "--location", "--compressed",
             "--user-agent", STANDARD_CHROME_USER_AGENT,
@@ -333,7 +334,7 @@ def run_chrome_active_tab(
 
     if applescript_available is not False:
         try:
-            result = subprocess.run(
+            result = run_preemptible_process(
                 ["osascript", "-e", _CHROME_TAB_APPLESCRIPT, url or "", origin,
                  str(CHROME_LOAD_WAIT_SECONDS), str(new_tab).lower()],
                 env=child_environment(), capture_output=True, text=True,
