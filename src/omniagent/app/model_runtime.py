@@ -291,7 +291,14 @@ async def stream_completion(
                 )
                 stream_slots[provider_index] = actual_slot
                 draft = drafts[actual_slot]
-                preview = preview_arguments(draft["name"], draft["arguments"])
+                # A partial value can expose a configured token prefix before it matches.
+                # Keep the tool name visible; wait for complete JSON before previewing values.
+                try:
+                    json.loads(draft["arguments"])
+                except (ValueError, RecursionError):
+                    preview = ""
+                else:
+                    preview = preview_arguments(draft["name"], draft["arguments"])
                 if previews.get(actual_slot) != preview:
                     previews[actual_slot] = preview
                     emit(

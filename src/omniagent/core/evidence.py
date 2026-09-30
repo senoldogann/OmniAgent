@@ -15,7 +15,10 @@ from typing import Any, Literal, Mapping, NotRequired, TypedDict
 from uuid import UUID, uuid4
 
 from omniagent import config
-from omniagent.core.observation_filter import mask_sensitive_text, mask_typed_arguments
+from omniagent.core.observation_filter import (
+    SENSITIVE_PLACEHOLDER, TYPED_ECHO_LIMIT, TYPED_TEXT_TOOLS, is_sensitive_key,
+    mask_sensitive_text, mask_typed_arguments, typed_texts,
+)
 
 VERSION = 1
 MAX_RUN_BYTES = 2 * 1024 * 1024
@@ -66,6 +69,44 @@ def utc_now() -> str:
 def sanitize_text(text: str) -> str:
     """Mask the entire result before clipping, persistence or model presentation."""
     return mask_sensitive_text(config.redact(text))
+
+
+def sanitize_presentation_arguments(tool: str, arguments: str) -> str:
+    """A JSON-valid presentation copy; execution and argument tags keep originals."""
+    try:
+        parsed = json.loads(mask_typed_arguments(tool, arguments))
+        def clean(value):
+            if isinstance(value, dict):
+                return {key: SENSITIVE_PLACEHOLDER if is_sensitive_key(key) else clean(item)
+                        for key, item in value.items()}
+            if isinstance(value, list):
+                return [clean(item) for item in value]
+            return sanitize_text(value) if isinstance(value, str) else value
+        cleaned = clean(parsed)
+        # Preserve exact formatting for ordinary calls and provider regressions.
+        if cleaned == json.loads(arguments):
+            return arguments
+        return json.dumps(cleaned, ensure_ascii=False)
+    except (ValueError, TypeError, RecursionError):
+        # Incomplete/invalid JSON may contain a partial secret that patterns cannot identify.
+        return json.dumps({"presentation": SENSITIVE_PLACEHOLDER})
+
+
+def sanitize_tool_text(tool: str, arguments: str, text: str) -> str:
+    """Mask tool text, including arbitrary echoes of that call's typed input."""
+    if tool in TYPED_TEXT_TOOLS:
+        try:
+            parsed = json.loads(arguments)
+            values = typed_texts(tool, parsed) if isinstance(parsed, dict) else []
+        except (ValueError, RecursionError):
+            values = []
+        for value in sorted(set(values), key=len, reverse=True):
+            if value:
+                # Standard GUI tools echo at most 80 chars; errors may echo the full value.
+                for echo in (value, value[:TYPED_ECHO_LIMIT]):
+                    text = text.replace(echo, SENSITIVE_PLACEHOLDER)
+                    text = text.replace(json.dumps(echo, ensure_ascii=False)[1:-1], SENSITIVE_PLACEHOLDER)
+    return sanitize_text(text)
 
 
 def validate_run_id(run_id: str) -> str:
@@ -262,8 +303,8 @@ class EvidenceStore:
         if not ok:
             failure = f"{result.get('error_type', 'Error')}: {result.get('error', result.get('code', 'unavailable'))}"
             text = f"{failure}\n{text}".rstrip()
-        text = sanitize_text(text)
-        reference = sanitize_text(source_reference or mask_typed_arguments(tool, arguments))
+        text = sanitize_tool_text(tool, arguments, text)
+        reference = sanitize_text(source_reference) if source_reference else sanitize_presentation_arguments(tool, arguments) if arguments else ""
         reference_cropped = len(reference.encode()) > MAX_SOURCE_REFERENCE_BYTES
         if reference_cropped:
             reference = _clip_bytes(reference, MAX_SOURCE_REFERENCE_BYTES)
@@ -284,14 +325,19 @@ class EvidenceStore:
         artifact_payload = None
         if len(_encoded(observation)) > MAX_OBSERVATION_BYTES:
             # Include metadata and JSON escaping in the per-observation byte cap.
+            def excerpt(kept: int) -> str:
+                head = (kept * 3) // 4
+                tail = kept - head
+                marker = f"\n… [orta bölüm kırpıldı: {len(text) - kept} karakter] …\n"
+                return text[:head] + marker + (text[-tail:] if tail else "")
             low, high = 0, len(text)
             while low < high:
                 middle = (low + high + 1) // 2
-                if len(_encoded({**observation, "text": text[:middle]})) <= MAX_OBSERVATION_BYTES - 512:
+                if len(_encoded({**observation, "text": excerpt(middle)})) <= MAX_OBSERVATION_BYTES - 512:
                     low = middle
                 else:
                     high = middle - 1
-            observation["text"] = text[:low]
+            observation["text"] = excerpt(low)
             observation["complete"] = False
             observation["completeness"] = "bounded"
             mark_incomplete(bundle, "Kaynak metni kayıt sınırını aşıyor; okunabilir dosyadan inceleyin veya daha dar bir istekle devam edin.")

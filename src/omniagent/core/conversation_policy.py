@@ -5,10 +5,12 @@ classify tools and treat all source material as untrusted data.
 """
 from __future__ import annotations
 
+import json
 import re
+import shlex
 from typing import Iterable, Literal, TypedDict
 
-from omniagent.core.evidence import EvidenceBundle, RequestContract, sanitize_text
+from omniagent.core.evidence import EvidenceBundle, RequestContract, SourceObservation, sanitize_text
 
 MAX_PRESENTATION_CHARS = 80000
 NATURAL_STYLE_POLICY = """Answer the user's actual subject in a natural, useful style.
@@ -57,6 +59,41 @@ def derive_request_contract(subject: str, *, route: Literal["chat", "investigate
             "required_fields": list(dict.fromkeys(fields)), "needs_observation": bool(needs_observation)}
 
 
+def _directory_identifiers(observation: SourceObservation) -> list[str]:
+    """Only host-recognized listings establish directory names; prose is not a listing."""
+    if observation["tool"] in ("list_directory", "read_directory"):
+        try:
+            returned = json.loads(observation["text"])
+        except ValueError:
+            return []
+        entries = returned.get("entries", []) if isinstance(returned, dict) else []
+        return [entry["name"] for entry in entries if isinstance(entry, dict)
+                and entry.get("type") == "directory" and isinstance(entry.get("name"), str)]
+    if observation["tool"] != "execute_shell":
+        return []
+    try:
+        reference = json.loads(observation["source_reference"])
+        command = reference.get("command") if isinstance(reference, dict) else None
+        # Refuse compound commands/substitutions; their unrelated stdout is ambiguous.
+        if not isinstance(command, str) or any(char in command for char in ";|&\n`$<>()"):
+            return []
+        words = shlex.split(command)
+    except (ValueError, TypeError):
+        return []
+    if not words or words[0] not in ("ls", "/bin/ls"):
+        return []
+    options = [word for word in words[1:] if word.startswith("-")]
+    if (not options or not any("F" in option or "p" in option for option in options)
+        or any(not re.fullmatch(r"-[1aAFp]+", option) for option in options)):
+        return []
+    text = observation["text"]
+    # execute_shell wraps stdout and stderr; names must come from stdout only.
+    if "STDOUT:" in text:
+        text = text.split("STDOUT:", 1)[1].split("STDERR:", 1)[0]
+    return [line.strip()[:-1] for line in text.splitlines()
+            if line.strip().endswith("/") and not line.lstrip().startswith(("…", "http://", "https://"))]
+
+
 def _field_identifiers(bundle: EvidenceBundle) -> dict[str, list[str]]:
     fields = set(bundle["contract"]["required_fields"])
     found: dict[str, list[str]] = {field: [] for field in fields}
@@ -71,12 +108,8 @@ def _field_identifiers(bundle: EvidenceBundle) -> dict[str, list[str]]:
             found["model_names"].extend(_MODEL.findall(text))
         if "release_dates" in fields:
             found["release_dates"].extend(_DATE.findall(text))
-        if "directory_names" in fields and observation["tool"] in ("execute_shell", "list_directory", "read_directory"):
-            # ls -F marks directories; an unmarked line is retained for bare listings.
-            for line in text.splitlines():
-                name = line.strip()
-                if name and not name.startswith(("total ", "…[", "https://", "http://")):
-                    found["directory_names"].append(name.rstrip("/"))
+        if "directory_names" in fields:
+            found["directory_names"].extend(_directory_identifiers(observation))
     return {field: list(dict.fromkeys(values)) for field, values in found.items()}
 
 

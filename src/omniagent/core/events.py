@@ -11,6 +11,8 @@ import re
 from typing import Callable, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 from .state import EpisodeMetrics
+from .evidence import sanitize_presentation_arguments, sanitize_text
+from .observation_filter import SENSITIVE_PLACEHOLDER
 
 # Önizleme için akıştaki argüman metninin taranacak baş kısmı: büyük write_file içeriklerinde
 # her parçada tüm metni taramak O(n²) olur; önizlenen alan hep baştadır.
@@ -238,7 +240,16 @@ def _partial_json_string(arguments: str, key: str) -> Optional[str]:
 
 
 def preview_arguments(name: str, arguments: str) -> str:
-    """Araç çağrısının insan okunur önizlemesi; model argümanı yazarken de çalışır. Saf."""
+    """Araç çağrısının gizlilik süzgecinden geçmiş önizlemesi; yarım JSON da kabul edilir."""
+    if name in ("cua_type_text", "cua_fill_field", "cua_submit_text", "cua_set_text_element"):
+        # Typed input is private even while JSON is incomplete.
+        return SENSITIVE_PLACEHOLDER
+    try:
+        json.loads(arguments)
+    except (ValueError, RecursionError):
+        pass
+    else:
+        arguments = sanitize_presentation_arguments(name, arguments)
     if name == "run_action_sequence":
         return " → ".join(re.findall(r'"action"\s*:\s*"(\w+)"', arguments[:PREVIEW_SCAN_LIMIT]))
     if name == "cua_click_point":
@@ -252,6 +263,7 @@ def preview_arguments(name: str, arguments: str) -> str:
     value: Optional[str] = _partial_json_string(arguments, _PREVIEW_KEYS[name])
     if value is None:
         return ""
+    value = sanitize_text(value)
     return value if len(value) <= PREVIEW_LIMIT else value[:PREVIEW_LIMIT] + "…"
 
 

@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import time
+from threading import Lock
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -20,6 +21,7 @@ from omniagent.app.tool_schema import (
 )
 from omniagent.app.types import ToolCallDraft, ToolResult
 from omniagent.config import redact
+from omniagent.core.evidence import sanitize_presentation_arguments, sanitize_text, sanitize_tool_text
 from omniagent.core.events import AgentEvent, EventSink, argument_point, argument_tag, preview_arguments
 from omniagent.integrations.capabilities import ToolEntry, validate_arguments
 from omniagent.integrations.runtime import (
@@ -42,6 +44,7 @@ from omniagent.tools import (
 
 CALL_LABEL_ARGS_LIMIT: int = 100
 EVENT_RESULT_LIMIT: int = 4000
+OUTPUT_PRESENTATION_BUFFER_LIMIT: int = 512 * 1024
 # Modele giden araç çıktısının enjeksiyon anındaki baş/kuyruk sınırları: uzun çıktı (sayfa okuma,
 # log, JSON) bağlama girmeden kırpılır; kuyruk korunur çünkü en taze bilgi sondadır.
 TOOL_MESSAGE_HEAD_LIMIT: int = 6000
@@ -343,7 +346,7 @@ async def execute_tool(
 ) -> ToolResult:
     """
     Tek bir araç çağrısını çalıştırır; başarı/hata durumunu yapılandırılmış şekilde döner.
-    Çalışırken üretilen canlı çıktı (komut satırları) tool_output olayı olarak yayınlanır;
+    Üretilen çıktı (komut satırları) çağrı sonunda süzülüp tool_output olarak yayınlanır;
     kullanıcı durdurursa çalışan komut hemen sonlandırılır.
 
     `inflight`, aynı turda paralel yürüyen eşdeğer salt-okur çağrıların aynı işi iki kez
@@ -393,8 +396,28 @@ async def execute_tool(
 
     method: Callable[..., Any] = dynamic["execute"] if dynamic else getattr(toolbox, name)
     integration_started = time.monotonic()
+    # Arbitrary chunks can split assignments, PEM blocks or typed echoes. Assemble
+    # before showing output; tool_started remains live while the operation runs.
+    output_parts: List[str] = []
+    output_size = 0
+    output_overflow = False
+    output_lock = Lock()
+
+    def buffer_output(text: str) -> None:
+        nonlocal output_size, output_overflow
+        # stdout/stderr reader threads share this callback and the byte budget.
+        with output_lock:
+            if output_overflow:
+                return
+            output_size += len(text.encode("utf-8"))
+            if output_size > OUTPUT_PRESENTATION_BUFFER_LIMIT:
+                output_parts.clear()
+                output_overflow = True
+            else:
+                output_parts.append(text)
+
     call_context: ToolRuntime = {
-        "emit_output": lambda text: emit({"kind": "tool_output", "call_id": call["id"], "text": text}),
+        "emit_output": buffer_output,
         "should_stop": should_stop,
         "approved": False,
         "request_approval": _async_approver(name),
@@ -485,19 +508,29 @@ async def execute_tool(
         # Bekleyen eşdeğer çağrı, sonuç önbelleğe yazıldıktan SONRA serbest bırakılır.
         if pending is not None and not pending.done():
             pending.set_result(outcome)
+        if output_overflow:
+            emit({"kind": "tool_output", "call_id": call["id"],
+                  "text": "Araç çıktısı gösterim sınırını aştı; ayrıntı için işlem sonucuna bakın.\n"})
+        elif output_parts:
+            emit({"kind": "tool_output", "call_id": call["id"],
+                  "text": sanitize_tool_text(name, call["arguments"], "".join(output_parts))})
     return outcome
+
+
+def raw_result_text(result: ToolResult) -> str:
+    """Actual receipt text; only source capture and the ledger sanitizer consume it."""
+    return str(result.get("result", "")) if result.get("ok") else \
+        f"{result.get('error_type')}: {result.get('error')}"
 
 
 def result_text(result: ToolResult) -> str:
     """
-    Araç sonucunun gösterim/kayıt metni (başarıda çıktı, hatada 'tip: mesaj'). Metin modele,
-    transkripte ve Telegram'a gitmeden önce bilinen sır değerleri maskelenir (redact):
-    execute_shell ile okunan bir API anahtarı süreç ağacına ve sohbet geçmişine yayılmaz.
-    Anahtarın kendisi hiçbir durumda log'a yazılmaz. Saf fonksiyon değildir (sır deposunu okur).
+    Araç sonucunun gösterim metni (başarıda çıktı, hatada 'tip: mesaj'). Bilinen sırlar
+    ve bilinmeyen parola/token biçimleri tam metinde, kırpma ve olay/model sunumundan
+    önce maskelenir. Ham makbuz raw_result_text ile kaynak süzgecine ayrı taşınır.
+    Saf fonksiyon değildir (sır deposunu okur).
     """
-    text: str = str(result.get("result", "")) if result.get("ok") else \
-        f"{result.get('error_type')}: {result.get('error')}"
-    return redact(text)
+    return sanitize_text(raw_result_text(result))
 
 
 async def _run_tool_with_events(
@@ -507,17 +540,17 @@ async def _run_tool_with_events(
 ) -> ToolResult:
     """Aracı çalıştırır; başlangıcını (önizlemeyle) ve bitişini (süre + sonuç) olay olarak yayınlar."""
     emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
-          "preview": preview, "argument_tag": argument_tag(call["name"], call["arguments"]),
+          "preview": sanitize_tool_text(call["name"], call["arguments"], preview), "argument_tag": argument_tag(call["name"], call["arguments"]),
           "point": argument_point(call["name"], call["arguments"])})
     started: float = time.monotonic()
     result: ToolResult = await execute_tool(call, toolbox, cache, emit, should_stop, inflight)
     finished: AgentEvent = {"kind": "tool_finished", "call_id": call["id"],
                             "ok": bool(result.get("ok")),
-                            "text": result_text(result)[:EVENT_RESULT_LIMIT],
+                            "text": sanitize_tool_text(call["name"], call["arguments"], result_text(result))[:EVENT_RESULT_LIMIT],
                             "seconds": round(time.monotonic() - started, 2)}
     failure_code = result.get("code") or (result.get("error_type") if not result.get("ok") else None)
     if failure_code:
-        finished["code"] = str(failure_code)
+        finished["code"] = sanitize_tool_text(call["name"], call["arguments"], str(failure_code))[:EVENT_RESULT_LIMIT]
     emit(finished)
     return result
 
@@ -567,9 +600,9 @@ def _call_label(call: ToolCallDraft) -> str:
     """
     Sonucun hangi çağrıya ait olduğunu gösteren kısa etiket. Paralel toplu sonuçlar yalnızca
     tool_call_id ile eşleşince hızlı model onları karıştırabiliyordu (ölçümde 5 dosyalık
-    okumada kodlar yanlış sıralandı/atlandı). Saf fonksiyon.
+    okumada kodlar yanlış sıralandı/atlandı). Argümanlar gösterim için maskelenir.
     """
-    arguments: str = " ".join(call["arguments"].split())
+    arguments: str = " ".join(sanitize_presentation_arguments(call["name"], call["arguments"]).split())
     return f"[{call['name']} {arguments[:CALL_LABEL_ARGS_LIMIT]}]"
 
 
@@ -596,9 +629,9 @@ def _tool_result_to_message(call: ToolCallDraft, result: ToolResult) -> Dict[str
     Uzun çıktı bağlama girmeden kırpılır (bkz. _clip_tool_message).
     """
     if result.get("ok"):
-        content: str = result_text(result)
+        content: str = sanitize_tool_text(call["name"], call["arguments"], result_text(result))
     else:
-        content = f"HATA {result_text(result)}"
+        content = f"HATA {sanitize_tool_text(call['name'], call['arguments'], result_text(result))}"
         code: object = result.get("code")
         if isinstance(code, str) and code:
             recoverable: object = result.get("recoverable")
@@ -610,7 +643,8 @@ def _tool_result_to_message(call: ToolCallDraft, result: ToolResult) -> Dict[str
                 guidance = " — kurtarılabilir: aynı yolu düzelterek yeniden deneyebilirsin"
             elif recoverable is False:
                 guidance = " — kalıcı: aynı çağrıyı yineleme"
-            content = f"{content}\n[hata kodu: {code}{guidance}]"
+            safe_code = sanitize_tool_text(call["name"], call["arguments"], code)
+            content = f"{content}\n[hata kodu: {safe_code}{guidance}]"
     return {"role": "tool", "tool_call_id": call["id"],
             "content": f"{_call_label(call)}\n{_clip_tool_message(content)}"}
 

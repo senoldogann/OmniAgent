@@ -28,7 +28,10 @@ from omniagent.config import (
     apply_stored_api_keys, redact,
 )
 from omniagent.core.conversation_policy import derive_request_contract
-from omniagent.core.evidence import EvidenceBundle, EvidenceStore, mark_incomplete, new_evidence_bundle, sanitize_text
+from omniagent.core.evidence import (
+    EvidenceBundle, EvidenceStore, mark_incomplete, new_evidence_bundle,
+    sanitize_presentation_arguments, sanitize_text,
+)
 from omniagent.core.events import (
     AWAITING_APPROVAL_CODE, AWAITING_DIRECTION_CODE, AgentEvent, ArtifactReady, EventSink, ProviderFallback,
     TokenUsage, argument_point, argument_tag, compact_count, preview_arguments, provider_fallback_text, tool_label,
@@ -166,6 +169,7 @@ from omniagent.app.tool_execution import (
     execute_tool,
     failed_call_key,
     require_approval,
+    raw_result_text,
     result_text,
     update_chrome_visits,
 )
@@ -314,7 +318,7 @@ def _assistant_entry(turn: ModelTurn) -> Dict[str, Any]:
         entry["content"] = turn["content"]
     if turn["tool_calls"]:
         entry["tool_calls"] = [
-            {"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": call["arguments"]}}
+            {"id": call["id"], "type": "function", "function": {"name": call["name"], "arguments": sanitize_presentation_arguments(call["name"], call["arguments"])}}
             for call in turn["tool_calls"]
         ]
     return entry
@@ -1131,7 +1135,7 @@ async def resolve_goal_report(
                                 "Kullanıcı /approve yazana kadar oturum açık kalacak; "
                                 "/btw yeni yönlendirme ekleyebilir."}
             emit({"kind": "notice", "level": "info", "code": AWAITING_APPROVAL_CODE, "text": (
-                f"Hedef kanıtı hazır: {redact(summary[:300])}. Onaylamak için /approve, "
+                f"Hedef kanıtı hazır: {sanitize_text(summary)[:300]}. Onaylamak için /approve, "
                 f"yeni yön vermek için /btw <mesaj> yazın; {GOAL_APPROVAL_TIMEOUT_SECONDS / 60:g} dk "
                 "içinde yanıt gelmezse oturum onaylanmamış olarak kapanır."
             )})
@@ -1139,7 +1143,7 @@ async def resolve_goal_report(
             try:
                 # Gerçek boolean onay: masaüstünde izin/ret kartı, uzak arayüzde onay düğmesi.
                 answer: Dict[str, Any] = await runtime.ask(
-                    redact(goal_confirmation_question(summary, evidence_ids, evidence)),
+                    sanitize_text(goal_confirmation_question(summary, evidence_ids, evidence)),
                     {"onay": {"type": "boolean", "label": "Hedef gerçekleşti", "default": False}},
                     None,
                 )
@@ -1150,7 +1154,7 @@ async def resolve_goal_report(
             else:
                 reply: str = str(answer.get("yanit", "")).strip()
                 if approval_granted(answer.get("onay", reply)):
-                    confirmed = summary.strip()
+                    confirmed = sanitize_text(summary.strip())
                     result = {"tool_call_id": call["id"], "ok": True,
                               "result": "Kullanıcı hedefin gerçekleştiğini ONAYLADI; görev tamamlandı."}
                 else:
@@ -2176,7 +2180,7 @@ async def run_agent_with_callback(
                 if not ok:
                     failures_in_turn += 1
                 if ok and call["name"] not in _ACTION_RECEIPT_TOOLS:
-                    host_task_ledger = record_tool_result(host_task_ledger, call["name"], result_text(result), iteration)
+                    host_task_ledger = record_tool_result(host_task_ledger, call["name"], redact(raw_result_text(result)), iteration)
                 # Deneyim belleği yalnız hata anında konuşur: aynı hata imzası için doğrulanmış
                 # önceki çözüm ve görev içi tekrar uyarısı araç sonucunun altına eklenir.
                 if result.get("code") in (

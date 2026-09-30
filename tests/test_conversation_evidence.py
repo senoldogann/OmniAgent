@@ -447,3 +447,97 @@ async def test_agent_real_tool_pipeline_masks_typed_history_without_changing_exe
     assert typed not in observed_messages[1]
     assert typed not in str(events)
     assert typed not in json.dumps(report["evidence"])
+
+
+@pytest.mark.asyncio
+async def test_real_automatic_observation_and_hosted_results_mask_before_events(tmp_path):
+    from omniagent.app import agent
+    from omniagent.tools import ToolError
+    events = []
+    class Tools:
+        memory_mutation_allowed = False
+        async def take_screenshot(self, filename, detail=False):
+            raise ToolError("Password: unknown-camera-value", "SCREEN_ERROR", False)
+    observation, _, _ = await agent._observe_after_actions("auto-private", 0, "Ekran okunuyor", Tools(), {}, events.append, lambda: False)
+    assert "unknown-camera-value" not in str(events)
+    assert "unknown-camera-value" not in str(observation)
+    async def ask(*args):
+        return {"onay": False, "yanit": "Password: unknown-hosted-value"}
+    from types import SimpleNamespace
+    call = {"id": "hosted-private", "name": "report_goal_met", "arguments": json.dumps({
+        "summary": "İnceleme tamamlandı, kaynak okundu.", "evidence_call_ids": ["source"]})}
+    result, _, _, asked = await agent.resolve_goal_report(call, 0, {"source": "read source"}, SimpleNamespace(ask=ask), events.append, frozenset(), 0)
+    assert asked
+    assert "unknown-hosted-value" in result["result"]  # original receipt still reaches capture
+    assert "unknown-hosted-value" not in str(events)
+
+
+@pytest.mark.asyncio
+async def test_tool_output_buffer_overflow_does_not_flush_partial_secret():
+    from omniagent.app.tool_execution import OUTPUT_PRESENTATION_BUFFER_LIMIT, _run_tool_with_events
+    from omniagent.tools import TOOL_RUNTIME
+    events = []
+    class Tools:
+        memory_mutation_allowed = False
+        async def execute_shell(self, command):
+            sink = TOOL_RUNTIME.get()["emit_output"]
+            sink("Password: unsafe-partial")
+            assert not any(event["kind"] == "tool_output" for event in events)
+            sink("x" * OUTPUT_PRESENTATION_BUFFER_LIMIT)
+            sink("secret-tail")
+            return "safe full receipt"
+    call = {"id": "overflow-output", "name": "execute_shell", "arguments": '{"command":"fixture"}'}
+    result = await _run_tool_with_events(0, call, "fixture", Tools(), {}, events.append, lambda: False)
+    assert result["result"] == "safe full receipt"
+    assert "unsafe-partial" not in str(events) and "secret-tail" not in str(events)
+    output = [event for event in events if event["kind"] == "tool_output"]
+    assert len(output) == 1 and "gösterim sınırını" in output[0]["text"]
+
+
+def test_structured_directory_facts_and_shell_compound_commands():
+    from omniagent.core.evidence import new_evidence_bundle
+    from datetime import datetime, timezone
+    bundle = new_evidence_bundle(derive_request_contract("List folders", required_fields=("directory_names",)))
+    observation = {"tool": "list_directory", "source_type": "tool", "source_reference": "/Desktop", "observed_at": datetime.now(timezone.utc).isoformat(),
+                   "text": json.dumps({"entries": [{"name": "Projects", "type": "directory"}, {"name": "notes.txt", "type": "file"}]}),
+                   "ok": True, "status": "ok", "complete": True, "completeness": "full"}
+    bundle["observations"].append(observation)
+    bundle["observations"].append({**observation, "tool": "execute_shell", "source_reference": '{"command":"ls -F; echo fake/"}', "text": "fake/"})
+    assert required_identifiers(bundle) == ["Projects"]
+
+
+def test_presentation_arguments_mask_nested_format_secrets_and_keep_valid_json():
+    from omniagent.core.evidence import sanitize_presentation_arguments
+    original = {"path": "/safe/path", "password": "opaque-format-value", "nested": {"header": "Bearer sk-example-token-1234567890"}}
+    masked = sanitize_presentation_arguments("some_tool", json.dumps(original))
+    parsed = json.loads(masked)
+    assert parsed["path"] == "/safe/path"
+    assert parsed["password"] == "[gizli]"
+    assert "opaque-format-value" not in masked
+    assert "sk-example-token" not in masked
+    assert original["password"] == "opaque-format-value"
+
+
+@pytest.mark.asyncio
+async def test_hosted_notice_and_confirmation_mask_full_text_before_clipping():
+    from omniagent.app import agent
+    from types import SimpleNamespace
+    events = []
+    questions = []
+    secret = "opaque-summary-value" * 15
+    summary = "İnceleme tamamlandı. Password: " + secret
+    call = {"id": "hosted-notice", "name": "report_goal_met", "arguments": json.dumps({"summary": summary, "evidence_call_ids": ["source"]})}
+    async def ask(question, *args):
+        questions.append(question)
+        return {"onay": False}
+    runtime = SimpleNamespace(ask=ask)
+    await agent.resolve_goal_report(call, 0, {"source": "read source"}, runtime, events.append, frozenset(), 0, defer_confirmation=True)
+    await agent.resolve_goal_report(call, 0, {"source": "Password: opaque-source-value"}, runtime, events.append, frozenset(), 0)
+    assert "opaque-summary-value" not in str(events)
+    assert "opaque-summary-value" not in str(questions)
+    assert "opaque-source-value" not in str(questions)
+    async def approve(*args):
+        return {"onay": True}
+    _, confirmed, _, _ = await agent.resolve_goal_report(call, 0, {"source": "read source"}, SimpleNamespace(ask=approve), events.append, frozenset(), 0)
+    assert "opaque-summary-value" not in confirmed
+    assert secret in call["arguments"]  # approval/execution input was not rewritten
