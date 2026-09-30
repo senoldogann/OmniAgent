@@ -74,12 +74,14 @@ iMessage current capabilities do not support typing. Use one real-work acknowled
 - Modify `src/omniagent/app/agent.py` (source capture before clipping; final RunReport)
 - Test `tests/test_conversation_evidence.py`
 
-- [ ] Write failing tests: middle-of-long-result names/URLs preserved or explicitly incomplete; secret masking before persistence; atomic private storage; invalid UUID/path/version rejected; unknown delivery retained across reload; failed tools preserve failure; required identifiers survive presentation; seven-day cleanup affects only confirmed delivery.
-- [ ] Run `.venv/bin/python -m pytest tests/test_conversation_evidence.py -q` and confirm failures correspond to missing implementation.
-- [ ] Add TypedDict/dataclass contracts with defensive JSON loading and a deterministic renderer. Add shared natural style text without channel-specific instructions. RunReport gains optional evidence field so existing callers/fakes remain compatible.
-- [ ] Capture actual tool results in `run_agent_with_callback` at the results-processing loop before StepRecord/task-ledger/event truncation; capture automatic observations where relevant. Persist bundle before terminal report and retain startup/error semantics. Supply full sanitized evidence independently of the clipped Exchange.
-- [ ] Run new tests plus `.venv/bin/python -m pytest tests/test_conversation.py tests/test_checkpoint_integration.py tests/test_task_ledger_integration.py -q`.
-- [ ] Self-review and commit only Task 1 files. Independent spec review, then quality review; resolve issues before Task 2.
+- [x] Write failing tests: middle-of-long-result names/URLs preserved or explicitly incomplete; secret masking before persistence; atomic private storage; invalid UUID/path/version rejected; unknown delivery retained across reload; failed tools preserve failure; required identifiers survive presentation; seven-day cleanup affects only confirmed delivery.
+- [x] Run `.venv/bin/python -m pytest tests/test_conversation_evidence.py -q` and confirm failures correspond to missing implementation.
+- [x] Add TypedDict/dataclass contracts with defensive JSON loading and a deterministic renderer. Add shared natural style text without channel-specific instructions. RunReport gains optional evidence field so existing callers/fakes remain compatible.
+- [x] Capture actual tool results in `run_agent_with_callback` at the results-processing loop before StepRecord/task-ledger/event truncation; capture automatic observations where relevant. Persist bundle before terminal report and retain startup/error semantics. Supply full sanitized evidence independently of the clipped Exchange.
+- [x] Run new tests plus `.venv/bin/python -m pytest tests/test_conversation.py tests/test_checkpoint_integration.py tests/test_task_ledger_integration.py -q`.
+- [x] Self-review and commit only Task 1 files. Independent spec review, then quality review; resolve issues before Task 2.
+
+Task 1 completed at `da4c36b`: independent specification review approved; independent quality review approved after fixes. Focused independent repair verification: 6 passed. Broader affected verification and deliberate canonical-output presentation changes are recorded in the implementation review. Tasks 2–4 and live rollout remain pending.
 
 ## Task 2: Shared coordinator and read-only routing through all adapters
 
