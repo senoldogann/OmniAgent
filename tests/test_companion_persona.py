@@ -29,7 +29,9 @@ def test_empty_persona_is_an_error(tmp_path: Path) -> None:
 
 def test_prompt_prefix_is_stable_and_situation_is_turkish() -> None:
     prompt = system_prompt(persona_text_for("Deniz"), "\n### USER MEMORY (saved by the user)\n- [preference] dil: türkçe\n")
-    assert prompt.startswith(RULES) and "Deniz" in prompt and "dil: türkçe" in prompt
+    assert "Answer the user's actual subject in a natural, useful style." in prompt
+    assert "Deniz" in prompt and "dil: türkçe" in prompt
+    assert "Her satır ayrı bir iMessage balonudur" not in prompt and "1-4 kısa satır" not in prompt
     moment = datetime(2026, 9, 29, 21, 5, tzinfo=timezone.utc)
     block = situation_block(moment, "a.pdf'i taşı", ["execute_shell: mv a.pdf"], "Taşıyayım mı?",
                             ["- Telegram'dan (09:00): rapor hazırla — bitti ✓"])

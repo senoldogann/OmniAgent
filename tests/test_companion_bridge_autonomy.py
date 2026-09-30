@@ -8,7 +8,7 @@ from omniagent.companion import delegate
 from omniagent.integrations import imessage
 from omniagent.memory.personal import utc_iso
 from test_imessage_bridge import parts, incoming, HANDLE, ScriptedChat, FlakyTransport, report_for
-from omniagent.integrations.imsg import ImsgProcessError
+from omniagent.integrations.imsg import DeliveryUnknown
 
 
 @pytest.mark.asyncio
@@ -116,17 +116,16 @@ async def test_stop_does_not_wait_for_pending_report_model(parts, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_partial_report_failure_cannot_repeat_delivered_first_bubble(parts, monkeypatch):
+async def test_unknown_final_report_delivery_is_not_replayed(parts, monkeypatch):
     bridge, _, store = parts
-    transport = FlakyTransport({"ikinci balon": ImsgProcessError("bağlantı kesildi")})
+    transport = FlakyTransport({"bitti": DeliveryUnknown("teslim bilinmiyor")})
     bridge.transport = transport
-    monkeypatch.setattr(imessage.chat, "respond", ScriptedChat([(["ilk balon", "ikinci balon"], None)]))
     now = utc_iso(datetime.now(timezone.utc))
     result = {"goal": "rapor", "report": report_for("rapor", "bitti", True),
               "started_at": now, "finished_at": now, "tokens": 0}
     bridge.heartbeat.queue_report(result)
     await bridge.heartbeat.flush_reports(force=True)
     await bridge.heartbeat.flush_reports(force=True)
-    assert transport.attempts == ["ilk balon", "ikinci balon"]
+    assert transport.attempts == ["bitti"]
     assert store.get_state("queued_morning_reports") == "[]"
     assert store.get_state("morning_report_delivery")

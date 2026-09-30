@@ -7,6 +7,8 @@ import pytest
 from omniagent.companion import heartbeat as module
 from omniagent.companion import delegate
 from omniagent.companion.autonomy import is_quiet_hour
+from omniagent.core.conversation_policy import derive_request_contract
+from omniagent.core.evidence import new_evidence_bundle
 from omniagent.integrations.imsg import DeliveryUnknown
 from omniagent.integrations.runtime import DeliveryFailed
 from omniagent.memory.personal import PersonalStore, utc_iso
@@ -272,6 +274,35 @@ async def test_report_queue_survives_restart_waits_for_morning_and_user_can_forc
     await reopened.flush_reports(force=True)
     assert sent == ["ilk", "ikinci"]
     assert json.loads(store.get_state(module.QUEUED_REPORTS_KEY)) == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_report_restart_preserves_full_evidence_payload(store):
+    seen = []
+    async def send_report(outcome):
+        seen.append(outcome)
+
+    outcome = delegate.failure_outcome(
+        "kaynakları raporla", "tamamlanamadı", utc_iso(NOW), origin="autonomous", rationale="gece kontrolü",
+    )
+    evidence = new_evidence_bundle(
+        derive_request_contract("Projects-Exact ve kaynak URL'sini raporla", route="task",
+                                required_fields=["directory_names", "source_urls"])
+    )
+    evidence["observations"].append({
+        "tool": "list_directory", "source_type": "tool", "source_reference": "/Desktop",
+        "observed_at": utc_iso(NOW), "text": "Projects-Exact\nhttps://example.test/deferred",
+        "ok": True, "status": "ok", "complete": True, "completeness": "full",
+    })
+    outcome["report"]["evidence"] = evidence
+    heart = new_heartbeat(store, [], [], NOW.replace(hour=0), report=send_report)
+    heart.queue_report(outcome)
+
+    reopened = new_heartbeat(store, [], [], NOW.replace(hour=0), report=send_report)
+    queued = json.loads(store.get_state(module.QUEUED_REPORTS_KEY))
+    assert queued[0]["report"]["evidence"] == evidence
+    await reopened.flush_reports(force=True)
+    assert seen[0]["report"]["evidence"] == evidence
 
 
 @pytest.mark.asyncio

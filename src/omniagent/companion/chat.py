@@ -1,12 +1,11 @@
-"""Hızlı sohbet katmanı: küçük istem + tek model çağrısı → iMessage balonları; gerekirse iş devri.
+"""Hızlı sohbet katmanı: küçük istem + tek model çağrısı → doğrulanmış iMessage finali; gerekirse iş devri.
 
 Model çağrısı ajanın yeniden deneme ve hata sınıflandırması sözleşmesini (agent.call_model_with_retries) kullanır;
-yeni istemci yazılmaz. Metin akarken tamamlanan satırlar hemen balon olur (ilk balon turun bitmesini beklemez);
-akış yeniden denenirse (stream_reset) gönderilmiş satırlar atlanır, balon iki kez gitmez.
+yeni istemci yazılmaz. Stream parçaları kullanıcıya gönderilmez; yalnız başarıyla tamamlanmış ModelTurn.content
+tek semantik final olarak yayınlanır. Retry/reset taslakları ve başarısız akış parçaları kullanıcıya sızmaz.
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import re
@@ -27,9 +26,7 @@ from omniagent.fallback_policy import (
 )
 from omniagent.memory.personal import utc_now_iso
 from omniagent.paths import data_root
-from omniagent.companion.bubbles import (
-    MAX_BUBBLE_CHARS, MAX_BUBBLES, bubble_delay, clean_line, split_complete_lines,
-)
+from omniagent.companion.bubbles import final_message
 from omniagent.core.events import AgentEvent
 from omniagent.memory.personal import ArchivedMessage, ChatToolCall
 
@@ -478,98 +475,59 @@ async def respond(
     session_id: str,
 ) -> ChatResult:
     """
-    Tek model turu. Tamamlanan satırlar akış sırasında balon olarak gönderilir: ilk MAX_BUBBLES-1 satır anında,
-    kalanlar sonda tek balonda birleşir. Akış yeniden denenirse (stream_reset) gönderilmiş satırlar yeni akışta
-    atlanır. Model ne metin ne iş üretirse ChatError.
+    Tek model turu. Stream yalnız geçici taslaktır; kullanıcıya semantik cevap ancak model turu başarıyla
+    tamamlandıktan sonra, final ModelTurn.content üzerinden tek kez gönderilir. Metinsel tool fallback'i yalnız
+    authenticated user turn'lerde (tools açıkken) yorumlanır.
     """
-    queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    def emit(_event: AgentEvent) -> None:
+        # Partial text, reset ve retry akışı kullanıcıya gönderilmez. Final otorite ModelTurn.content'tir.
+        return
+
+    turn, _answered_by = await _chat_completion(
+        clients, [{"role": "system", "content": system}, *(messages if tools else without_tool_calls(messages))],
+        tools, session_id, backend, emit, should_stop,
+    )
+
+    textual_goals: List[str] = []
+    textual_recalls: List[str] = []
+    textual_forgets: List[int] = []
+    content = final_message(turn["content"])
+
+    if tools and content:
+        visible_lines: List[str] = []
+        for line in content.split("\n"):
+            query, fact_ids = textual_memory_calls(line)
+            visible, goal = textual_start_task(line)
+            if goal is not None:
+                textual_goals.append(goal)
+            if query is not None:
+                textual_recalls.append(query)
+            for fact_id in fact_ids:
+                if fact_id not in textual_forgets:
+                    textual_forgets.append(fact_id)
+            visible_lines.append(visible)
+        content = final_message("\n".join(visible_lines))
+
     sent: List[str] = []
-    held: List[str] = []
-    buffer: str = ""
-    streamed: int = 0      # bu akışta görülen boş olmayan satır sayısı
-    queued: int = 0        # kuyruğa verilen balon sayısı (akış sıfırlansa da korunur)
-    replay_skip: int = 0   # yeniden denenen akışta atlanacak, zaten kuyruğa verilmiş satır sayısı
-    textual_goals: List[str] = []  # metne yazılmış start_task çağrılarının hedefleri
-    textual_recalls: List[str] = []  # metne yazılmış recall sorguları
-    textual_forgets: List[int] = []  # metne yazılmış forget kimlikleri (akış yeniden denense de bir kez)
+    if content:
+        await send_bubble(content)
+        sent.append(content)
 
-    def visible_text(line: str) -> str:
-        """Metinsel araç çağrılarını ayıklar (argümanlarını saklar) ve kalan satırı temizler."""
-        visible, goal = textual_start_task(line)
-        if goal is not None:
-            textual_goals.append(goal)
-        query, fact_ids = textual_memory_calls(line)
-        if query is not None:
-            textual_recalls.append(query)
-        for fact_id in fact_ids:
-            if fact_id not in textual_forgets:
-                textual_forgets.append(fact_id)
-        return clean_line(visible)
-
-    def accept(line: str) -> None:
-        nonlocal streamed, queued
-        streamed += 1
-        if streamed <= replay_skip:
-            return
-        if queued < MAX_BUBBLES - 1:
-            queued += 1
-            queue.put_nowait(line)
-        else:
-            held.append(line)
-
-    def emit(event: AgentEvent) -> None:
-        nonlocal buffer, streamed, replay_skip
-        if event["kind"] == "stream_reset":
-            buffer, streamed, replay_skip = "", 0, queued
-            held.clear()
-            return
-        if event["kind"] != "text_delta":
-            return
-        complete, buffer = split_complete_lines(buffer, event["text"])
-        for line in complete:
-            cleaned: str = visible_text(line)
-            if cleaned:
-                accept(cleaned)
-
-    async def sender() -> None:
-        while True:
-            bubble: Optional[str] = await queue.get()
-            if bubble is None:
-                return
-            if sent:
-                await asyncio.sleep(bubble_delay(bubble))
-            await send_bubble(bubble)
-            sent.append(bubble)
-
-    sending: asyncio.Task[None] = asyncio.create_task(sender())
-    try:
-        turn, _answered_by = await _chat_completion(
-            clients, [{"role": "system", "content": system}, *(messages if tools else without_tool_calls(messages))],
-            tools, session_id, backend, emit, should_stop,
-        )
-    except BaseException:
-        sending.cancel()
-        await asyncio.gather(sending, return_exceptions=True)
-        raise
-    tail: str = visible_text(buffer)
-    if tail:
-        accept(tail)
-    if held:
-        queue.put_nowait(" ".join(held)[:MAX_BUBBLE_CHARS])
-    queue.put_nowait(None)
-    await sending
-    start_task: Optional[str] = parse_start_task(turn["tool_calls"])
-    if start_task is None and textual_goals:
-        logging.info("Sohbet modeli aracı metin içinde çağırdı; iş başlatılıyor", extra={"calls": len(textual_goals)})
-        start_task = textual_goals[0]
-    recall, forget = parse_memory_calls(turn["tool_calls"])
-    if recall is None and textual_recalls:
-        logging.info("Sohbet modeli hafıza aramasını metin içinde çağırdı", extra={"calls": len(textual_recalls)})
-        recall = textual_recalls[0]
-    if not forget and textual_forgets:
-        logging.info("Sohbet modeli unutmayı metin içinde çağırdı", extra={"calls": len(textual_forgets)})
-        forget = textual_forgets
-    controls = control_calls(turn["tool_calls"])
+    if tools:
+        start_task: Optional[str] = parse_start_task(turn["tool_calls"])
+        if start_task is None and textual_goals:
+            logging.info("Sohbet modeli aracı metin içinde çağırdı; iş başlatılıyor", extra={"calls": len(textual_goals)})
+            start_task = textual_goals[0]
+        recall, forget = parse_memory_calls(turn["tool_calls"])
+        if recall is None and textual_recalls:
+            logging.info("Sohbet modeli hafıza aramasını metin içinde çağırdı", extra={"calls": len(textual_recalls)})
+            recall = textual_recalls[0]
+        if not forget and textual_forgets:
+            logging.info("Sohbet modeli unutmayı metin içinde çağırdı", extra={"calls": len(textual_forgets)})
+            forget = textual_forgets
+        controls = control_calls(turn["tool_calls"])
+    else:
+        start_task, recall, forget, controls = None, None, [], {}
     if not sent and start_task is None and recall is None and not forget and not controls and turn["finish_reason"] != "stopped":
         raise ChatError(f"Sohbet modeli boş yanıt döndürdü (finish_reason={turn['finish_reason']}).")
     result: ChatResult = {"bubbles": sent, "start_task": start_task}

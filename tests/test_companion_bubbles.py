@@ -1,6 +1,6 @@
 """Model metnini balonlara çevirme: markdown temizliği, 4 balon sınırı, akış satırları, insan benzeri aralık."""
 from omniagent.companion.bubbles import (
-    MAX_BUBBLE_CHARS, bubble_delay, clean_line, split_bubbles, split_complete_lines,
+    MAX_BUBBLE_CHARS, bubble_delay, clean_line, final_message, split_bubbles, split_complete_lines,
 )
 
 
@@ -21,6 +21,11 @@ def test_long_line_is_clipped() -> None:
 def test_stream_lines_complete_only_at_newline() -> None:
     assert split_complete_lines("sel", "am\nna") == (["selam"], "na")
     assert split_complete_lines("na", "ber") == ([], "naber")
+
+
+def test_normal_final_message_is_lossless_and_normalizes_only_transport_newlines() -> None:
+    text = "başlık\r\n\r\n" + ("x" * 900) + "\rson"
+    assert final_message("  " + text + "  ") == "başlık\n\n" + ("x" * 900) + "\nson"
 
 
 def test_bubble_delay_is_bounded() -> None:

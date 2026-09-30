@@ -9,8 +9,13 @@ MAX_BUBBLE_CHARS: int = 600
 _MARKDOWN_PREFIX: re.Pattern[str] = re.compile(r"^(?:[-*•]\s+|#{1,6}\s+|\d+[.)]\s+|>\s*)")
 
 
+def final_message(text: str) -> str:
+    """Normal chat/report finalini lossless tutar; yalnız dış boşluğu ve CRLF farkını normalize eder."""
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
 def clean_line(line: str) -> str:
-    """Satırdan markdown işaretlerini (madde, başlık, kalın, kod) atar ve MAX_BUBBLE_CHARS'ta keser. Saf."""
+    """Proaktif kısa balondan markdown işaretlerini atar ve mevcut heartbeat sınırında keser. Saf."""
     text: str = _MARKDOWN_PREFIX.sub("", line.strip())
     text = text.replace("**", "").replace("__", "").replace("`", "")
     return text.strip()[:MAX_BUBBLE_CHARS]

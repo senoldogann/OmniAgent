@@ -19,20 +19,23 @@ def scripted_model(chunks: List[str], tool_calls: List[ToolCallDraft]) -> Callab
     async def call(clients: Dict[str, AsyncOpenAI], messages: List[Dict[str, str]], tool_schemas: object,
                    session_id: str, backend: str, emit: Callable[[AgentEvent], None],
                    should_stop: Callable[[], bool]) -> Tuple[ModelTurn, str]:
+        final_chunks: List[str] = []
         for chunk in chunks:
             if chunk == "RESET":
+                final_chunks = []
                 emit({"kind": "stream_reset", "reason": "geçici hata"})
             else:
+                final_chunks.append(chunk)
                 emit({"kind": "text_delta", "text": chunk})
             await asyncio.sleep(0)
-        turn: ModelTurn = {"content": "", "tool_calls": tool_calls, "finish_reason": "stop", "usage": ZERO_USAGE}
+        turn: ModelTurn = {"content": "".join(final_chunks), "tool_calls": tool_calls,
+                           "finish_reason": "stop", "usage": ZERO_USAGE}
         return turn, backend
     return call
 
 
 async def run(monkeypatch: pytest.MonkeyPatch, model: Callable[..., object]) -> Tuple[chat.ChatResult, List[str]]:
     monkeypatch.setattr(chat, "call_model_with_retries", model)
-    monkeypatch.setattr(chat, "bubble_delay", lambda text: 0.0)
     sent: List[str] = []
 
     async def send(bubble: str) -> None:
@@ -47,40 +50,77 @@ async def run(monkeypatch: pytest.MonkeyPatch, model: Callable[..., object]) -> 
 
 
 @pytest.mark.asyncio
-async def test_first_line_is_sent_while_model_is_still_streaming(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_no_reply_is_sent_until_model_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
+    started = asyncio.Event()
     release = asyncio.Event()
 
     async def call(clients: Dict[str, AsyncOpenAI], messages: List[Dict[str, str]], tool_schemas: object,
                    session_id: str, backend: str, emit: Callable[[AgentEvent], None],
                    should_stop: Callable[[], bool]) -> Tuple[ModelTurn, str]:
         emit({"kind": "text_delta", "text": "selaam\nnasılsın"})
+        started.set()
         await release.wait()
         emit({"kind": "text_delta", "text": " bugün"})
-        return {"content": "", "tool_calls": [], "finish_reason": "stop", "usage": ZERO_USAGE}, backend
+        return {"content": "selaam\nnasılsın bugün", "tool_calls": [],
+                "finish_reason": "stop", "usage": ZERO_USAGE}, backend
 
     monkeypatch.setattr(chat, "call_model_with_retries", call)
-    monkeypatch.setattr(chat, "bubble_delay", lambda text: 0.0)
     sent: List[str] = []
 
-    async def send(bubble: str) -> None:
-        sent.append(bubble)
-        release.set()
+    async def send(message: str) -> None:
+        sent.append(message)
 
-    result = await asyncio.wait_for(chat.respond({}, "openai", "sistem", [], chat.CHAT_TOOLS, send, lambda: False, "test"), timeout=5)
-    assert sent == ["selaam", "nasılsın bugün"]
+    task = asyncio.create_task(
+        chat.respond({}, "openai", "sistem", [], chat.CHAT_TOOLS, send, lambda: False, "test")
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    await asyncio.sleep(0)
+    assert sent == []
+    release.set()
+    result = await asyncio.wait_for(task, 5)
+    assert sent == ["selaam\nnasılsın bugün"]
     assert result == {"bubbles": sent, "start_task": None}
 
 
 @pytest.mark.asyncio
-async def test_more_than_four_lines_merge_into_last_bubble(monkeypatch: pytest.MonkeyPatch) -> None:
-    result, sent = await run(monkeypatch, scripted_model(["a\nb\n", "c\nd\ne"], []))
-    assert sent == ["a", "b", "c", "d e"] and result["bubbles"] == sent
+async def test_multiline_and_more_than_four_paragraphs_stay_in_one_final_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    text = "bir\n\niki\n\nüç\n\ndört\n\nbeş"
+    result, sent = await run(monkeypatch, scripted_model([text], []))
+    assert sent == [text] and result["bubbles"] == [text]
 
 
 @pytest.mark.asyncio
-async def test_stream_reset_does_not_resend_bubbles(monkeypatch: pytest.MonkeyPatch) -> None:
-    _result, sent = await run(monkeypatch, scripted_model(["bir\n", "RESET", "bir\niki\n", "üç"], []))
-    assert sent == ["bir", "iki", "üç"]
+async def test_reply_longer_than_600_characters_is_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    text = "başlangıç\n" + ("x" * 900) + "\nhttps://example.test/source"
+    result, sent = await run(monkeypatch, scripted_model([text], []))
+    assert sent == [text] and result["bubbles"] == [text]
+
+
+@pytest.mark.asyncio
+async def test_stream_reset_discards_unverified_draft_and_sends_only_final(monkeypatch: pytest.MonkeyPatch) -> None:
+    _result, sent = await run(monkeypatch, scripted_model(
+        ["asla görünmemeli\n", "RESET", "bir\niki\n", "üç"], []
+    ))
+    assert sent == ["bir\niki\nüç"]
+
+
+@pytest.mark.asyncio
+async def test_model_failure_after_partial_stream_sends_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def call(clients: Dict[str, AsyncOpenAI], messages: List[Dict[str, str]], tool_schemas: object,
+                   session_id: str, backend: str, emit: Callable[[AgentEvent], None],
+                   should_stop: Callable[[], bool]) -> Tuple[ModelTurn, str]:
+        emit({"kind": "text_delta", "text": "doğrulanmamış taslak\n"})
+        raise chat.ChatError("provider failed")
+
+    monkeypatch.setattr(chat, "call_model_with_retries", call)
+    sent: List[str] = []
+
+    async def send(message: str) -> None:
+        sent.append(message)
+
+    with pytest.raises(chat.ChatError, match="provider failed"):
+        await chat.respond({}, "openai", "sistem", [], chat.CHAT_TOOLS, send, lambda: False, "test")
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -196,10 +236,9 @@ async def test_toolless_turn_sends_history_without_tool_call_structure(monkeypat
                    should_stop: Callable[[], bool]) -> Tuple[ModelTurn, str]:
         seen.append(messages)
         emit({"kind": "text_delta", "text": "hallettim\n"})
-        return {"content": "", "tool_calls": [], "finish_reason": "stop", "usage": ZERO_USAGE}, backend
+        return {"content": "hallettim", "tool_calls": [], "finish_reason": "stop", "usage": ZERO_USAGE}, backend
 
     monkeypatch.setattr(chat, "call_model_with_retries", call)
-    monkeypatch.setattr(chat, "bubble_delay", lambda text: 0.0)
     history = chat.history_messages([
         {"id": 1, "direction": "in", "kind": "chat", "text": "masaüstümde ne var", "created_at": "t1", "delivery": None},
         {"id": 2, "direction": "out", "kind": "chat", "text": "bakıyorum", "created_at": "t2", "delivery": "sent"},
@@ -212,6 +251,25 @@ async def test_toolless_turn_sends_history_without_tool_call_structure(monkeypat
                        send, lambda: False, "test")
     assert all("tool_calls" not in message and message["role"] != "tool" for message in seen[0])
     assert {"role": "assistant", "content": "bakıyorum"} in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_toolless_turn_ignores_returned_and_textual_action_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: List[ToolCallDraft] = [
+        {"id": "s1", "name": "start_task", "arguments": json.dumps({"goal": "sil"})},
+        {"id": "f1", "name": "forget", "arguments": json.dumps({"fact_id": 4})},
+        {"id": "m1", "name": "mute", "arguments": json.dumps({"hours": 24})},
+    ]
+    model = scripted_model(['rapor <call:recall query="Ela" />'], calls)
+    monkeypatch.setattr(chat, "call_model_with_retries", model)
+    sent: List[str] = []
+
+    async def send(message: str) -> None:
+        sent.append(message)
+
+    result = await chat.respond({}, "openai", "sistem", [], [], send, lambda: False, "report")
+    assert sent == ['rapor <call:recall query="Ela" />']
+    assert result == {"bubbles": sent, "start_task": None}
 
 
 @pytest.mark.asyncio

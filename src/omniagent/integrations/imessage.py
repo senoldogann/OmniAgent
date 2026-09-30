@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Protocol, Set, Tuple, TypedDict, Union
 
 from openai import AsyncOpenAI
 
-from omniagent.app.agent import close_model_clients, create_model_clients
+from omniagent.app.agent import STATE_FILE, close_model_clients, create_model_clients
 from omniagent.app.conversation import ConversationDecision, decide_conversation
 from omniagent.app.model_retry import ModelCallFailed
 from omniagent.companion import chat, delegate, media, persona
@@ -32,6 +32,8 @@ from omniagent.companion.autonomy import is_quiet_hour, make_autonomy_guards
 from omniagent.companion.heartbeat import Heartbeat
 from omniagent.config import BACKENDS, apply_model_preferences, apply_stored_api_keys, redact
 from omniagent.core.conversation import Exchange, make_exchange, trim_history
+from omniagent.core.conversation_policy import render_evidence
+from omniagent.core.evidence import EvidenceStore
 from omniagent.core.log_format import configure_stream_logging
 from omniagent.fallback_policy import FallbackNotPermitted
 from omniagent.integrations.capabilities import CapabilityService
@@ -71,6 +73,7 @@ RESTART_DELAYS_SECONDS: Tuple[float, ...] = (1.0, 2.0, 4.0)
 STABLE_CONNECTION_SECONDS: float = 60.0
 CLOSE_TASK_TIMEOUT_SECONDS: float = 5.0
 RECENT_TASKS: int = 5  # [DURUM]'da gösterilen son iş sayısı (tüm kanallar)
+EVIDENCE_DELIVERY_PREFIX: str = "evidence_delivery:"
 BUSY_TEXT: str = "elimde bir iş var şu an, bitince bakarım (ya da 'dur' yaz)"
 # Model iş sözü verdi ama düzeltme çağrısında da iş başlatmadı: söz tutulamadığı dürüstçe söylenir.
 PROMISE_FAILED_TEXT: str = "pardon, işi başlatamadım; bir daha yazar mısın?"
@@ -236,6 +239,8 @@ class ImessageBridge:
             )
             if confirmed is None:
                 self.store.advance_cursor(message["rowid"])
+            else:
+                self._confirm_evidence_delivery(confirmed)
             return None
         if not accepted(message, handle):
             self.store.advance_cursor(message["rowid"])
@@ -422,22 +427,71 @@ class ImessageBridge:
 
     # --- gönderim ---
 
-    async def _send(self, text: str, kind: str) -> int:
+    @staticmethod
+    def _evidence_run_id(report: Dict[str, object]) -> Optional[str]:
+        evidence = report.get("evidence")
+        if not isinstance(evidence, dict):
+            return None
+        run_id = evidence.get("run_id")
+        return run_id if isinstance(run_id, str) and run_id else None
+
+    def _mark_evidence_unknown(self, message_id: int) -> None:
+        key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
+        run_id = self.store.get_state(key)
+        if not run_id:
+            return
+        try:
+            evidence_store = EvidenceStore(STATE_FILE)
+            bundle = evidence_store.load(run_id)
+            bundle["delivery_status"] = "unknown"
+            bundle["delivered_at"] = None
+            evidence_store.save(bundle)
+        except (OSError, ValueError) as error:
+            logging.warning("iMessage evidence teslim durumu güncellenemedi",
+                            extra={"message_id": message_id, "error_type": type(error).__name__})
+            return
+        self.store.set_state(key, "")
+
+    def _confirm_evidence_delivery(self, message_id: int) -> None:
+        key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
+        run_id = self.store.get_state(key)
+        if not run_id:
+            return
+        try:
+            EvidenceStore(STATE_FILE).mark_delivered(run_id)
+        except (OSError, ValueError) as error:
+            logging.warning("iMessage evidence teslimi doğrulanamadı",
+                            extra={"message_id": message_id, "error_type": type(error).__name__})
+            return
+        self.store.set_state(key, "")
+
+    async def _send(
+        self, text: str, kind: str, *, evidence_run_id: Optional[str] = None,
+        propagate_unknown: bool = False,
+    ) -> int:
         """
-        Balonu arşive 'pending' yazıp gönderir ve arşiv kimliğini döner. Sonucu bilinmeyen gönderim (DeliveryUnknown:
-        -32001, -32004, zaman aşımı) hata değildir: balon 'unconfirmed' işaretlenir, uyarı loglanır ve yeniden
-        gönderilmez (çift mesaj kayıp mesajdan kötüdür); akış sürer. Kesin hata (süreç, RPC) 'unconfirmed'
-        işaretlenip yükseltilir.
+        Balonu arşive 'pending' yazıp gönderir ve arşiv kimliğini döner. Normal sohbetlerde sonucu bilinmeyen
+        gönderim yeniden oynatılmaz ve akış sürer. Final task report'ta propagate_unknown, deferred-report
+        kuyruğunun belirsiz teslimi tekrar etmeden saklamasına izin verir. Evidence yalnız own-echo sonrası
+        delivered olur; belirsiz gönderimde unknown kalır.
         """
         message_id: int = self.store.record_outgoing(text, kind, utc_iso(datetime.now(timezone.utc)))
+        evidence_key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
+        if evidence_run_id is not None:
+            self.store.set_state(evidence_key, evidence_run_id)
         try:
             await self.transport.send_text(self.settings["handle"], text)
         except DeliveryUnknown as error:
             self.store.mark_unconfirmed(message_id)
+            self._mark_evidence_unknown(message_id)
             logging.warning("iMessage balonunun teslimi bilinmiyor; yeniden gönderilmiyor",
                             extra={"message_id": message_id, **_send_failure_fields(error)})
+            if propagate_unknown:
+                raise
         except ImsgError as error:
             self.store.mark_unconfirmed(message_id)
+            if evidence_run_id is not None:
+                self.store.set_state(evidence_key, "")
             logging.warning("iMessage balonu gönderilemedi",
                             extra={"message_id": message_id, **_send_failure_fields(error)})
             raise
@@ -875,41 +929,34 @@ class ImessageBridge:
             return
         await self._present_report(outcome)
 
+    @staticmethod
+    def _report_text(outcome: delegate.TaskOutcome) -> str:
+        """Authoritative report presentation; no second model may weaken or invent the result."""
+        report = outcome["report"]
+        body = str(report.get("outcome", "")).strip()
+        if not body and report.get("evidence") is not None:
+            body = render_evidence(report["evidence"])
+        if not body:
+            body = str(report.get("reason", "")).strip()
+        if report["success"]:
+            text = body or "İş tamamlandı."
+        else:
+            text = "İş tamamlanamadı."
+            if body:
+                text += "\n\n" + body
+        if outcome.get("origin") == "autonomous" and outcome.get("rationale", "").strip():
+            text += "\n\nGerekçe: " + outcome["rationale"].strip()
+        if outcome.get("deferred_approvals"):
+            text += "\n\nOnay bekleyen adımlar: " + "; ".join(outcome["deferred_approvals"])
+        return text
+
     async def _present_report(self, outcome: delegate.TaskOutcome) -> None:
         report = outcome["report"]
+        text = self._report_text(outcome)
         async with self.chat_lock:
-            history: List[ArchivedMessage] = self.store.recent_messages(chat.HISTORY_LIMIT)
-            turn: str = chat.report_turn(outcome["goal"], report["success"], report["outcome"], self._situation())
-            if outcome.get("origin") == "autonomous":
-                turn += "\ngerekçe: " + outcome.get("rationale", "")
-                if outcome.get("deferred_approvals"):
-                    turn += "\nonay bekleyen adımlar: " + "; ".join(outcome["deferred_approvals"])
-            # Rapor turu araçsızdır: model yalnız sonucu anlatır; iş başlatamaz, raporu araç çağrısıyla da yutamaz.
-            sent: List[int] = []
-            try:
-                reply: Optional[ModelReply] = await self._respond(
-                    self._history(history) + [{"role": "user", "content": turn}], [], None, "task_report", sent,
-                )
-            except ImsgError as error:
-                if sent:
-                    raise DeliveryUnknown("İş raporu kısmen gönderildi; bütünü yeniden gönderilmeyecek.") from error
-                raise
-        if reply is not None and reply["result"]["start_task"] is not None:
-            # Rapor yalnız anlatılır (spec §5): girdisi önceki işin çıktısıdır (web içeriği olabilir); kullanıcı mesajı
-            # olmadan iş başlatmak dolaylı istem enjeksiyonu yolu olur. Söz koruması da yalnız kullanıcı turundadır.
-            # Hedef metni loglanmaz, yalnız sayı.
-            logging.warning("İş raporu turunda sohbet modeli yeni iş istedi; yok sayıldı", extra={"ignored_tasks": 1})
-        if reply is not None and (reply["result"].get("recall") is not None or reply["result"].get("forget")):
-            # Hafıza araçları da yalnız kullanıcı turunda çalışır. Rapor turu araçsızdır ama metne yazılmış çağrı yine
-            # ayrıştırılır; rapor girdisi (web içeriği olabilir) kullanıcının bilgisini unutturamaz ya da arama turu
-            # açamaz. İçerik loglanmaz.
-            logging.warning("İş raporu turunda sohbet modeli hafıza aracı istedi; yok sayıldı",
-                            extra={"ignored_calls": 1})
-        if reply is None or not reply["result"]["bubbles"]:
-            summary = ("iş bitti: " if report["success"] else "iş tamamlanamadı: ") + report["outcome"][:1500]
-            if outcome.get("deferred_approvals"):
-                summary += "\nonayın gereken adımlar: " + "; ".join(outcome["deferred_approvals"])
-            await self._send(summary, "task_report")
+            await self._send(
+                text, "task_report", evidence_run_id=self._evidence_run_id(report), propagate_unknown=True,
+            )
 
     async def _interim_after(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -930,6 +977,8 @@ class ImessageBridge:
         while True:
             await asyncio.sleep(SWEEP_SECONDS)
             expired: List[int] = self.store.expire_pending(datetime.now(timezone.utc), CONFIRM_WINDOW_SECONDS)
+            for message_id in expired:
+                self._mark_evidence_unknown(message_id)
             if expired:
                 logging.warning("iMessage balonları izlemede görülmedi (teslim doğrulanamadı)",
                                 extra={"message_ids": expired})
