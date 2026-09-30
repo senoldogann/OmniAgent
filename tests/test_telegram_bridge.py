@@ -128,6 +128,17 @@ async def test_bridge_delivers_host_rejection_without_model_success_claim(
         return {"content": "Hedef silindi.", "tool_calls": [],
                 "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
 
+    async def route_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str,
+        backend: str, emit: Any, should_stop: Any,
+    ) -> tuple[dict[str, Any], str]:
+        # Deterministic action guard must override even a mistaken chat classification.
+        return {
+            "content": json.dumps({"route": "chat", "required_fields": [], "needs_observation": False}),
+            "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE,
+        }, backend
+
+    monkeypatch.setattr(main, "call_model_with_retries", route_model)
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
     try:
         await bridge.handle({"message": {
@@ -139,7 +150,8 @@ async def test_bridge_delivers_host_rejection_without_model_success_claim(
     finally:
         await bridge.integrations.close()
     transcript = "\n".join(api.sent + api.edited + api.html_sent + api.html_edited)
-    assert "Doğrulanmadı:" in transcript
+    assert "Görev tamamlanamadı:" in transcript
+    assert "silme komutu doğrulanmadı:" in transcript
     assert "Hedef silindi." not in transcript
     assert target.read_text(encoding="utf-8") == "koru"
 
@@ -369,7 +381,7 @@ async def test_bridge_rebuilds_model_clients_at_every_task_start(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("backends,request_count", [("none", 0), ("openai", 1)])
+@pytest.mark.parametrize("backends,request_count", [("none", 0), ("openai", 2)])
 async def test_telegram_auto_task_reaches_openai_only_with_permission_when_ollama_is_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backends: str, request_count: int,
 ) -> None:
@@ -417,6 +429,7 @@ async def test_telegram_tasks_get_the_remote_model_retry_budget(
 
     async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
         budgets.append(options["model_retry_seconds"])
+        assert options["task_context"] is telegram.async_host_task_lock_preempting
         return {"outcome": "bitti", "success": True, "reason": "", "metrics": {
             "turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
             "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0,
@@ -1525,20 +1538,22 @@ def final_answer_model(text: str) -> Any:
 async def test_goal_typed_answer_and_report_reach_personal_memory(monkeypatch: pytest.MonkeyPatch,
                                                                   tmp_path: Path) -> None:
     bridge, _api = memory_bridge(monkeypatch, tmp_path)
-    turns = 0
 
-    async def fake_model(clients: Any, messages: Any, schemas: Any, session_id: str, backend: str, emit: Any,
-                         should_stop: Any) -> tuple[dict[str, Any], str]:
-        nonlocal turns
-        turns += 1
-        if turns == 1:
-            return {"content": "", "tool_calls": [{"id": "ask-1", "name": "ask_user", "arguments": json.dumps(
-                {"question": "Raporu hangi klasöre koyayım?", "kind": "text"})}],
-                "finish_reason": "tool_calls", "usage": main.ZERO_USAGE}, backend
-        emit({"kind": "text_delta", "text": "Tamam."})
-        return {"content": "Tamam.", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+    async def fake_run(goal: str, emit: Callable[[AgentEvent], None], options: RunOptions,
+                       clients: Dict[str, AsyncOpenAI]) -> RunReport:
+        answer = await options["answer"]("Raporu hangi klasöre koyayım?", {
+            "yanit": {"type": "string", "label": "Yanıtınız"},
+        })
+        assert answer["yanit"] == "Belgeler/Raporlar klasörüne, hep oraya koy"
+        return {
+            "outcome": "Tamam.", "success": True, "reason": "",
+            "metrics": {"turns": 1, "tool_calls": 1, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+                        "prompt_tokens": 10, "cached_tokens": 0, "completion_tokens": 5,
+                        "model_seconds": 0.1, "tool_seconds": 0.0},
+            "exchange": make_exchange(goal, "Tamam.", []),
+        }
 
-    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
     try:
         await bridge.handle(text_update("aylık raporu hazırla"))
         active = bridge.active

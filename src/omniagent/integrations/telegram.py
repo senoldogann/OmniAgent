@@ -62,7 +62,8 @@ from omniagent.integrations.imessage_settings import memory_backend_if_paired
 from omniagent.memory import channels, learning
 from omniagent.memory.personal import local_timezone
 from omniagent.memory.profile import MemoryCommand, parse_memory_command
-from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
+from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients
+from omniagent.app.conversation import run_conversation_with_callback as run_agent_with_callback
 from omniagent.app.constants import RUN_MODE_PROFILES
 from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
 from omniagent.app.policy import screenshot_requested, source_change_expected
@@ -1220,6 +1221,8 @@ class TelegramBridge:
             "run_mode": self.run_mode,
             # Kullanıcı makinenin başında değil: kısa ağ kopmalarında görev düşmez, model çağrısı bekler.
             "model_retry_seconds": REMOTE_MODEL_RETRY_SECONDS,
+            # Chat/investigation makine sahipliği istemez; coordinator bunu yalnız task route'unda açar.
+            "task_context": async_host_task_lock_preempting,
         }
         if self.active_run_mode == "continuous":
             options["unattended"] = True
@@ -1233,8 +1236,7 @@ class TelegramBridge:
             # Hazır profiller görevler arasında değişebilir (Ollama sonradan açılıp kapanabilir): Otomatik seçim
             # köprü açılışındaki bayat listeye dayanmasın diye istemciler her görev başında yeniden kurulur.
             await self._refresh_clients()
-            async with async_host_task_lock_preempting():
-                return await run_agent_with_callback(goal, emit, options, self.clients)
+            return await run_agent_with_callback(goal, emit, options, self.clients)
 
         worker = asyncio.create_task(work())
         stream = TelegramStream(self.api, self.settings["chat_id"])

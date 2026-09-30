@@ -51,8 +51,9 @@ from omniagent.model_catalog import (
 )
 from omniagent.app.agent import (
     RUN_MODE_PROFILES, STATE_FILE, RunOptions, RunReport, close_model_clients,
-    create_model_clients, run_agent_with_callback,
+    create_model_clients,
 )
+from omniagent.app.conversation import run_conversation_with_callback as run_agent_with_callback
 from omniagent.app.continuous import (
     ContinuousLimits, continuous_limits_path, load_continuous_limits, parse_continuous_limits,
     save_continuous_limits,
@@ -2993,13 +2994,13 @@ class OmniUI(ctk.CTk):
                 return commands
 
     async def _run_exclusive(self, goal: str, options: RunOptions) -> RunReport:
-        """Telegram ile aynı makineyi eşzamanlı kullanma çakışmasını önler."""
+        """Ortak coordinator'ı çalıştırır; yalnız effectful task route host lock alır."""
         started_at = utc_now_iso()
         # Kanıtlı hafıza: kullanıcının hedef metni. Bağlantı iş parçacığında açılıp kapanır; hata görevi durdurmaz.
         await asyncio.to_thread(record_user_message, "desktop", goal, utc_now_iso())
+        options = {**options, "task_context": async_host_task_lock_preempting}
         try:
-            async with async_host_task_lock_preempting():
-                report = await run_agent_with_callback(goal, self._post, options, self._clients)
+            report = await run_agent_with_callback(goal, self._post, options, self._clients)
         except (Exception, asyncio.CancelledError) as error:
             await asyncio.to_thread(record_failed_task, "desktop", goal, type(error).__name__, started_at, 0)
             raise

@@ -299,11 +299,12 @@ async def test_autonomous_delegate_requires_rationale_and_uses_combined_preempti
     seen = []
     async def run(goal, emit, options, clients):
         seen.append(options)
-        waiting.append(asyncio.create_task(_wait_lock()))
-        deadline = time.monotonic() + 1
-        while not options["should_stop"]():
-            assert time.monotonic() < deadline
-            await asyncio.sleep(.02)
+        async with options["task_context"]():
+            waiting.append(asyncio.create_task(_wait_lock()))
+            deadline = time.monotonic() + 1
+            while not options["should_stop"]():
+                assert time.monotonic() < deadline
+                await asyncio.sleep(.02)
         return delegate.failure_outcome(goal, "kullanıcı işi geldi, durduruldu",
                                         "2026-09-30T10:00:00+00:00")["report"]
     monkeypatch.setattr(delegate, "run_agent_with_callback", run)

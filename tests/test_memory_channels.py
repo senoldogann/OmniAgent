@@ -118,6 +118,9 @@ async def test_desktop_report_is_recorded_before_the_run_returns(
     completed = report("raporu hazırla", "tamam", False)
 
     async def run(*args: object) -> RunReport:
+        options = args[2]
+        assert isinstance(options, dict)
+        assert options["task_context"] is ui.async_host_task_lock_preempting
         return completed
 
     monkeypatch.setattr(ui, "run_agent_with_callback", run)

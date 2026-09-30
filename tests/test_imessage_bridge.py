@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -118,6 +119,11 @@ class ScriptedChat:
 def parts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Parts]:
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(delegate, "create_model_clients", lambda: {})
+
+    async def chat_decision(*args: object, **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(error=None, contract={"route": "chat"})
+
+    monkeypatch.setattr(imessage, "decide_conversation", chat_decision)
     store = PersonalStore(tmp_path / "companion.db")
     transport = FakeTransport()
     bridge = imessage.ImessageBridge(transport, settings(), store, {}, "# Deniz\nyakın arkadaş", "test")
@@ -161,12 +167,68 @@ async def stop_task(task: "asyncio.Task[None]") -> None:
 async def test_unpaired_and_group_messages_never_reach_chat(parts: Parts, monkeypatch: pytest.MonkeyPatch) -> None:
     bridge, transport, store = parts
     scripted = ScriptedChat([])
+
+    async def no_route(*args: object, **kwargs: object) -> object:
+        raise AssertionError("unauthorized input reached shared routing")
+
+    monkeypatch.setattr(imessage, "decide_conversation", no_route)
     monkeypatch.setattr(chat, "respond", scripted)
     await bridge.on_message(incoming(10, "gizli bilgi", "+905559998877"))
     await bridge.on_message({**incoming(11, "grup mesajı", HANDLE), "is_group": True})
     await settle(bridge)
     assert store.recent_messages(10) == [] and store.cursor() == 11
     assert transport.texts == [] and scripted.inputs == []
+
+
+@pytest.mark.parametrize("route", ["investigate", "task"])
+@pytest.mark.asyncio
+async def test_shared_non_chat_decision_bypasses_companion_reply_and_is_handed_to_runner(
+    parts: Parts, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    bridge, transport, _store = parts
+    handed: List[RunOptions] = []
+    presented: List[delegate.TaskOutcome] = []
+    decision = SimpleNamespace(error=None, contract={"route": route}, requested_backend="openai")
+
+    async def decide(goal: str, emit: object, options: RunOptions, clients: object) -> SimpleNamespace:
+        assert goal == "OpenAI yeni model çıkardı mı?"
+        assert options["requested_backend"] == bridge.settings["chat_backend"] == "openai"
+        assert clients is bridge.chat_clients
+        return decision
+
+    async def no_chat(*args: object, **kwargs: object) -> chat.ChatResult:
+        raise AssertionError("non-chat shared route reached companion free chat")
+
+    async def run_task(
+        goal: str, options: RunOptions, on_progress: Callable[[str], None], **kwargs: object,
+    ) -> delegate.TaskOutcome:
+        handed.append(options)
+        return {
+            "goal": goal,
+            "report": report_for(goal, "grounded shared result", True),
+            "started_at": "2026-09-30T12:00:00+00:00",
+            "finished_at": "2026-09-30T12:00:01+00:00",
+            "tokens": 120,
+            "origin": "user",
+            "rationale": "",
+            "deferred_approvals": [],
+        }
+
+    async def present(outcome: delegate.TaskOutcome) -> None:
+        presented.append(outcome)
+
+    monkeypatch.setattr(imessage, "decide_conversation", decide)
+    monkeypatch.setattr(chat, "respond", no_chat)
+    monkeypatch.setattr(delegate, "run_task", run_task)
+    monkeypatch.setattr(bridge, "_present_report", present)
+
+    await bridge.on_message(incoming(12, "OpenAI yeni model çıkardı mı?", HANDLE))
+    await settle(bridge)
+
+    assert transport.texts == [chat.TASK_ACK]
+    assert len(handed) == 1 and handed[0]["conversation_decision"] is decision
+    assert handed[0]["requested_backend"] == "openai"
+    assert presented and presented[0]["report"]["outcome"] == "grounded shared result"
 
 
 @pytest.mark.asyncio
@@ -284,7 +346,8 @@ async def test_busy_host_is_reported_to_user(parts: Parts, monkeypatch: pytest.M
 
     async def must_not_run(goal: str, emit: Callable[[AgentEvent], None], options: RunOptions,
                            clients: Dict[str, AsyncOpenAI]) -> RunReport:
-        raise AssertionError("kilit meşgulken ajan çalışmamalı")
+        async with options["task_context"]():
+            raise AssertionError("kilit meşgulken task branch çalışmamalı")
 
     monkeypatch.setattr(delegate, "run_agent_with_callback", must_not_run)
     monkeypatch.setattr(chat, "respond", ScriptedChat([([], "ekran görüntüsü al")]))

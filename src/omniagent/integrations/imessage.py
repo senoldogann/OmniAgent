@@ -25,12 +25,13 @@ from typing import Dict, List, Optional, Protocol, Set, Tuple, TypedDict, Union
 from openai import AsyncOpenAI
 
 from omniagent.app.agent import close_model_clients, create_model_clients
+from omniagent.app.conversation import ConversationDecision, decide_conversation
 from omniagent.app.model_retry import ModelCallFailed
 from omniagent.companion import chat, delegate, media, persona
 from omniagent.companion.autonomy import is_quiet_hour, make_autonomy_guards
 from omniagent.companion.heartbeat import Heartbeat
 from omniagent.config import BACKENDS, apply_model_preferences, apply_stored_api_keys, redact
-from omniagent.core.conversation import Exchange, trim_history
+from omniagent.core.conversation import Exchange, make_exchange, trim_history
 from omniagent.core.log_format import configure_stream_logging
 from omniagent.fallback_policy import FallbackNotPermitted
 from omniagent.integrations.capabilities import CapabilityService
@@ -171,6 +172,8 @@ class ImessageBridge:
         self.task_goal: str = ""
         self.task_origin: str = "user"
         self.task_progress: List[str] = []
+        self.task_decision: Optional[ConversationDecision] = None
+        self.task_history: Optional[List[Exchange]] = None
         self.stop_event: threading.Event = threading.Event()
         self.question: Optional[PendingQuestion] = None
         self.integrations: Optional[CapabilityService] = None
@@ -195,6 +198,8 @@ class ImessageBridge:
             self.task_origin = "autonomous"
             self.task_goal = goal
             self.task_progress = []
+            self.task_decision = None
+            self.task_history = None
             self._launch_task(goal, [], "autonomous", rationale)
 
     def _launch_task(self, goal: str, images: List[str], origin: str = "user", rationale: str = "") -> None:
@@ -473,6 +478,24 @@ class ImessageBridge:
                 return
             recent: List[ArchivedMessage] = self.store.recent_messages(chat.HISTORY_LIMIT + len(ids))
             history: List[ArchivedMessage] = [item for item in recent if item["id"] not in ids][-chat.HISTORY_LIMIT:]
+            goal = "\n".join(texts).strip() or ("Gönderdiğim görseli incele." if images else "Yanıtla.")
+            if self.integrations is None:
+                self.integrations = CapabilityService()
+            route_history = self._conversation_history(history)
+            route_options = delegate.run_options(
+                self.answer, self.deliver, route_history, images, self.stop_event.is_set, self.integrations,
+            )
+            route_options["requested_backend"] = self.settings["chat_backend"]
+            route_options["conversation_persona"] = self.persona_text
+            decision = await decide_conversation(goal, lambda event: None, route_options, self.chat_clients)
+            if decision.error is not None or decision.contract["route"] != "chat":
+                ack_id = await self._send(chat.TASK_ACK, "chat")
+                if await self._start_task(goal, images, decision, route_history):
+                    self.store.record_task_start(ack_id, goal)
+                if audio_failed:
+                    await self._send(media.AUDIO_FAILURE_TEXT, "chat")
+                return
+
             turn: str = chat.burst_turn(texts, images, self._situation())
             prepared = await prepare_turn_images(images)
             with prepared:
@@ -516,6 +539,24 @@ class ImessageBridge:
                 result[index] += "\n🎤 " + transcript
             self.store.finish_transcription(message_id)
         return result, failed
+
+    def _conversation_history(self, history: List[ArchivedMessage]) -> List[Exchange]:
+        """Authenticated iMessage history for shared routing; archive text is context, never source evidence."""
+        exchanges: List[Exchange] = []
+        pending: List[str] = []
+        for item in history:
+            if item["direction"] == "in":
+                if item["text"].strip():
+                    pending.append(item["text"])
+                continue
+            if pending and item["direction"] == "out" and item["kind"] in ("chat", "task_report"):
+                exchanges.append(make_exchange("\n".join(pending), item["text"], []))
+                pending = []
+        combined = list(self.history)
+        for exchange in exchanges:
+            if not combined or exchange != combined[-1]:
+                combined.append(exchange)
+        return trim_history(combined)
 
     def _history(self, history: List[ArchivedMessage]) -> List[chat.ChatMessage]:
         """Arşivi, iş başlatan balonları ve hafıza çağrılarını gerçek araç çağrısı olarak gösteren geçmişe çevirir."""
@@ -721,8 +762,11 @@ class ImessageBridge:
 
     # --- iş ---
 
-    async def _start_task(self, goal: str, images: List[str]) -> bool:
-        """İşi başlatır; çalışan iş varsa kullanıcıya söyler ve False döner."""
+    async def _start_task(
+        self, goal: str, images: List[str], decision: Optional[ConversationDecision] = None,
+        history: Optional[List[Exchange]] = None,
+    ) -> bool:
+        """İşi başlatır; shared route kararı varsa aynı karar task runner'a devredilir."""
         if self.task is not None and self.task_origin == "autonomous":
             self.stop_event.set()
             self._cancel_question(IntegrationStopped("Kullanıcı işi öncelikli."))
@@ -736,6 +780,8 @@ class ImessageBridge:
         self.task_origin = "user"
         self.task_goal = goal
         self.task_progress = []
+        self.task_decision = decision
+        self.task_history = list(history) if history is not None else None
         self._launch_task(goal, images)
         return True
 
@@ -747,6 +793,10 @@ class ImessageBridge:
         """
         started_at: str = utc_iso(datetime.now(timezone.utc))
         generation = self.task_generation
+        decision = self.task_decision if origin == "user" else None
+        conversation_history = (
+            list(self.task_history) if origin == "user" and self.task_history is not None else list(self.history)
+        )
         def progress(line: str) -> None:
             if self.task_generation == generation:
                 self._on_progress(line)
@@ -759,9 +809,13 @@ class ImessageBridge:
             with prepared:
                 guards = make_autonomy_guards(self.settings["gui_idle_seconds"], self.stop_event.is_set,
                                              self.settings["quiet_hours"]) if origin == "autonomous" else None
-                options = delegate.run_options(self.answer, self.deliver, self.history,
+                options = delegate.run_options(self.answer, self.deliver, conversation_history,
                                                [str(path) for path in prepared.image_paths], self.stop_event.is_set,
                                                self.integrations, guards)
+                options["conversation_persona"] = self.persona_text
+                if decision is not None:
+                    options["requested_backend"] = decision.requested_backend
+                    options["conversation_decision"] = decision
                 if origin == "autonomous":
                     result = await delegate.run_task(goal, options, progress, origin=origin, rationale=rationale)
                 else:
@@ -779,6 +833,8 @@ class ImessageBridge:
             self._cancel_question(IntegrationStopped("İş bitti."))
             self.task, self.task_goal, self.task_progress = None, "", []
             self.task_origin = "user"
+            self.task_decision = None
+            self.task_history = None
             self.stop_event.clear()
         try:
             if isinstance(result, str):

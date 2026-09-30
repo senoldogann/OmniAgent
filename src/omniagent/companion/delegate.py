@@ -10,12 +10,14 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Literal, NotRequired, Optional, TypedDict
 
 from openai import AsyncOpenAI
 
-from omniagent.app.agent import STATE_FILE, call_model_with_retries, close_model_clients, create_model_clients, run_agent_with_callback
+from omniagent.app.agent import STATE_FILE, call_model_with_retries, close_model_clients, create_model_clients
+from omniagent.app.conversation import run_conversation_with_callback as run_agent_with_callback
 from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
 from omniagent.app.types import AutonomyGuards, RunOptions, RunReport
 from omniagent.config import apply_model_preferences, redact
@@ -121,11 +123,17 @@ async def run_task(goal: str, options: RunOptions, on_progress: Callable[[str], 
             gate = options["autonomy"]["gui_gate"]
             if hasattr(gate, "should_stop"):
                 gate.should_stop = autonomous_options["should_stop"]
-            with preemptible_host_task_lock():
-                report: RunReport = await run_agent_with_callback(goal, emit, autonomous_options, clients)
+
+            @asynccontextmanager
+            async def autonomous_task_context():
+                with preemptible_host_task_lock():
+                    yield
+
+            autonomous_options["task_context"] = autonomous_task_context
+            report: RunReport = await run_agent_with_callback(goal, emit, autonomous_options, clients)
         else:
-            async with async_host_task_lock_preempting():
-                report = await run_agent_with_callback(goal, emit, options, clients)
+            user_options: RunOptions = {**options, "task_context": async_host_task_lock_preempting}
+            report = await run_agent_with_callback(goal, emit, user_options, clients)
     finally:
         await close_model_clients(clients)
     metrics = report["metrics"]
