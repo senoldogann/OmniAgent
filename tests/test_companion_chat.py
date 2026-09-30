@@ -349,3 +349,45 @@ def test_dismissive_idioms_are_not_forget_requests_and_correction_has_an_exit() 
         assert not chat.forget_requested(text), text
     assert chat.forget_requested("kızımın adını unut") and chat.forget_requested("bunu unutur musun")
     assert "hiçbir araç çağırma" in chat.FORGET_CORRECTION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason,cancel", [("stopped", False), ("stop", True)])
+async def test_canceled_completed_turn_has_no_draft_or_effects(monkeypatch, finish_reason, cancel):
+    calls = [
+        {"id": "s", "name": "start_task", "arguments": '{"goal":"Delete files"}'},
+        {"id": "f", "name": "forget", "arguments": '{"fact_id":12}'},
+        {"id": "m", "name": "mute", "arguments": '{"hours":24}'},
+        {"id": "p", "name": "set_proactive", "arguments": '{"enabled":false}'},
+    ]
+    async def model(*args):
+        args[-2]({"kind": "text_delta", "text": "Draft"})
+        return {"content": 'Draft\n<call:forget fact_id="12" />\n<call:start_task goal="Delete files" />\n<call:mute hours="24" />\n<call:set_proactive enabled="false" />',
+                "tool_calls": calls, "finish_reason": finish_reason, "usage": ZERO_USAGE}, "openai"
+    monkeypatch.setattr(chat, "call_model_with_retries", model)
+    sent = []
+    async def send(text):
+        sent.append(text)
+    result = await chat.respond({}, "openai", "system", [], chat.CHAT_TOOLS, send, lambda: cancel, "cancel")
+    assert result == {"bubbles": [], "start_task": None}
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_between_final_chunks_stops_delivery_and_effects(monkeypatch):
+    monkeypatch.setattr(chat, "call_model_with_retries", scripted_model(["word " * 1800], [
+        {"id": "s", "name": "start_task", "arguments": '{"goal":"Delete files"}'}]))
+    sent = []
+    async def send(text):
+        sent.append(text)
+    result = await chat.respond({}, "openai", "system", [], chat.CHAT_TOOLS, send, lambda: bool(sent), "cancel")
+    assert len(sent) == 1 and len(sent[0]) <= 3500
+    assert result == {"bubbles": sent, "start_task": None}
+
+
+@pytest.mark.asyncio
+async def test_large_final_chunks_reconstruct_exact_content(monkeypatch):
+    text = "\n\n".join((f"İzmir-Çınar-{n}. " + "word " * 900 + "https://example.test/Çınar") for n in range(6))
+    result, sent = await run(monkeypatch, scripted_model([text], []))
+    assert len(sent) > 4 and all(len(item) <= 3500 for item in sent)
+    assert "".join(sent) == text and result["bubbles"] == sent

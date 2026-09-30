@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 import pytest
@@ -1664,3 +1664,42 @@ async def test_forwarded_words_are_not_recorded_as_the_users_own(monkeypatch: py
     finally:
         await bridge.integrations.close()
     assert companion_rows(tmp_path / "companion.db") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize("failure", [None, 500, "unknown"])
+async def test_verified_final_marks_evidence_only_after_all_api_pages(monkeypatch, tmp_path, verbose, failure):
+    from omniagent.core.evidence import EvidenceStore
+    from omniagent.core.conversation_policy import derive_request_contract
+    bridge, api = memory_bridge(monkeypatch, tmp_path)
+    bridge.verbose = verbose
+    store = EvidenceStore(telegram.STATE_FILE)
+    bundle = store.create(derive_request_contract("report", route="task"))
+    text = "\n\n".join(f"part {i}: " + "result " * 800 for i in range(3))
+    metrics = {"turns": 1, "tool_calls": 0, "elapsed_seconds": .1, "backend": "ollama-cloud", "prompt_tokens": 1, "cached_tokens": 0, "completion_tokens": 1}
+    async def model(goal, emit, options, clients):
+        emit({"kind":"text_delta", "text":text})
+        emit({"kind":"run_finished", "outcome":text, "success":True, "reason":"", "metrics":metrics})
+        return {"outcome":text, "success":True, "reason":"", "metrics":metrics, "exchange":make_exchange(goal,text,[]), "evidence":bundle}
+    monkeypatch.setattr(telegram, "run_agent_with_callback", model)
+    accepted = []
+    async def send_page(chat_id, page):
+        assert store.load(bundle["run_id"])["delivery_status"] != "delivered"
+        if len(accepted) == 1 and failure is not None:
+            raise telegram.TelegramError("network", None if failure == "unknown" else failure)
+        accepted.append(page)
+        return len(accepted)
+    monkeypatch.setattr(api, "send_html", send_page)
+    monkeypatch.setattr(api, "send", send_page)
+    try:
+        await bridge._execute("report")
+    finally:
+        await bridge.integrations.close()
+    saved = store.load(bundle["run_id"])
+    if failure is None:
+        assert saved["delivery_status"] == "delivered" and saved["delivered_at"]
+        assert "part 2:" in "".join(accepted)
+        assert text.strip() in "".join(accepted)
+    else:
+        assert saved["delivery_status"] != "delivered" and saved["delivered_at"] is None

@@ -995,3 +995,50 @@ async def test_forget_claim_after_recall_is_guarded_too(parts: Parts, monkeypatc
     await bridge.on_message(incoming(250, "Ela'yı unut", HANDLE))
     await settle(bridge)
     assert asked == ["tamam unuttum"] and store.active_facts() == []
+
+
+@pytest.mark.asyncio
+async def test_multipart_evidence_waits_for_every_echo_across_restart(parts, monkeypatch, tmp_path):
+    bridge, transport, personal = parts
+    evidence_store = EvidenceStore(tmp_path / "selected-state.json")
+    bundle = evidence_store.create(derive_request_contract("long report", route="task"))
+    text = "\n\n".join(f"section {i}. " + "word " * 850 for i in range(6)).rstrip()
+    report = report_for("long report", text, True)
+    report["evidence"] = bundle
+    monkeypatch.setattr(imessage, "EvidenceStore", lambda _state: evidence_store)
+    now = utc_iso(datetime.now(timezone.utc))
+    await bridge._present_report({"goal": "long report", "report": report, "started_at": now, "finished_at": now, "tokens": 0})
+    assert len(transport.texts) > 4 and max(map(len, transport.texts)) <= 3500
+    assert "".join(transport.texts) == text
+    await bridge.on_message(echo(991, transport.texts[-1]))
+    assert evidence_store.load(bundle["run_id"])["delivery_status"] == "pending"
+    restarted = imessage.ImessageBridge(transport, settings(), personal, {}, "persona", "restart")
+    for i, chunk in enumerate(transport.texts[:-1]):
+        await restarted.on_message(echo(992 + i, chunk))
+        expected = "delivered" if i == len(transport.texts) - 2 else "pending"
+        assert evidence_store.load(bundle["run_id"])["delivery_status"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown", [True, False])
+async def test_multipart_failure_after_first_chunk_is_unknown_and_never_continues(parts, monkeypatch, tmp_path, unknown):
+    bridge, transport, personal = parts
+    evidence_store = EvidenceStore(tmp_path / "state.json")
+    bundle = evidence_store.create(derive_request_contract("long report", route="task"))
+    text = "first " * 600 + "\n\n" + "second " * 600 + "\n\n" + "third " * 600
+    report = report_for("long report", text, True)
+    report["evidence"] = bundle
+    monkeypatch.setattr(imessage, "EvidenceStore", lambda _state: evidence_store)
+    attempts = []
+    async def fail_second(handle, chunk):
+        attempts.append(chunk)
+        if len(attempts) == 2:
+            raise DeliveryUnknown("unknown") if unknown else ImsgError("definite")
+        return await transport.send_text(handle, chunk)
+    bridge.transport = SimpleNamespace(send_text=fail_second)
+    now = utc_iso(datetime.now(timezone.utc))
+    with pytest.raises(DeliveryUnknown):
+        await bridge._present_report({"goal": "long report", "report": report, "started_at": now, "finished_at": now, "tokens": 0})
+    assert len(attempts) == 2
+    await bridge.on_message(echo(991, attempts[0]))
+    assert evidence_store.load(bundle["run_id"])["delivery_status"] == "unknown"

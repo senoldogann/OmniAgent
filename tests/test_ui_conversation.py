@@ -1414,3 +1414,38 @@ def test_desktop_run_records_goal_typed_answer_and_report(app: ui.OmniUI, tmp_pa
     assert [(item["channel"], item["text"]) for item in evidence] == [
         ("desktop", "aylık raporu hazırla"), ("desktop", "Belgeler/Raporlar klasörüne")]
     assert [(task["channel"], task["goal"]) for task in tasks] == [("desktop", "aylık raporu hazırla")]
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_desktop_evidence_confirmation_waits_for_rendered_final_persistence(app, monkeypatch, tmp_path, failure):
+    from omniagent.core.evidence import EvidenceStore
+    from omniagent.core.conversation_policy import derive_request_contract
+    monkeypatch.setattr(ui, "STATE_FILE", str(tmp_path / "selected-state.json"))
+    store = EvidenceStore(ui.STATE_FILE)
+    bundle = store.create(derive_request_contract("report", route="task"))
+    assert app._ensure_chat("report")
+    app._active_goal = "report"
+    _start(app)
+    text = "Çınar final " * 900
+    app._handle_event({"kind": "text_delta", "text": text})
+    _drain(app)
+    gate = threading.Event()
+    entered = threading.Event()
+    real_save = ui.save_chat
+    def blocked_save(snapshot, directory):
+        entered.set()
+        assert gate.wait(5)
+        if failure:
+            raise OSError("disk failed")
+        real_save(snapshot, directory)
+    monkeypatch.setattr(ui, "save_chat", blocked_save)
+    report = {"success": True, "reason": "", "outcome": text, "exchange": make_exchange("report", text, []), "evidence": bundle}
+    app._on_run_done("", report)
+    assert entered.wait(2)
+    assert store.load(bundle["run_id"])["delivery_status"] == "pending"
+    assert text.strip() in app._text.get("1.0", "end")
+    gate.set()
+    assert pump_until(app, lambda: app._chat_write.done(), 3)
+    pump(app, .1)
+    saved = store.load(bundle["run_id"])
+    assert saved["delivery_status"] == ("pending" if failure else "delivered")
