@@ -315,6 +315,52 @@ async def test_quick_read_timeout_keeps_receipt_and_full_subject_continuation(co
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [True, False], ids=["stop", "timeout"])
+async def test_real_engine_interruption_keeps_tool_and_timing_accounting_once(
+    coordinator, scripted, tmp_path, monkeypatch, cancel,
+):
+    scripts, requests = scripted
+    target = tmp_path / "source.txt"
+    target.write_text("REAL observed receipt")
+    stopped = asyncio.Event()
+    inner_metrics = []
+    original_filter = coordinator._private_emit
+    def observing_filter(emit):
+        filtered = original_filter(emit)
+        def observe(event):
+            if event["kind"] == "run_finished":
+                inner_metrics.append(dict(event["metrics"]))
+            filtered(event)
+        return observe
+    monkeypatch.setattr(coordinator, "_private_emit", observing_filter)
+    async def first(emit, stop):
+        await asyncio.sleep(.015)
+        return turn(calls=[call("read_file", path=str(target))])
+    async def waiting(emit, stop):
+        if cancel:
+            stopped.set()
+        await asyncio.sleep(10)
+    scripts.extend([first, waiting])
+    @asynccontextmanager
+    async def lock():
+        yield
+    extra = {} if cancel else {"max_wall_clock_seconds": .09}
+    report, events = await run(coordinator, tmp_path, f"Inspect this file: {target}", {
+        "run_mode": "extended", "task_context": lock, "should_stop": stopped.is_set, **extra})
+    assert not report["success"] and len(report["evidence"]["observations"]) == 1
+    assert len(requests) == report["metrics"]["turns"] == 2
+    assert len(inner_metrics) == 1 and inner_metrics[0]["tool_calls"] == 1
+    assert report["metrics"]["tool_calls"] == 1
+    assert report["metrics"]["model_seconds"] == inner_metrics[0]["model_seconds"] > 0
+    assert report["metrics"]["tool_seconds"] == inner_metrics[0]["tool_seconds"]
+    assert report["metrics"]["prompt_tokens"] == 11 and report["metrics"]["completion_tokens"] == 7
+    assert len([e for e in events if e["kind"] == "tool_started"]) == 1
+    assert len([e for e in events if e["kind"] == "tool_finished"]) == 1
+    terminal = [e for e in events if e["kind"] == "run_finished"]
+    assert len(terminal) == 1 and terminal[0]["metrics"] == report["metrics"] and not terminal[0]["success"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     coordinator, scripted, tmp_path, monkeypatch, verbose,
