@@ -97,7 +97,7 @@ def test_delivery_unknown_and_failures_survive_json_reload(tmp_path):
     assert loaded["delivery_status"] == "unknown"
     assert loaded["observations"][0]["ok"] is False
     assert "Timeout: provider unavailable" in render_evidence(loaded)
-    assert "incomplete" in render_evidence(loaded).lower()
+    assert "eksik" in render_evidence(loaded).lower()
     assert json.loads(json.dumps({"evidence": loaded}))["evidence"] == loaded
 
 
@@ -128,7 +128,7 @@ def test_crop_search_snippets_and_budget_are_explicitly_incomplete(tmp_path):
     assert Path(observation["artifact_path"]).stat().st_mode & 0o777 == 0o600
     store.capture(bundle, "execute_shell", {"ok": True, "result": "z" * (MAX_RUN_BYTES + 100)})
     assert not bundle["complete"]
-    assert "continu" in render_evidence(bundle).lower()
+    assert "devam" in render_evidence(bundle).lower()
     assert sum(p.stat().st_size for p in store.directory.iterdir()) <= MAX_RUN_BYTES
 
 
@@ -237,3 +237,44 @@ async def test_agent_startup_failure_and_store_failure_still_finish(tmp_path, mo
     assert not report["success"]
     assert not report["evidence"]["complete"]
     assert events[-1]["kind"] == "run_finished"
+
+
+@pytest.mark.parametrize("marker", ["…[stdout çıktısı 1048576 bayt sınırında kırpıldı]", "…liste öğe/süre sınırıyla kısaltıldı; aranan öğe yoksa yenile"])
+def test_existing_tool_limit_markers_are_incomplete(tmp_path, marker):
+    store, bundle = make_bundle(tmp_path)
+    store.capture(bundle, "execute_shell", {"ok": True, "result": "Projects/\n" + marker})
+    assert not bundle["complete"]
+
+
+def test_duplicate_run_creation_cannot_erase_pending_evidence(tmp_path):
+    store, bundle = make_bundle(tmp_path)
+    store.capture(bundle, "execute_shell", {"ok": True, "result": "Projects/"})
+    with pytest.raises(FileExistsError):
+        store.create(bundle["contract"], bundle["run_id"])
+    assert store.load(bundle["run_id"])["observations"][0]["text"] == "Projects/"
+
+
+def test_source_reference_budget_is_honest_and_unicode_capture_is_byte_bounded(tmp_path):
+    store, bundle = make_bundle(tmp_path)
+    store.capture(bundle, "execute_shell", {"ok": True, "result": "İ" * MAX_OBSERVATION_BYTES}, source_reference="a" * MAX_RUN_BYTES)
+    assert not bundle["complete"]
+    observation = bundle["observations"][0]
+    assert len(observation["text"].encode()) <= MAX_OBSERVATION_BYTES
+    assert "kayıt" in render_evidence(bundle)
+    assert store.load(bundle["run_id"])
+
+
+def test_loading_rejects_artifact_symlink_and_wrong_identity(tmp_path):
+    store, bundle = make_bundle(tmp_path)
+    store.capture(bundle, "read_file", {"ok": True, "result": "a" * (MAX_OBSERVATION_BYTES + 1)})
+    artifact = Path(bundle["observations"][0]["artifact_path"])
+    artifact.unlink()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private outside data")
+    artifact.symlink_to(outside)
+    with pytest.raises(ValueError):
+        store.load(bundle["run_id"])
+    artifact.unlink()
+    store.path_for(bundle["run_id"]).write_text(json.dumps({**bundle, "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}))
+    with pytest.raises(ValueError):
+        store.load(bundle["run_id"])
