@@ -201,20 +201,28 @@ async def test_d_two_bridges_triggering_together_process_each_message_once(
         ids = [store.record_channel_message("telegram", f"{index}. not: kızımın adı Ela",
                                             utc_iso(start + timedelta(seconds=index))) for index in range(3)]
     extraction_inputs: List[str] = []
+    extraction_started = asyncio.Event()
+    release_extraction = asyncio.Event()
 
     async def model(clients: Any, messages: List[Dict[str, object]], tool_schemas: Any, session_id: str,
                     backend: str, emit: Callable[[AgentEvent], None],
                     should_stop: Callable[[], bool]) -> Tuple[ModelTurn, str]:
         if tool_schemas[0]["function"]["name"] == "record_facts":
             extraction_inputs.append(str(messages[-1]["content"]))
-            await asyncio.sleep(0.2)   # ilk köprü kilidi tutarken ikinci köprü dener
+            extraction_started.set()
+            await release_extraction.wait()
             return tool_turn("record_facts", {"facts": [{**ELA_FACT, "message_id": ids[0]}]}), backend
         return tool_turn("verdict", {"answer": "evet"}), backend
 
     patch_models(monkeypatch, model)
     now = datetime.now(timezone.utc)
-    results = await asyncio.gather(learning.learn_if_due("openai", database, lock, now),
-                                   learning.learn_if_due("openai", database, lock, now))
+    first = asyncio.create_task(learning.learn_if_due("openai", database, lock, now))
+    try:
+        await asyncio.wait_for(extraction_started.wait(), timeout=5)
+        second = await learning.learn_if_due("openai", database, lock, now)
+    finally:
+        release_extraction.set()
+    results = [await first, second]
     assert sorted(result["status"] for result in results) == ["busy", "learned"]
     assert len(extraction_inputs) == 1 and all(f"#{message_id} ·" in extraction_inputs[0] for message_id in ids)
     assert (await learning.learn_if_due("openai", database, lock, now + timedelta(minutes=1)))["status"] == "not_due"

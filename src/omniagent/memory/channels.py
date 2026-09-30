@@ -63,8 +63,7 @@ def _mark_failure(channel: str, operation: str, error: Exception) -> None:
     _record_health["last"] = {"channel": channel, "operation": operation, "error_type": type(error).__name__,
                               "at": utc_now_iso()}
     logging.error("Kanıtlı hafıza işlemi başarısız; görev sürüyor",
-                  extra={"channel": channel, "operation": operation, "error_type": type(error).__name__,
-                         "error": str(error)[:200]})
+                  extra={"channel": channel, "operation": operation, "error_type": type(error).__name__})
 
 
 def _mark_success() -> None:
@@ -144,6 +143,11 @@ def record_report(channel: str, report: RunReport) -> None:
     started: datetime = finished - timedelta(seconds=float(metrics["elapsed_seconds"]))
     record_task(channel, report["exchange"]["goal"], report["outcome"], report["success"], utc_iso(started),
                 utc_iso(finished), int(metrics["prompt_tokens"]) + int(metrics["completion_tokens"]))
+
+
+def record_failed_task(channel: str, goal: str, error_type: str, started_at: str, tokens: int) -> None:
+    """Rapor üretemeyen görevi kaydeder; istisnanın özel içerik taşıyabilen metni arşive girmez."""
+    record_task(channel, goal, f"Görev tamamlanamadı ({error_type}).", False, started_at, utc_now_iso(), tokens)
 
 
 def answer_evidence(title: str, fields: Dict[str, object], values: Dict[str, object]) -> Optional[str]:

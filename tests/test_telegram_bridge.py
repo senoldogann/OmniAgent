@@ -1133,6 +1133,135 @@ async def test_poll_offset_prevents_replaying_command(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("control_kind", ["message", "button"])
+async def test_poll_handles_authorized_stop_while_a_previous_handler_is_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, control_kind: str,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {})
+    entered = asyncio.Event()
+    stopped = asyncio.Event()
+    blocked = asyncio.Event()
+
+    def stop_update(user_id: int) -> dict[str, Any]:
+        if control_kind == "message":
+            return {"message": {"chat": {"id": 123, "type": "private"}, "from": {"id": user_id}, "text": "/stop"}}
+        return {"callback_query": {"id": "cb", "from": {"id": user_id}, "data": "ctl:token:stop",
+                "message": {"chat": {"id": 123, "type": "private"}, "message_id": 1}}}
+
+    class PollAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def call(self, method: str, payload: dict[str, Any]) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                return [{"update_id": 1, **text_update("slow")}]
+            if self.calls == 2:
+                await entered.wait()
+                return [{"update_id": 2, **stop_update(999)}]
+            if self.calls == 3:
+                assert not bridge.stop_event.is_set()
+                return [{"update_id": 3, **stop_update(456)}]
+            await stopped.wait()
+            raise telegram.TelegramError("getUpdates: HTTP 401", 401)
+
+        async def send(self, chat_id: int, text: str) -> int:
+            raise telegram.TelegramError("bildirim gönderilemedi", 503)
+
+        async def answer_callback(self, callback_id: str, text: str) -> None:
+            raise telegram.TelegramError("bildirim gönderilemedi", 503)
+
+    bridge = telegram.TelegramBridge(PollAPI(), {"chat_id": 123, "user_id": 456})
+    bridge.run_token = "token"
+    bridge.active = asyncio.create_task(stopped.wait())
+    original_handle = bridge.handle
+
+    async def handle(update: dict[str, Any]) -> None:
+        if update.get("message", {}).get("text") == "slow":
+            entered.set()
+            await blocked.wait()
+        else:
+            try:
+                await original_handle(update)
+            finally:
+                if bridge.stop_event.is_set():
+                    stopped.set()
+
+    bridge.handle = handle  # type: ignore[method-assign]
+    with pytest.raises(telegram.TelegramError, match="401"):
+        await asyncio.wait_for(bridge.run(), timeout=3)
+    assert stopped.is_set() and not blocked.is_set()
+    assert "Task exception was never retrieved" not in caplog.text
+    assert any("Durdurma" in record.message or "Buton dokunuşu" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_attachment_download_prevents_late_task_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    api = FakeAPI()
+
+    async def download(*args: object) -> Path:
+        entered.set()
+        await release.wait()
+        return tmp_path / "rapor.pdf"
+
+    monkeypatch.setattr(api, "download", download, raising=False)
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    pending = asyncio.create_task(bridge.handle({"message": {
+        "chat": {"id": 123, "type": "private"}, "from": {"id": 456},
+        "document": {"file_id": "pdf", "file_name": "rapor.pdf", "file_size": 10},
+    }}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        await bridge.handle(text_update("/stop"))
+    finally:
+        release.set()
+        await pending
+    assert bridge.active is None
+    assert api.sent[-1] == "Ekten görev başlatma iptal edildi."
+
+
+@pytest.mark.asyncio
+async def test_update_consumer_error_is_propagated_and_polling_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {})
+    polling_cancelled = asyncio.Event()
+
+    class PollAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        async def call(self, method: str, payload: dict[str, Any]) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                return [{"update_id": 1, **text_update("görev")}]
+            try:
+                await asyncio.Event().wait()
+            finally:
+                polling_cancelled.set()
+
+    api = PollAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+
+    async def broken_handle(update: dict[str, Any]) -> None:
+        raise telegram.TelegramError("işleyici hata verdi", 503)
+
+    bridge.handle = broken_handle  # type: ignore[method-assign]
+    with pytest.raises(telegram.TelegramError, match="işleyici"):
+        await asyncio.wait_for(bridge.run(), timeout=3)
+    assert api.calls == 2 and polling_cancelled.is_set() and api.closed
+
+
+@pytest.mark.asyncio
 async def test_question_waits_for_authorized_reply(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     api = FakeAPI()
@@ -1427,6 +1556,29 @@ async def test_goal_typed_answer_and_report_reach_personal_memory(monkeypatch: p
     with opened_store(tmp_path / "companion.db") as store:
         assert [(task["channel"], task["goal"]) for task in store.recent_tasks(5)] == [
             ("telegram", "aylık raporu hazırla")]
+
+
+@pytest.mark.asyncio
+async def test_exceptional_task_reaches_activity_without_private_error_details(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    bridge, _api = memory_bridge(monkeypatch, tmp_path)
+
+    async def broken_run(*args: object) -> object:
+        raise RuntimeError("özel dosya içeriği: kızımın adı Ela")
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", broken_run)
+    try:
+        await bridge.handle(text_update("aylık raporu hazırla"))
+        active = bridge.active
+        assert active is not None
+        await active
+    finally:
+        await bridge.integrations.close()
+    with opened_store(tmp_path / "companion.db") as store:
+        [task] = store.recent_tasks(5)
+    assert (task["channel"], task["goal"], task["success"]) == ("telegram", "aylık raporu hazırla", False)
+    assert task["outcome"] == "Görev tamamlanamadı (RuntimeError)."
 
 
 @pytest.mark.asyncio

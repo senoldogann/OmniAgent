@@ -37,7 +37,8 @@ from omniagent.core.events import (
 from omniagent.model_catalog import (
     ModelCatalogError, list_provider_models, load_model_preferences, save_model_preferences, valid_model_id,
 )
-from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
+from omniagent.platform.macos.host_lock import HostBusyError, async_host_task_lock_preempting, host_owner, host_task_lock
+from omniagent.memory.personal import utc_now_iso
 from omniagent.platform.macos import launch_agent
 # Testler ve eski çağıranlar bu sabitleri telegram modülünden okur (tests/test_telegram_service.py).
 from omniagent.platform.macos.launch_agent import (  # noqa: F401
@@ -1066,6 +1067,7 @@ class TelegramBridge:
         self.history: list[Exchange] = trim_history(safe_history)
         self.active: Optional[asyncio.Task[None]] = None
         self.stop_event = threading.Event()
+        self._stop_generation = 0
         self.pending_answer: Optional[asyncio.Future[Dict[str, Any]]] = None
         self.pending_fields: Dict[str, Any] = {}
         # Bekleyen sorunun butonları (callback verisi → yanıt); soru kapanınca boşalır, eski butonlar işlemez
@@ -1179,6 +1181,7 @@ class TelegramBridge:
         # Butonlu sürekli oturum istemleri bu göreve bağlanır; önceki görevin butonları işlemez.
         self.run_token = secrets.token_hex(4)
         self.run_started, self.run_tool, self.run_model, self.run_tokens = time.monotonic(), "", "", 0
+        started_at = utc_now_iso()
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         # Ajan, boş çıktılı başarısız görevin kısmi raporunu run_finished çıktısı olarak yayınlamadan hemen önce
@@ -1229,7 +1232,7 @@ class TelegramBridge:
             # Hazır profiller görevler arasında değişebilir (Ollama sonradan açılıp kapanabilir): Otomatik seçim
             # köprü açılışındaki bayat listeye dayanmasın diye istemciler her görev başında yeniden kurulur.
             await self._refresh_clients()
-            with host_task_lock():
+            async with async_host_task_lock_preempting():
                 return await run_agent_with_callback(goal, emit, options, self.clients)
 
         worker = asyncio.create_task(work())
@@ -1262,6 +1265,7 @@ class TelegramBridge:
         screenshot_paths: Dict[str, Path] = {}
         final_screenshot: Optional[Path] = None
         saw_finished = False
+        report: Optional[RunReport] = None
         try:
             while not worker.done() or not queue.empty():
                 try:
@@ -1298,6 +1302,8 @@ class TelegramBridge:
                     elif image is not None:
                         final_screenshot = image
             report = await worker
+            # Rapor sunumu veya geçmiş yazımı hata verse de tamamlanan iş tek kez kaydedilir.
+            await asyncio.to_thread(channels.record_report, "telegram", report)
             # Aynı turdaki call_soon_threadsafe olaylarını son sayfadan önce işle.
             await asyncio.sleep(0)
             while not queue.empty():
@@ -1315,8 +1321,6 @@ class TelegramBridge:
                 await compact.finish(report)
             self.history = trim_history(self.history + [report["exchange"]])
             save_json(history_path(), self.history)
-            # İş günlüğü (companion.db, kanal etiketli): Deniz Telegram'dan yaptırılan işi bilir.
-            await asyncio.to_thread(channels.record_report, "telegram", report)
         except (HostBusyError, TelegramError) as error:
             try:
                 if verbose:
@@ -1339,6 +1343,14 @@ class TelegramBridge:
                 self.stop_event.set()
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
+            if report is None:
+                # Ajan sunumdan önce bitmiş olabilir; gerçek rapor varsa onu koru, yoksa hata türünü kaydet.
+                if not worker.cancelled() and worker.exception() is None:
+                    await asyncio.to_thread(channels.record_report, "telegram", worker.result())
+                else:
+                    error_type = "CancelledError" if worker.cancelled() else type(worker.exception()).__name__
+                    await asyncio.to_thread(channels.record_failed_task, "telegram", goal, error_type,
+                                            started_at, self.run_tokens)
             self.stop_event.clear()
             self.goal = ""
             self.active = None
@@ -1553,6 +1565,7 @@ class TelegramBridge:
 
     def _request_stop(self) -> None:
         """Çalışan görevi durdurur; yanıt bekleyen soru varsa iptal eder."""
+        self._stop_generation += 1
         self.stop_event.set()
         if self.pending_answer is not None and not self.pending_answer.done():
             self.pending_answer.set_exception(IntegrationStopped("Kullanıcı tarafından durduruldu."))
@@ -1586,7 +1599,8 @@ class TelegramBridge:
             with host_task_lock():
                 pass
         except HostBusyError:
-            return  # arayüzde görev sürüyor; bir sonraki turda yeniden denenir
+            if host_owner() != "autonomous":
+                return  # kullanıcı görevi sürüyor; bir sonraki turda yeniden denenir
         record = ready[0]
         try:
             schedule.save_schedules(path, schedule.advance_schedule(records, record["id"], now))
@@ -1708,6 +1722,7 @@ class TelegramBridge:
 
     async def _start_attachment_task(self, message: Dict[str, Any], attachment: TelegramAttachment) -> None:
         """Eki indirir ve açıklamasıyla (yoksa varsayılan istekle) görevi başlatır."""
+        generation = self._stop_generation
         chat_id = self.settings["chat_id"]
         if self.pending_answer is not None:
             await self.api.send(chat_id, "Bir soruya yanıt bekleniyor; lütfen yanıtı metin olarak yazın.")
@@ -1740,6 +1755,9 @@ class TelegramBridge:
             goal = transcript
         else:
             goal = attachment_goal(caption, attachment, path)
+        if generation != self._stop_generation:
+            await self.api.send(chat_id, "Ekten görev başlatma iptal edildi.")
+            return
         if self.active is not None:
             # İndirme/yazıya çevirme sürerken zamanlanmış görev başlamış olabilir; onu ezme
             await self.api.send(chat_id, f"Bir görev çalışıyor; ek kaydedildi: {path}. Görev bitince yeniden isteyin.")
@@ -1772,10 +1790,10 @@ class TelegramBridge:
         text = text.strip()
         chat_id = self.settings["chat_id"]
         if text == "/stop":
+            self._request_stop()
             if self.active is None:
                 await self.api.send(chat_id, "Çalışan görev yok.")
             else:
-                self._request_stop()
                 await self.api.send(chat_id, "Durdurma istendi; çalışan işlem iptal ediliyor.")
             return
         if text.startswith("/btw ") or text == "/approve":
@@ -1880,6 +1898,38 @@ class TelegramBridge:
         # Kanıtlı hafıza öğrenme hattı (iMessage köprüsüyle ortak kilit ve imleç); iMessage kurulu değilse kapalı.
         learner = asyncio.create_task(
             learning.learning_loop(learning_backend, companion_db_file(), memory_learning_lock_file()))
+        # Normal güncellemeler sıralı kalır; yavaş indirme veya SQLite yazımı yeni /stop'u bekletemez.
+        pending_updates: asyncio.Queue[Tuple[int, Dict[str, Any]]] = asyncio.Queue()
+        controls: set[asyncio.Task[None]] = set()
+
+        async def consume_updates() -> None:
+            while True:
+                generation, update = await pending_updates.get()
+                try:
+                    if generation == self._stop_generation:
+                        await self.handle(update)
+                finally:
+                    pending_updates.task_done()
+
+        def control_done(task: asyncio.Task[None]) -> None:
+            controls.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                logging.warning("Durdurma bildirimi gönderilemedi",
+                                extra={"error_type": type(task.exception()).__name__})
+
+        def fast_stop(update: Dict[str, Any]) -> bool:
+            message = update.get("message")
+            if isinstance(message, dict) and authorized(message, self.settings):
+                return isinstance(message.get("text"), str) and message["text"].strip() == "/stop"
+            query = update.get("callback_query")
+            if not isinstance(query, dict) or not isinstance(query.get("message"), dict):
+                return False
+            return (isinstance(query.get("id"), str)
+                    and authorized({"chat": query["message"].get("chat"), "from": query.get("from")}, self.settings)
+                    and bool(self.run_token) and query.get("data") == f"ctl:{self.run_token}:stop")
+
+        consumer = asyncio.create_task(consume_updates())
+        polling: Optional[asyncio.Task[object]] = None
         try:
             try:
                 await self.api.set_commands(BOT_COMMANDS)
@@ -1895,11 +1945,17 @@ class TelegramBridge:
             failures = 0
             while True:
                 try:
-                    updates = await self.api.call("getUpdates", {
+                    polling = asyncio.create_task(self.api.call("getUpdates", {
                         "offset": self.offset, "timeout": POLL_SECONDS,
                         "allowed_updates": ["message", "callback_query"],
-                    })
+                    }))
+                    ready, _ = await asyncio.wait({polling, consumer}, return_when=asyncio.FIRST_COMPLETED)
+                    if consumer in ready:
+                        consumer.result()  # İşleyici hatası tüketilir ve köprünün normal kapanışından geçer.
+                    updates = await polling
                 except TelegramError as error:
+                    if consumer.done():
+                        raise  # Normal işleyici hatası yoklama hatası gibi sonsuz yeniden denenmez.
                     if error.status is not None and error.status < 500 and error.status != 429:
                         raise
                     failures += 1
@@ -1917,8 +1973,23 @@ class TelegramBridge:
                     self.offset = update_id + 1
                     # Tekrarlanan uzaktan komut yan etkiyi yeniden başlatmasın.
                     save_json(offset_path(), {"offset": self.offset})
-                    await self.handle(update)
+                    if fast_stop(update):
+                        control = asyncio.create_task(self.handle(update))
+                        controls.add(control)
+                        control.add_done_callback(control_done)
+                    else:
+                        pending_updates.put_nowait((self._stop_generation, update))
+                    # Stop bayrağı ağdaki bildirimi beklemeden, sonraki güncellemeden önce uygulanır.
+                    await asyncio.sleep(0)
         finally:
+            if polling is not None and not polling.done():
+                polling.cancel()
+                await asyncio.gather(polling, return_exceptions=True)
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
+            for control in controls:
+                control.cancel()
+            await asyncio.gather(*controls, return_exceptions=True)
             # Önce: /restart execv'den sonra yenisini kurar, eski engel geride kalmasın
             stop_keep_awake(self.keep_awake)
             self.keep_awake = None

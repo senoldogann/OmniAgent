@@ -39,8 +39,8 @@ from omniagent.core.events import AgentEvent, compact_count, provider_fallback_t
 from omniagent.core.log_format import StructuredFormatter
 from omniagent.ui import native_macos
 from omniagent.platform.macos.desktop_status import MenuBarTaskStatus, app_is_active, is_backgrounded, notify_finished, set_dock_badge
-from omniagent.platform.macos.host_lock import host_task_lock
-from omniagent.memory.channels import record_report, record_user_message, recording_answer
+from omniagent.platform.macos.host_lock import async_host_task_lock_preempting
+from omniagent.memory.channels import record_failed_task, record_report, record_user_message, recording_answer
 from omniagent.memory.personal import utc_now_iso
 from omniagent.platform.macos.visibility import (
     GlobalVisibilityHotkey, VisibilityHotkeyError, application_is_hidden, set_application_hidden,
@@ -2994,10 +2994,17 @@ class OmniUI(ctk.CTk):
 
     async def _run_exclusive(self, goal: str, options: RunOptions) -> RunReport:
         """Telegram ile aynı makineyi eşzamanlı kullanma çakışmasını önler."""
+        started_at = utc_now_iso()
         # Kanıtlı hafıza: kullanıcının hedef metni. Bağlantı iş parçacığında açılıp kapanır; hata görevi durdurmaz.
         await asyncio.to_thread(record_user_message, "desktop", goal, utc_now_iso())
-        with host_task_lock():
-            return await run_agent_with_callback(goal, self._post, options, self._clients)
+        try:
+            async with async_host_task_lock_preempting():
+                report = await run_agent_with_callback(goal, self._post, options, self._clients)
+        except (Exception, asyncio.CancelledError) as error:
+            await asyncio.to_thread(record_failed_task, "desktop", goal, type(error).__name__, started_at, 0)
+            raise
+        await asyncio.to_thread(record_report, "desktop", report)
+        return report
 
     async def _request_input(self, title: str, fields: Dict[str, object]) -> Dict[str, object]:
         """
@@ -3157,10 +3164,6 @@ class OmniUI(ctk.CTk):
                              "error": f"{type(error).__name__}: {error}", "report": None})
         else:
             self._inbox.put({"event": None, "done": True, "error": "", "report": report})
-            if report is not None:
-                # İş günlüğü (companion.db, channel=desktop): yazım Tk'yi ve olay döngüsünü bekletmesin diye ayrı iş
-                # parçacığında; kayıt hatası görevi etkilemez (record_report yükseltmez).
-                threading.Thread(target=record_report, args=("desktop", report), daemon=True).start()
 
     def _on_run_done(self, error: str, report: Optional[RunReport]) -> None:
         background = is_backgrounded(

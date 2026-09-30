@@ -3,6 +3,7 @@ yanıtındaki kullanıcı sözleri, ana ajanın profil ve personal_memory yüzü
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Tuple
 
 import pytest
@@ -64,6 +65,67 @@ def test_recording_failure_never_raises_and_shows_in_status(data: Path) -> None:
         Path(f"{data}{suffix}").unlink(missing_ok=True)
     channels.record_user_message("telegram", "kızımın adı Ela", utc_iso(NOW))
     assert channels.last_record_failure() is None and channels.record_failure_line(TZ) is None
+
+
+def test_recording_error_logs_never_include_private_exception_text(
+    data: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    private = "kişisel mesajım: kızımın adı Ela ghp_0123456789abcdefghij"
+
+    def broken_store(path: Path) -> None:
+        raise sqlite3.OperationalError(private)
+
+    monkeypatch.setattr(channels, "opened_store", broken_store)
+    channels.record_user_message("telegram", "normal hedef", utc_iso(NOW))
+    assert channels.last_record_failure()["error_type"] == "OperationalError"
+    assert private not in str([record.__dict__ for record in caplog.records])
+
+
+def test_failed_task_is_channel_labelled_and_masks_the_goal(data: Path) -> None:
+    channels.record_failed_task("desktop", "şifrem kedi123", "RuntimeError", utc_iso(NOW), 12)
+    with opened_store(data) as store:
+        [task] = store.recent_tasks(5)
+    assert task["channel"] == "desktop" and task["success"] is False
+    assert task["goal"] == channels.HIDDEN_TEXT and task["tokens"] == 12
+    assert task["outcome"] == "Görev tamamlanamadı (RuntimeError)."
+
+
+@pytest.mark.asyncio
+async def test_desktop_exception_records_failure_without_private_error_details(
+    data: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omniagent.ui import app as ui
+
+    async def broken_run(*args: object) -> RunReport:
+        raise RuntimeError("özel dosya içeriği: kızımın adı Ela")
+
+    monkeypatch.setattr(ui, "run_agent_with_callback", broken_run)
+    app = SimpleNamespace(_clients={}, _post=lambda event: None)
+    with pytest.raises(RuntimeError, match="özel dosya"):
+        await ui.OmniUI._run_exclusive(app, "raporu hazırla", {})
+    with opened_store(data) as store:
+        [task] = store.recent_tasks(5)
+    assert (task["channel"], task["goal"], task["success"]) == ("desktop", "raporu hazırla", False)
+    assert task["outcome"] == "Görev tamamlanamadı (RuntimeError)."
+
+
+@pytest.mark.asyncio
+async def test_desktop_report_is_recorded_before_the_run_returns(
+    data: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omniagent.ui import app as ui
+
+    completed = report("raporu hazırla", "tamam", False)
+
+    async def run(*args: object) -> RunReport:
+        return completed
+
+    monkeypatch.setattr(ui, "run_agent_with_callback", run)
+    app = SimpleNamespace(_clients={}, _post=lambda event: None)
+    assert await ui.OmniUI._run_exclusive(app, "raporu hazırla", {}) is completed
+    with opened_store(data) as store:
+        tasks = store.recent_tasks(5)
+    assert len(tasks) == 1 and tasks[0]["success"] is False
 
 
 def test_task_report_lands_in_the_activity_log_with_masked_secrets(data: Path) -> None:
