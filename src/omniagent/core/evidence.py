@@ -315,7 +315,14 @@ class EvidenceStore:
             reference = _clip_bytes(reference, MAX_SOURCE_REFERENCE_BYTES)
             mark_incomplete(bundle, "Kaynak adresi veya işlem metni kayıt sınırını aştığı için eksik; daha dar bir istekle devam edin.")
         snippet = tool == "web_search"
-        cropped = bool(_CROP.search(text)) or bool(result.get("truncated")) or result.get("complete") is False
+        structured_incomplete = False
+        if tool == "list_directory" and ok:
+            try:
+                listing = json.loads(text)
+                structured_incomplete = isinstance(listing, dict) and listing.get("complete") is False
+            except ValueError:
+                structured_incomplete = True
+        cropped = structured_incomplete or bool(_CROP.search(text)) or bool(result.get("truncated")) or result.get("complete") is False
         complete = not cropped and not snippet and not reference_cropped
         observation: SourceObservation = {
             "tool": tool, "source_type": "web" if tool.startswith("web_") else "tool",
@@ -369,6 +376,14 @@ class EvidenceStore:
         bundle["observations"].append(observation)
         self.save(bundle)
         return observation
+
+    def observation_text(self, bundle: EvidenceBundle, index: int) -> str:
+        """Authoritative sanitized source, including retained full artifact text."""
+        self._validate(bundle)
+        observation = bundle["observations"][index]
+        if observation.get("artifact_path"):
+            return self._read(self._artifact_name(bundle["run_id"], index), MAX_RUN_BYTES).decode("utf-8")
+        return observation["text"]
 
     def mark_delivered(self, run_id: str, *, delivered_at: str | None = None) -> EvidenceBundle:
         bundle = self.load(run_id)

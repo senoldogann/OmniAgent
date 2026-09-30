@@ -253,6 +253,10 @@ def route_tool_schemas(
                 "kind": {"type": "string", "enum": ["confirm", "text"]},
             },
         ),
+        _function_schema("list_directory", "Dizinin bir seviyesindeki ad ve türleri JSON olarak okur; "
+                         "complete=false sınırlı sonucu gösterir, toplam sayı çıkarma.", {
+            "path": {"type": "string"}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000},
+        }, required=["path"]),
         _function_schema("read_file", "Bir dosyanın içeriğini okur (uzun dosyalar kısaltılır).", {
             "path": {"type": "string", "description": "Okunacak dosyanın yolu."},
         }),
@@ -584,7 +588,7 @@ _DETERMINISTIC_PROGRESS_TOOLS: frozenset[str] = frozenset({
     "write_file", "edit_file", "execute_js", "execute_python", "capture_photo", "user_memory", "send_file", "schedule_task",
 })
 _READ_PROGRESS_TOOLS: frozenset[str] = frozenset({
-    "web_search", "fetch_raw", "read_file", "browse_url", "cua_read_scrollable",
+    "web_search", "fetch_raw", "read_file", "list_directory", "browse_url", "cua_read_scrollable",
     "cua_read_visible_text",
 })
 AUTO_OBSERVATION_PREVIEW: str = "otomatik gözlem"

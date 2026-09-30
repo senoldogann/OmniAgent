@@ -93,7 +93,7 @@ from .system import (
 
 from .filesystem import (
     _backup_file, _logical_path,
-    clean_html, edit_file_content, missing_path_hint,
+    clean_html, edit_file_content, missing_path_hint, list_directory_content,
     read_file_content, read_full_file, write_file_content,
 )
 
@@ -1954,6 +1954,10 @@ class Toolbox:
     def edit_file(self, path: str, old_text: str, new_text: str) -> str:
         """Benzersiz metni değiştirir; tam içeriği write_file ile güvenle yazar."""
         return edit_file_content(path, old_text, new_text, self._read_full, self.write_file)
+
+    def list_directory(self, path: str, max_entries: int = 1000) -> str:
+        """Read one directory level with explicit bounded completeness metadata."""
+        return list_directory_content(path, max_entries)
 
     def read_file(self, path: str) -> str:
         """Dosya okur ve model için kısaltılmış içeriği döner."""

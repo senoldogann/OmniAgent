@@ -2,6 +2,7 @@
 OmniAgent Dosya Sistemi Yönetimi (tools/filesystem.py)
 Yüksek performanslı atomik yazma, akıllı okuma ve optimize edilmiş HTML temizleme.
 """
+import json
 import hashlib
 import os
 import shutil
@@ -64,6 +65,36 @@ def clean_html(html: str) -> str:
     text = soup.get_text(separator=" ")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return clip_text(" ".join(lines), PAGE_TEXT_LIMIT)
+
+DIRECTORY_ENTRY_LIMIT = 1000
+
+
+def list_directory_content(path: str, max_entries: int = DIRECTORY_ENTRY_LIMIT) -> str:
+    """One level of names and types; no shell or recursion. Entry symlinks are not followed.
+
+    Keep at most max_entries plus one sentinel. The snapshot may change during
+    enumeration and is explicitly marked bounded when more entries exist.
+    """
+    if type(max_entries) is not int or not 1 <= max_entries <= DIRECTORY_ENTRY_LIMIT:
+        raise ToolError("Dizin sınırı 1-1000 olmalı.", "INVALID_LIMIT", False)
+    target = Path(path).expanduser().absolute()
+    entries = []
+    complete = True
+    try:
+        with os.scandir(target) as iterator:
+            for entry in iterator:
+                if len(entries) >= max_entries:
+                    complete = False
+                    break
+                kind = ("symlink" if entry.is_symlink() else "directory" if entry.is_dir(follow_symlinks=False)
+                        else "file" if entry.is_file(follow_symlinks=False) else "other")
+                entries.append({"name": entry.name, "type": kind})
+    except OSError as error:
+        raise ToolError(f"Dizin okunamadı: {target}: {error}", "DIRECTORY_READ_FAILED", True) from error
+    return json.dumps({"path": str(target), "entries": sorted(entries, key=lambda entry: entry["name"]),
+                       "complete": complete, "limit": max_entries,
+                       "scope": "single_level_snapshot", "returned_entries": len(entries)}, ensure_ascii=False)
+
 
 def read_full_file(path: str) -> str:
     source_path = Path(path).expanduser()

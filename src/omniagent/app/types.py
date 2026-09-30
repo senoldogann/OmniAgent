@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Awaitable, Callable, List, NotRequired, Optional, TypedDict
+from typing import TYPE_CHECKING, AsyncContextManager, Awaitable, Callable, List, NotRequired, Optional, TypedDict
 
 from omniagent.core import state as sm
 from omniagent.core.conversation import Exchange
@@ -10,6 +10,10 @@ from omniagent.core.events import TokenUsage
 from omniagent.core.evidence import EvidenceBundle, RequestContract
 from omniagent.integrations.capabilities import CapabilityService
 from omniagent.integrations.runtime import AnswerSink, DeliverSink
+
+
+if TYPE_CHECKING:
+    from omniagent.app.conversation import ConversationDecision
 
 
 class RunModeProfile(TypedDict):
@@ -58,6 +62,11 @@ class AutonomyGuards(TypedDict):
 
 class RunOptions(TypedDict):
     requested_backend: Optional[str]
+    # Host owned factory: only the task route may acquire exclusive ownership.
+    task_context: NotRequired[Callable[[], AsyncContextManager[object]]]
+    conversation_decision: NotRequired[ConversationDecision]
+    conversation_persona: NotRequired[str]
+    conversation_memory: NotRequired[str]
     request_contract: NotRequired[RequestContract]
     evidence_run_id: NotRequired[str]
     should_stop: Callable[[], bool]

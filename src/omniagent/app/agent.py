@@ -27,7 +27,7 @@ from omniagent.config import (
     FILE_EXCHANGE_GUIDANCE, INTEGRATIONS_GUIDANCE, SCHEDULING_GUIDANCE, SYSTEM_PROMPT, BackendProfile,
     apply_stored_api_keys, redact,
 )
-from omniagent.core.conversation_policy import derive_request_contract
+from omniagent.core.conversation_policy import derive_request_contract, NATURAL_STYLE_POLICY
 from omniagent.core.evidence import (
     EvidenceBundle, EvidenceStore, mark_incomplete, new_evidence_bundle,
     sanitize_presentation_arguments, sanitize_text,
@@ -690,6 +690,14 @@ def _escalation_backend(
         return candidate
 
 
+# Host-owned observers account and gate actual provider attempts, including retries.
+# CLI/direct agent behavior is unchanged when no conversation scope is active.
+_MODEL_ATTEMPT: ContextVar[Optional[Callable[[str], None]]] = ContextVar("conversation_model_attempt", default=None)
+_MODEL_USAGE: ContextVar[Optional[Callable[[TokenUsage], None]]] = ContextVar("conversation_model_usage", default=None)
+_MODEL_TOKEN_LIMIT: ContextVar[Optional[Callable[[List[Dict[str, Any]], List[Dict[str, Any]], int], int]]] = ContextVar(
+    "conversation_model_token_limit", default=None)
+
+
 async def _call_model_with_retries(
     clients: Dict[str, AsyncOpenAI],
     messages: List[Dict[str, Any]],
@@ -775,10 +783,17 @@ async def _call_model_with_retries(
             # yedekte de her yeni görüntü seviyesi (metin, ekran görüntüsü) için yeni kayıt düşer.
             _announce_provider_switch(emit, failed_backend, active, _switch_reason(last_failure), image_count)
             announced.add((active, image_count > 0))
+        token_limiter = _MODEL_TOKEN_LIMIT.get()
+        profile = BACKENDS[active]
+        if token_limiter is not None:
+            profile = {**profile, "max_tokens": token_limiter(messages, tool_schemas, profile["max_tokens"])}
+        observer = _MODEL_ATTEMPT.get()
+        if observer is not None:
+            observer(active)
         attempts += 1
         try:
             turn: ModelTurn = await _stream_completion(
-                clients[active], BACKENDS[active], messages, tool_schemas, session_id, tracking_emit, should_stop,
+                clients[active], profile, messages, tool_schemas, session_id, tracking_emit, should_stop,
             )
         # ssl.SSLError (ör. SSLV3_ALERT_BAD_RECORD_MAC) SDK tarafından sarılmadan akış okumasından
         # yükselebiliyor (anyio yeniden fırlatır, httpcore2 eşlemez); akış içi hata olayları ise düz
@@ -844,6 +859,9 @@ async def _call_model_with_retries(
         else:
             if runtime is not None:
                 runtime.backend_cooldowns.pop(active, None)
+            usage_observer = _MODEL_USAGE.get()
+            if usage_observer is not None:
+                usage_observer(turn["usage"])
             return turn, active
 
 
@@ -1172,6 +1190,42 @@ async def resolve_goal_report(
     return result, confirmed, evaluated, asked
 
 
+def select_initial_backend(options: RunOptions, clients: Dict[str, AsyncOpenAI], emit: EventSink,
+                           fallback_policy: FallbackPolicy) -> Tuple[str, str, Optional[Tuple[str, bool]]]:
+    """Shared startup policy; substitution is audited before any provider receives data."""
+    if not clients:
+        raise RuntimeError(
+            "Kullanılabilir model yok: Ollama Cloud modeli veya bir API anahtarı "
+            "(OPENAI_API_KEY / OPENCODE_API_KEY / OPENROUTER_API_KEY) gerekli."
+        )
+    available: frozenset[str] = frozenset(clients)
+    backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
+    # Seçilen profil: açık seçim (arayüz menüsü, /model, --backend, OMNI_BACKEND) ya da 'Otomatik' = varsayılan
+    # profil. Yedek izni ve ekran görüntüsü denetimi bu profile göre yapılır.
+    selected_backend: str = backend_override if backend_override else DEFAULT_BACKEND
+    current_backend: str = selected_backend
+    startup_announced: Optional[Tuple[str, bool]] = None  # başlangıç ikamesinin duyurulan (hedef, görüntülü mü) çifti
+    if selected_backend not in available:
+        # Seçilen profil hazır değil (anahtar yok, Ollama kapalı): Otomatik dahil, başka sağlayıcıya yalnız
+        # yedek izniyle geçilir; görsel ek varsa görüntü izni de gerekir. İzin yoksa sessiz ikame yapılmaz.
+        allowed_backends: frozenset[str] = frozenset(fallback_policy["backends"])
+        attached_images: int = len(options.get("images", []))
+        replacement: Optional[str] = startup_replacement(
+            selected_backend, available, allowed_backends, fallback_policy["allow_images"], attached_images,
+        )
+        if replacement is None:
+            raise FallbackNotPermitted(startup_substitution_problem(
+                selected_backend, available, allowed_backends, fallback_policy["allow_images"], attached_images,
+            ))
+        try:
+            _announce_provider_switch(emit, selected_backend, replacement, "seçili profil hazır değil", attached_images)
+        except FallbackAuditFailed:
+            raise
+        startup_announced = (replacement, attached_images > 0)
+        current_backend = replacement
+    return selected_backend, current_backend, startup_announced
+
+
 async def run_agent_with_callback(
     goal: str, emit: EventSink, options: RunOptions, clients: Dict[str, AsyncOpenAI],
 ) -> RunReport:
@@ -1275,36 +1329,11 @@ async def run_agent_with_callback(
         return startup_failure(ValueError(
             "Sürekli mod, soru sorup yanıt bekleyebileceği bir kanal ister (masaüstü uygulaması veya Telegram)."
         ), DEFAULT_BACKEND)
-    if not clients:
-        return startup_failure(RuntimeError(
-            "Kullanılabilir model yok: Ollama Cloud modeli veya bir API anahtarı "
-            "(OPENAI_API_KEY / OPENCODE_API_KEY / OPENROUTER_API_KEY) gerekli."
-        ), DEFAULT_BACKEND)
     available: frozenset[str] = frozenset(clients)
-    backend_override: Optional[str] = options["requested_backend"] or os.environ.get("OMNI_BACKEND")
-    # Seçilen profil: açık seçim (arayüz menüsü, /model, --backend, OMNI_BACKEND) ya da 'Otomatik' = varsayılan
-    # profil. Yedek izni ve ekran görüntüsü denetimi bu profile göre yapılır.
-    selected_backend: str = backend_override if backend_override else DEFAULT_BACKEND
-    current_backend: str = selected_backend
-    startup_announced: Optional[Tuple[str, bool]] = None  # başlangıç ikamesinin duyurulan (hedef, görüntülü mü) çifti
-    if selected_backend not in available:
-        # Seçilen profil hazır değil (anahtar yok, Ollama kapalı): Otomatik dahil, başka sağlayıcıya yalnız
-        # yedek izniyle geçilir; görsel ek varsa görüntü izni de gerekir. İzin yoksa sessiz ikame yapılmaz.
-        allowed_backends: frozenset[str] = frozenset(fallback_policy["backends"])
-        attached_images: int = len(options.get("images", []))
-        replacement: Optional[str] = startup_replacement(
-            selected_backend, available, allowed_backends, fallback_policy["allow_images"], attached_images,
-        )
-        if replacement is None:
-            return startup_failure(FallbackNotPermitted(startup_substitution_problem(
-                selected_backend, available, allowed_backends, fallback_policy["allow_images"], attached_images,
-            )), DEFAULT_BACKEND)
-        try:
-            _announce_provider_switch(emit, selected_backend, replacement, "seçili profil hazır değil", attached_images)
-        except FallbackAuditFailed as error:
-            return startup_failure(error, DEFAULT_BACKEND)
-        startup_announced = (replacement, attached_images > 0)
-        current_backend = replacement
+    try:
+        selected_backend, current_backend, startup_announced = select_initial_backend(options, clients, emit, fallback_policy)
+    except (RuntimeError, FallbackNotPermitted, FallbackAuditFailed) as error:
+        return startup_failure(error, DEFAULT_BACKEND)
     emit({"kind": "run_started", "goal": goal, "backend": current_backend, "model": BACKENDS[current_backend]["model"],
           "run_mode": run_mode, "max_turns": max_iterations, "max_wall_clock_seconds": max_wall_clock})
 
@@ -1364,7 +1393,7 @@ async def run_agent_with_callback(
             user_message_with_images, user_content, options.get("images", []),
         )
         messages: List[Dict[str, Any]] = (
-            [{"role": "system", "content": route_system_prompt(date.today(), goal, memory_block, prompt_route)
+            [{"role": "system", "content": route_system_prompt(date.today(), goal, memory_block, prompt_route) + "\n" + NATURAL_STYLE_POLICY
               + (CONTINUOUS_GUIDANCE if continuous else "")}]
             + to_messages(options["history"])
             + [first_message]
@@ -1402,6 +1431,11 @@ async def run_agent_with_callback(
             except Exception:
                 logging.exception("Başlangıç hatasından sonra entegrasyon kapanışı başarısız")
         return startup_failure(error, current_backend)
+    parent_runtime = CURRENT_RUNTIME.get() if _MODEL_ATTEMPT.get() is not None else None
+    if parent_runtime is not None:
+        runtime.blocked_backends.update(parent_runtime.blocked_backends)
+        runtime.backend_cooldowns.update(parent_runtime.backend_cooldowns)
+        runtime.announced_fallbacks.update(parent_runtime.announced_fallbacks)
     runtime.primary_backend = selected_backend
     runtime.fallback_backends = frozenset(fallback_policy["backends"])
     runtime.fallback_images = fallback_policy["allow_images"]
@@ -2635,6 +2669,10 @@ async def run_agent_with_callback(
             cleanup_errors.append(f"Entegrasyon kapanışı: {type(error).__name__}: {error}")
         persist_evidence()
         _EVIDENCE_CAPTURE.reset(evidence_token)
+        if parent_runtime is not None:
+            parent_runtime.blocked_backends.update(runtime.blocked_backends)
+            parent_runtime.backend_cooldowns.update(runtime.backend_cooldowns)
+            parent_runtime.announced_fallbacks.update(runtime.announced_fallbacks)
         CURRENT_RUNTIME.reset(runtime_token)
         CURRENT_SERVICE.reset(service_token)
         for detail in cleanup_errors:
