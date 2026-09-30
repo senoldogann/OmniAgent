@@ -415,3 +415,29 @@ async def test_incomplete_model_finish_sends_no_partial_or_effects(monkeypatch, 
     with pytest.raises(chat.ChatError, match=finish_reason):
         await chat.respond({}, "openai", "system", [], chat.CHAT_TOOLS, send, lambda: False, "incomplete")
     assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_authenticated_final_preserves_indentation_tabs_and_repeated_spaces(monkeypatch):
+    text = '```python\nif ready:\n    send("Çınar  Projects")\n\treturn True\n```'
+    result, sent = await run(monkeypatch, scripted_model([text], []))
+    assert sent == [text]
+    assert result == {"bubbles": [text], "start_task": None}
+
+
+@pytest.mark.asyncio
+async def test_authenticated_marker_removal_preserves_unrelated_whitespace(monkeypatch):
+    text = ('başlangıç\n'
+            '    Çınar  Projects\t<call:start_task goal="List Projects" />  bitti\n'
+            '\trecall  <call:recall query="Çınar  Projects" />\tsonuç\n'
+            '    forget  <call:forget fact_id="12" />  son\n'
+            'bitiş')
+    expected = ('başlangıç\n'
+                '    Çınar  Projects\t  bitti\n'
+                '\trecall  \tsonuç\n'
+                '    forget    son\n'
+                'bitiş')
+    result, sent = await run(monkeypatch, scripted_model([text], []))
+    assert sent == [expected]
+    assert result == {"bubbles": [expected], "start_task": "List Projects", "recall": "Çınar  Projects", "forget": [12]}
+    assert "<call:" not in sent[0]
