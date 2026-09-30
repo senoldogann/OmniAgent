@@ -1428,7 +1428,6 @@ def test_desktop_evidence_confirmation_waits_for_rendered_final_persistence(app,
     _start(app)
     text = "Çınar final " * 900
     app._handle_event({"kind": "text_delta", "text": text})
-    _drain(app)
     gate = threading.Event()
     entered = threading.Event()
     real_save = ui.save_chat

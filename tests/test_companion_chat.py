@@ -391,3 +391,27 @@ async def test_large_final_chunks_reconstruct_exact_content(monkeypatch):
     result, sent = await run(monkeypatch, scripted_model([text], []))
     assert len(sent) > 4 and all(len(item) <= 3500 for item in sent)
     assert "".join(sent) == text and result["bubbles"] == sent
+
+
+@pytest.mark.parametrize("text", ["Ç🧭" * 5000, "name Çınar. https://example.test/" + "a" * 3490 + " end", "\n\n".join("paragraph " * 600 for _ in range(8))])
+def test_final_chunk_helper_preserves_tokens_and_unicode(text):
+    from omniagent.companion.bubbles import final_chunks
+    chunks = final_chunks(text)
+    assert "".join(chunks) == text.strip()
+    assert all(0 < len(chunk) <= 3500 for chunk in chunks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_reason", ["length", "content_filter"])
+async def test_incomplete_model_finish_sends_no_partial_or_effects(monkeypatch, finish_reason):
+    async def model(*args):
+        return {"content": 'Partial draft <call:forget fact_id="12" />', "tool_calls": [
+            {"id":"s", "name":"start_task", "arguments":'{"goal":"Delete files"}'}],
+            "finish_reason":finish_reason, "usage":ZERO_USAGE}, "openai"
+    monkeypatch.setattr(chat, "call_model_with_retries", model)
+    sent = []
+    async def send(text):
+        sent.append(text)
+    with pytest.raises(chat.ChatError, match=finish_reason):
+        await chat.respond({}, "openai", "system", [], chat.CHAT_TOOLS, send, lambda: False, "incomplete")
+    assert sent == []

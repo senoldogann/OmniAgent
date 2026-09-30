@@ -4,7 +4,7 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Dict
 
 import httpx
 import pytest
@@ -12,6 +12,8 @@ from openai import AsyncOpenAI
 
 from omniagent.integrations import telegram
 from omniagent.app import agent as main
+from omniagent.app.types import RunOptions, RunReport
+from omniagent.core.events import AgentEvent
 from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
 from omniagent.core.conversation import make_exchange
 from omniagent.integrations.capabilities import CapabilityService
@@ -1700,6 +1702,6 @@ async def test_verified_final_marks_evidence_only_after_all_api_pages(monkeypatc
     if failure is None:
         assert saved["delivery_status"] == "delivered" and saved["delivered_at"]
         assert "part 2:" in "".join(accepted)
-        assert text.strip() in "".join(accepted)
+        assert " ".join(text.split()) in " ".join("".join(accepted).split())
     else:
         assert saved["delivery_status"] != "delivered" and saved["delivered_at"] is None

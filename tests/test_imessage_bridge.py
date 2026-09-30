@@ -1042,3 +1042,88 @@ async def test_multipart_failure_after_first_chunk_is_unknown_and_never_continue
     assert len(attempts) == 2
     await bridge.on_message(echo(991, attempts[0]))
     assert evidence_store.load(bundle["run_id"])["delivery_status"] == "unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "unknown", "definite", "cancel"])
+async def test_echo_racing_final_send_cannot_deliver_before_transport_returns(parts, monkeypatch, tmp_path, failure):
+    bridge, transport, personal = parts
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("report", route="task"))
+    report = report_for("report", "single final", True)
+    report["evidence"] = bundle
+    monkeypatch.setattr(imessage, "EvidenceStore", lambda _state: store)
+    async def racing_send(handle, chunk):
+        await bridge.on_message(echo(901, chunk))
+        assert store.load(bundle["run_id"])["delivery_status"] == "pending"
+        if failure == "unknown":
+            raise DeliveryUnknown("lost response")
+        if failure == "definite":
+            raise ImsgProcessError("late failure")
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        return await transport.send_text(handle, chunk)
+    bridge.transport = SimpleNamespace(send_text=racing_send)
+    now = utc_iso(datetime.now(timezone.utc))
+    outcome = {"goal":"report", "report":report, "started_at":now, "finished_at":now, "tokens":0}
+    if failure:
+        with pytest.raises(asyncio.CancelledError if failure == "cancel" else DeliveryUnknown):
+            await bridge._present_report(outcome)
+    else:
+        await bridge._present_report(outcome)
+    assert store.load(bundle["run_id"])["delivery_status"] == ("unknown" if failure else "delivered")
+
+
+@pytest.mark.asyncio
+async def test_normal_chat_unknown_stops_chunks_and_effects(parts, monkeypatch):
+    from tests.test_companion_chat import scripted_model
+    bridge, transport, personal = parts
+    monkeypatch.setattr(chat, "call_model_with_retries", scripted_model(["word " * 1800], [
+        {"id":"s", "name":"start_task", "arguments":'{"goal":"Delete files"}'}]))
+    attempts = []
+    async def unknown_send(handle, chunk):
+        attempts.append(chunk)
+        raise DeliveryUnknown("unknown")
+    bridge.transport = SimpleNamespace(send_text=unknown_send)
+    with pytest.raises(DeliveryUnknown):
+        await bridge._respond([], chat.CHAT_TOOLS, None, "chat")
+    assert len(attempts) == 1 and len(attempts[0]) <= 3500
+
+
+@pytest.mark.asyncio
+async def test_first_definite_report_failure_remains_retryable(parts, monkeypatch, tmp_path):
+    bridge, transport, personal = parts
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("report", route="task"))
+    report = report_for("report", "word " * 1800, True)
+    report["evidence"] = bundle
+    monkeypatch.setattr(imessage, "EvidenceStore", lambda _state: store)
+    async def fail(handle, chunk):
+        raise ImsgProcessError("not sent")
+    bridge.transport = SimpleNamespace(send_text=fail)
+    now = utc_iso(datetime.now(timezone.utc))
+    with pytest.raises(ImsgProcessError):
+        await bridge._present_report({"goal":"report", "report":report, "started_at":now, "finished_at":now, "tokens":0})
+    assert store.load(bundle["run_id"])["delivery_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_expired_unconfirmed_member_keeps_whole_report_unknown(parts, monkeypatch, tmp_path):
+    bridge, transport, personal = parts
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("report", route="task"))
+    report = report_for("report", "first " * 600 + "\n\n" + "second " * 600, True)
+    report["evidence"] = bundle
+    monkeypatch.setattr(imessage, "EvidenceStore", lambda _state: store)
+    now = utc_iso(datetime.now(timezone.utc))
+    await bridge._present_report({"goal":"report", "report":report, "started_at":now, "finished_at":now, "tokens":0})
+    await bridge.on_message(echo(901, transport.texts[0]))
+    assert store.load(bundle["run_id"])["delivery_status"] == "pending"
+    restarted = imessage.ImessageBridge(transport, settings(), personal, {}, "persona", "restart")
+    expired = personal.expire_pending(datetime.now(timezone.utc) + timedelta(seconds=imessage.CONFIRM_WINDOW_SECONDS + 1), imessage.CONFIRM_WINDOW_SECONDS)
+    for message_id in expired:
+        restarted._mark_evidence_unknown(message_id)
+    assert expired and store.load(bundle["run_id"])["delivery_status"] == "unknown"
+    for i, chunk in enumerate(transport.texts[1:]):
+        await restarted.on_message(echo(902 + i, chunk))
+    assert store.load(bundle["run_id"])["delivery_status"] == "unknown"
