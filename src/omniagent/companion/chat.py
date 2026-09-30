@@ -18,6 +18,7 @@ from openai import AsyncOpenAI
 
 from omniagent.app.agent import call_model_with_retries
 from omniagent.app.model_retry import ModelCallFailed
+from omniagent.app.policy import final_verdict
 from omniagent.app.types import ModelTurn, ToolCallDraft
 from omniagent.approval import append_audit
 from omniagent.config import QUALITY_LADDER
@@ -26,7 +27,7 @@ from omniagent.fallback_policy import (
 )
 from omniagent.memory.personal import utc_now_iso
 from omniagent.paths import data_root
-from omniagent.companion.bubbles import final_message
+from omniagent.companion.bubbles import final_chunks, final_message
 from omniagent.core.events import AgentEvent
 from omniagent.memory.personal import ArchivedMessage, ChatToolCall
 
@@ -488,6 +489,12 @@ async def respond(
         tools, session_id, backend, emit, should_stop,
     )
 
+    if turn["finish_reason"] == "stopped" or should_stop():
+        return {"bubbles": [], "start_task": None}
+    if turn["finish_reason"] in {"length", "content_filter"}:
+        _complete, reason = final_verdict(turn["content"], turn["finish_reason"])
+        raise ChatError(f"Sohbet yanıtı tamamlanmadı ({turn['finish_reason']}): {reason}.")
+
     textual_goals: List[str] = []
     textual_recalls: List[str] = []
     textual_forgets: List[int] = []
@@ -509,10 +516,14 @@ async def respond(
         content = final_message("\n".join(visible_lines))
 
     sent: List[str] = []
-    if content:
-        await send_bubble(content)
-        sent.append(content)
+    for chunk in final_chunks(content):
+        if should_stop():
+            return {"bubbles": sent, "start_task": None}
+        await send_bubble(chunk)
+        sent.append(chunk)
 
+    if should_stop():
+        return {"bubbles": sent, "start_task": None}
     if tools:
         start_task: Optional[str] = parse_start_task(turn["tool_calls"])
         if start_task is None and textual_goals:

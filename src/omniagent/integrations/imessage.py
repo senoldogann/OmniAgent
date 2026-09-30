@@ -27,6 +27,7 @@ from openai import AsyncOpenAI
 from omniagent.app.agent import STATE_FILE, close_model_clients, create_model_clients
 from omniagent.app.conversation import ConversationDecision, decide_conversation
 from omniagent.app.model_retry import ModelCallFailed
+from omniagent.companion.bubbles import final_chunks
 from omniagent.companion import chat, delegate, media, persona
 from omniagent.companion.autonomy import is_quiet_hour, make_autonomy_guards
 from omniagent.companion.heartbeat import Heartbeat
@@ -74,6 +75,8 @@ STABLE_CONNECTION_SECONDS: float = 60.0
 CLOSE_TASK_TIMEOUT_SECONDS: float = 5.0
 RECENT_TASKS: int = 5  # [DURUM]'da gösterilen son iş sayısı (tüm kanallar)
 EVIDENCE_DELIVERY_PREFIX: str = "evidence_delivery:"
+EVIDENCE_GROUP_PREFIX: str = "evidence_delivery_group:"
+EVIDENCE_MEMBER_PREFIX: str = "evidence_delivery_member:"
 BUSY_TEXT: str = "elimde bir iş var şu an, bitince bakarım (ya da 'dur' yaz)"
 # Model iş sözü verdi ama düzeltme çağrısında da iş başlatmadı: söz tutulamadığı dürüstçe söylenir.
 PROMISE_FAILED_TEXT: str = "pardon, işi başlatamadım; bir daha yazar mısın?"
@@ -234,7 +237,7 @@ class ImessageBridge:
         handle: str = self.settings["handle"]
         if own_echo(message, handle):
             confirmed: Optional[int] = self.store.confirm_outgoing(
-                message_text(message), message["rowid"], message["guid"], datetime.now(timezone.utc),
+                message["text"].replace("\ufffc", ""), message["rowid"], message["guid"], datetime.now(timezone.utc),
                 CONFIRM_WINDOW_SECONDS,
             )
             if confirmed is None:
@@ -435,11 +438,21 @@ class ImessageBridge:
         run_id = evidence.get("run_id")
         return run_id if isinstance(run_id, str) and run_id else None
 
-    def _mark_evidence_unknown(self, message_id: int) -> None:
-        key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
-        run_id = self.store.get_state(key)
-        if not run_id:
-            return
+    def _delivery_group(self, group_id: str) -> Dict[str, object]:
+        raw = self.store.get_state(EVIDENCE_GROUP_PREFIX + group_id)
+        return json.loads(raw) if raw else {}
+
+    def _save_delivery_group(self, group_id: str, group: Dict[str, object]) -> None:
+        self.store.set_state(EVIDENCE_GROUP_PREFIX + group_id, json.dumps(group))
+
+    def _mark_group_unknown(self, group_id: str) -> None:
+        group = self._delivery_group(group_id)
+        group["unknown"] = True
+        self._save_delivery_group(group_id, group)
+        self._save_evidence_unknown(str(group["run_id"]))
+
+    @staticmethod
+    def _save_evidence_unknown(run_id: str) -> None:
         try:
             evidence_store = EvidenceStore(STATE_FILE)
             bundle = evidence_store.load(run_id)
@@ -448,39 +461,75 @@ class ImessageBridge:
             evidence_store.save(bundle)
         except (OSError, ValueError) as error:
             logging.warning("iMessage evidence teslim durumu güncellenemedi",
-                            extra={"message_id": message_id, "error_type": type(error).__name__})
-            return
-        self.store.set_state(key, "")
+                            extra={"error_type": type(error).__name__})
 
-    def _confirm_evidence_delivery(self, message_id: int) -> None:
+    def _mark_evidence_unknown(self, message_id: int) -> None:
+        group_id = self.store.get_state(EVIDENCE_MEMBER_PREFIX + str(message_id))
+        if group_id:
+            self._mark_group_unknown(group_id)
+            return
         key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
         run_id = self.store.get_state(key)
-        if not run_id:
+        if run_id:
+            self._save_evidence_unknown(run_id)
+            self.store.set_state(key, "")
+
+    def _finish_evidence_group(self, group_id: str) -> None:
+        group = self._delivery_group(group_id)
+        members = group["members"]
+        if (group["sealed"] and not group["unknown"] and len(members) == group["expected"]
+                and all(members.values())):
+            try:
+                EvidenceStore(STATE_FILE).mark_delivered(str(group["run_id"]))
+            except (OSError, ValueError) as error:
+                logging.warning("iMessage evidence teslimi doğrulanamadı",
+                                extra={"error_type": type(error).__name__})
+
+    def _confirm_evidence_delivery(self, message_id: int) -> None:
+        group_id = self.store.get_state(EVIDENCE_MEMBER_PREFIX + str(message_id))
+        if group_id:
+            group = self._delivery_group(group_id)
+            group["members"][str(message_id)] = True
+            self._save_delivery_group(group_id, group)
+            self._finish_evidence_group(group_id)
             return
-        try:
-            EvidenceStore(STATE_FILE).mark_delivered(run_id)
-        except (OSError, ValueError) as error:
-            logging.warning("iMessage evidence teslimi doğrulanamadı",
-                            extra={"message_id": message_id, "error_type": type(error).__name__})
-            return
-        self.store.set_state(key, "")
+        # Compatibility for single-message receipts persisted by older bridges.
+        key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
+        run_id = self.store.get_state(key)
+        if run_id:
+            try:
+                EvidenceStore(STATE_FILE).mark_delivered(run_id)
+            except (OSError, ValueError) as error:
+                logging.warning("iMessage evidence teslimi doğrulanamadı",
+                                extra={"message_id": message_id, "error_type": type(error).__name__})
+                return
+            self.store.set_state(key, "")
 
     async def _send(
         self, text: str, kind: str, *, evidence_run_id: Optional[str] = None,
-        propagate_unknown: bool = False,
+        propagate_unknown: bool = False, evidence_group_id: Optional[str] = None,
     ) -> int:
         """
-        Balonu arşive 'pending' yazıp gönderir ve arşiv kimliğini döner. Normal sohbetlerde sonucu bilinmeyen
-        gönderim yeniden oynatılmaz ve akış sürer. Final task report'ta propagate_unknown, deferred-report
-        kuyruğunun belirsiz teslimi tekrar etmeden saklamasına izin verir. Evidence yalnız own-echo sonrası
-        delivered olur; belirsiz gönderimde unknown kalır.
+        Balonu arşive 'pending' yazıp gönderir ve arşiv kimliğini döner. Çok parçalı sohbet ve iş raporları
+        propagate_unknown ile belirsiz teslimde durur; deferred-report kuyruğu raporu tekrar etmez.
+        Evidence yalnız tamamı gönderilmiş grubun bütün own-echo'ları sonrası delivered olur.
+        Belirsiz veya kısmi gönderimde unknown kalır.
         """
         message_id: int = self.store.record_outgoing(text, kind, utc_iso(datetime.now(timezone.utc)))
         evidence_key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
         if evidence_run_id is not None:
+            if evidence_group_id is not None:
+                group = self._delivery_group(evidence_group_id)
+                group["members"][str(message_id)] = False
+                self._save_delivery_group(evidence_group_id, group)
+                self.store.set_state(EVIDENCE_MEMBER_PREFIX + str(message_id), evidence_group_id)
             self.store.set_state(evidence_key, evidence_run_id)
         try:
             await self.transport.send_text(self.settings["handle"], text)
+        except asyncio.CancelledError:
+            self.store.mark_unconfirmed(message_id)
+            self._mark_evidence_unknown(message_id)
+            raise
         except DeliveryUnknown as error:
             self.store.mark_unconfirmed(message_id)
             self._mark_evidence_unknown(message_id)
@@ -495,6 +544,11 @@ class ImessageBridge:
             logging.warning("iMessage balonu gönderilemedi",
                             extra={"message_id": message_id, **_send_failure_fields(error)})
             raise
+        archived = self.store.message(message_id)
+        if propagate_unknown and archived is not None and archived["delivery"] == "unconfirmed":
+            # A sweep can expire this pending message while send_text awaits its
+            # response. Acceptance arriving later does not restore certainty.
+            raise DeliveryUnknown("Gönderim yanıtı beklenirken teslim doğrulaması zaman aşımına uğradı.")
         return message_id
 
     # --- sohbet ---
@@ -628,7 +682,7 @@ class ImessageBridge:
         sent_ids: List[int] = tracked_ids if tracked_ids is not None else []
 
         async def send_bubble(bubble: str) -> None:
-            sent_ids.append(await self._send(bubble, kind))
+            sent_ids.append(await self._send(bubble, kind, propagate_unknown=True))
             if not first_sent:
                 first_sent.append(time.monotonic())
 
@@ -952,11 +1006,43 @@ class ImessageBridge:
 
     async def _present_report(self, outcome: delegate.TaskOutcome) -> None:
         report = outcome["report"]
-        text = self._report_text(outcome)
+        chunks = final_chunks(self._report_text(outcome))
+        run_id = self._evidence_run_id(report)
         async with self.chat_lock:
-            await self._send(
-                text, "task_report", evidence_run_id=self._evidence_run_id(report), propagate_unknown=True,
-            )
+            group_id = uuid.uuid4().hex if run_id else None
+            if group_id:
+                self._save_delivery_group(group_id, {
+                    "run_id": run_id, "expected": len(chunks), "members": {}, "sealed": False, "unknown": False,
+                })
+            for index, chunk in enumerate(chunks):
+                try:
+                    if group_id and self._delivery_group(group_id)["unknown"]:
+                        raise DeliveryUnknown("Raporun önceki parçasının teslimi doğrulanamadı.")
+                    if self._is_closing():
+                        raise DeliveryUnknown("Rapor teslimi tamamlanmadan köprü kapandı.")
+                    await self._send(chunk, "task_report", evidence_run_id=run_id,
+                                     evidence_group_id=group_id, propagate_unknown=True)
+                except DeliveryUnknown:
+                    if group_id:
+                        self._mark_group_unknown(group_id)
+                    raise
+                except ImsgError as error:
+                    confirmed = group_id and any(self._delivery_group(group_id)["members"].values())
+                    if index or confirmed:
+                        if group_id:
+                            self._mark_group_unknown(group_id)
+                        raise DeliveryUnknown("Raporun yalnız bir bölümü gönderildi.") from error
+                    raise
+                except BaseException:
+                    # Cancellation or a transport interruption may have reached the recipient.
+                    if group_id:
+                        self._mark_group_unknown(group_id)
+                    raise
+            if group_id:
+                group = self._delivery_group(group_id)
+                group["sealed"] = True
+                self._save_delivery_group(group_id, group)
+                self._finish_evidence_group(group_id)
 
     async def _interim_after(self, seconds: float) -> None:
         await asyncio.sleep(seconds)

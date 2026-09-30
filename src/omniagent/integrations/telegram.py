@@ -31,6 +31,7 @@ from omniagent.config import (
 )
 from omniagent.core import schedule
 from omniagent.core.conversation import Exchange, trim_history
+from omniagent.core.evidence import EvidenceStore
 from omniagent.core.events import (
     AWAITING_APPROVAL_CODE, AWAITING_DIRECTION_CODE, AgentEvent, compact_count, provider_fallback_text, tool_label,
 )
@@ -401,7 +402,7 @@ def event_text(event: AgentEvent) -> str:
         metrics = event["metrics"]
         mark = "✓" if event["success"] else "✗"
         return (
-            f"\n{mark} {event['outcome'][:1200]}\n"
+            f"\n{mark} {event['outcome']}\n"
             f"{metrics['elapsed_seconds']:.1f} sn · {metrics['turns']} tur · "
             f"{metrics['tool_calls']} araç · {metrics['backend']}\n"
             f"Token: giriş {metrics['prompt_tokens']}, önbellek {metrics['cached_tokens']}, "
@@ -1316,12 +1317,23 @@ class TelegramBridge:
             if verbose:
                 if not saw_finished:
                     await stream.append(
-                        f"\n{'✓' if report['success'] else '✗'} {report['outcome'][:1200]}\n"
+                        f"\n{'✓' if report['success'] else '✗'} {report['outcome']}\n"
                     )
             else:
                 if send_final_screenshot and final_screenshot is not None:
                     await self._send_screenshot(stream, final_screenshot)
                 await compact.finish(report)
+            # append() may leave the last verbose page behind the edit throttle.
+            # Every final API send/edit must succeed before evidence is delivered.
+            if verbose:
+                await stream.flush(force=True)
+            evidence = report.get("evidence")
+            if isinstance(evidence, dict) and isinstance(evidence.get("run_id"), str):
+                try:
+                    EvidenceStore(options["state_file"]).mark_delivered(evidence["run_id"])
+                except (OSError, ValueError) as error:
+                    logging.warning("Telegram evidence teslimi doğrulanamadı",
+                                    extra={"error_type": type(error).__name__})
             self.history = trim_history(self.history + [report["exchange"]])
             save_json(history_path(), self.history)
         except (HostBusyError, TelegramError) as error:

@@ -65,6 +65,7 @@ from omniagent.ui.appearance import (
     save_appearance, validate_appearance,
 )
 from omniagent.core.conversation import Exchange, make_exchange, trim_history
+from omniagent.core.evidence import EvidenceStore
 from omniagent.ui.attention import (
     ALERT_NOTIFY, ALERT_RAISE, input_alert_action, notify_input_required, request_user_attention,
 )
@@ -2324,7 +2325,11 @@ class OmniUI(ctk.CTk):
             self._turn_streamed_chars = 0
             self._activity_verb = "Düşünüyor"
             self.model_label.configure(text=self._model_text(event["backend"]))
-        elif event["kind"] == "text_delta" and self._turn is not None:
+        elif event["kind"] == "text_delta":
+            # Shared chat/investigation publishes one verified final without the
+            # legacy agent's turn_started lifecycle event.
+            if self._turn is None:
+                self._turn = {"number": 0, "text_region": None, "reasoning_region": None, "tools": {}}
             region: str = self._text_region()
             self._raw_text[region] = self._raw_text.get(region, "") + event["text"]
             self._pending_text[region] = self._pending_text.get(region, "") + event["text"]
@@ -2998,6 +3003,7 @@ class OmniUI(ctk.CTk):
         started_at = utc_now_iso()
         # Kanıtlı hafıza: kullanıcının hedef metni. Bağlantı iş parçacığında açılıp kapanır; hata görevi durdurmaz.
         await asyncio.to_thread(record_user_message, "desktop", goal, utc_now_iso())
+        self._evidence_state_file = options.get("state_file", STATE_FILE)
         options = {**options, "task_context": async_host_task_lock_preempting}
         try:
             report = await run_agent_with_callback(goal, self._post, options, self._clients)
@@ -3186,6 +3192,15 @@ class OmniUI(ctk.CTk):
         self._settle_running_tool_views()
         self._close_tool_group()
         self._end_live_regions()
+        # The coordinator's final can still be buffered in the typewriter. Render
+        # the complete authoritative region before taking the delivery snapshot.
+        final_presented = False
+        region = self._turn.get("text_region") if self._turn else None
+        if (report is not None and not error and region and self._region_bounds(region)
+                and self._raw_text.get(region, "").strip() == str(report.get("outcome", "")).strip()):
+            self._pending_text[region] = ""
+            self._finish_streaming(region)
+            final_presented = True
         self.backend_menu.configure(state="normal")
         self.mode_menu.configure(state="normal")
         self.voice_btn.configure(
@@ -3209,7 +3224,7 @@ class OmniUI(ctk.CTk):
         self._set_chat_outcome(OUTCOME_STOPPED if stopped else OUTCOME_DONE if success else OUTCOME_FAILED)
         self._save_catalog()
         self._refresh_chat_list()
-        self._request_chat_save()
+        self._request_chat_save(report if final_presented else None)
         if self._clients_stale:
             # Görev sürerken kaydedilen anahtarlar biter bitmez uygulanır. Patlayabilecek işlem
             # en sona alındı: arayüz durumu yukarıda zaten geri yüklendi, hata arayüzü kilitlemez.
@@ -3295,12 +3310,26 @@ class OmniUI(ctk.CTk):
         self._chat_write = future
         return future
 
-    def _request_chat_save(self) -> None:
+    def _request_chat_save(self, delivered_report: Optional[RunReport] = None) -> None:
         """Sohbeti arka plan yazıcısına verir; diske yazma BEKLENMEZ, sonuç sonraki karede uygulanır."""
         snapshot: Optional[ChatRecord] = self._snapshot_chat()
         if snapshot is None:
             return
-        self._watch_chat_write(self._submit_chat_write(snapshot))
+        future = self._submit_chat_write(snapshot)
+        self._watch_chat_write(future)
+        evidence = delivered_report.get("evidence") if delivered_report else None
+        if isinstance(evidence, dict) and isinstance(evidence.get("run_id"), str):
+            run_id = evidence["run_id"]
+            state_file = getattr(self, "_evidence_state_file", STATE_FILE)
+            def confirm(done: "Future[None]") -> None:
+                if done.cancelled() or done.exception() is not None:
+                    return
+                try:
+                    EvidenceStore(state_file).mark_delivered(run_id)
+                except (OSError, ValueError) as error:
+                    logging.warning("Masaüstü evidence teslimi doğrulanamadı",
+                                    extra={"error_type": type(error).__name__})
+            future.add_done_callback(confirm)
 
     def _watch_chat_write(self, future: "Future[None]") -> None:
         """Yazma bitince sonucu (hata bildirimi ya da bildirimin temizlenmesi) Tk thread'ine taşır."""
