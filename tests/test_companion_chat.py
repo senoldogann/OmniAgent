@@ -211,9 +211,9 @@ async def test_promised_task_is_recovered_with_one_tool_only_call(monkeypatch: p
 def test_textual_tool_call_is_stripped_and_its_goal_captured() -> None:
     """gemma4 bazen aracı metne yazıyor: etiket kullanıcıya gitmez, start_task hedefi yakalanır."""
     assert chat.textual_start_task('bir bakayım hemen <call:start_task goal="FB başkanını bul."> </call>') == (
-        "bir bakayım hemen", "FB başkanını bul.")
+        "bir bakayım hemen ", "FB başkanını bul.")
     assert chat.textual_start_task("bakıyorum <call:start_task goal='fb başkanı kim araştır' />") == (
-        "bakıyorum", "fb başkanı kim araştır")
+        "bakıyorum ", "fb başkanı kim araştır")
     assert chat.textual_start_task('<call:web_search query="x" />') == ("", None)
     assert chat.textual_start_task("selam naber") == ("selam naber", None)
 

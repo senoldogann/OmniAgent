@@ -288,7 +288,8 @@ def recall_follow_up(messages: List[ChatMessage], bubbles: List[str], calls: Lis
 def textual_start_task(line: str) -> Tuple[str, Optional[str]]:
     """
     Satırdaki metinsel araç çağrısı etiketlerini siler; start_task etiketinin goal'ünü döner (yoksa None).
-    Etiket kullanıcıya balon olarak gitmez; bilinmeyen araç etiketi silinir ve çalıştırılmaz. Saf.
+    Etiket kullanıcıya balon olarak gitmez; bilinmeyen araç etiketi silinir ve çalıştırılmaz.
+    Etiket dışındaki boşluk, girinti ve sekmeler aynen korunur. Saf.
     """
     goal: Optional[str] = None
     for match in _TEXTUAL_CALL.finditer(line):
@@ -296,7 +297,7 @@ def textual_start_task(line: str) -> Tuple[str, Optional[str]]:
         if goal is None and match.group("name") == "start_task" and attribute is not None:
             found: str = (attribute.group("double") or attribute.group("single") or "").strip()
             goal = found or None
-    visible: str = " ".join(_TEXTUAL_CALL.sub(" ", line).split())
+    visible: str = _TEXTUAL_CALL.sub("", line)
     return visible, goal
 
 
