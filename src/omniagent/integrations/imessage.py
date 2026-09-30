@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -41,11 +42,19 @@ from omniagent.integrations.imsg import (
     DeliveryUnknown, ImsgClient, ImsgError, ImsgProcessError, ImsgRpcError, IncomingMessage, SendResult, imsg_command,
 )
 from omniagent.integrations.runtime import DeliveryFailed, IntegrationStopped, boolean_field, read_json, save_json
-from omniagent.memory.personal import ArchivedMessage, PersonalStore, to_utc_iso, utc_iso
+from omniagent.memory import learning
+from omniagent.memory.channels import memory_command_reply
+from omniagent.memory.personal import (
+    RECALL_LIMIT, ArchivedMessage, ChatToolCall, PersonalStore, local_timezone, to_utc_iso, utc_iso,
+)
+from omniagent.memory.profile import (
+    MemoryCommand, companion_profile_block, forget_reply, memory_status_line, parse_memory_command, recall_lines,
+    task_lines,
+)
 from omniagent.memory.user import load_memory, memory_prompt_block
 from omniagent.paths import (
-    companion_db_file, data_root, imessage_history_file, imessage_settings_file, persona_file, project_root,
-    user_memory_file,
+    companion_db_file, data_root, imessage_history_file, imessage_settings_file, memory_learning_lock_file,
+    persona_file, project_root, user_memory_file,
 )
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 from omniagent.platform.macos.launch_agent import LaunchAgentError
@@ -58,9 +67,14 @@ SWEEP_SECONDS: float = 30.0
 RESTART_DELAYS_SECONDS: Tuple[float, ...] = (1.0, 2.0, 4.0)
 STABLE_CONNECTION_SECONDS: float = 60.0
 CLOSE_TASK_TIMEOUT_SECONDS: float = 5.0
+RECENT_TASKS: int = 5  # [DURUM]'da gösterilen son iş sayısı (tüm kanallar)
 BUSY_TEXT: str = "elimde bir iş var şu an, bitince bakarım (ya da 'dur' yaz)"
 # Model iş sözü verdi ama düzeltme çağrısında da iş başlatmadı: söz tutulamadığı dürüstçe söylenir.
 PROMISE_FAILED_TEXT: str = "pardon, işi başlatamadım; bir daha yazar mısın?"
+# Kullanıcı unutmayı istedi, model "unuttum" dedi ama düzeltme çağrısında da forget çağırmadı: dürüstçe söylenir.
+FORGET_FAILED_TEXT: str = (
+    "pardon, aslında hiçbir şeyi silmedim; hangisini unutayım? 'unut <numara>' yazabilirsin (/hafıza listeler)"
+)
 HOST_BUSY_TEXT: str = "bilgisayarda başka bir iş çalışıyor (masaüstü ya da telegram), o bitince tekrar söyler misin?"
 
 
@@ -192,6 +206,10 @@ class ImessageBridge:
         if command is not None:
             await self._command(command)
             return
+        memory_command: Optional[MemoryCommand] = parse_memory_command(text) if text else None
+        if memory_command is not None:
+            await self._memory_command(memory_command)
+            return
         if text and self.question is not None and await self._answer_question(text):
             return
         self.burst_ids.append(message_id)
@@ -228,7 +246,20 @@ class ImessageBridge:
         today = self.store.activities_since(midnight)
         lines: List[str] = status_lines(self.task_goal or None, self.task_progress, len(today),
                                         sum(item["tokens"] for item in today), self.store.latency_p50())
+        lines = lines + [memory_status_line(len(self.store.active_facts()), self.store.learning_failure(),
+                                            local_timezone())]
         await self._send("\n".join(lines), "chat")
+
+    async def _memory_command(self, command: MemoryCommand) -> None:
+        """
+        /hafıza ve unut N: kullanıcının doğrudan komutu, onay istemez. Unutma cevap balonuna bağlanır; böylece geçmişte
+        gerçek forget çağrısı olarak görünür.
+        """
+        reply: str = memory_command_reply(self.store, command, local_timezone())
+        message_id: int = await self._send(reply, "chat")
+        if command["action"] == "forget" and command["fact_id"] is not None:
+            self._mark_memory_calls([{"name": "forget", "arguments": json.dumps({"fact_id": command["fact_id"]}),
+                                      "result": reply}], [message_id])
 
     def _cancel_question(self, error: BaseException) -> None:
         question: Optional[PendingQuestion] = self.question
@@ -347,11 +378,12 @@ class ImessageBridge:
             messages: List[chat.ChatMessage] = self._history(history) + [{"role": "user", "content": turn}]
             reply: Optional[ModelReply] = await self._respond(messages, chat.CHAT_TOOLS, burst_end, "chat")
             if reply is not None:
-                await self._delegate(reply, messages, images)
+                await self._act(reply, messages, "\n".join(texts), images, burst_end)
 
     def _history(self, history: List[ArchivedMessage]) -> List[chat.ChatMessage]:
-        """Arşivi, iş başlatan balonları gerçek araç çağrısı olarak gösteren sohbet geçmişine çevirir."""
-        return chat.history_messages(history, self.store.task_starts([item["id"] for item in history]))
+        """Arşivi, iş başlatan balonları ve hafıza çağrılarını gerçek araç çağrısı olarak gösteren geçmişe çevirir."""
+        ids: List[int] = [item["id"] for item in history]
+        return chat.history_messages(history, self.store.task_starts(ids), self.store.chat_tool_calls(ids))
 
     async def _respond(self, messages: List[chat.ChatMessage], tools: List[Dict[str, object]], burst_end: Optional[float],
                        kind: str) -> Optional[ModelReply]:
@@ -385,6 +417,112 @@ class ImessageBridge:
             logging.info("iMessage ilk balon gecikmesi",
                          extra={"latency_ms": round(latency_ms), "backend": self.settings["chat_backend"]})
         return {"result": result, "sent_ids": sent_ids}
+
+    async def _act(self, reply: ModelReply, messages: List[chat.ChatMessage], user_text: str, images: List[str],
+                   burst_end: Optional[float]) -> None:
+        """
+        Kullanıcı turunun eylemleri. Rapor turu buraya gelmez, çünkü girdisi web içeriği olabilir.
+        1) Unutma: istenen bilgiler unutulur. Kullanıcı unutmayı istediği hâlde model forget çağırmadan "unuttum"
+           dediyse tek düzeltme çağrısı yapılır; yine çağırmazsa bu dürüstçe söylenir.
+        2) Arama: recall istendiyse sonucu gerçek araç çağrısı + sonuç olarak verilir ve model bir kez daha çağrılır.
+           İş kararı o turdan verilir; ilk turdaki "bakayım" aramayla tutulmuş sözdür. İkinci turdaki recall yok sayılır.
+           Hafıza çağrıları yanıtın ilk balonuna bağlanır, böylece sonraki turların geçmişinde gerçek çağrı görünür.
+        3) İş kararı: `_delegate`.
+        """
+        result: chat.ChatResult = reply["result"]
+        calls, host_ids = await self._forget_facts(await self._forget_ids(result, messages, user_text))
+        sent: List[int] = list(reply["sent_ids"]) + host_ids
+        query: Optional[str] = result.get("recall")
+        if query is None:
+            self._mark_memory_calls(calls, sent)
+            await self._delegate(reply, messages, images)
+            return
+        calls.append(self._recall_call(query))
+        follow_up: List[chat.ChatMessage] = chat.recall_follow_up(messages, result["bubbles"], calls)
+        # Balon ilk kez bu turda gidiyorsa gecikme ölçümü burst bitişinden buraya kadardır.
+        second: Optional[ModelReply] = await self._respond(follow_up, chat.CHAT_TOOLS, None if sent else burst_end,
+                                                           "chat")
+        if second is None:
+            self._mark_memory_calls(calls, sent)
+            return
+        if second["result"].get("recall") is not None:
+            logging.warning("Sohbet modeli hafıza aramasını yineledi; ikinci arama yapılmadı", extra={"turn": 2})
+        # İkinci turdaki "unuttum" sözü de ilk turla aynı korumadan geçer (arama sonrası söz tutulmadan kalmasın).
+        more_calls, more_ids = await self._forget_facts(await self._forget_ids(second["result"], follow_up, user_text))
+        self._mark_memory_calls(calls + more_calls, sent + list(second["sent_ids"]) + more_ids)
+        final: ModelReply = {
+            "result": {"bubbles": second["result"]["bubbles"],
+                       "start_task": second["result"]["start_task"] or result["start_task"]},
+            "sent_ids": list(second["sent_ids"]),
+        }
+        await self._delegate(final, follow_up, images)
+
+    async def _forget_ids(self, result: chat.ChatResult, messages: List[chat.ChatMessage], user_text: str) -> List[int]:
+        """
+        Turun unutma kimlikleri. Kullanıcı unutmayı istediği hâlde model forget çağırmadan "unuttum" dediyse tek düzeltme
+        çağrısı yapılır; yine çağırmazsa bu dürüstçe söylenir ve hiçbir şey silinmez.
+        """
+        forget_ids: List[int] = list(result.get("forget", []))
+        if (not forget_ids and chat.forget_requested(user_text)
+                and any(chat.claims_forgotten(bubble) for bubble in result["bubbles"])):
+            forget_ids = await self._recover_forget(messages, result["bubbles"])
+            if not forget_ids:
+                await self._send(FORGET_FAILED_TEXT, "chat")
+        return forget_ids
+
+    async def _forget_facts(self, fact_ids: List[int]) -> Tuple[List[ChatToolCall], List[int]]:
+        """
+        Unutma isteklerini uygular; geçmiş için çağrı kayıtlarını ve gönderilen host balonlarının kimliklerini döner.
+        Her sonuç kullanıcıya host metniyle bildirilir, unutulan bilginin ifadesiyle: unutma geri alınamaz ve modelin
+        balonu hangi bilginin silindiğini söylemeyebilir.
+        """
+        statements: Dict[int, str] = (
+            {fact["id"]: fact["statement"] for fact in self.store.active_facts()} if fact_ids else {}
+        )
+        calls: List[ChatToolCall] = []
+        sent: List[int] = []
+        for fact_id in fact_ids:
+            forgotten: bool = self.store.forget_fact(fact_id, utc_iso(datetime.now(timezone.utc)))
+            statement: Optional[str] = statements.get(fact_id)
+            reply: str = (f"#{fact_id} unutuldu: {statement}" if forgotten and statement is not None
+                          else forget_reply(fact_id, forgotten))
+            logging.info("Deniz unutma isteğini uyguladı", extra={"fact_id": fact_id, "forgotten": forgotten})
+            sent.append(await self._send(reply, "chat"))
+            calls.append({"name": "forget", "arguments": json.dumps({"fact_id": fact_id}), "result": reply})
+        return calls, sent
+
+    def _recall_call(self, query: str) -> ChatToolCall:
+        """Tüm kanalların mesajlarında ve etkin bilgilerde arama; sonuç ikinci turun araç sonucudur."""
+        lines: List[str] = recall_lines(self.store.recall(query, RECALL_LIMIT), local_timezone())
+        logging.info("Deniz kanıtlı hafızada aradı", extra={"hits": len(lines), "query_chars": len(query)})
+        return {"name": "recall", "arguments": json.dumps({"query": query}, ensure_ascii=False),
+                "result": chat.recall_result(query, lines)}
+
+    def _mark_memory_calls(self, calls: List[ChatToolCall], sent: List[int]) -> None:
+        """Hafıza çağrılarını yanıtın ilk balonuna bağlar; sonraki turların geçmişinde gerçek çağrı + sonuç görünür."""
+        if not calls:
+            return
+        if not sent:
+            logging.warning("Hafıza çağrısı geçmişe bağlanamadı: yanıtta balon yok", extra={"calls": len(calls)})
+            return
+        for call in calls:
+            self.store.record_chat_tool_call(sent[0], call)
+
+    async def _recover_forget(self, messages: List[chat.ChatMessage], bubbles: List[str]) -> List[int]:
+        """'Unuttum' deyip forget çağırmayan modelden tek düzeltme çağrısıyla kimlikleri alır; model hatası boş liste."""
+        try:
+            fact_ids: List[int] = await chat.recover_promised_forget(
+                self.chat_clients, self.settings["chat_backend"], self._system_prompt(), messages, bubbles,
+                self._is_closing, self.session_id,
+            )
+        except (ModelCallFailed, FallbackNotPermitted) as error:
+            logging.error("Unutma sözü düzeltme çağrısı başarısız",
+                          extra={"backend": self.settings["chat_backend"], "error_type": type(error).__name__})
+            return []
+        if not fact_ids:
+            logging.warning("Sohbet modeli unuttum dedi, düzeltme çağrısında da forget çağırmadı",
+                            extra={"bubbles": len(bubbles)})
+        return fact_ids
 
     async def _delegate(self, reply: ModelReply, messages: List[chat.ChatMessage], images: List[str]) -> None:
         """
@@ -424,12 +562,16 @@ class ImessageBridge:
         return goal
 
     def _system_prompt(self) -> str:
-        return persona.system_prompt(self.persona_text, memory_prompt_block(load_memory(str(user_memory_file()))))
+        """Sabit önek: kurallar, karakter, USER MEMORY ve KANITLI PROFİL (önek yalnız bilgiler değişince değişir)."""
+        memory: str = memory_prompt_block(load_memory(str(user_memory_file())))
+        return persona.system_prompt(self.persona_text,
+                                     memory + companion_profile_block(self.store.active_facts(), local_timezone()))
 
     def _situation(self) -> str:
         pending: Optional[str] = self.question["title"] if self.question is not None else None
-        return persona.situation_block(datetime.now().astimezone(), self.task_goal or None, self.task_progress,
-                                       pending)
+        now_local: datetime = datetime.now().astimezone()
+        return persona.situation_block(now_local, self.task_goal or None, self.task_progress, pending,
+                                       task_lines(self.store.recent_tasks(RECENT_TASKS), now_local))
 
     def _is_closing(self) -> bool:
         return self.closing
@@ -486,7 +628,7 @@ class ImessageBridge:
     async def _fail_task(self, goal: str, failure: str, started_at: str) -> None:
         """Koşamayan ya da çöken işi (meşgul bilgisayar, beklenmedik hata) etkinlik günlüğüne yazar ve kullanıcıya söyler."""
         self.store.record_activity({
-            "kind": "task", "origin": "user", "goal": goal, "rationale": "", "outcome": failure[:2000],
+            "kind": "task", "origin": "user", "channel": "imessage", "goal": goal, "rationale": "", "outcome": failure[:2000],
             "success": False, "started_at": started_at, "finished_at": utc_iso(datetime.now(timezone.utc)),
             "tokens": 0,
         })
@@ -497,7 +639,7 @@ class ImessageBridge:
         self.history = trim_history(self.history + [report["exchange"]])
         save_json(imessage_history_file(), self.history)
         self.store.record_activity({
-            "kind": "task", "origin": "user", "goal": outcome["goal"], "rationale": "",
+            "kind": "task", "origin": "user", "channel": "imessage", "goal": outcome["goal"], "rationale": "",
             "outcome": report["outcome"][:2000], "success": report["success"], "started_at": outcome["started_at"],
             "finished_at": outcome["finished_at"], "tokens": outcome["tokens"],
         })
@@ -513,6 +655,12 @@ class ImessageBridge:
             # olmadan iş başlatmak dolaylı istem enjeksiyonu yolu olur. Söz koruması da yalnız kullanıcı turundadır.
             # Hedef metni loglanmaz, yalnız sayı.
             logging.warning("İş raporu turunda sohbet modeli yeni iş istedi; yok sayıldı", extra={"ignored_tasks": 1})
+        if reply is not None and (reply["result"].get("recall") is not None or reply["result"].get("forget")):
+            # Hafıza araçları da yalnız kullanıcı turunda çalışır. Rapor turu araçsızdır ama metne yazılmış çağrı yine
+            # ayrıştırılır; rapor girdisi (web içeriği olabilir) kullanıcının bilgisini unutturamaz ya da arama turu
+            # açamaz. İçerik loglanmaz.
+            logging.warning("İş raporu turunda sohbet modeli hafıza aracı istedi; yok sayıldı",
+                            extra={"ignored_calls": 1})
 
     async def _interim_after(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -523,6 +671,10 @@ class ImessageBridge:
         self.task_progress = (self.task_progress + [line])[-delegate.PROGRESS_LIMIT:]
 
     # --- bakım ---
+
+    def memory_backend(self) -> Optional[str]:
+        """Öğrenme hattının modeli: imessage.json'daki memory_backend (her zaman yapılandırılmış)."""
+        return self.settings["memory_backend"]
 
     async def sweep_forever(self) -> None:
         """İzlemede görülmeyen balonları süre dolunca 'unconfirmed' yapar ve uyarır."""
@@ -631,6 +783,7 @@ async def _serve(store: PersonalStore) -> None:
     bridge = ImessageBridge(session, settings, store, chat_clients, persona_text, f"imessage-{uuid.uuid4().hex}")
     keep_awake: Optional["subprocess.Popen[bytes]"] = None
     sweeper: Optional[asyncio.Task[None]] = None
+    learner: Optional[asyncio.Task[None]] = None
     try:
         if settings["chat_backend"] not in chat_clients:
             raise ImessageConfigError(
@@ -640,12 +793,18 @@ async def _serve(store: PersonalStore) -> None:
         ensure_messages_running()
         keep_awake = start_keep_awake(os.getpid())
         sweeper = asyncio.create_task(bridge.sweep_forever())
+        # Kanıtlı hafıza öğrenme hattı: Telegram köprüsüyle ortak kilit ve imleç, kilidi alan köprü turu çalıştırır.
+        learner = asyncio.create_task(
+            learning.learning_loop(bridge.memory_backend, store.path, memory_learning_lock_file()))
         await session.listen(bridge)
     finally:
         stop_keep_awake(keep_awake)
         if sweeper is not None:
             sweeper.cancel()
             await asyncio.gather(sweeper, return_exceptions=True)
+        if learner is not None:
+            learner.cancel()
+            await asyncio.gather(learner, return_exceptions=True)
         await bridge.close()
         await close_model_clients(chat_clients)
 

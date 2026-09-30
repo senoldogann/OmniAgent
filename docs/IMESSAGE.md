@@ -26,7 +26,10 @@ iPhone'daki "Yeni konuşmaları şuradan başlat" adresini (telefon ↔ e-posta)
 ## Komutlar
 
 - `dur` ya da `/dur`: çalışan işi durdurur.
-- `/durum`: çalışan iş, bugünkü işler ve token, cevap gecikmesi medyanı.
+- `/durum`: çalışan iş, bugünkü işler ve token (tüm kanallar), cevap gecikmesi medyanı, kanıtlı hafıza ve son
+  öğrenme hatası.
+- `/hafıza`: kanıtlı hafızadaki etkin bilgiler, numaralarıyla.
+- `unut <numara>` ya da `/unut <numara>`: o bilgiyi unutur (istemden ve aramadan çıkar).
 
 ## Faz A canlı kontrol listesi
 
@@ -42,3 +45,22 @@ iPhone'daki "Yeni konuşmaları şuradan başlat" adresini (telefon ↔ e-posta)
 - [ ] Mesaj yazarken `launchctl kickstart -k gui/$(id -u)/com.omniagent.imessage` → mesaj kaybolmuyor, iki kez
       cevaplanmıyor (ölçüt 4).
 - [ ] Başka bir numaradan ajana yazınca cevap yok ve `companion.db`'de iz yok (ölçüt 2).
+
+## Faz B+ canlı kontrol listesi
+
+- [ ] Telegram'a "kızımın adı Ela" yaz; 3–4 dk sonra iMessage'da Deniz'e "kızımın adı neydi?" diye sor. Deniz Ela'yı
+      bilir ve `/hafıza`'da `[#N] … — "kızımın adı Ela"` satırı görünür (kabul a).
+- [ ] Deniz'e "cuma İzmir'e gidiyorum" yaz; Telegram'a "İzmir'e ne zaman gidiyordum?" yaz. Ajan `personal_memory`
+      ile birebir alıntıyı bulur (kabul b).
+- [ ] Telegram'a uydurma bir token içeren hedef yaz (`ghp_` + 20 karakter). Ardından
+      `sqlite3 ~/Library/Application\ Support/OmniAgent/companion.db "select count(*) from messages where text like '%ghp_%'"`
+      çıktısı `0` olmalı (kabul c).
+- [ ] İki köprü açıkken 20'den fazla mesaj yaz. `/hafıza`'da aynı bilgi bir kez görünür; köprü günlüklerinde tek
+      "Hafıza öğrenme turu tamamlandı", diğer köprüde "atlandı" satırı vardır (kabul d).
+- [ ] `unut <numara>` bilgiyi `/hafıza`'dan çıkarır. Deniz'e "şunu unut" deyince bilgi gerçekten silinir; silinmezse
+      Deniz bunu açıkça söyler.
+- [ ] Masaüstünde bir görev bitince Deniz'e "az önce masaüstünde ne yaptım?" diye sor. Deniz [DURUM]'daki
+      "masaüstünden" satırıyla cevaplar.
+- [ ] `/durum` "hafıza: N bilgi" satırını gösterir. Öğrenme hatası varsa zamanı ve türü de yazar.
+- [ ] `OMNI_LIVE_COMPANION=1 OMNI_LIVE_MEMORY_BACKEND=<memory_backend> uv run python -m pytest tests/test_memory_live.py -v`
+      → PASS.

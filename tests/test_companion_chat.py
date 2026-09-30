@@ -10,7 +10,7 @@ from omniagent.app.model_runtime import ZERO_USAGE
 from omniagent.app.types import ModelTurn, ToolCallDraft
 from omniagent.companion import chat
 from omniagent.core.events import AgentEvent
-from omniagent.memory.personal import ArchivedMessage
+from omniagent.memory.personal import ArchivedMessage, ChatToolCall
 
 
 def scripted_model(chunks: List[str], tool_calls: List[ToolCallDraft]) -> Callable[..., object]:
@@ -102,7 +102,7 @@ def test_history_merges_consecutive_bubbles() -> None:
         {"id": 2, "direction": "in", "kind": "chat", "text": "naber", "created_at": "t2", "delivery": None},
         {"id": 3, "direction": "out", "kind": "chat", "text": "iyiyim", "created_at": "t3", "delivery": "sent"},
     ]
-    assert chat.history_messages(history, {}) == [
+    assert chat.history_messages(history, {}, {}) == [
         {"role": "user", "content": "selam\nnaber"}, {"role": "assistant", "content": "iyiyim"},
     ]
 
@@ -118,7 +118,7 @@ def test_history_shows_delegation_as_a_real_tool_call_and_drops_orphan_acks() ->
         {"id": 5, "direction": "out", "kind": "chat", "text": chat.TASK_ACK, "created_at": "t5", "delivery": "sent"},
         {"id": 6, "direction": "out", "kind": "chat", "text": "dur bir bakayım", "created_at": "t6", "delivery": "sent"},
     ]
-    messages = chat.history_messages(history, {2: "Masaüstündeki dosyaları listele"})
+    messages = chat.history_messages(history, {2: "Masaüstündeki dosyaları listele"}, {})
     call = messages[1]["tool_calls"][0]  # type: ignore[index]
     assert messages[1]["content"] == "bakıyorum hemen" and call["function"]["name"] == "start_task"
     assert json.loads(call["function"]["arguments"]) == {"goal": "Masaüstündeki dosyaları listele"}
@@ -203,7 +203,7 @@ async def test_toolless_turn_sends_history_without_tool_call_structure(monkeypat
     history = chat.history_messages([
         {"id": 1, "direction": "in", "kind": "chat", "text": "masaüstümde ne var", "created_at": "t1", "delivery": None},
         {"id": 2, "direction": "out", "kind": "chat", "text": "bakıyorum", "created_at": "t2", "delivery": "sent"},
-    ], {2: "Masaüstünü listele"})
+    ], {2: "Masaüstünü listele"}, {})
 
     async def send(bubble: str) -> None:
         return None
@@ -212,3 +212,82 @@ async def test_toolless_turn_sends_history_without_tool_call_structure(monkeypat
                        send, lambda: False, "test")
     assert all("tool_calls" not in message and message["role"] != "tool" for message in seen[0])
     assert {"role": "assistant", "content": "bakıyorum"} in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_memory_tool_calls_are_returned_and_textual_ones_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
+    recall_call: ToolCallDraft = {"id": "r1", "name": "recall", "arguments": json.dumps({"query": "İzmir"})}
+    forget_call: ToolCallDraft = {"id": "f1", "name": "forget", "arguments": json.dumps({"fact_id": "#3"})}
+    result, sent = await run(monkeypatch, scripted_model(["bi bakayım\n"], [recall_call, forget_call]))
+    assert sent == ["bi bakayım"] and result["start_task"] is None
+    assert result.get("recall") == "İzmir" and result.get("forget") == [3]
+    line = 'tamam unuttum <call:forget fact_id="4" />\n'
+    result, sent = await run(monkeypatch, scripted_model([line, "RESET", line], []))
+    assert sent == ["tamam unuttum"] and result.get("forget") == [4] and "recall" not in result
+    result, sent = await run(monkeypatch, scripted_model(["<call:recall query='Ela' />"], []))
+    assert sent == [] and result.get("recall") == "Ela"      # yalnız araçlı tur boş yanıt hatası değildir
+
+
+def test_history_shows_memory_calls_before_the_bubble_that_used_them() -> None:
+    history: List[ArchivedMessage] = [
+        {"id": 1, "direction": "in", "kind": "chat", "text": "ben nereye gidiyordum", "created_at": "t1",
+         "delivery": None},
+        {"id": 2, "direction": "out", "kind": "chat", "text": "dur bir bakayım", "created_at": "t2", "delivery": "sent"},
+        {"id": 3, "direction": "out", "kind": "chat", "text": "cuma İzmir'e", "created_at": "t3", "delivery": "sent"},
+    ]
+    calls: Dict[int, List[ChatToolCall]] = {
+        2: [{"name": "recall", "arguments": '{"query": "İzmir"}', "result": "[HAFIZA ARAMASI: İzmir] sonuç"}]}
+    messages = chat.history_messages(history, {}, calls)
+    assert messages[0] == {"role": "user", "content": "ben nereye gidiyordum"}
+    call = messages[1]["tool_calls"][0]  # type: ignore[index]
+    assert messages[1]["content"] == "" and call["function"]["name"] == "recall"
+    assert messages[2] == {"role": "tool", "tool_call_id": call["id"], "content": "[HAFIZA ARAMASI: İzmir] sonuç"}
+    # Çağrısı olan söz balonu sahipsiz söz sayılmaz; sonraki balonla birleşir.
+    assert messages[3] == {"role": "assistant", "content": "dur bir bakayım\ncuma İzmir'e"}
+
+
+def test_recall_follow_up_is_a_real_tool_exchange() -> None:
+    base: List[chat.ChatMessage] = [{"role": "user", "content": "nereye gidiyordum"}]
+    result_text = chat.recall_result("İzmir", ['kullanıcı · telegram · 29.09.2026: "cuma İzmir’e gidiyorum"'])
+    calls: List[ChatToolCall] = [{"name": "recall", "arguments": '{"query": "İzmir"}', "result": result_text}]
+    follow = chat.recall_follow_up(base, ["bi bakayım"], calls)
+    assert follow[0] == base[0] and follow[1]["content"] == "bi bakayım"
+    assert follow[1]["tool_calls"][0]["function"]["name"] == "recall"  # type: ignore[index]
+    assert follow[2]["role"] == "tool" and "cuma İzmir’e gidiyorum" in str(follow[2]["content"])
+    assert "'ajan' satırları" in str(follow[2]["content"])
+    assert chat.recall_follow_up(base, [], calls)[1]["content"] == ""
+    assert base == [{"role": "user", "content": "nereye gidiyordum"}]    # girdi değişmez
+
+
+def test_forget_claim_counts_only_when_the_user_asked() -> None:
+    assert chat.forget_requested("kızımın adını unut") and chat.forget_requested("bunu unutur musun")
+    assert chat.forget_requested("hafızandan sil şunu")
+    assert not chat.forget_requested("unutma bunu") and not chat.forget_requested("unuttun mu")
+    assert chat.claims_forgotten("tamam unuttum") and chat.claims_forgotten("sildim gitti")
+    assert not chat.claims_forgotten("unutmam merak etme")
+
+
+@pytest.mark.asyncio
+async def test_forget_promise_is_recovered_with_one_tool_only_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: List[List[Dict[str, object]]] = []
+
+    async def model(clients: Dict[str, AsyncOpenAI], messages: List[Dict[str, object]], tool_schemas: object,
+                    session_id: str, backend: str, emit: Callable[[AgentEvent], None],
+                    should_stop: Callable[[], bool]) -> Tuple[ModelTurn, str]:
+        seen.append(messages)
+        call: ToolCallDraft = {"id": "f", "name": "forget", "arguments": '{"fact_id": 7}'}
+        return {"content": "", "tool_calls": [call], "finish_reason": "tool_calls", "usage": ZERO_USAGE}, backend
+
+    monkeypatch.setattr(chat, "call_model_with_retries", model)
+    assert await chat.recover_promised_forget({}, "openai", "sistem", [{"role": "user", "content": "Ela'yı unut"}],
+                                              ["tamam unuttum"], lambda: False, "test") == [7]
+    assert seen[0][-2] == {"role": "assistant", "content": "tamam unuttum"}
+    assert seen[0][-1] == {"role": "user", "content": chat.FORGET_CORRECTION}
+
+
+def test_dismissive_idioms_are_not_forget_requests_and_correction_has_an_exit() -> None:
+    """'boşver unut gitsin' gibi deyim unutma isteği değildir; düzeltme notu hiçbir şey silmemeye izin verir."""
+    for text in ("boşver unut gitsin", "neyse unut", "unut gitsin ya", "boş ver unut"):
+        assert not chat.forget_requested(text), text
+    assert chat.forget_requested("kızımın adını unut") and chat.forget_requested("bunu unutur musun")
+    assert "hiçbir araç çağırma" in chat.FORGET_CORRECTION

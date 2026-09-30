@@ -7,7 +7,8 @@ import pytest
 
 from omniagent import approval
 from omniagent.integrations.imessage_settings import (
-    ImessageConfigError, load_settings, normalize_handle, pairing_expired, parse_pairing, parse_settings,
+    ImessageConfigError, load_settings, memory_backend_if_paired, normalize_handle, pairing_expired, parse_pairing,
+    parse_settings,
     save_settings,
 )
 
@@ -77,3 +78,10 @@ def test_imessage_files_are_protected_from_agent_tools() -> None:
     for name in ("imessage.json", "imessage-pairing.json", "persona.md", "imessage-history.json",
                  "companion.db", "companion.db-wal", "companion.db-shm"):
         assert name in approval.PROTECTED_DATA_FILES
+
+
+def test_memory_backend_is_known_only_when_imessage_is_paired(tmp_path: Path) -> None:
+    path = tmp_path / "imessage.json"
+    assert memory_backend_if_paired(path, BACKENDS) is None
+    save_settings(path, parse_settings(valid_settings(), BACKENDS))
+    assert memory_backend_if_paired(path, BACKENDS) == "opencode"

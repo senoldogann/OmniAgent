@@ -27,7 +27,7 @@ async def live_turn(text: str) -> Tuple[chat.ChatResult, List[str]]:
 
     try:
         system = persona.system_prompt(persona.persona_text_for("Deniz"), "")
-        situation = persona.situation_block(datetime.now().astimezone(), None, [], None)
+        situation = persona.situation_block(datetime.now().astimezone(), None, [], None, [])
         result = await chat.respond(clients, backend, system,
                                     [{"role": "user", "content": chat.burst_turn([text], [], situation)}],
                                     chat.CHAT_TOOLS, send, lambda: False, "live-test")

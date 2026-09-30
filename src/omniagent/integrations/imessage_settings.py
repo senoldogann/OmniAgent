@@ -164,6 +164,16 @@ def load_settings(path: Path, backends: Collection[str]) -> ImessageSettings:
     return parse_settings(read_json(path, None), backends)
 
 
+def memory_backend_if_paired(path: Path, backends: Collection[str]) -> Optional[str]:
+    """
+    Kanıtlı hafıza öğrenme hattının modeli (memory_backend). iMessage kurulmamışsa (dosya yok) None döner ve Telegram
+    köprüsünde öğrenme kapalıdır; kodda varsayılan model yok. Geçersiz ayar ImessageConfigError verir.
+    """
+    if not path.exists():
+        return None
+    return load_settings(path, backends)["memory_backend"]
+
+
 def save_settings(path: Path, settings: ImessageSettings) -> None:
     """Ayarları atomik ve 0600 izinle yazar."""
     save_json(path, settings)
