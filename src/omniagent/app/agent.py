@@ -12,6 +12,7 @@ import time
 import uuid
 from datetime import date, datetime, timezone
 from io import BytesIO
+from itertools import count
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, TypedDict, NotRequired
 from urllib.request import urlopen
@@ -130,6 +131,7 @@ from omniagent.app.policy import (
     screenshot_requested,
     source_change_expected,
     unmet_explicit_deletion,
+    explicit_deletion_target,
     unmet_wait_status,
 )
 from omniagent.app.answer_fidelity import (
@@ -473,6 +475,12 @@ def resolve_run_limits(options: RunOptions) -> Tuple[str, int, float]:
     mode: str = options.get("run_mode", "normal")
     if mode not in RUN_MODE_PROFILES:
         raise ValueError(f"Bilinmeyen görev modu: {mode}")
+    if options.get("autonomy") is not None:
+        if options.get("unattended"):
+            raise ValueError("Otonom işler unattended otomatik onay moduyla çalışamaz")
+        if mode != "normal":
+            raise ValueError("Otonom işler normal görev bitiş sözleşmesini kullanır")
+        return mode, 0, float("inf")
     profile: RunModeProfile = RUN_MODE_PROFILES[mode]
     # Testlerin ve mevcut çağıranların MAX_ITERATIONS monkeypatch davranışını koruyoruz.
     default_iterations: int = MAX_ITERATIONS if mode == "normal" else profile["max_iterations"]
@@ -1189,7 +1197,7 @@ async def run_agent_with_callback(
     except (OSError, ValueError) as error:
         return startup_failure(error, DEFAULT_BACKEND)
     continuous: bool = run_mode == CONTINUOUS_MODE
-    max_total_tokens: Optional[int] = options.get("max_total_tokens")
+    max_total_tokens: Optional[int] = None if options.get("autonomy") is not None else options.get("max_total_tokens")
     if continuous and options.get("answer") is None:
         return startup_failure(ValueError(
             "Sürekli mod, soru sorup yanıt bekleyebileceği bir kanal ister (masaüstü uygulaması veya Telegram)."
@@ -1294,6 +1302,7 @@ async def run_agent_with_callback(
             messages.append({"role": "user", "content": episodic_hint})
         service = options.get("integrations") or CapabilityService()
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"), options.get("deliver"))
+        runtime.autonomy = options.get("autonomy")
         if continuous:
             runtime.unattended = bool(options.get("unattended"))
             # Etkileşimli eski akış kullanıcı yanıtını süresiz bekleyebilir.
@@ -1488,7 +1497,10 @@ async def run_agent_with_callback(
         return True
 
     try:
-        for iteration in range(1, max_iterations + 1):
+        deletion_target = explicit_deletion_target(goal) if runtime.autonomy is not None else None
+        if deletion_target is not None:
+            await require_approval("autonomous_goal", approval.deletion_request("autonomous_goal", {"path": str(deletion_target)}))
+        for iteration in (count(1) if runtime.autonomy is not None else range(1, max_iterations + 1)):
             if continuous and options.get("pop_control_messages") is not None:
                 controls = options["pop_control_messages"]()
                 parked_at: float = time.monotonic()
@@ -2408,6 +2420,9 @@ async def run_agent_with_callback(
         else:
             success = False
             reason = f"maksimum iterasyon sayısına ({max_iterations}) ulaşıldı"
+    except (ToolError, IntegrationStopped) as error:
+        outcome, reason = str(error), "durduruldu" if isinstance(error, IntegrationStopped) else str(error)
+        emit({"kind": "notice", "level": "info", "text": outcome})
     except ModelCallFailed as error:
         # Sağlayıcı kesintisi/kota gibi dış nedenle model yanıt vermedi: gerçek kod hatasından ayrı raporlanır.
         logging.exception(

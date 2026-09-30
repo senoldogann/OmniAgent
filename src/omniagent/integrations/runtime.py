@@ -6,7 +6,10 @@ import tempfile
 import time
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar, TypedDict
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Tuple, TypeVar, TypedDict
+
+if TYPE_CHECKING:
+    from omniagent.app.types import AutonomyGuards
 
 from omniagent.approval import APPROVAL_TIMEOUT_SECONDS
 from omniagent.core.events import EventSink
@@ -106,6 +109,7 @@ class IntegrationRuntime:
         # ask_user'ın yanıt bekleme sınırı; sürekli görevde None: kullanıcı yanıtlayana dek bekler.
         self.user_input_timeout: Optional[float] = APPROVAL_TIMEOUT_SECONDS
         self.unattended: bool = False
+        self.autonomy: Optional["AutonomyGuards"] = None
         self.deferred_questions: set[str] = set()
         self.gui_draft_text: str = ""
         self.denied_confirmation_questions: set[str] = set()
@@ -154,6 +158,10 @@ class IntegrationRuntime:
         """
         if self.answer is None or (self.unattended and not allow_unattended):
             raise InteractionRequired(title)
+        if self.autonomy is not None and self.autonomy["quiet_now"]():
+            if title not in self.autonomy["deferred_approvals"]:
+                self.autonomy["deferred_approvals"].append(title)
+            raise TimeoutError("Sessiz saatlerde otonom işin sorusu sabah raporuna bırakıldı.")
         start = time.monotonic()
         self.status("waiting_user", title)
         shown: Dict[str, Any] = fields if timeout is None else {**fields, INPUT_TIMEOUT_FIELD: timeout}

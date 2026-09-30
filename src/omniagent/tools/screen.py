@@ -17,6 +17,7 @@ import cv2
 
 from .system import child_environment, parent_process_name
 from .types import (
+    mark_gui_input,
     ACCESSIBILITY_SETTINGS_URL,
     DISPLAY_WAKE_SECONDS,
     INPUT_PAUSE_SECONDS,
@@ -413,6 +414,7 @@ def click_model_point(x: int, y: int, button: str, geometry: ScreenGeometry) -> 
         raise ToolError(f"Geçersiz fare tuşu: {button} (left/right/middle).", "INVALID_BUTTON", False)
     _check_in_model_space(x, y, geometry)
     px, py = model_to_points(x, y, geometry)
+    mark_gui_input()
     pyautogui.click(px, py, button=button)
     return f"({x}, {y}) konumuna {button} tıklandı."
 
@@ -420,6 +422,7 @@ def move_model_point(x: int, y: int, geometry: ScreenGeometry) -> str:
     """Fareyi ortak uzaydaki noktaya taşır."""
     _check_in_model_space(x, y, geometry)
     px, py = model_to_points(x, y, geometry)
+    mark_gui_input()
     pyautogui.moveTo(px, py)
     return f"Fare ({x}, {y}) konumuna taşındı."
 
@@ -440,6 +443,7 @@ def _post_mouse_event(kind: int, px: float, py: float, button_code: int, click_s
     event = Quartz.CGEventCreateMouseEvent(None, kind, (px, py), button_code)
     if click_state:
         Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, click_state)
+    mark_gui_input()
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
 def multi_click_model_point(x: int, y: int, button: str, clicks: int, geometry: ScreenGeometry) -> str:
@@ -451,6 +455,7 @@ def multi_click_model_point(x: int, y: int, button: str, clicks: int, geometry: 
     down, up, _, code = _mouse_event_types(button)
     _check_in_model_space(x, y, geometry)
     px, py = model_to_points(x, y, geometry)
+    mark_gui_input()
     pyautogui.moveTo(px, py)
     for state in range(1, clicks + 1):
         _post_mouse_event(down, px, py, code, state)
@@ -470,6 +475,7 @@ def drag_model_points(start: Tuple[int, int], end: Tuple[int, int], button: str,
     _check_in_model_space(end[0], end[1], geometry)
     sx, sy = model_to_points(start[0], start[1], geometry)
     ex, ey = model_to_points(end[0], end[1], geometry)
+    mark_gui_input()
     pyautogui.moveTo(sx, sy)
     _post_mouse_event(down, sx, sy, code, 1)
     time.sleep(MOUSE_DRAG_HOLD_SECONDS)
@@ -487,6 +493,7 @@ def post_scroll(dx: float, dy: float) -> None:
     # cua_read_scrollable her adımda örtüşmeyi kaçırıp adım yarılıyordu.
     event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitPixel, 2, round(-dy), round(-dx))
     Quartz.CGEventSetIntegerValueField(event, Quartz.kCGScrollWheelEventIsContinuous, 1)
+    mark_gui_input()
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
 def changed_region(before: np.ndarray, after: np.ndarray, anchor: Tuple[int, int], min_share: float) -> Optional[Tuple[int, int, int, int]]:

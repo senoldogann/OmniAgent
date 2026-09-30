@@ -16,6 +16,7 @@ from omniagent.app.tool_schema import (
     TOOL_NAMES,
     _CACHEABLE_TOOLS,
     _SIDE_EFFECT_TOOLS,
+    _SCREEN_ACTION_TOOLS,
 )
 from omniagent.app.types import ToolCallDraft, ToolResult
 from omniagent.config import redact
@@ -45,6 +46,38 @@ EVENT_RESULT_LIMIT: int = 4000
 # log, JSON) bağlama girmeden kırpılır; kuyruk korunur çünkü en taze bilgi sondadır.
 TOOL_MESSAGE_HEAD_LIMIT: int = 6000
 TOOL_MESSAGE_TAIL_LIMIT: int = 2000
+
+
+_DELETION_PATTERN = re.compile(
+    r"\b(?:rm|rmdir|unlink|trash)\b|\bgit\s+clean\b|\bfind\b[^\n;]*\s-delete\b|"
+    r"\b(?:os\.(?:remove|unlink|rmdir)|shutil\.rmtree)\s*\(|\.(?:unlink|rmdir)\s*\("
+)
+
+
+def deletion_command(code: str) -> bool:
+    """Conventional shell/Python deletion patterns; deliberately best effort, not a sandbox."""
+    return _DELETION_PATTERN.search(code) is not None
+
+
+def autonomy_requests_for_call(name: str, arguments: Dict[str, Any],
+                               runtime: IntegrationRuntime) -> List[approval.ApprovalRequest]:
+    guards = runtime.autonomy
+    if guards is None:
+        return []
+    requests: List[approval.ApprovalRequest] = []
+    code = str(arguments.get("command" if name == "execute_shell" else "code", ""))
+    if name in ("execute_shell", "execute_python") and deletion_command(code):
+        requests.append(approval.deletion_request(name, arguments))
+    if name == "capture_photo":
+        requests.append(approval.camera_request(arguments))
+    if name in ("write_file", "edit_file"):
+        typed = Path(str(arguments.get("path", ""))).expanduser()
+        candidates = ((workspace_dir() / typed).resolve(), typed.resolve())
+        if any(candidate.is_relative_to(root.resolve()) or any(
+                _same_filesystem_object(parent, root) for parent in (candidate, *candidate.parents))
+               for candidate in candidates for root in guards["guarded_roots"]):
+            requests.append(approval.self_modification_request(name, arguments))
+    return requests
 
 
 def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
@@ -230,9 +263,9 @@ async def require_approval(tool: str, request: approval.ApprovalRequest) -> None
     # BYPASS: (1) güvenli host/tutar, (2) sürekli mod → otomatik onay
     if request["category"] == "communication" and denied_question:
         decision = "denied"
-    elif approval.should_auto_approve(request.get("url", ""), request.get("amount")):
+    elif (runtime is None or runtime.autonomy is None) and approval.should_auto_approve(request.get("url", ""), request.get("amount")):
         decision = "auto_approved"
-    elif runtime is not None and runtime.unattended and approval.AUTO_APPROVE_IN_CONTINUOUS_MODE:
+    elif runtime is not None and runtime.autonomy is None and runtime.unattended and approval.AUTO_APPROVE_IN_CONTINUOUS_MODE:
         decision = "auto_approved"
     elif runtime is not None and runtime.answer is not None:
         try:
@@ -366,7 +399,10 @@ async def execute_tool(
         "approved": False,
         "request_approval": _async_approver(name),
         "request_approval_blocking": _blocking_approver(name, asyncio.get_running_loop(), should_stop),
+        "preemptible": runtime is not None and runtime.autonomy is not None,
     }
+    if runtime is not None and runtime.autonomy is not None:
+        call_context["mark_gui_input"] = runtime.autonomy["mark_gui_input"]
     # İptal gibi bir BaseException dışarı taşınırsa bekleyen eşdeğer çağrı askıda kalmasın diye
     # sonuç önceden güvenli bir başarısızlıkla doldurulur; normal yol bunu ezber.
     outcome: ToolResult = {
@@ -374,6 +410,7 @@ async def execute_tool(
         "error_type": "Interrupted", "error": "Araç çağrısı tamamlanmadan kesildi.",
     }
     token = TOOL_RUNTIME.set(call_context)
+    autonomous_started = False
     try:
         if runtime is not None:
             runtime.check()
@@ -386,6 +423,18 @@ async def execute_tool(
             await require_approval(name, request)
             # Onay yalnız bu çağrının bağlamına işlenir; araç (ör. user_memory) bunu doğrular.
             TOOL_RUNTIME.set({**call_context, "approved": True})
+        if runtime is not None and runtime.autonomy is not None:
+            for guard_request in autonomy_requests_for_call(name, arguments, runtime):
+                await require_approval(name, guard_request)
+            if name in _SCREEN_ACTION_TOOLS:
+                await runtime.wait(runtime.autonomy["gui_gate"]())
+            runtime.check()
+            approval.append_audit(data_root() / "audit.jsonl", approval.audit_record(
+                name, {"category": "autonomous_action", "title": "Otonom araç eylemi",
+                       "summary": approval.call_summary(name, arguments)}, "started", datetime.now(timezone.utc).isoformat()))
+            autonomous_started = True
+            if name in _SCREEN_ACTION_TOOLS:
+                runtime.autonomy["mark_gui_input"]()
         if asyncio.iscoroutinefunction(method):
             operation = method(**arguments)
             result: Any = await runtime.wait(operation) if runtime is not None and not dynamic else await operation
@@ -418,6 +467,14 @@ async def execute_tool(
             "error_type": type(error).__name__, "error": str(error),
         }
     finally:
+        if autonomous_started:
+            try:
+                approval.append_audit(data_root() / "audit.jsonl", approval.audit_record(
+                    name, {"category": "autonomous_action", "title": "Otonom araç eylemi",
+                           "summary": approval.call_summary(name, arguments)},
+                    "succeeded" if outcome.get("ok") else "failed", datetime.now(timezone.utc).isoformat()))
+            except OSError:
+                logging.error("Otonom araç sonuç denetimi yazılamadı", extra={"tool": name})
         TOOL_RUNTIME.reset(token)
         if dynamic and service:
             service.record(dynamic["capability"], time.monotonic() - integration_started, bool(outcome.get("ok")))

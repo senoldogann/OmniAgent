@@ -1,7 +1,8 @@
 """Agent katmanları arasında paylaşılan tip sözleşmeleri."""
 from __future__ import annotations
 
-from typing import Callable, List, NotRequired, Optional, TypedDict
+from pathlib import Path
+from typing import Awaitable, Callable, List, NotRequired, Optional, TypedDict
 
 from omniagent.core import state as sm
 from omniagent.core.conversation import Exchange
@@ -45,6 +46,15 @@ class ModelTurn(TypedDict):
     usage: TokenUsage
 
 
+class AutonomyGuards(TypedDict):
+    """Host enforced gates only for companion initiated work; approval is never implied."""
+    gui_gate: Callable[[], Awaitable[None]]
+    mark_gui_input: Callable[[], None]
+    guarded_roots: List[Path]
+    quiet_now: Callable[[], bool]
+    deferred_approvals: List[str]
+
+
 class RunOptions(TypedDict):
     requested_backend: Optional[str]
     should_stop: Callable[[], bool]
@@ -62,6 +72,7 @@ class RunOptions(TypedDict):
     max_wall_clock_seconds: NotRequired[float]
     max_total_tokens: NotRequired[int]
     unattended: NotRequired[bool]
+    autonomy: NotRequired[AutonomyGuards]
     pop_control_messages: NotRequired[Callable[[], List[str]]]
     # Model çağrısı yeniden deneme bütçesi (sn). Sürekli/gözetimsiz görevde kalan görev süresi (çağrı başına
     # en çok 30 dk) kullanılır ve bu değer yok sayılır; verilmezse etkileşimli 60 sn

@@ -685,8 +685,23 @@ PROTECTED_DATA_FILES: frozenset[str] = frozenset({
     "user_memory.json", "schedules.json", "catalog.json", "experience_memory.json", "cognitive_memory.json",
     # iMessage kanalı: eşleşme, eşleştirme isteği, karakter, görev geçmişi ve yol arkadaşı deposu
     "imessage.json", "imessage-pairing.json", "persona.md", "imessage-history.json",
-    "companion.db", "companion.db-wal", "companion.db-shm",
+    "companion.db", "companion.db-wal", "companion.db-shm", "kalp_atisi.md",
 })
+
+
+def deletion_request(tool: str, arguments: Dict[str, object]) -> ApprovalRequest:
+    return {"category": "deletion", "title": "SİLME ONAYI: otonom iş dosya veya dizin silecek. Onaylıyor musun?",
+            "summary": call_summary(tool, arguments)}
+
+
+def self_modification_request(tool: str, arguments: Dict[str, object]) -> ApprovalRequest:
+    return {"category": "self_modification", "title": "KOD DEĞİŞİKLİĞİ ONAYI: otonom iş OmniAgent kaynak kodunu değiştirecek. Onaylıyor musun?",
+            "summary": call_summary(tool, arguments)}
+
+
+def camera_request(arguments: Dict[str, object]) -> ApprovalRequest:
+    return {"category": "camera", "title": "KAMERA ONAYI: otonom iş fotoğraf çekmek istiyor. Onaylıyor musun?",
+            "summary": call_summary("capture_photo", arguments)}
 
 
 def config_write_request(tool: str, file_name: str) -> ApprovalRequest:

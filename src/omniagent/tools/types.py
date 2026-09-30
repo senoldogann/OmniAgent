@@ -225,9 +225,18 @@ class ToolRuntime(TypedDict):
     approved: NotRequired[bool]
     request_approval: NotRequired[Callable[[ApprovalRequest], Awaitable[None]]]
     request_approval_blocking: NotRequired[Callable[[ApprovalRequest], None]]
+    mark_gui_input: NotRequired[Callable[[], None]]
+    preemptible: NotRequired[bool]
 
 
 TOOL_RUNTIME: ContextVar[Optional[ToolRuntime]] = ContextVar("TOOL_RUNTIME", default=None)
+
+
+def mark_gui_input() -> None:
+    """Mark the actual input emission, before tool settling can hide later human input."""
+    runtime = TOOL_RUNTIME.get()
+    if runtime is not None and runtime.get("mark_gui_input") is not None:
+        runtime["mark_gui_input"]()
 
 
 class ScreenGeometry(TypedDict):

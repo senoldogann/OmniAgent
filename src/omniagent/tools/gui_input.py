@@ -41,6 +41,7 @@ from .screen import (
 )
 from .system import child_environment
 from .types import (
+    mark_gui_input,
     ACTIVATION_POLL_SECONDS, ACTIVATION_SETTLE_SECONDS, ACTIVATION_TIMEOUT_SECONDS, AX_ELEMENT_LIMIT, AX_LABEL_SEARCH_NODES,
     AX_MESSAGING_TIMEOUT_SECONDS, AX_NODE_LIMIT, AX_SCAN_BUDGET_SECONDS, AX_WEB_READY_SECONDS, AX_WEB_RETRY_SECONDS,
     CLICK_EVENT_GAP_SECONDS, CUA_ACTIVATE_TIMEOUT_SECONDS, ELEMENT_LABEL_MARGIN, ELEMENT_LABEL_MIN_RADIUS,
@@ -1383,6 +1384,7 @@ def _post_unicode_chunk(chunk: str) -> None:
         # Takılı kalmış bir değiştirici (cmd vb.) yazımı kısayola çevirmesin
         Quartz.CGEventSetFlags(event, 0)
         Quartz.CGEventKeyboardSetUnicodeString(event, units, chunk)
+        mark_gui_input()
         Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
 
 
@@ -1395,6 +1397,7 @@ def type_unicode_text(text: str) -> None:
     """
     for line_index, line in enumerate(text.replace("\r\n", "\n").split("\n")):
         if line_index > 0:
+            mark_gui_input()
             pyautogui.press("enter")
         for chunk in unicode_chunks(line, UNICODE_CHUNK_UNITS):
             _post_unicode_chunk(chunk)
@@ -1429,6 +1432,7 @@ def press_key_spec(spec: str) -> str:
             "backspace, delete, up, down, pageup, f5, cmd+c, cmd+shift+t.",
             "INVALID_KEY", False,
         )
+    mark_gui_input()
     if len(names) == 1:
         pyautogui.press(names[0])
     else:
