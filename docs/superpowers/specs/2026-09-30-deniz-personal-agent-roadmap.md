@@ -9,6 +9,8 @@ Deniz is a personal agent available through desktop, Telegram and iMessage. It u
 
 The user referenced OpenAI Dots and accepted the recommended hybrid architecture. The target is the observable behavior described here; this does not claim integration with Dots or access to its proprietary runtime.
 
+Deployment clarification from the user: there is no VPS; proceed on the current computer now. A currently unused Windows computer may become a continuously available executor later. The first deliveries therefore run locally on the Mac. The executor boundary remains extensible, but no cloud dependency, server purchase or Windows enrollment belongs to the current delivery.
+
 ## Existing foundation
 
 The repository already has a model/tool agent, cross-process Mac ownership and user priority, approvals, shared personal memory, task checkpoints, scheduling, companion heartbeat and guarded autonomy. These are reusable components. Existing checkpoints and heartbeat are not a durable distributed task service. Current execution depends on the Mac being available.
@@ -34,6 +36,8 @@ This subproject needs its own focused specification, implementation plan and acc
 ### 3. Hybrid always-on execution
 
 An always-on coordinator maintains tasks and responsibilities. Cloud workers handle eligible research, documents and repository jobs. A paired Mac executor handles local files, logged-in local applications and desktop actions. Choose the executor by required capabilities, authorized data access and current availability; do not transfer local files, credentials or entire conversations implicitly.
+
+The user's current rollout choice is local-first: the Mac hosts coordination and execution together. A later Windows executor can supply eligible research/document/repository capabilities while online; Mac-only applications, local files not explicitly shared and current iMessage transport still wait for the Mac. Windows support requires its own pairing, capability and outcome-verification design rather than assuming Mac GUI tools are portable.
 
 When the Mac is offline, cloud-capable work can continue. Mac-only work enters waiting-executor and resumes under the same authorization when the Mac returns. Current iMessage transport also depends on the Mac: pending outbound iMessage delivery waits for it. Telegram can become independently reachable only after its receiver is moved to an always-on service.
 
