@@ -265,6 +265,35 @@ async def test_completed_effect_keeps_verified_verdict_when_presentation_budget_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("overrun", ["tokens", "deadline"])
+async def test_actual_engine_overrun_stays_failed_with_latest_receipts(coordinator, scripted, tmp_path, monkeypatch, overrun):
+    @asynccontextmanager
+    async def lock():
+        yield
+    async def engine(goal, emit, opts, clients):
+        agent._MODEL_ATTEMPT.get()("ollama-cloud")
+        if overrun == "tokens":
+            agent._MODEL_USAGE.get()({"prompt_tokens": 900, "completion_tokens": 101, "cached_tokens": 0})
+        store = EvidenceStore(opts["state_file"])
+        bundle = store.load(opts["evidence_run_id"])
+        store.capture(bundle, "read_file", {"ok": True, "result": "ACTUAL overrun receipt"})
+        report = {**failed_report(opts), "success": True, "reason": "done", "evidence": bundle}
+        if overrun == "deadline":
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                # Even an engine suppressing cancellation cannot promote overrun.
+                return report
+        return report
+    monkeypatch.setattr(coordinator, "run_agent_with_callback", engine)
+    extra = {"max_total_tokens": 1000} if overrun == "tokens" else {"max_wall_clock_seconds": .02}
+    report, events = await run(coordinator, tmp_path, "task", {"run_mode": "extended", "task_context": lock, **extra})
+    assert not report["success"] and "ACTUAL overrun receipt" in report["outcome"]
+    assert not scripted[1]
+    assert not [e for e in events if e["kind"] == "run_finished"][0]["success"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     coordinator, scripted, tmp_path, monkeypatch, verbose,
