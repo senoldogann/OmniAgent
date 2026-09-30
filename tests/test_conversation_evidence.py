@@ -300,3 +300,150 @@ async def test_agent_handoff_appends_only_pending_matching_run(tmp_path, deliver
     else:
         assert report["evidence"]["run_id"] != bundle["run_id"]
         assert store.path_for(bundle["run_id"]).read_bytes() == original
+
+
+def test_oversized_capture_retains_head_tail_and_omitted_middle_marker(tmp_path):
+    store, bundle = make_bundle(tmp_path, ("source_urls",))
+    text = "HEAD-RECEIPT\n" + "x" * MAX_RUN_BYTES + "\nTAIL-RECEIPT https://example.org/tail"
+    store.capture(bundle, "fetch_raw", {"ok": True, "result": text})
+    observation = bundle["observations"][0]
+    assert "HEAD-RECEIPT" in observation["text"]
+    assert "TAIL-RECEIPT https://example.org/tail" in observation["text"]
+    assert "orta bölüm" in observation["text"] and "kırpıldı" in observation["text"]
+    assert "artifact_path" not in observation
+    assert not observation["complete"]
+    assert len(json.dumps(observation, ensure_ascii=False, separators=(",", ":")).encode()) <= MAX_OBSERVATION_BYTES
+
+
+def test_directory_identifiers_require_listing_provenance(tmp_path):
+    store, bundle = make_bundle(tmp_path, ("directory_names",))
+    store.capture(bundle, "execute_shell", {"ok": True, "result": "inspection finished\n/Users/example/Desktop"},
+                  arguments=json.dumps({"command": "echo 'inspection finished'; pwd"}))
+    store.capture(bundle, "execute_shell", {"ok": True, "result": "ÇIKIŞ_KODU: 0\nSTDOUT:\nProjects/\nPhotos/\nnotes.txt\nSTDERR:"},
+                  arguments=json.dumps({"command": "ls -F ~/Desktop"}))
+    assert required_identifiers(bundle) == ["Projects", "Photos"]
+    assert check_grounded_answer("Projects ve Photos", bundle)["ok"]
+
+
+@pytest.mark.asyncio
+async def test_real_tool_events_mask_output_chunks_and_keep_execution_arguments(monkeypatch):
+    from omniagent import config
+    from omniagent.app.tool_execution import _run_tool_with_events, _tool_result_to_message
+    from omniagent.core.events import argument_tag
+    from omniagent.tools import TOOL_RUNTIME
+    monkeypatch.setattr(config, "secret_values", lambda: ("configured-secret-value",))
+    events = []
+    executed = []
+    snapshots = []
+    class Tools:
+        memory_mutation_allowed = False
+        async def execute_shell(self, command):
+            executed.append(command)
+            sink = TOOL_RUNTIME.get()["emit_output"]
+            for text in ("Password: UNKNOWN-", "VALUE\nconfigured-secret-value\n", "safe result\n"):
+                sink(text)
+                snapshots.append(str(events))
+            return "Password: UNKNOWN-VALUE\nconfigured-secret-value\nsafe result"
+    call = {"id": "raw-call", "name": "execute_shell", "arguments": json.dumps({"command": "printf ordinary"})}
+    result = await _run_tool_with_events(0, call, "ordinary", Tools(), {}, events.append, lambda: False)
+    assert executed == ["printf ordinary"]
+    assert result["result"].startswith("Password: UNKNOWN-VALUE")
+    assert all("UNKNOWN" not in snapshot and "configured-secret" not in snapshot for snapshot in snapshots)
+    assert "UNKNOWN-VALUE" not in str(events)
+    assert "configured-secret-value" not in str(events)
+    assert "safe result" in str(events)
+    assert "UNKNOWN-VALUE" not in str(_tool_result_to_message(call, result))
+    assert events[0]["argument_tag"] == argument_tag(call["name"], call["arguments"])
+
+
+@pytest.mark.asyncio
+async def test_typed_tool_result_label_and_started_preview_are_private():
+    from omniagent.app.tool_execution import _run_tool_with_events, _tool_result_to_message
+    from omniagent.app.agent import _assistant_entry, ZERO_USAGE
+    from omniagent.tools import TOOL_RUNTIME
+    events = []
+    executed = []
+    typed = "opaque-user-value"
+    class Tools:
+        memory_mutation_allowed = False
+        async def cua_type_text(self, text):
+            executed.append(text)
+            TOOL_RUNTIME.get()["emit_output"](text)
+            return f"Metin yazıldı ({len(text)} karakter): {text}"
+    call = {"id": "typed-call", "name": "cua_type_text", "arguments": json.dumps({"text": typed})}
+    result = await _run_tool_with_events(0, call, typed, Tools(), {}, events.append, lambda: False)
+    turn = {"content": "", "tool_calls": [call], "finish_reason": "tool_calls", "usage": ZERO_USAGE}
+    assert executed == [typed]
+    assert call["arguments"] == json.dumps({"text": typed})
+    assert typed not in str(events)
+    assert typed not in str(_tool_result_to_message(call, result))
+    assert typed not in str(_assistant_entry(turn))
+    assert json.loads(_assistant_entry(turn)["tool_calls"][0]["function"]["arguments"])["text"] == "[gizli]"
+
+
+@pytest.mark.asyncio
+async def test_streamed_partial_typed_arguments_never_enter_preview_events():
+    from types import SimpleNamespace
+    from omniagent.app.agent import _stream_completion
+    from omniagent.config import BACKENDS
+    from omniagent.core.events import preview_arguments
+    typed = "opaque-user-value"
+    chunks = []
+    for index, fragment in enumerate(('{"text":"opaque-user-', 'value"}')):
+        chunks.append(SimpleNamespace(usage=None, choices=[SimpleNamespace(
+            delta=SimpleNamespace(content=None, model_extra={}, tool_calls=[SimpleNamespace(
+                index=0, id="typed-stream" if index == 0 else None,
+                function=SimpleNamespace(name="cua_type_text" if index == 0 else None, arguments=fragment))]),
+            finish_reason="tool_calls" if index == 1 else None)]))
+    class Stream:
+        def __init__(self): self.chunks = iter(chunks)
+        def __aiter__(self): return self
+        async def __anext__(self):
+            try: return next(self.chunks)
+            except StopIteration: raise StopAsyncIteration
+        async def close(self): pass
+    class Completions:
+        async def create(self, **kwargs): return Stream()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    events = []
+    turn = await _stream_completion(client, BACKENDS["openai"], [{"role": "user", "content": "Fill the field"}], [],
+                                    "session", events.append, lambda: False)
+    assert turn["tool_calls"][0]["arguments"] == json.dumps({"text": typed}, separators=(",", ":"))
+    assert "opaque-user" not in str(events)
+    assert "opaque-user" not in preview_arguments("cua_type_text", '{"text":"opaque-user-')
+
+
+@pytest.mark.asyncio
+async def test_agent_real_tool_pipeline_masks_typed_history_without_changing_execution(tmp_path, monkeypatch):
+    from omniagent.app import agent
+    from omniagent.integrations.capabilities import CapabilityService
+    from omniagent.tools import Toolbox, ToolError
+    typed = "opaque-user-value"
+    executed = []
+    observed_messages = []
+    async def type_text(self, text):
+        executed.append(text)
+        return f"Metin yazıldı ({len(text)} karakter): {text}"
+    async def screenshot(self, filename, detail=False):
+        raise ToolError("No camera available", "SCREEN_UNAVAILABLE", False)
+    async def model(*args, **kwargs):
+        observed_messages.append(str(args[1]))
+        return {"content": "" if len(observed_messages) == 1 else "İşlem denendi.",
+                "tool_calls": [{"id": "typed-call", "name": "cua_type_text", "arguments": json.dumps({"text": typed})}] if len(observed_messages) == 1 else [],
+                "finish_reason": "tool_calls" if len(observed_messages) == 1 else "stop", "usage": agent.ZERO_USAGE}, "openai"
+    monkeypatch.setattr(Toolbox, "cua_type_text", type_text)
+    monkeypatch.setattr(Toolbox, "take_screenshot", screenshot)
+    monkeypatch.setattr(agent, "_call_model_with_retries", model)
+    service = CapabilityService(tmp_path)
+    events = []
+    try:
+        report = await agent.run_agent_with_callback("Chrome sekmesindeki alanı incele", events.append,
+            {"requested_backend": "openai", "should_stop": lambda: False, "state_file": str(tmp_path / "state.json"),
+             "history": [], "integrations": service, "max_iterations": 2}, {"openai": object()})
+    finally:
+        await service.close()
+    assert executed == [typed], report
+    assert len(observed_messages) == 2
+    assert typed not in observed_messages[1]
+    assert typed not in str(events)
+    assert typed not in json.dumps(report["evidence"])
