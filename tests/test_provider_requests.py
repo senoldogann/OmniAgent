@@ -61,6 +61,19 @@ async def test_model_token_limit_matches_provider(backend, token_field):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["openai", "ollama-cloud"])
+async def test_request_without_tools_sends_neither_tools_nor_tool_choice(backend):
+    """Araçsız tur (iMessage iş raporu): boş liste ve araçsız tool_choice sağlayıcıda istek hatasıdır."""
+    client = FakeClient()
+    await _stream_completion(
+        client, BACKENDS[backend], [{"role": "user", "content": "Merhaba"}], [],
+        "session", lambda event: None, lambda: False,
+    )
+    kwargs = client.chat.completions.kwargs
+    assert "tools" not in kwargs and "tool_choice" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_ollama_same_index_stream_yields_two_calls_and_previews():
     """Sağlayıcının index=0 tekrarını gerçek iki çağrı ve iki önizleme olarak ayırır."""
     class TwoCallStream:

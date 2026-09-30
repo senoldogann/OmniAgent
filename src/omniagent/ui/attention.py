@@ -31,7 +31,7 @@ class ProcessLauncher(Protocol):
 def input_alert_action(hidden: bool, backgrounded: bool) -> str:
     """
     Yanıt bekleyen istek için ne yapılacağı: gizliyse bildirim (pencere açılmaz), görünür ama arka
-    plandaysa uygulamayı öne alma, ön plandaysa hiçbir şey. Saf.
+    plandaysa dikkat kartı gösterme, ön plandaysa normal yanıt gösterimi. Saf.
     """
     if hidden:
         return ALERT_NOTIFY

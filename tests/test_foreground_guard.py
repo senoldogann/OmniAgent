@@ -283,6 +283,9 @@ def _get_app_toolbox(monkeypatch: pytest.MonkeyPatch, readiness: Union[AppReadin
     monkeypatch.setattr(tools, "screen_capture_granted", lambda request=False: False)
     monkeypatch.setattr(tools, "_require_accessibility", lambda: None)
     monkeypatch.setattr(tools, "wait_app_ready", ready)
+    # Gerçek pencere listesi ve AX testi kirletmesin: ad çözümleme boş listeyle, pencere geri açma yapılmadan.
+    monkeypatch.setattr(gui_input, "_dock_app_owners", lambda: [])
+    monkeypatch.setattr(tools, "restore_minimized_window", lambda pid: False)
     return Toolbox(), runs
 
 
@@ -328,6 +331,94 @@ def test_get_app_timeout_is_a_typed_error_and_permission_is_checked_before_activ
     with pytest.raises(ToolError) as error:
         box.cua_get_app("Notes")
     assert error.value is denied
+
+
+T3: FrontApp = {"pid": 22, "name": "T3 Code (Nightly)", "bundle_name": "T3 Code (Nightly)",
+                "bundle_id": "com.t3tools.t3code"}
+RUNNING: List[Tuple[str, int]] = [("Finder", 11), ("T3 Code (Nightly)", 22)]
+
+
+def test_running_app_is_matched_by_exact_name_or_unique_prefix() -> None:
+    """Canlı hata (29 Eylül): kullanıcı 'T3 kod' dedi, uygulamanın gerçek adı 'T3 Code (Nightly)'."""
+    assert gui_input.match_running_app("t3 code", RUNNING) == ("T3 Code (Nightly)", 22)
+    assert gui_input.match_running_app("FINDER", RUNNING) == ("Finder", 11)
+    assert gui_input.match_running_app("Cursor", RUNNING) is None
+    assert gui_input.match_running_app("S", [("Safari", 1), ("Signal", 2)]) is None
+
+
+def test_background_services_are_neither_matched_nor_listed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Canlı hata (29 Eylül, düzeltme sonrası): 'Cursor' ön eki arka plan servisi CursorUIViewService'e eşlendi."""
+    owners = [("CursorUIViewService", 5), ("Finder", 11), ("T3 Code (Nightly)", 22)]
+    policies = {5: 2, 11: 0, 22: 0}  # 0 = NSApplicationActivationPolicyRegular (Dock'ta görünür)
+    monkeypatch.setattr(gui_input, "_visible_app_owners", lambda: owners)
+    monkeypatch.setattr(gui_input, "running_application",
+                        lambda pid: SimpleNamespace(activationPolicy=lambda: policies[pid]))
+    assert gui_input.resolve_running_app("Cursor") == ("Cursor", None)
+    assert gui_input.resolve_running_app("t3 code") == ("T3 Code (Nightly)", 22)
+    assert "CursorUIViewService" not in gui_input._running_apps_text()
+
+
+def test_get_app_restores_the_minimized_window_before_waiting_for_the_front(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Canlı hata (29 Eylül, düzeltme sonrası): tek penceresi küçültülmüş uygulamada ön plan okunamıyor
+    (AXFocusedApplication NoValue); bekleme geri açmadan önce yapılınca araç hata veriyordu."""
+    box, runs = _get_app_toolbox(monkeypatch, {"front": T3, "has_window": True})
+    monkeypatch.setattr(gui_input, "_dock_app_owners", lambda: RUNNING)
+    calls: List[str] = []
+
+    def restore(pid: int) -> bool:
+        calls.append(f"restore:{pid}")
+        return True
+
+    def ready(app_name: str, wait_seconds: float) -> AppReadiness:
+        calls.append(f"ready:{app_name}")
+        return {"front": T3, "has_window": True}
+
+    monkeypatch.setattr(tools, "restore_minimized_window", restore)
+    monkeypatch.setattr(tools, "wait_app_ready", ready)
+    message = box.cua_get_app("T3 Code")
+    assert runs[0][3] == "T3 Code (Nightly)" and box._input_app == "T3 Code (Nightly)"
+    assert calls == ["restore:22", "ready:T3 Code (Nightly)"]
+    assert "Küçültülmüş penceresi geri açıldı" in message
+
+
+def test_failed_activation_lists_running_apps_instead_of_pointing_to_a_screenshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Canlı hata (29 Eylül): uydurma 'Cursor' adı zaman aşımına düştü; hata 'ekran görüntüsüne bak' deyince model
+    masaüstü görüntüsünden 'uygulama açık değil' sonucuna vardı."""
+    box, _runs = _get_app_toolbox(monkeypatch, {"front": NOTES, "has_window": True})
+    monkeypatch.setattr(gui_input, "_dock_app_owners", lambda: RUNNING)
+
+    def hang(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(tools.subprocess, "run", hang)
+    with pytest.raises(ToolError) as timeout:
+        box.cua_get_app("Cursor")
+    assert timeout.value.code == "APP_ACTIVATE_TIMEOUT" and timeout.value.recoverable
+    assert "T3 Code (Nightly)" in str(timeout.value) and "take_screenshot ile bak" not in str(timeout.value)
+
+
+def test_minimized_window_is_restored_only_when_every_window_is_minimized(monkeypatch: pytest.MonkeyPatch) -> None:
+    minimized = {"w1": True, "w2": True}
+    writes: List[Tuple[object, str, object]] = []
+
+    def attribute(element: object, name: str) -> object:
+        if name == "AXWindows":
+            return list(minimized)
+        return minimized[str(element)] if name == "AXMinimized" else None
+
+    def write(element: object, name: str, value: object) -> int:
+        writes.append((element, name, value))
+        return 0
+
+    monkeypatch.setattr(gui_input, "_ax_attribute", attribute)
+    monkeypatch.setattr(gui_input.AX, "AXUIElementCreateApplication", lambda pid: f"app-{pid}")
+    monkeypatch.setattr(gui_input.AX, "AXUIElementSetAttributeValue", write)
+    assert gui_input.restore_minimized_window(22) is True and writes == [("w1", "AXMinimized", False)]
+    minimized["w2"] = False
+    writes.clear()
+    assert gui_input.restore_minimized_window(22) is False and writes == []
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="osascript yalnız macOS'ta")

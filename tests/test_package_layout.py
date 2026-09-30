@@ -18,6 +18,7 @@ def test_project_is_installable_src_package_with_entry_points() -> None:
         "omniagent": "omniagent.cli:main",
         "omniagent-ui": "omniagent.ui.app:main",
         "omniagent-telegram": "omniagent.integrations.telegram:main",
+        "omniagent-imessage": "omniagent.integrations.imessage:main",
         "omniagent-benchmark": "omniagent.dev.benchmark:main",
         "omniagent-permissions": "omniagent.platform.macos.permissions:main",
     }

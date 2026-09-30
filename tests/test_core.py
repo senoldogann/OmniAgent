@@ -979,7 +979,7 @@ def test_flat_chrome_actions_use_shared_coordinates(monkeypatch: pytest.MonkeyPa
     assert "Enter" in toolbox.cua_submit_text([10, 20], "senior developer")
     assert calls == [(10, 20, "left"), guard, ("key", "cmd+a"), ("type", "senior developer"), ("key", "enter")]
     calls.clear()
-    assert "Alan dolduruldu" in toolbox.cua_fill_field([30, 40], "ad")
+    assert "Değer geri okunmadı" in toolbox.cua_fill_field([30, 40], "ad")
     assert calls == [(30, 40, "left"), guard, ("key", "cmd+a"), ("type", "ad")]
     # Modelin ayrı x/y alanlarında ürettiği bozuk biçim açık hata verir, tıklamaz
     calls.clear()

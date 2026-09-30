@@ -13,8 +13,8 @@ MODEL_SCREEN_SIZE: int = 1000
 SCREENSHOT_MAX_EDGE: int = 1920
 
 # Çıktı ve bellek limitleri (her bayt token demektir)
-SHELL_STDOUT_LIMIT: int = 4000
-SHELL_STDERR_LIMIT: int = 1000
+SHELL_STDOUT_LIMIT: int = 8000
+SHELL_STDERR_LIMIT: int = 2000
 FILE_READ_LIMIT: int = 8000
 FILE_READ_MAX_BYTES: int = 8 * 1024 * 1024
 STREAM_STDOUT_MAX_BYTES: int = 64 * 1024
@@ -176,6 +176,8 @@ SHELL_TIMEOUT_SECONDS: float = 60.0
 SHELL_MAX_TIMEOUT_SECONDS: int = 3600
 TIMEOUT_OUTPUT_TAIL: int = 1500
 JS_TIMEOUT_SECONDS: float = 20.0
+# Python kodu genellikle hesaplama/veri işleme yaptığından JS'ten daha geniş bütçe verilir.
+PY_TIMEOUT_SECONDS: float = 120.0
 FETCH_ERROR_BODY_LIMIT: int = 800
 HISTORY_RESULT_LIMIT: int = 8
 PROCESS_POLL_SECONDS: float = 0.05
@@ -190,13 +192,9 @@ class ToolError(Exception):
     Ajanın kendi kendini iyileştirmesi için yapılandırılmış hata sınıfı.
 
     `recoverable` her raise yerinde zorunlu olarak verilir: "bu hatadan sonra aynı yol/yöntem yeniden
-    denenebilir mi". TODO(recoverable): alan bugün src/ içinde hiç OKUNMUYOR; yalnız ToolResult yüküne ve
-    tool_finished olayına taşınır, modele giden araç mesajına girmez (bkz. app/tool_execution._tool_result_to_message:
-    yalnız "HATA <error_type>: <error>" kurar). Sıkı moddaki "bu engeli aşmaya çalışma" kuralı bu yüzden
-    `recoverable`a değil `code`a ve metin işaretine dayanır (bot_wall.ACCESS_CHALLENGE_MARKER; app/answer_fidelity,
-    app/partial_report). Karar bekliyor: ya alan bir kurala bağlanmalı (ör. kurtarılamaz hatada yeniden deneme /
-    alternatif yol önerisini bastırmak) ve metin işareti bağımlılığı kalkmalı, ya da ToolResult yükünden
-    çıkarılmalı. Parametrenin kendisini silmek ucuz DEĞİLDİR: her raise yerinde mecburen veriliyor.
+    denenebilir mi". Alan, ToolResult yüküne taşınır ve modele giden araç mesajına girer
+    (bkz. app/tool_execution._tool_result_to_message: hata kodunun yanına kurtarılabilirlik
+    yönergesi eklenir); ayrıca tool_finished olayında da görünür.
     """
     def __init__(self, message: str, code: str, recoverable: bool, completed_steps: int = 0) -> None:
         super().__init__(message)

@@ -21,6 +21,7 @@ from playwright.async_api import (
 from omniagent.approval import (
     AMOUNT_LINES_LIMIT, NO_CIRCUMVENTION_NOTE, TARGET_CHANGED_CODE, ApprovalRequest, ClickTarget, amount_lines,
     click_financial_reason, financial_cta_reason, gui_click_request, is_generic_commit_label,
+    communication_click_label, gui_communication_request,
 )
 from omniagent.core.text_norm import curl_http_statuses
 
@@ -719,7 +720,8 @@ async def confirm_click_target(page: Page, selector: str) -> None:
         return
     labels: List[str] = await _click_labels(page, selector)
 
-    if not any(financial_cta_reason(item) is not None or is_generic_commit_label(item) for item in labels):
+    if not any(financial_cta_reason(item) is not None or is_generic_commit_label(item)
+               or communication_click_label(item) for item in labels):
         return
     page_text: str = await page.evaluate(
         "(limit) => (document.body ? document.body.innerText : '').slice(0, limit)", _PAGE_AMOUNT_SCAN_CHARS,
@@ -729,14 +731,22 @@ async def confirm_click_target(page: Page, selector: str) -> None:
         ((item, reason) for item in labels if (reason := click_financial_reason(item, context)) is not None), None,
     )
     if found is None:
-        return
-    label, reason = found
+        label = next((item for item in labels if communication_click_label(item)), None)
+        if label is None:
+            return
+        draft = await page.locator("textarea, [contenteditable='true']").evaluate_all(
+            "els => els.map(el => el.value || el.innerText || '').filter(Boolean).join('\\n\\n')",
+        )
+        request = gui_communication_request("browse_url", label, page.url, draft)
+    else:
+        label, reason = found
+        request = None
     target: ClickTarget = {
         "tool": "browse_url", "label": label, "requested": selector, "where": page.url,
         "amounts": amount_lines(context, AMOUNT_LINES_LIMIT),
     }
     try:
-        await gate(gui_click_request(target, reason))
+        await gate(request if request is not None else gui_click_request(target, reason))
     except ToolError as error:
         raise ApprovalRefused(
             f"{error} Tıklanmayan öğe: {label!r} ({selector}). {NO_CIRCUMVENTION_NOTE}", error.code, error.recoverable,

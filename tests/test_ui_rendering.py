@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 from typing import Dict, List
 
 import pytest
@@ -10,7 +11,7 @@ from omniagent.ui.chats import TranscriptSpan
 from omniagent.ui.markdown import Part
 from omniagent.ui.rendering import (
     ToolView, activity_meta, command_block_lines, detail_output_lines, error_hint, fold_tags,
-    format_elapsed, format_run_summary, group_head_parts, parse_fold_tag, plain_transcript,
+    format_elapsed, format_run_summary, group_head_parts, parse_fold_tag, plain_transcript, sent_time_text,
     remap_fold_tags, summary_parts, tool_parts, tool_title,
 )
 from omniagent.ui.theme import COLUMN_MAX_WIDTH, COLUMN_MIN_SIDE, column_side, column_width
@@ -167,3 +168,11 @@ def test_group_head_and_summary_have_both_chevrons_and_hidden_details() -> None:
 
 def test_clipboard_copy_drops_chevrons_and_tabs() -> None:
     assert plain_transcript("✓\tKabuk  git  0.4sn  ▾  ▸\nmetin ▾ kalır") == "✓  Kabuk  git  0.4sn\nmetin ▾ kalır"
+
+
+def test_sent_time_text_renders_local_hh_mm_and_ignores_broken_stamps() -> None:
+    """Kullanıcı mesajının altındaki saat yerel saatte HH:MM olur; bozuk kayıt saatsiz gösterilir."""
+    stamp = "2026-09-29T11:40:00+00:00"
+    expected = datetime.fromisoformat(stamp).astimezone().strftime("%H:%M")
+    assert sent_time_text(stamp) == expected and len(expected) == 5
+    assert sent_time_text("bozuk") == "" and sent_time_text("") == ""

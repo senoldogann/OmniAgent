@@ -30,6 +30,10 @@ SEARCH_STEM_LENGTH: int = 5
 # kalıplardan geçirilir (bkz. clip_step_for_storage): kalıcı kayıt bellekteki tam metnin sızdırma yolu olmamalı.
 STEP_DETAIL_LIMIT: int = 500
 STEP_ARGS_LIMIT: int = 300
+# Görev başında ipucu olarak enjekte edilecek benzer geçmiş görev özetleri (bkz. relevant_episodes):
+# en az EPISODIC_HINT_MIN_SCORE sözcük kökü örtüşen, en çok EPISODIC_HINT_LIMIT görev.
+EPISODIC_HINT_LIMIT: int = 2
+EPISODIC_HINT_MIN_SCORE: int = 2
 
 
 class StepRecord(TypedDict):
@@ -83,10 +87,12 @@ class Episode(TypedDict):
 
 class StateDict(TypedDict):
     """
-    Kalıcı bellek: tamamlanan görevlerin sınırlı kaydı. Modele geri enjekte
-    EDİLMEZ; otomatik ders/rota enjeksiyonu ölçümde alakasız ipuçları ve başka
-    görevlerin yollarını taşıyıp hedef sapmasına yol açtığı için kaldırıldı.
-    Kayıt, gerçek çalıştırmaları incelemek için tutulur.
+    Kalıcı bellek: tamamlanan görevlerin sınırlı kaydı. Modele geri enjekte EDİLMEZ — tek
+    istisna: hedefle YÜKSEK sözcük kökü örtüşen az sayıda özet görev başında ipucu olarak
+    verilir (bkz. relevant_episodes/episodic_hint_text). Tüm kaydın otomatik ders/rota
+    enjeksiyonu ölçümde alakasız ipuçları ve başka görevlerin yollarını taşıyıp hedef
+    sapmasına yol açtığı için kaldırılmıştı. Kayıt, gerçek çalıştırmaları incelemek ve
+    user_memory(action=history) araması için tutulur.
     """
     episodic_memory: List[Episode]
 
@@ -223,3 +229,47 @@ def search_episodes(state: StateDict, query: str, limit: int) -> List[EpisodeSum
         scored.append((score, episode["timestamp"], summary))
     ordered: List[tuple[int, str, EpisodeSummary]] = sorted(scored, key=lambda item: (item[0], item[1]), reverse=True)
     return [summary for _, _, summary in ordered[:limit]]
+
+
+def relevant_episodes(state: StateDict, query: str, limit: int, min_score: int) -> List[EpisodeSummary]:
+    """
+    Hedefle en az `min_score` sözcük kökü örtüşen geçmiş görevlerin özetleri (skor sırası, eşit skorda
+    yeni görev önce). Bilinçli sınır: geçmiş görevlerin TÜMÜNÜN enjeksiyonu ölçümde alakasız ipuçları
+    taşıyıp hedef sapmasına yol açtığı için kaldırılmıştı (bkz. StateDict); bu işlev yalnız YÜKSEK
+    örtüşen az sayıda özeti görev başında ipucu olarak verir. Saf fonksiyon.
+    """
+    wanted: frozenset[str] = search_stems(query)
+    if not wanted:
+        return []
+    scored: List[tuple[int, str, EpisodeSummary]] = []
+    for episode in state["episodic_memory"]:
+        score: int = len(wanted & search_stems(f"{episode['goal']} {episode['outcome']}"))
+        if score < min_score:
+            continue
+        summary: EpisodeSummary = {
+            "timestamp": episode["timestamp"],
+            "goal": _clip(episode["goal"], HISTORY_GOAL_LIMIT),
+            "success": episode["success"],
+            "outcome": _clip(episode["outcome"], HISTORY_OUTCOME_LIMIT),
+        }
+        scored.append((score, episode["timestamp"], summary))
+    ordered = sorted(scored, key=lambda item: (item[0], item[1]), reverse=True)
+    return [summary for _, _, summary in ordered[:limit]]
+
+
+def episodic_hint_text(episodes: List[EpisodeSummary]) -> str:
+    """
+    Modele verilecek geçmiş görev ipucu metni. İpucu olarak çerçevelenir: model önceki sonucu
+    doğrulamadan tekrar etmemeli; önceki yaklaşımı ve engeli yalnız bağlam olarak kullanmalı,
+    hedefin kendisi için yeni araç kanıtı üretmeli. Saf fonksiyon.
+    """
+    if not episodes:
+        return ""
+    lines: List[str] = [
+        "HOST — BENZER GEÇMİŞ GÖREVLER (yalnız bağlam: önceki sonucu doğrulamadan tekrarlama; "
+        "bu hedef için yeni araç kanıtı üret):",
+    ]
+    for episode in episodes:
+        status: str = "başarılı" if episode["success"] else "başarısız"
+        lines.append(f"- [{episode['timestamp'][:10]}] {episode['goal']} → {status}: {episode['outcome']}")
+    return "\n".join(lines)

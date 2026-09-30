@@ -19,8 +19,9 @@ from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 
 from omniagent.app import agent as main
 from omniagent.app.model_retry import (
-    ModelCallFailed, ModelErrorInfo, classify_model_error, decide_retry, interactive_model_retry_seconds,
-    retry_after_seconds, retry_wait_seconds, unattended_model_retry_seconds,
+    ModelCallFailed, ModelErrorInfo, _wait_text, classify_model_error, decide_retry,
+    interactive_model_retry_seconds, is_context_overflow, model_call_failure, retry_after_seconds,
+    retry_wait_seconds, unattended_model_retry_seconds,
 )
 from omniagent.core.events import AgentEvent
 from omniagent.integrations.runtime import CURRENT_RUNTIME, IntegrationRuntime
@@ -227,6 +228,74 @@ def test_interactive_model_retry_budget(explicit: Optional[float], expected: flo
 def test_unattended_model_retry_budget_is_the_remaining_run_time_capped(max_wall_clock: float, expected: float) -> None:
     """Gözetimsiz kipte açık RunOptions değeri yoktur: bütçe kalan görev süresidir (en çok 30 dk)."""
     assert unattended_model_retry_seconds(max_wall_clock) == expected
+
+
+@pytest.mark.parametrize("seconds,expected", [
+    (45.0, "45 sn"), (120.0, "2 dk"), (172800.0, "2 gün"), (633720.0, "7 gün"),
+])
+def test_wait_text_shows_days_for_monthly_scale_waits(seconds: float, expected: str) -> None:
+    """Aylık kota beklemeleri '10562 dk' diye okunamaz hâle geliyordu; gün mertebesi gün olarak yazılır."""
+    assert _wait_text(seconds) == expected
+
+
+def test_failure_message_says_when_a_wait_cannot_fit_the_budget() -> None:
+    """
+    Bütçeye sığmayan bekleme "hız sınırı, sonra yeniden denenecek" diye anlatılınca geçici sanılıyordu:
+    ileti beklemenin yapılmadığını ve aylık kota gibi bir durumda modeli değiştirmek gerektiğini söyler.
+    """
+    quota = ModelErrorInfo("rate_limited", 429, None, 633720.0, False, None, "limitName: monthly")
+    message: str = str(model_call_failure(
+        "opencode-think", "qwen3.8-flash", quota, 1, 0.0, "Hazır yedek sağlayıcılara (openai) geçilmedi: izin yok.",
+        budget_exceeded=True,
+    ))
+    assert "7 gün sonra yeniden denenmesini istedi" in message and "10562 dk" not in message
+    assert "bütçesine sığmadığı için beklemeden bitirildi" in message
+    assert "aylık kullanım kotası" in message and "başka bir model seçin" in message
+    assert "Hazır yedek sağlayıcılara (openai) geçilmedi" in message
+    # Bütçeye sığan kısa bekleme aynı cümleyi almaz; bayrak verilmezse bütçe cümlesi hiç çıkmaz.
+    short = ModelErrorInfo("rate_limited", 429, None, 90.0, False, None, "429")
+    assert "bütçesine sığmadığı için" in str(model_call_failure("openai", "gpt-6-luna", short, 2, 5.0, "", budget_exceeded=True))
+    assert "aylık kullanım kotası" not in str(model_call_failure("openai", "gpt-6-luna", short, 2, 5.0, "", budget_exceeded=True))
+    assert "bütçesine sığmadığı" not in str(model_call_failure("openai", "gpt-6-luna", short, 2, 5.0, ""))
+
+
+@pytest.mark.asyncio
+async def test_monthly_quota_wait_ends_the_run_with_an_honest_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """
+    Sunucu 429 + 7 günlük Retry-After verirse (aylık kota) beklenmez: görev, beklemenin bütçeye
+    sığmadığını söyleyen açık hatayla biter; 'birazdan yeniden denenecek' izlenimi verilmez.
+    """
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    quota, paths = serve([{
+        "status": 429, "headers": {"retry-after": "633718", "content-type": "application/json"},
+        "body": json.dumps({"type": "error", "error": {"type": "GoUsageLimitError",
+                                                        "message": "Go usage limit exceeded"},
+                            "metadata": {"limitName": "monthly"}}),
+    }])
+    clients = {"opencode-think": AsyncOpenAI(
+        api_key="test", base_url=f"http://127.0.0.1:{quota.server_port}/v1", max_retries=0)}
+    runtime = IntegrationRuntime(lambda event: None, lambda: False)
+    runtime.primary_backend = "opencode-think"
+    runtime.model_retry_until = time.monotonic() + 1.0  # görev bütçesi: 1 sn
+    token = CURRENT_RUNTIME.set(runtime)
+    started: float = time.monotonic()
+    try:
+        with pytest.raises(ModelCallFailed) as failure:
+            await main._call_model_with_retries(
+                clients, [{"role": "user", "content": "selam"}], TOOLS, "oturum", "opencode-think",
+                lambda event: None, lambda: False,
+            )
+    finally:
+        CURRENT_RUNTIME.reset(token)
+        await clients["opencode-think"].close()
+        quota.shutdown()
+        quota.server_close()
+    message: str = str(failure.value)
+    assert time.monotonic() - started < 5.0  # 7 gün beklenmedi
+    assert failure.value.kind == "rate_limited" and failure.value.attempts == 1 and len(paths) == 1
+    assert "7 gün sonra yeniden denenmesini istedi" in message and "bütçesine sığmadığı" in message
 
 
 @pytest.mark.parametrize("budget_function, value", [
@@ -593,3 +662,23 @@ async def test_refused_retry_message_does_not_suggest_enabling_fallback(
         refused.server_close()
     assert failure.value.kind == "retry_refused"
     assert "yedek sağlayıcı izni" not in str(failure.value)
+
+
+def test_is_context_overflow_detects_code_and_message() -> None:
+    """Bağlam taşması 'kalıcı' sınıfındadır ama kurtarılabilir: kompaktlama için ayrılır."""
+    by_code: ModelErrorInfo = ModelErrorInfo(
+        "permanent", 400, "context_length_exceeded", None, False, None, "çok uzun istem",
+    )
+    assert is_context_overflow(by_code) is True
+    by_message: ModelErrorInfo = ModelErrorInfo(
+        "permanent", 400, "invalid_request_error", None, False, None,
+        "maximum context length exceeded",
+    )
+    assert is_context_overflow(by_message) is True
+    other: ModelErrorInfo = ModelErrorInfo(
+        "permanent", 400, "invalid_request_error", None, False, None, "geçersiz istek",
+    )
+    assert is_context_overflow(other) is False
+    assert is_context_overflow(
+        ModelErrorInfo("rate_limited", 429, None, 30.0, False, None, "429"),
+    ) is False

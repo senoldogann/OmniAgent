@@ -617,6 +617,49 @@ def test_user_bubble_is_rebuilt_from_hidden_text_after_reload(app: ui.OmniUI) ->
     assert again == saved
 
 
+def test_user_bubble_footer_shows_send_time_and_copies_only_that_message(app: ui.OmniUI) -> None:
+    """
+    Kullanıcı mesajının altında gönderim saati ve o mesajı kopyalayan simge görünür; saat kayda
+    yazıldığı için sohbet yeniden açıldığında da aynı değerle kurulur.
+    """
+    assert app._ensure_chat("saat ve kopyalama")
+    chat_id = app._active_chat_id
+    assert chat_id is not None
+    with app._writable_transcript():
+        app._render_goal("saat ve kopyalama")
+    bubble = app._bubbles[0]
+    assert bubble["time"].cget("text") == datetime.now().astimezone().strftime("%H:%M")
+    assert bubble["foot"].master is bubble["frame"] and bubble["copy"].master is bubble["foot"]
+    assert bubble["foot"].winfo_manager() == "grid"
+    # Kopyalama simgeyi yeşil onaya çevirir ve yalnız bu mesajı panoya koyar.
+    app.clipboard_clear()
+    app._copy_message("saat ve kopyalama", bubble["copy"])
+    assert app.clipboard_get() == "saat ve kopyalama"
+    assert bubble["copy"].cget("image") == str(app._copy_photo_done)
+    app._restore_message_copy(bubble["copy"])
+    assert bubble["copy"].cget("image") == str(app._copy_photo)
+    sent_text: str = bubble["time"].cget("text")
+    assert app._save_current_chat()
+    stamps = ui.load_chat(chat_id)["sends"]
+    assert len(stamps) == 1 and ui.sent_time_text(stamps[0]) == sent_text
+    app._new_chat()
+    assert not app._bubbles
+    app._open_chat(chat_id)
+    assert app._bubbles[0]["time"].cget("text") == sent_text
+
+
+def test_user_bubble_footer_without_a_saved_stamp_keeps_only_the_copy_icon(app: ui.OmniUI) -> None:
+    """Eski kayıtlarda gönderim saati yoktur: kabarcık saatsiz kurulur, kopyalama yine çalışır."""
+    record: ui.ChatRecord = ui.new_chat("eski kayıt")
+    record["spans"] = [{"text": "eski hedef\n", "tags": ["user_msg", "user_line"]}]
+    ui.save_chat(record)
+    app._open_chat(record["id"], save_current=False)
+    bubble = app._bubbles[0]
+    assert bubble["label"].cget("text") == "eski hedef\n" and bubble["time"].cget("text") == ""
+    app._copy_message(bubble["label"].cget("text"), bubble["copy"])
+    assert app.clipboard_get() == "eski hedef\n"
+
+
 def test_reloaded_tool_groups_are_collapsed_and_still_toggle(app: ui.OmniUI) -> None:
     assert app._ensure_chat("araç")
     chat_id = app._active_chat_id
@@ -1069,6 +1112,7 @@ def detached_windows(monkeypatch: pytest.MonkeyPatch) -> None:
     gizli olduğundan geçicilik bağı kaldırılır; üretimde ana pencere yanıt penceresinden önce öne alınır.
     """
     monkeypatch.setattr(ui.ctk.CTkToplevel, "transient", lambda self, master=None: "")
+    monkeypatch.setattr(ui, "create_confirmation_popup", lambda *args: None)
 
 
 def _answer_fields(timeout: Optional[float]) -> dict[str, object]:
@@ -1112,8 +1156,8 @@ def test_hidden_app_defers_the_answer_window_and_notifies_without_content(
     assert any("Yanıt süresi 15 dk" in text for text in _label_texts(app._input_windows["r1"]))
 
 
-@pytest.mark.parametrize("backgrounded,expected", [(True, [False]), (False, [])])
-def test_visible_app_shows_the_answer_window_and_only_raises_when_backgrounded(
+@pytest.mark.parametrize("backgrounded,expected", [(True, []), (False, [])])
+def test_visible_app_shows_the_answer_window_without_raising_main_window(
     app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch, detached_windows: None, backgrounded: bool, expected: List[bool],
 ) -> None:
     raised: List[Tuple[bool, int]] = []

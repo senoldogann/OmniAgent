@@ -6,7 +6,7 @@ Bu belge, 27 Eylül 2026 itibarıyla kodda bulunan yetenekleri ve bu makinedeki 
 
 Kullanıcı hedefi arayüzden, CLI'den veya eşleştirilmiş özel Telegram sohbetinden alınır. Ajan, varsayılan `ollama-cloud` modeliyle kısa bir araç çağırma döngüsü çalıştırır; araç sonucunu görüp gerektiğinde sonraki tura geçer. Bir turda bağımsız okumalar paralel, yan etkili işlemler sırayla çalışır. Composer'daki Normal profil 25 tur/10 dakika, Uzun profil 50 tur/20 dakika, Otonom profil 100 tur/45 dakika bütçe sunar; kullanıcı cevabı bekleme süresi bu bütçeden düşülür. Model yanıtı ve kabuk çıktısı arayüze canlı akar. `Esc` çalışan görevi durdurur.
 
-Arayüzde model seçimi, kalıcı sohbet geçmişi, komut/araç önizlemeleri, canlı çıktı, hata ve bağlantı durumları bulunur. Soldaki listeden eski sohbet açılır; **Yeni sohbet** düğmesi ve `⌘K` yeni, boş bir sohbet başlatır. Eski sohbetler silinmez. Masaüstü sohbetleri `~/Library/Application Support/OmniAgent/desktop_chats/` altında sohbet başına ayrı JSON dosyasında saklanır; son açık sohbet uygulama yeniden başlayınca yüklenir. Görev sürerken üst sağda süreli bir durum göstergesi görünür; pencere arka plandaysa macOS menü çubuğunda geçici animasyon ve Dock rozeti gösterilir. Arka planda tamamlanan görev macOS bildirimi verir; bildirim görev içeriğini taşımaz. Görev bitince alt bölümde toplam süre, model/araç süresi, tur ve araç sayısı, kesin giriş/önbellek/yeni giriş/çıkış/toplam token sayısı görünür. Entegrasyon kullanıldıysa ağ isteği, keşif, kurulum ve bekleme ölçüleri de gösterilir. Genel `⌘X` tüm OmniAgent pencerelerini gizleyip yeniden gösterir; macOS'taki Kes kısayoluyla çakışır. Gizleme görev durumunu korur ve menü çubuğu göstergesini kaldırır. OmniAgent kendi tam ekran yakalamalarından UI pencerelerini çıkarır; üçüncü taraf ekran görüntüsü veya videosunda görünür pencereyi gizleme garantisi yoktur.
+Arayüzde model seçimi, kalıcı sohbet geçmişi, komut/araç önizlemeleri, canlı çıktı, hata ve bağlantı durumları bulunur. Soldaki listeden eski sohbet açılır; **Yeni sohbet** düğmesi ve `⌘K` yeni, boş bir sohbet başlatır. Eski sohbetler silinmez. Masaüstü sohbetleri `~/Library/Application Support/OmniAgent/desktop_chats/` altında sohbet başına ayrı JSON dosyasında saklanır; son açık sohbet uygulama yeniden başlayınca yüklenir. Görev sürerken üst sağda süreli bir durum göstergesi görünür; pencere arka plandaysa macOS menü çubuğunda geçici animasyon ve Dock rozeti gösterilir. Arka planda tamamlanan görev macOS bildirimi verir; bildirim görev içeriğini taşımaz. Görev bitince alt bölümde toplam süre, model/araç süresi, tur ve araç sayısı, kesin giriş/önbellek/yeni giriş/çıkış/toplam token sayısı görünür. Kullanıcı mesajının altında gönderim saati ve yalnız o mesajı kopyalayan simge durur; gönderim zamanları sohbet kaydıyla saklanır, eski kayıtlarda saat bulunmaz. Ana pencerede klavye odağı composer'dır: kartın dolgusuna, üst şeride ya da sohbete tıklamak odağı giriş alanına döndürür (CustomTkinter tıklanan bileşene odak verdiği için aksi hâlde yazılan komut düşüyordu); transkriptte metin seçiliyken odak metinde kalır. Boş alanda yer tutucu yazı, imlecin (caret) sağından başlar; imleç yer tutucunun opak arka planı altında kalıp görünmez olmaz. Entegrasyon kullanıldıysa ağ isteği, keşif, kurulum ve bekleme ölçüleri de gösterilir. Genel `⌘X` tüm OmniAgent pencerelerini gizleyip yeniden gösterir; macOS'taki Kes kısayoluyla çakışır. Gizleme görev durumunu korur ve menü çubuğu göstergesini kaldırır. OmniAgent kendi tam ekran yakalamalarından UI pencerelerini çıkarır; üçüncü taraf ekran görüntüsü veya videosunda görünür pencereyi gizleme garantisi yoktur.
 
 ## Yerleşik araçlar
 
@@ -20,7 +20,7 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 
 | Alan | Araçlar | Yapabildikleri |
 | --- | --- | --- |
-| Sistem | `execute_shell`, `process_list`, `execute_js` | macOS kabuğu ve Node.js çalıştırma; süreçleri özetleme |
+| Sistem | `execute_shell`, `process_list`, `execute_js`, `execute_python` | macOS kabuğu, Node.js ve Python 3 çalıştırma; süreçleri özetleme |
 | Dosya | `read_file`, `write_file` | Dosya okuma/yazma; Python sözdizimi denetimi, önceki sürüm yedeği ve yazma doğrulaması |
 | Web | `web_search`, `fetch_raw`, `browse_url` | Arama; hızlı HTTP/HTML/JSON okuma; kalıcı Playwright sekmesinde DOM eylem dizisi |
 | Açık Chrome oturumu | `chrome_active_tab`, `cua_click_point`, `cua_type_text`, `cua_press_key`, `cua_submit_text`, `cua_fill_field` | Aynı siteye ait açık sekmeyi bulup yüklenmesini bekleme veya `new_tab=true` ile yeni sekme açma; tek çağrıda arama kutusuna yazıp gönderme; form alanını Enter'a basmadan doldurma |
@@ -41,7 +41,7 @@ Görünür metne tıklama (`cua_click_text`) macOS Vision OCR ile tam Retina ç�
 
 Outlook/Hotmail için yerleşik Microsoft Graph adaptörü bulunur. Kuralı hesap başına saklayabilir, postaları sunucu tarafında filtreleyebilir, adayları seçebilir, 20'lik Graph batch istekleriyle Çöp Kutusu'na taşıyabilir ve işlem kaydından geri yükleyebilir. Giriş Microsoft OAuth ile kullanıcı tarafından tamamlanır; token Keychain'de tutulur. Bu makinede Outlook uygulama kimliği ve hesap bağlantısı **henüz yapılandırılmamış**; canlı posta kutusu testi yapılmadı. Kurulum ve izin ayrıntıları [INTEGRATIONS.md](INTEGRATIONS.md) içindedir.
 
-Genel MCP katmanı `stdio` ve Streamable HTTP bağlantılarını destekler. Yalnız kaynak/sabit sürüm/güven durumu katalogda açıkça tanımlanan paketler otomatik kurulabilir; Python ve Node bağımlılıkları ana ajan ortamından ayrı tutulur. Uzak araçların yalnız ilgili şemaları modele açılır. Skill metinleri yöntem bilgisi sağlar, kendi başlarına hesap erişimi veya yürütme yetkisi sağlamaz. Kurulu yerel skill dosyaları `~/.agents/skills` ve `~/.codex/skills` altından başlangıçta ve eşleşme bulunamadığında dizinlenir; `OMNI_SKILLS_DIRS` ile özel dizinler seçilebilir. `discover_capabilities(query="catalog", operations=[], allow_online=false)` yerel yetenek envanterini ağ çağrısı olmadan verir. Tekrarlı yerel işlemlerde ajan tek `execute_js` çağrısında geçici yardımcı kod kullanabilir. Aynı kod yeniden gerekiyorsa `// omni:save ad` ile başarılı JS kodunu yalnız görev belleğine kaydeder ve `// omni:run ad` ile JSON girdisiyle tekrar çalıştırır. Kalıcı eklenti ve kendi kaynak değişikliği yalnız açık görev kapsamında yapılır. Context7 anahtarsız uzak MCP olarak kayıtlıdır; bilinmeyen registry sonucu incelenmeden kurulmaz.
+Genel MCP katmanı `stdio` ve Streamable HTTP bağlantılarını destekler. Yalnız kaynak/sabit sürüm/güven durumu katalogda açıkça tanımlanan paketler otomatik kurulabilir; Python ve Node bağımlılıkları ana ajan ortamından ayrı tutulur. Uzak araçların yalnız ilgili şemaları modele açılır. Skill metinleri yöntem bilgisi sağlar, kendi başlarına hesap erişimi veya yürütme yetkisi sağlamaz. Kurulu yerel skill dosyaları `~/.agents/skills` ve `~/.codex/skills` altından başlangıçta ve eşleşme bulunamadığında dizinlenir; `OMNI_SKILLS_DIRS` ile özel dizinler seçilebilir. `discover_capabilities(query="catalog", operations=[], allow_online=false)` yerel yetenek envanterini ağ çağrısı olmadan verir. Tekrarlı yerel işlemlerde ajan tek `execute_js` ya da `execute_python` çağrısında geçici yardımcı kod kullanabilir. Aynı kod yeniden gerekiyorsa `// omni:save ad` (JS) ya da `# omni:save ad` (Python) ile başarılı kodu yalnız görev belleğine kaydeder ve `// omni:run ad` / `# omni:run ad` ile JSON girdisiyle tekrar çalıştırır. Kalıcı eklenti ve kendi kaynak değişikliği yalnız açık görev kapsamında yapılır. Context7 anahtarsız uzak MCP olarak kayıtlıdır; bilinmeyen registry sonucu incelenmeden kurulmaz.
 
 Telegram köprüsü `telegram_bridge.py` ile ayrı bir uzak arayüzdür; model aracı veya MCP
 değildir. Varsayılan kısa görünüm yanıtı tek balonda canlı günceller; araç turunda yalnız
@@ -84,13 +84,32 @@ Varsayılan profil `ollama-cloud` (`gemma4:cloud`, yerel Ollama API'si); bu maki
 varsayılan `gemma4:cloud` korunur. `qwen3.5:cloud` denendi fakat bu hesapta 402 ile
 "ücretsiz kullanıma dahil değil" yanıtı verdi; bu yüzden hazır profil yapılmadı.
 
+Ayarlar (⚙) sayfasındaki model listesi Ollama profili için yerel sunucunun `/api/tags`
+yanıtından üretilir ve 15 dakika önbelleklenir ("Modelleri yenile" önbelleği atlar). Bir kayıt
+bulut sayılır: ad son eki `:cloud`/`-cloud` ise ya da sunucu `remote_model`/`remote_host`
+alanlarını bildiriyorsa; yalnız `completion` yeteneği olan kayıtlar listelenir, gömme modeli
+(ör. `mxbai-embed-large`) ve yerel sohbet modeli listelenmez. Yerel sunucuya kurulu olmayan
+bulut modeli listede görünmez (`ollama pull <ad>` ile kurulur); kutu elle düzenlenebildiği için
+listede olmayan geçerli bir ad doğrudan yazılabilir. Not satırı bulut modelinin ollama.com adını
+da gösterir (ör. `gemma4:cloud → gemma4:31b`), böylece `gemma4:31b:cloud` gibi var olmayan bir
+ad aranmaz. OpenAI ve OpenRouter listeleri anahtar girilmeden sorgulanmaz.
+
 Fast Loop semantik ilerlemeyi host seviyesinde izler. Yeni ve başarılı komut çıktısı en fazla sekiz farklı sonuç için ilerleme sayılır; aynı veya boş çıktı sayılmaz. Eylem isteklerinde yalnız keşif, okuma veya gezinme sonucu başarı kanıtı değildir: host gerçek bir işlem denemesi ister, ardından kanıt yoksa görevi başarısız işaretler. `git status` mutasyon hedefinde yalnız gözlem sayılır; zincirde başka bir komut varsa bütün çağrı ayrıca değerlendirilir. `remove` ve `kaldır` da silme eylemi sayılır. İngilizce `How to ...?`/`How can I ...?` yöntem soruları tek başına eylem sayılmaz; soru sonrası açık emir kendi eylem türüyle doğrulanır. Açık yerel dosya silme hedeflerinde tüm yolların başlangıçta mevcut, bitişte yok olması ve her birine yönelik başarılı silme komutu gerekir. Taşıma için kaynak/hedef ve içerik özeti veya sembolik bağ hedefi; düzenleme için ilk/son içerik özeti ile hedefli dosya aracı eşleştirilir. Bağıl yollar görev başındaki çalışma dizinine göre yorumlanır. Belirsiz hedef, README içindeki yol referansı, okunamayan veya boyut sınırını aşan dosya doğrulanmış teslim sayılmaz; sonuç `Doğrulanmadı` olur. Dosya sözleşmesi yalnız açık ve dar yerel yol biçimlerini kapsar. Eylem kanıtı ve son durum kontrolü aynı tek kurtarma hakkını kullanır. Görsel olmayan turlarda iki anlamsız tur
 sonra yeniden planlama, görsel otomatik gözlem taşıyan turlarda üç tur tolerans, teslim aşamasında iki
 anlamsız tur sonra kontrollü durma uygulanır. Bu erken durma yalnız Normal, Uzun ve Otonom modlarındadır.
 Sürekli mod ayarlanan süre ve toplam token sınırlarına kadar çalışır. Başarısız araç çağrısının
 hemen ardından hatayı özetleyip alternatif adım ister; önceki turdaki aynı başarısız çağrı aynı
 argümanlarla yinelenirse çalıştırmaz. Farklı bir adımın ardından yeniden deneme mümkündür.
-Tekrarlanan başarısızlıkları ve araçsız raporları kullanıcıya otomatik yön sorusu açmadan yeniden planlar.
+Tekrarlanan başarısızlıkları ve araçsız raporları en fazla iki kez yeniden planlar; yeni sonuç yoksa
+model/araç çağrılarını durdurup kullanıcıdan yön ister. Önceki ilerleme imzası sürekli modda da tutulur;
+aynı dosyayı/ekranı tekrar okumak ilerleme değildir. Düz metinde bırakılmış açık onay sorusu gerçek
+`ask_user(kind=confirm)` çağrısına dönüştürülür. Masaüstündeki sürekli mod etkileşimlidir: onay kartı
+sağ üstte, ana uygulamayı öne getirmeden görünür ve **İzin ver / Reddet** seçenekleri sunar.
+Yanıt gelmeden bağımlı işlem yürütülmez; kapanan/süresi dolan karta geç yanıt uygulanmaz. ⌘⇧X ile
+bilerek gizlenen uygulamada içeriksiz bildirim/Dock uyarısı verilir; uygulama gösterilince kart açılır.
+Başarı bildiriminin onay süresi dolması başarı değildir. Çıplak GUI tıklama/yazım kayıtları hedef
+kanıtı olarak kullanılamaz; sonuç ayrıca okunmalıdır. Pasif düğmede koordinat yoluyla yeniden
+tıklama yerine form doğrulaması istenir.
 Önbelleksiz token veya araç çağrısı sayısı opsiyonel keşfi daraltmaz. 24 Eylül'deki üçer stress koşusunda
 `long_research` 3/3 başarı, 6 tur/13 araç ve 8,5 saniye medyan; `stagnation` 3/3 beklenen
 bounded-failure, 7 tur ve 5,4 saniye medyan verdi. Önceki stagnation politikası 10 tur
@@ -139,6 +158,11 @@ alınmaz; yalnız araç çıktılarından çıkarılmış host gerçekleri korun
 kaynak yazımı ve durum kanıtını uygular; hedefteki bütün alt maddeler için genel bir doğrulama
 garantisi vermez.
 
+Retry-After görevin yeniden deneme bütçesine sığmıyorsa (ör. aylık kotanın dolduğunu bildiren
+gün mertebesindeki bir bekleme) hiç beklenmez: görev, beklemenin yapılmadığını, bunun geçici bir
+yavaşlama olmadığını ve başka bir model seçilmesi ya da izinli bir yedek gerektiğini söyleyen hatayla
+biter. Bekleme süresi gösterimi 48 saatten sonrasını gün olarak yazar.
+
 Uzun görevlerde model her turda son gerçek araç çağrılarının kimliğini, başarı durumunu ve kısa
 sonucunu çalışma kaydında görür. Modelin kendi `STATE` notu açıkça doğrulanmamış olarak etiketlenir
 ve tek başına ilerleme sayılmaz. Kontrol noktası, araç çıktılarından çıkarılmış değerleri düz metin
@@ -182,9 +206,12 @@ canlı `self_repair` ölçümünde 3/3 başarı: ilk koşu 5 tur/4 araç/4,5 sn;
 okunan ödeme/sipariş onayı düğmelerine tıklama (OCR, erişilebilirlik adı, DOM), entegrasyon araçlarıyla geri
 alınamaz dış iletişim ve kullanıcının istemediği kalıcı hafıza mutasyonları `approval.py` host kapısından
 geçer; onay yoksa (kanal yok, ret, zaman aşımı) ilgili çağrı çalıştırılmaz. İki otomatik onay yolu vardır ve
-her ikisi de varsayılan olarak izlenebilir kalır: güvenli host listesi/tutar limiti (`AUTO_APPROVE_HOSTS`,
+her ikisi de varsayılan olarak kapalıdır: güvenli host listesi/tutar limiti (`AUTO_APPROVE_HOSTS`,
 `AUTO_APPROVE_LIMIT`; ikisi de boş/0 iken kapalı) ve sürekli mod (`AUTO_APPROVE_IN_CONTINUOUS_MODE`).
-Otomatik onayda denetim kaydına `auto_approved` yazılır; kapatmak için ilgili ayar `False` yapılır.
+`AUTO_APPROVE_IN_CONTINUOUS_MODE=False`; sürekli mod tek başına onay yetkisi vermez.
+GUI/DOM üzerindeki tanınan yayınla/gönder/yanıtla düğmeleri de host onayından geçer; kart son
+yazılan taslak metnini gösterir. Onaydan sonra hedef yeniden kontrol edilir. Açıkça etkinleştirilen
+otomatik onayda denetim kaydına `auto_approved` yazılır.
 Kapsam ve sınırlar (Enter ile gönderim, ikon-only düğme gibi denetlenmeyen yollar) `approval.py` başlığındadır.
 
 Bot doğrulaması ve erişim engeli sayfaları (Cloudflare ara sayfası, reCAPTCHA/hCaptcha/Turnstile, hız sınırı)

@@ -11,6 +11,7 @@ import os
 import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Literal, Optional, Tuple, TypeVar
 
@@ -27,7 +28,7 @@ from .ax_snapshot import (
     AX_ERROR_API_DISABLED, AX_ERROR_CANNOT_COMPLETE, AX_ERROR_INVALID_ELEMENT,
     AX_ERROR_SUCCESS, ApprovedStep,
     AX_NODE_READER, COMMIT_ROLES, CapturedSnapshot, Effect, EffectProbe, Element, Frame, LiveElement, PressStep, Snapshot,
-    SnapshotLimits, TEXT_INPUT_ROLES, ax_frame, ax_read, ax_text, ax_value_text, capture_snapshot,
+    SnapshotLimits, TEXT_INPUT_ROLES, ax_frame, ax_list, ax_read, ax_text, ax_value_text, capture_snapshot,
     changed_signals, clip_label, frame_center, intersect, normalize_snapshot_id, normalize_text, poll_effect,
     approved_press_outcome, press_outcome, quantized_frame, read_live_element, remember_snapshot_labels, role_name,
     running_application, stale_reason,
@@ -288,6 +289,82 @@ def _bundle_name(pid: int) -> str:
     return str(running.bundleURL().lastPathComponent()).removesuffix(".app")
 
 
+def _owner_names(owners: List[Tuple[str, int]]) -> List[str]:
+    """Pencere sahiplerinin boş olmayan, tekil, sıralı adları (en çok 20); hata iletilerinde modele verilir. Saf."""
+    return sorted({name for name, _pid in owners if name})[:20]
+
+
+def _folded_app_name(name: str) -> str:
+    """Ad karşılaştırması için yalnız harf/rakam, aksansız, küçük harf: 'T3 Code (Nightly)' → 't3codenightly'. Saf."""
+    decomposed: str = unicodedata.normalize("NFKD", name)
+    return "".join(character for character in decomposed if character.isalnum()).casefold()
+
+
+# NSApplicationActivationPolicyRegular: Dock'ta görünen normal uygulama (arka plan servisi değil).
+_REGULAR_ACTIVATION_POLICY: int = 0
+
+
+def _dock_app_owners() -> List[Tuple[str, int]]:
+    """
+    Penceresi olan ve Dock'ta görünen (normal) uygulamalar. Arka plan servisleri (ör. CursorUIViewService, AutoFill)
+    ad eşleştirmesine ve modele verilen listeye girmez: canlı hatada (29 Eylül) 'Cursor' tahmini bu servise eşlendi.
+    """
+    owners: List[Tuple[str, int]] = []
+    for name, pid in _visible_app_owners():
+        running = running_application(pid)
+        if running is not None and int(running.activationPolicy()) == _REGULAR_ACTIVATION_POLICY:
+            owners.append((name, pid))
+    return owners
+
+
+def match_running_app(app_name: str, owners: List[Tuple[str, int]]) -> Optional[Tuple[str, int]]:
+    """
+    İstenen adı çalışan uygulamalardan birine (gerçek ad, pid) eşler: önce büyük/küçük harfsiz tam ad, sonra harf/rakam
+    dışı atılmış ön ek YALNIZ bir uygulamayla eşleşiyorsa o ('T3 Code' → 'T3 Code (Nightly)'). Eşleşme yoksa ya da
+    belirsizse None: çağıran adı olduğu gibi (kapalı uygulamayı açmak için) dener. Saf.
+    """
+    unique: List[Tuple[str, int]] = sorted({(name, pid) for name, pid in owners if name})
+    wanted: str = app_name.strip().casefold()
+    for name, pid in unique:
+        if name.casefold() == wanted:
+            return name, pid
+    folded: str = _folded_app_name(app_name)
+    if not folded:
+        return None
+    candidates: List[Tuple[str, int]] = [
+        (name, pid) for name, pid in unique if _folded_app_name(name).startswith(folded)
+    ]
+    return candidates[0] if len({name for name, _pid in candidates}) == 1 else None
+
+
+def resolve_running_app(app_name: str) -> Tuple[str, Optional[int]]:
+    """Adı Dock'taki çalışan bir uygulamanın (gerçek ad, pid) ikilisine çözer; çözülemezse (ad, None): açılacak uygulama."""
+    matched: Optional[Tuple[str, int]] = match_running_app(app_name, _dock_app_owners())
+    return matched if matched is not None else (app_name, None)
+
+
+def _running_apps_text() -> str:
+    """Modelin yanlış uygulama adını düzeltebilmesi için Dock'taki çalışan uygulamaların listesi."""
+    names: List[str] = _owner_names(_dock_app_owners())
+    return f"Çalışan uygulamalar: {', '.join(names) if names else 'yok'}."
+
+
+def restore_minimized_window(pid: int) -> bool:
+    """
+    Uygulamanın BÜTÜN pencereleri küçültülmüşse ilkini geri açar (AXMinimized=false) ve True döner; ekranda en az bir
+    penceresi varsa dokunmaz. Küçültülmüş pencere ekran görüntüsünde ve OCR'da görünmez (pencere listesi
+    kCGWindowListOptionAll ile onu yine de 'pencere var' sayar): içeriği okunacak uygulama önce geri açılmalıdır.
+    Geri açma reddedilirse açık hata.
+    """
+    windows: List[object] = ax_list(_ax_attribute(AX.AXUIElementCreateApplication(pid), "AXWindows"))
+    if not windows or not all(bool(_ax_attribute(window, "AXMinimized")) for window in windows):
+        return False
+    code: int = int(AX.AXUIElementSetAttributeValue(windows[0], "AXMinimized", False))
+    if code != AX_ERROR_SUCCESS:
+        raise ToolError(f"Küçültülmüş pencere geri açılamadı (AX hata kodu {code}).", "WINDOW_RESTORE_FAILED", True)
+    return True
+
+
 def _app_pid(app_name: str) -> int:
     """
     Uygulamanın PID'ini pencere sunucusundan bulur (yerel ad veya paket adıyla).
@@ -301,7 +378,7 @@ def _app_pid(app_name: str) -> int:
     for _name, pid in owners:
         if _bundle_name(pid).casefold() == wanted:
             return pid
-    available: str = ", ".join(sorted({name for name, _ in owners if name})[:20])
+    available: str = ", ".join(_owner_names(owners))
     raise ToolError(
         f"Penceresi olan çalışan uygulama bulunamadı: {app_name}. Açık uygulamalar: {available}. "
         "Kapalıysa önce cua_get_app ile başlat.",
@@ -458,6 +535,26 @@ def _focus_signature(application: object) -> str:
     frame: Optional[Frame] = ax_frame(ax_read(focused, "AXPosition"), ax_read(focused, "AXSize"))
     role: str = ax_text(ax_read(focused, "AXRole"))
     return f"{role}|{label}|{quantized_frame(frame)}" if frame is not None else f"{role}|{label}"
+
+
+def focused_text_value(app_name: Optional[str]) -> Optional[str]:
+    """Koordinatla yazılmış alanın gerçek AX değeri; okunamaz/parola alanında None.
+
+    Bu değer kaydetme/yayınlama kanıtı değil, yalnız hedef alanın geri okumasıdır.
+    """
+    if not app_name:
+        return None
+    try:
+        application = AX.AXUIElementCreateApplication(_app_pid(app_name))
+        focused = ax_read(application, "AXFocusedUIElement")
+        if focused is None or ax_text(ax_read(focused, "AXRole")) not in TEXT_INPUT_ROLES:
+            return None
+        if ax_text(ax_read(focused, "AXSubrole")) == "AXSecureTextField":
+            return None
+        value = ax_read(focused, "AXValue")
+        return value if isinstance(value, str) else None
+    except ToolError:
+        return None
 
 
 def _window_stack_image(pid: int, window_frame: Frame) -> Optional[object]:
@@ -754,15 +851,20 @@ class CUA:
                 env=child_environment(), capture_output=True, text=True, timeout=CUA_ACTIVATE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as error:
+            # Canlı hata (29 Eylül): uydurma adla (yüklü olmayan 'Cursor') zaman aşımı "ekran görüntüsüne bak" diyordu;
+            # model masaüstü görüntüsünden "uygulama açık değil" sonucuna vardı. Hata artık çalışan uygulamaları verir.
             raise ToolError(
-                f"Uygulama {CUA_ACTIVATE_TIMEOUT_SECONDS:.0f} sn içinde etkinleşmedi: {app_name}. Açılış sürüyor olabilir; "
-                "take_screenshot ile bak, sonra cua_get_app'i yeniden dene.",
+                f"Uygulama {CUA_ACTIVATE_TIMEOUT_SECONDS:.0f} sn içinde etkinleşmedi: {app_name}. {_running_apps_text()} "
+                "Aradığın bunlardan biriyse cua_get_app'i listedeki tam adla çağır; listede yoksa ve yüklüyse açılışı "
+                "sürüyor olabilir, aynı adla bir kez daha dene. Ekran görüntüsü yalnız ekrandaki pencereleri gösterir: "
+                "bir uygulamanın kapalı olduğunu kanıtlamaz.",
                 "APP_ACTIVATE_TIMEOUT", True,
             ) from error
         if result.returncode == 0:
             return f"{app_name} aktif edildi ve öne getirildi."
         raise ToolError(
-            f"Uygulama bulunamadı veya aktif edilemedi: {app_name}, ayrıntı={result.stderr.strip()}",
+            f"Uygulama bulunamadı veya aktif edilemedi: {app_name}, ayrıntı={result.stderr.strip()}. "
+            f"{_running_apps_text()}",
             "APP_NOT_FOUND", False,
         )
 
@@ -951,7 +1053,12 @@ class CUA:
         _require_accessibility()
         target: ResolvedElement = self.resolve_element(snapshot_id, index)
         if not target.live["enabled"]:
-            raise ToolError(f"{_describe(target.element)} pasif (disabled); işlem yapılmadı.", "ELEMENT_DISABLED", True)
+            raise ToolError(
+                f"{_describe(target.element)} pasif (disabled); işlem yapılmadı. "
+                "Koordinat veya klavye ile yeniden tıklama. Formun hata/karakter sayacı ve "
+                "alan değerlerini incele; nedenini düzeltip yeni öğe listesi al.",
+                "ELEMENT_DISABLED", True,
+            )
         return target
 
     def click_snapshot_element(self, snapshot_id: str, index: int) -> str:

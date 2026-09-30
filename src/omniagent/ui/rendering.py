@@ -426,6 +426,17 @@ def plain_transcript(raw: str) -> str:
     return _FOLD_MARKERS.sub("", raw).replace("\t", "  ")
 
 
+def sent_time_text(stamp: str) -> str:
+    """
+    Kayıtlı ISO gönderim zamanını yerel saat olarak 'HH:MM' biçiminde gösterir. Kullanıcı mesajının
+    altındaki not bunu kullanır; okunamayan değer boş metne düşer (eski kayıtlar saatsiz kalır). Saf.
+    """
+    try:
+        return datetime.fromisoformat(stamp).astimezone().strftime("%H:%M")
+    except ValueError:
+        return ""
+
+
 # --- Kenar çubuğu: tarihe göre gruplama, satır görünümü ve durum noktası ---
 GROUP_TODAY: str = "Bugün"
 GROUP_YESTERDAY: str = "Dün"

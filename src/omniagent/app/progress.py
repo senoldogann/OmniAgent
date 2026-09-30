@@ -21,6 +21,7 @@ from omniagent.app.tool_schema import (
 )
 from omniagent.app.types import ToolCallDraft, ToolResult
 from omniagent.config import redact
+from omniagent.approval import APPROVAL_REFUSAL_CODES
 from omniagent.core.events import TokenUsage
 from omniagent.core.fast_loop import normalize_progress_signature
 from omniagent.tools.bot_wall import ACCESS_CHALLENGE_CODE
@@ -43,6 +44,18 @@ def failed_tool_recovery_message(calls: List[ToolCallDraft], results: List[ToolR
     """
     if any(result.get("code") == ACCESS_CHALLENGE_CODE for result in results):
         return None
+    if any(result.get("code") == "ELEMENT_DISABLED" for result in results):
+        return (
+            "HOST — FORM HAZIR DEĞİL: Düğme pasif; başka araç, koordinat veya klavye ile "
+            "tıklamayı deneme. Güncel alan değerlerini, karakter sayacını, eksik alanları ve "
+            "doğrulama hatasını oku. Formu düzelt; düğme etkinleştiğini yeni öğe listesinde "
+            "doğruladıktan sonra gönder. Kaydetme/yayınlama henüz gerçekleşmedi."
+        )
+    if any(result.get("code") in APPROVAL_REFUSAL_CODES | {"INPUT_DEFERRED"} for result in results):
+        return (
+            "HOST — KULLANICI ONAYI/GİRDİSİ YOK: Bu eylemi başka araç veya yolla gerçekleştirme. "
+            "Bekleyen bağımlılığı kaydet; yalnız bağımsız kalan işi sürdür, kalmadıysa yanıt bekle."
+        )
     failures: List[str] = [
         f"{call['name']}: {result_text(result)[:180]}"
         for call, result in zip(calls, results, strict=True) if not result.get("ok")

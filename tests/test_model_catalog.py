@@ -38,6 +38,59 @@ def test_model_lists_filter_specialized_models() -> None:
     }) == ("gemma4:cloud", "gpt-oss:20b-cloud")
 
 
+def test_ollama_cloud_keeps_remote_registered_models() -> None:
+    """
+    Ad son eki olmayan bulut kaydı (`ollama pull` sonrası düz etiket) gizlenmemeli; yerel
+    sohbet modeli ve gömme modeli ise bulut profiline girmemeli.
+    """
+    rows = {"models": [
+        {"name": "gemma4:cloud", "remote_model": "gemma4:31b", "remote_host": "https://ollama.com"},
+        {"name": "satici/deepseek-v41-uncensored:latest", "remote_model": "deepseek-v4.1-flash",
+         "remote_host": "https://ollama.com:443", "capabilities": ["completion", "tools"]},
+        {"name": "mxbai-embed-large:latest", "capabilities": ["embedding"]},
+        {"name": "orcarouter/Qwen3.8-27B-Uncensored:iq2_xxs",
+         "capabilities": ["completion", "vision", "tools"]},
+        {"name": "../bad"},
+    ]}
+    assert catalog._listed_ids("ollama-cloud", rows) == (
+        "gemma4:cloud", "satici/deepseek-v41-uncensored:latest",
+    )
+
+
+def test_remote_targets_expose_ollama_com_model_name() -> None:
+    """Ayarlar notu, kullanıcının aradığı gerçek ollama.com adını gösterebilmeli."""
+    payload = {"models": [
+        {"name": "gemma4:cloud", "remote_model": "gemma4:31b"},
+        {"name": "gpt-oss:20b-cloud", "remote_model": "gpt-oss:20b-cloud"},
+        {"name": "gemma4:cloud", "remote_model": "  "},
+        {"name": "llama3:latest"},
+    ]}
+    assert catalog._remote_targets("ollama-cloud", payload) == {"gemma4:cloud": "gemma4:31b"}
+    assert catalog._remote_targets("openai", payload) == {}
+
+
+@pytest.mark.asyncio
+async def test_ollama_cloud_listing_caches_remote_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_client = httpx.AsyncClient
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"models": [
+        {"name": "satici/model:latest", "remote_model": "deepseek-v4.1-flash",
+         "capabilities": ["completion"]},
+        {"name": "mxbai-embed-large:latest", "capabilities": ["embedding"]},
+    ]}))
+    monkeypatch.setattr(catalog.httpx, "AsyncClient", lambda **kw: real_client(transport=transport, **kw))
+    catalog._CACHE.clear()
+    assert await catalog.list_provider_models(
+        "ollama-cloud", "http://127.0.0.1:11434/v1/", None,
+    ) == ("satici/model:latest",)
+    assert catalog.cached_remote_targets("ollama-cloud", None) == {
+        "satici/model:latest": "deepseek-v4.1-flash",
+    }
+    catalog._CACHE.clear()
+    assert catalog.cached_remote_targets("ollama-cloud", None) == {}
+
+
 @pytest.mark.asyncio
 async def test_openrouter_uses_tools_filter_and_cache(
     monkeypatch: pytest.MonkeyPatch,

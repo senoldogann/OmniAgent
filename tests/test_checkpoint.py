@@ -309,3 +309,50 @@ def test_summarize_completed_steps_keeps_only_the_last_steps_and_summarises_only
     assert time.perf_counter() - started < 0.5
     assert len(summary) == CHECKPOINT_MAX_STEPS
     assert [line.split(" çıktı", 1)[0] for line in summary] == [f"execute_shell: adım {number}" for number in range(95, 100)]
+
+
+def test_checkpoint_model_state_roundtrip_and_scratchpad(tmp_path: Path) -> None:
+    """Modelin STATE kaydı temizlenerek saklanır ve 'devam et' scratchpad'ine girer."""
+    saved_path = save_checkpoint(
+        session_id=session_id_for(77),
+        goal="Adayları kontrol et",
+        facts={"aday": "uygun"},
+        completed_steps=["read_file: özgeçmiş.pdf okundu"],
+        turn_count=4,
+        runs_dir=tmp_path,
+        model_state="STATE:\nFACTS: aday1=uygun\nREMAINING: rapor yazımı",
+    )
+    assert saved_path.is_file()
+    loaded = load_checkpoint(session_id_for(77), runs_dir=tmp_path)
+    assert loaded is not None
+    assert "aday1=uygun" in loaded["model_state"]
+    scratchpad: str = format_checkpoint_scratchpad(loaded)
+    assert "Önceki Model STATE'i" in scratchpad
+    assert "aday1=uygun" in scratchpad
+
+
+def test_checkpoint_model_state_masks_secrets(tmp_path: Path) -> None:
+    """Model STATE'i diske yazılırken bilinen sır kalıpları maskelenir."""
+    saved_path = save_checkpoint(
+        session_id=session_id_for(78),
+        goal="Rapor hazırla",
+        facts={},
+        completed_steps=[],
+        turn_count=1,
+        runs_dir=tmp_path,
+        model_state="STATE:\nFACTS: anahtar=sk_abc123def4567890\nREMAINING: teslim",
+    )
+    raw: str = saved_path.read_text(encoding="utf-8")
+    assert "sk_abc123def4567890" not in raw
+    loaded = load_checkpoint(session_id_for(78), runs_dir=tmp_path)
+    assert loaded is not None
+    assert "sk_abc123def4567890" not in loaded["model_state"]
+
+
+def test_checkpoint_without_model_state_still_loads(tmp_path: Path) -> None:
+    """Eski sürüm kontrol noktaları (model_state'siz) geriye dönük okunur."""
+    save_checkpoint(session_id_for(79), "Eski görev", {}, [], 1, runs_dir=tmp_path)
+    loaded = load_checkpoint(session_id_for(79), runs_dir=tmp_path)
+    assert loaded is not None
+    assert loaded["model_state"] == ""
+    assert "Önceki Model STATE'i" not in format_checkpoint_scratchpad(loaded)

@@ -11,7 +11,7 @@ from omniagent.app.continuous import (
     CONTINUE_PROMPT, WINDOW_MARKER, parse_continuous_limits, window_messages,
 )
 from omniagent.app.types import RunReport
-from omniagent.core.events import AgentEvent
+from omniagent.core.events import AWAITING_APPROVAL_CODE, AWAITING_DIRECTION_CODE, AgentEvent
 from omniagent.integrations import runtime as runtime_module
 from omniagent.integrations.capabilities import CapabilityService
 from omniagent.tools import filesystem
@@ -78,6 +78,84 @@ class ContinuousRun:
 
 def tool_messages(messages: List[Message]) -> str:
     return "\n".join(str(message.get("content", "")) for message in messages if message.get("role") == "tool")
+
+
+@pytest.mark.asyncio
+async def test_plain_text_approval_request_opens_real_confirmation_before_next_model_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ContinuousRun([
+        text_turn("Hazırladığım yorum: Merhaba. Bu yorumu sizin adınıza paylaşmamı ister misiniz?"),
+        text_turn("Onay verilmedi; taslak olarak kaldı."),
+    ], [{"onay": False}], 0.0)
+    await session.run(tmp_path, monkeypatch, {})
+    assert len(session.questions) == 1
+    assert "Merhaba" in session.questions[0]
+    assert "ONAYLAMADI" in tool_messages(session.model_inputs[1])
+
+
+@pytest.mark.asyncio
+async def test_continuous_loop_without_state_does_not_treat_repeated_reads_as_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "unchanged.txt"
+    probe.write_text("ok", encoding="utf-8")
+    session = ContinuousRun([
+        tool_turn(call(f"r{i}", "read_file", {"path": str(probe)})) for i in range(10)
+    ], [], 0.0)
+    await session.run(tmp_path, monkeypatch, {})
+    assert any("ardışık ilerlemesiz tur" in str(event.get("text", "")) for event in session.events)
+
+
+@pytest.mark.asyncio
+async def test_unattended_confirmation_still_reaches_user_and_never_runs_on_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = ContinuousRun([
+        tool_turn(call("a1", "ask_user", {"question": "Taslağı yayınlayayım mı?", "kind": "confirm"})),
+    ], [{"onay": False}], 0.0)
+    await session.run(tmp_path, monkeypatch, {"unattended": True})
+    assert session.questions == ["Taslağı yayınlayayım mı?"]
+    assert "ONAYLAMADI" in tool_messages(session.model_inputs[1])
+
+
+def test_bare_gui_actions_are_not_goal_evidence():
+    evidence = main.record_goal_evidence({}, [
+        call("click", "cua_click_point", {"point": [100, 100]}),
+        call("fill", "cua_fill_field", {"point": [100, 100], "text": "taslak"}),
+        call("shot", "take_screenshot", {}),
+        call("read", "cua_snapshot", {"app": "Google Chrome"}),
+    ], [{"tool_call_id": name, "ok": True, "result": "ok"} for name in ("click", "fill", "shot", "read")])
+    assert set(evidence) == {"read"}
+
+
+@pytest.mark.asyncio
+async def test_unverified_gui_success_is_not_streamed_as_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claim = "Bio optimize edildi. Yorum bıraktım ve gönderiyi yayınladım."
+    session = ContinuousRun([text_turn(claim)], [], 0.0)
+    original_model = session.model
+
+    async def streaming_model(*args):
+        args[5]({"kind": "text_delta", "text": claim})
+        return await original_model(*args)
+
+    monkeypatch.setattr(session, "model", streaming_model)
+    await session.run(tmp_path, monkeypatch, {})
+    assert not any(event["kind"] == "text_delta" and claim in event["text"] for event in session.events)
+    assert any("SONUÇ DOĞRULAMA" in str(message.get("content", "")) for message in session.model_inputs[1])
+
+
+@pytest.mark.asyncio
+async def test_stopped_continuous_history_does_not_preserve_false_model_state_as_fact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    false_claim = "profilim 1000 yeni takipçi kazandı"
+    session = ContinuousRun([text_turn("STATE:\nconfirmed: " + false_claim + "\nremaining: yok")], [], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {})
+    assert not report["success"]
+    assert false_claim not in report["exchange"]["answer"]
 
 
 @pytest.mark.asyncio
@@ -229,7 +307,7 @@ async def test_idle_reports_recover_without_asking_user(
 
 
 @pytest.mark.asyncio
-async def test_repeated_successful_reads_do_not_trigger_budget_or_delivery_question(
+async def test_repeated_successful_reads_exhaust_recovery_and_require_new_direction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     probe = tmp_path / "probe.txt"
@@ -239,11 +317,11 @@ async def test_repeated_successful_reads_do_not_trigger_budget_or_delivery_quest
         {**tool_turn(call(f"r{index}", "read_file", {"path": str(probe)})), "usage": high_usage}
         for index in range(26)
     ]
-    session = ContinuousRun(script, [], 0.0)
+    session = ContinuousRun(script, [{"yanit": ""}], 0.0)
     report = await session.run(tmp_path, monkeypatch, {})
-    assert report["reason"] == "durduruldu"
-    assert report["metrics"]["turns"] == 27
-    assert session.questions == []
+    assert report["reason"] == "ilerleme yok: yeni yön verilmedi"
+    assert report["metrics"]["turns"] < 26
+    assert len(session.questions) == 1
     assert not any("HOST FAST LOOP" in str(message.get("content", ""))
                    for turn in session.model_inputs for message in turn)
     assert not any(event["kind"] == "notice" and "bütçesi baskısı" in event["text"].lower()
@@ -320,6 +398,32 @@ async def test_unattended_proven_goal_waits_for_approve_without_model_calls(
 
 
 @pytest.mark.asyncio
+async def test_unattended_proven_goal_closes_when_approve_never_arrives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Onay bekleyen oturum host kilidini süresiz tutmaz; sessizlik başarı değildir."""
+    monkeypatch.setattr(main, "GOAL_APPROVAL_TIMEOUT_SECONDS", 0.5)
+    session = ContinuousRun([
+        tool_turn(call("w1", "write_file", {"path": str(tmp_path / "plan.md"), "content": "plan"})),
+        tool_turn(call("g1", "report_goal_met", {"summary": "Plan hazır.",
+                                                 "evidence_call_ids": ["w1"]})),
+    ], [], 0.0)
+
+    def pop_controls() -> List[str]:
+        return []
+
+    report = await asyncio.wait_for(session.run(
+        tmp_path, monkeypatch, {"unattended": True, "pop_control_messages": pop_controls},
+    ), timeout=5)
+    assert not report["success"] and report["outcome"] == "Plan hazır."
+    assert report["reason"] == "hedef kullanıcı tarafından onaylanmadı"
+    assert len(session.model_inputs) == 2
+    prompts: List[str] = [str(event.get("text")) for event in session.events
+                          if event["kind"] == "notice" and event.get("code") == AWAITING_APPROVAL_CODE]
+    assert len(prompts) == 1 and "/approve" in prompts[0]
+
+
+@pytest.mark.asyncio
 async def test_unattended_idle_run_parks_until_btw(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -344,6 +448,8 @@ async def test_unattended_idle_run_parks_until_btw(
     ), timeout=5)
     assert report["reason"] == "durduruldu"
     assert delivered and session.questions == []
+    assert any(event["kind"] == "notice" and event.get("code") == AWAITING_DIRECTION_CODE
+               for event in session.events)
     assert any("Eksik hesap olmadan plan yap" in str(message.get("content", ""))
                for message in session.model_inputs[4])
 

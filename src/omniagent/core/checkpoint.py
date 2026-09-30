@@ -13,9 +13,12 @@ import os
 import re
 from pathlib import Path
 import tempfile
-from typing import Dict, List, Optional, Sequence, Tuple, TypedDict
+from typing import Dict, List, NotRequired, Optional, Sequence, Tuple, TypedDict
 
-from omniagent.core.observation_filter import sanitize_observation, single_line_snippet
+from omniagent.core.observation_filter import (
+    DIRECTIVE_PLACEHOLDER, has_directive_phrase, mask_sensitive_text, sanitize_observation,
+    single_line_snippet, strip_invisible_characters,
+)
 from omniagent.core.state import StepRecord
 from omniagent.paths import checkpoints_dir
 
@@ -27,6 +30,8 @@ CHECKPOINT_STEP_DETAIL_LEN: int = 80
 CHECKPOINT_FACT_VALUE_LEN: int = 120
 CHECKPOINT_FACT_KEY_LEN: int = 60
 CHECKPOINT_GOAL_LEN: int = 300
+# Modelin kendi STATE kaydının kontrol noktasındaki azami uzunluğu (crash sonrası devamda bağlam)
+CHECKPOINT_MODEL_STATE_LEN: int = 2000
 # Kontrol noktası kimliği uuid4 metnidir ve aynı zamanda dosya adıdır (app/agent.py uuid.uuid4()). Yol ayırıcı ya da
 # nokta içeren başka biçim dizin dışına çıkan bir yol üretebileceğinden kabul edilmez (kimlik dosya yoluna katılır).
 _SESSION_ID_PATTERN: re.Pattern[str] = re.compile(
@@ -44,6 +49,7 @@ class SessionCheckpoint(TypedDict):
     completed_steps: List[str]
     turn_count: int
     updated_at: str
+    model_state: NotRequired[str]
 
 
 class CheckpointFormatError(ValueError):
@@ -69,6 +75,16 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _clean_model_state(raw: str) -> str:
+    """
+    Model STATE bloğunu diske yazmadan ve modele vermeden önce temizler: görünmez karakterler atılır,
+    hassas kalıplar maskelenir, uzunluk kırpılır; açık talimat taklidi görünüyorsa işaret döner. Saf.
+    """
+    bounded: str = strip_invisible_characters(raw[:CHECKPOINT_MODEL_STATE_LEN])
+    masked: str = mask_sensitive_text(bounded)
+    return DIRECTIVE_PLACEHOLDER if has_directive_phrase(masked) else masked
+
+
 def save_checkpoint(
     session_id: str,
     goal: str,
@@ -76,10 +92,12 @@ def save_checkpoint(
     completed_steps: List[str],
     turn_count: int,
     runs_dir: Optional[Path] = None,
+    model_state: Optional[str] = None,
 ) -> Path:
     """
     Oturum durumunu .omni_runs dizini altına atomik olarak yazar.
     fsync ve atomic replace ile yarım yazılma/bozulma riski sıfırlanır.
+    model_state: modelin kendi STATE kaydı; crash sonrası 'devam et' bağlamı için temizlenerek saklanır.
     """
     target_dir: Path = runs_dir or RUNS_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -93,6 +111,8 @@ def save_checkpoint(
         "turn_count": turn_count,
         "updated_at": _utc_now_iso(),
     }
+    if model_state:
+        payload["model_state"] = _clean_model_state(model_state)
     content: str = json.dumps(payload, ensure_ascii=False, indent=2)
 
     temp_path: Optional[Path] = None
@@ -139,6 +159,9 @@ def _parse_checkpoint(session_id: str, data: object) -> SessionCheckpoint:
     # JSON'daki Infinity/NaN float olarak gelir ve bool int'in alt türüdür: ikisi de geçerli tur sayısı değildir.
     if not isinstance(turn_count, int) or isinstance(turn_count, bool):
         raise CheckpointFormatError(f"turn_count tamsayı olmalı, alınan: {type(turn_count).__name__}")
+    model_state: object = data.get("model_state")
+    if model_state is not None and not isinstance(model_state, str):
+        raise CheckpointFormatError(f"model_state metin olmalı, alınan: {type(model_state).__name__}")
     return {
         "session_id": session_id,
         "goal": str(data.get("goal", "")),
@@ -146,6 +169,7 @@ def _parse_checkpoint(session_id: str, data: object) -> SessionCheckpoint:
         "completed_steps": [str(s) for s in steps],
         "turn_count": turn_count,
         "updated_at": str(data.get("updated_at", "")),
+        "model_state": str(model_state) if model_state is not None else "",
     }
 
 
@@ -308,5 +332,9 @@ def format_checkpoint_scratchpad(checkpoint: SessionCheckpoint) -> str:
                 f"  * {single_line_snippet(key, CHECKPOINT_FACT_KEY_LEN)}: "
                 f"{single_line_snippet(value, CHECKPOINT_FACT_VALUE_LEN)}"
             )
+    model_state: str = _clean_model_state(checkpoint.get("model_state", ""))
+    if model_state:
+        lines.append("- Önceki Model STATE'i (modelin kendi kaydı, doğrulanmamış):")
+        lines.append(model_state)
     lines.append("Gerekmedikçe bu gözlemleri yeniden sorgulamadan sıradaki eksik adımla devam et.")
     return "\n".join(lines)

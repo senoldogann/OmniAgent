@@ -14,6 +14,10 @@ from typing import Callable, Optional, Union
 from omniagent.ui.rendering import composer_lines
 from omniagent.ui.theme import ACCENT_DIM, COMPOSER_MIN_LINES, SURFACE, TEXT, TEXT_FAINT
 
+# Yer tutucunun sol boşluğu: imleç (caret) metin alanının en solunda (x=0) çizilir ve yer tutucu
+# opak bir etiket olduğu için tam x=0'a konursa imleci örter ("tıkladım ama imleç yanmıyor").
+PLACEHOLDER_CARET_GAP: int = 2
+
 # Entry uyumlu dizinler: 0 başlangıç, "end" son.
 EntryIndex = Union[int, str]
 _ENTRY_INDEXES: dict[EntryIndex, str] = {0: "1.0", "end": "end-1c"}
@@ -47,7 +51,7 @@ class ComposerInput:
             self.widget, text=placeholder, bg=SURFACE, fg=TEXT_FAINT, font=font, bd=0,
             highlightthickness=0, padx=0, pady=0, anchor="w", cursor="xterm",
         )
-        self._placeholder.place(x=0, y=0)
+        self._placeholder.place(x=PLACEHOLDER_CARET_GAP, y=0)
         self._placeholder.bind("<Button-1>", lambda _event: self._focus_start())
         self.widget.bind("<Return>", self._submit)
         self.widget.bind("<KP_Enter>", self._submit)
@@ -112,7 +116,8 @@ class ComposerInput:
         if self.get():
             self._placeholder.place_forget()
         else:
-            self._placeholder.place(x=0, y=0)
+            # Sol boşluk korunur: imleç yer tutucunun altında kalmasın (bkz. PLACEHOLDER_CARET_GAP).
+            self._placeholder.place(x=PLACEHOLDER_CARET_GAP, y=0)
         # `count -displaylines` iki dizin arasındaki satır SINIRLARINI sayar: n görünen satır için n - 1 döner.
         crossings: object = self.widget.tk.call(str(self.widget), "count", "-update", "-displaylines", "1.0", "end-1c")
         wanted: int = composer_lines((int(crossings) if crossings else 0) + 1)

@@ -254,3 +254,39 @@ def test_short_values_are_not_masked() -> None:
     """Çok kısa sırlar (ör. '1') metni bozmasın: yalnız eşiği geçen değerler maskelenir."""
     config.set_api_key("OPENAI_API_KEY", "1")
     assert config.redact("sürüm 1 hazır") == "sürüm 1 hazır"
+
+
+def test_tool_message_carries_structured_error_code_and_recoverability() -> None:
+    """Başarısız araç sonucu modele hata kodu ve kurtarılabilirlik kararıyla gider."""
+    from omniagent.app import tool_execution
+    call: main.ToolCallDraft = {
+        "id": "err-1", "name": "execute_shell", "arguments": '{"command": "ls"}',
+    }
+    recoverable: main.ToolResult = {
+        "ok": False, "error_type": "ToolError", "error": "zaman aşımı",
+        "code": "SHELL_TIMEOUT", "recoverable": True,
+    }
+    message: str = main._tool_result_to_message(call, recoverable)["content"]
+    assert "[hata kodu: SHELL_TIMEOUT" in message
+    assert "kurtarılabilir" in message
+    permanent: main.ToolResult = {
+        "ok": False, "error_type": "ToolError", "error": "engel",
+        "code": "BOT_WALL_DETECTED", "recoverable": False,
+    }
+    message = main._tool_result_to_message(call, permanent)["content"]
+    assert "kalıcı" in message
+    uncoded: main.ToolResult = {"ok": False, "error_type": "TypeError", "error": "geçersiz"}
+    assert "[hata kodu:" not in main._tool_result_to_message(call, uncoded)["content"]
+
+
+def test_tool_message_clips_long_output_head_and_tail() -> None:
+    """Uzun araç çıktısı bağlama girmeden baş-kuyruk korumalı kırpılır."""
+    from omniagent.app import tool_execution
+    body: str = "x" * 9000
+    clipped: str = tool_execution._clip_tool_message(body)
+    assert len(clipped) < len(body)
+    assert clipped.startswith("x" * 50)
+    assert clipped.endswith("x" * 50)
+    assert "kırpıldı" in clipped
+    short: str = "kısa çıktı"
+    assert tool_execution._clip_tool_message(short) == short

@@ -426,11 +426,11 @@ async def test_blocking_gate_bridges_worker_thread_to_the_host_prompt(
     stop: List[bool] = []
     refused = await _execute_dynamic(_probe_runtime(None, False, stop), _gate_entry(probe))
     assert refused["code"] == "APPROVAL_UNAVAILABLE" and refused["recoverable"] is False and ran == []
-    assert (await _execute_dynamic(_probe_runtime(confirm, True, stop), _gate_entry(probe)))["code"] == "APPROVAL_UNAVAILABLE"
+    assert (await _execute_dynamic(_probe_runtime(confirm, True, stop), _gate_entry(probe)))["ok"]
     assert (await _execute_dynamic(_probe_runtime(deny, False, stop), _gate_entry(probe)))["code"] == "APPROVAL_DENIED"
     approved = await _execute_dynamic(_probe_runtime(confirm, False, stop), _gate_entry(probe))
-    assert approved["ok"] and ran == ["çalıştı"]
-    assert [record["decision"] for record in _audit(tmp_path)] == ["unavailable", "unavailable", "denied", "approved"]
+    assert approved["ok"] and ran == ["çalıştı", "çalıştı"]
+    assert [record["decision"] for record in _audit(tmp_path)] == ["unavailable", "approved", "denied", "approved"]
 
 
 def test_should_auto_approve_uses_the_host_whitelist_and_the_amount_limit(
@@ -470,6 +470,7 @@ async def test_continuous_mode_auto_approves_and_audits_it(tmp_path: Path, monke
     karar izlenebilir kalır. (Kapatmak için approval.AUTO_APPROVE_IN_CONTINUOUS_MODE = False.)
     """
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(approval, "AUTO_APPROVE_IN_CONTINUOUS_MODE", True)
     ran: List[str] = []
 
     def probe() -> str:

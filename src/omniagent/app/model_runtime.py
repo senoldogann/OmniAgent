@@ -220,7 +220,6 @@ async def stream_completion(
     request: Dict[str, Any] = {
         "model": profile["model"],
         "messages": messages,
-        "tools": tool_schemas,
         (
             "max_completion_tokens"
             if profile["provider"] == "openai"
@@ -231,8 +230,11 @@ async def stream_completion(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
-    if profile["provider"] != "ollama-cloud":
-        request["tool_choice"] = "auto"
+    # Araçsız turda (iMessage iş raporu) ne boş araç listesi ne tool_choice gönderilir: ikisi de sağlayıcıda istek hatası.
+    if tool_schemas:
+        request["tools"] = tool_schemas
+        if profile["provider"] != "ollama-cloud":
+            request["tool_choice"] = "auto"
 
     stream: Optional[AsyncStream[ChatCompletionChunk]] = await _open_stream_unless_stopped(client, request, should_stop)
     if stream is None:

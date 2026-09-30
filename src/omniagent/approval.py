@@ -656,6 +656,26 @@ def outbound_request(tool: str, arguments: Dict[str, object], reason: str) -> Ap
     }
 
 
+def communication_click_label(label: str) -> bool:
+    """Kısa yayın/gönderim CTA'ları; besteleyici açma ve gezinme etiketleri hariç."""
+    normalized = " ".join(ascii_fold(label).strip().split()).rstrip(".!…")
+    return normalized in {
+        "gonder", "gonderi yayinla", "yayinla", "paylas", "yanitla", "cevapla", "tweetle",
+        "send", "send message", "send reply", "post", "post all", "publish", "publish post",
+        "reply", "tweet", "share", "share now",
+    }
+
+
+def gui_communication_request(tool: str, label: str, where: str, draft: str) -> ApprovalRequest:
+    request = outbound_request(tool, {"hedef": label, "uygulama": where}, "yayınlama/gönderme")
+    request["summary"] = redact(
+        f"Uygulama/sayfa: {where}\nDüğme: {label}\n"
+        + (f"Son yazılan taslak (ekrandan kontrol edin):\n{draft}" if draft else
+           "Taslak metni araç kaydında yok. İçeriği ve alıcıyı ekranda kontrol edin."),
+    )
+    return request
+
+
 # Veri kökündeki güvenlik ilkesini, denetim kaydını, kalıcı hafızayı (kullanıcı tercihleri, deneyim dersleri, epizot
 # geçmişi) ve zamanlanmış görevleri belirleyen dosyalar: ajanın kendi dosya/kabuk araçlarıyla yazması yedek sağlayıcı
 # iznini, hafıza onayını ve denetim izini atlatırdı. Adlar küçük harfle karşılaştırılır (macOS dosya sistemi büyük/küçük
@@ -663,6 +683,9 @@ def outbound_request(tool: str, arguments: Dict[str, object], reason: str) -> Ap
 PROTECTED_DATA_FILES: frozenset[str] = frozenset({
     "provider_fallback.json", "audit.jsonl", "telegram.json", "continuous_limits.json",
     "user_memory.json", "schedules.json", "catalog.json", "experience_memory.json", "cognitive_memory.json",
+    # iMessage kanalı: eşleşme, eşleştirme isteği, karakter, görev geçmişi ve yol arkadaşı deposu
+    "imessage.json", "imessage-pairing.json", "persona.md", "imessage-history.json",
+    "companion.db", "companion.db-wal", "companion.db-shm",
 })
 
 
@@ -740,7 +763,7 @@ AUTO_APPROVE_LIMIT: float = 0.0  # 0.0 = tüm tutarlar onay ister; >0 ise bu kad
 AUTO_APPROVE_HOSTS: frozenset[str] = frozenset()  # boş = whitelist yok; dolu = bu hostlar serbest
 
 # Sürekli modda otomatik onay verilsin mi?
-AUTO_APPROVE_IN_CONTINUOUS_MODE: bool = True
+AUTO_APPROVE_IN_CONTINUOUS_MODE: bool = False
 
 
 def should_auto_approve(url: str, amount: Optional[float] = None) -> bool:

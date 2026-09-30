@@ -47,6 +47,9 @@ class ChatRecord(TypedDict):
     updated_at: str
     history: List[Exchange]
     spans: List[TranscriptSpan]
+    # Kullanıcı mesajlarının gönderim zamanları (ISO 8601), transkriptte görünme sırasıyla. Kullanıcı
+    # mesajının altındaki saat satırı bundan kurulur; eski kayıtlarda alan yoktur (boş liste okunur).
+    sends: List[str]
     last_outcome: NotRequired[str]
 
 
@@ -104,7 +107,7 @@ def new_chat(goal: str) -> ChatRecord:
     now: str = datetime.now(timezone.utc).isoformat()
     title: str = " ".join(goal.strip().split())[:64] or "Yeni sohbet"
     return {"id": uuid.uuid4().hex, "title": title, "created_at": now,
-            "updated_at": now, "history": [], "spans": []}
+            "updated_at": now, "history": [], "spans": [], "sends": []}
 
 
 def load_catalog(root: Optional[Path] = None) -> Tuple[List[ChatSummary], Optional[str]]:
@@ -157,12 +160,16 @@ def load_chat(chat_id: str, root: Optional[Path] = None) -> ChatRecord:
     for item in raw_spans:
         if isinstance(item, dict) and isinstance(item.get("text"), str) and isinstance(item.get("tags"), list):
             spans.append({"text": item["text"], "tags": [tag for tag in item["tags"] if isinstance(tag, str)]})
+    raw_sends: object = raw.get("sends", [])
+    if not isinstance(raw_sends, list):
+        raise ValueError("Sohbet gönderim zamanları biçimi geçersiz")
+    sends: List[str] = [stamp for stamp in raw_sends if isinstance(stamp, str) and stamp]
     # Eski kayıtlarda kalmış geçici Tk durumu (seçim, akış imleci, takılı işaretler) yüklerken
     # temizlenir; dosya bir sonraki kayıtta düzelir.
     record: ChatRecord = {
         "id": chat_id, "title": str(raw.get("title", "Yeni sohbet")),
         "created_at": str(raw.get("created_at", "")), "updated_at": str(raw.get("updated_at", "")),
-        "history": history, "spans": sanitize_spans(spans),
+        "history": history, "spans": sanitize_spans(spans), "sends": sends,
     }
     outcome: Optional[str] = known_outcome(raw.get("last_outcome"))
     if outcome is not None:

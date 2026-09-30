@@ -46,6 +46,8 @@ RATE_LIMIT_COOLDOWN_SECONDS: float = 30.0
 # Bundan kısa beklemeler arayüzde durum satırı üretmez (yalnız günlük).
 STATUS_MIN_WAIT_SECONDS: float = 2.0
 DETAIL_LIMIT: int = 500
+# Bu süreden uzun beklemeler (ör. aylık kota) geçici yavaşlama değildir: mesaj bunu açıkça söyler.
+LONG_WAIT_SECONDS: float = 3600.0
 
 # Sağlayıcı hata kodu/tipi (küçük harf). Listeler kasıtlı kısa tutuldu ve sağlayıcı belgeleriyle canlı
 # doğrulanmadı; tanınmayan akış içi hata geçici sayılır (bkz. _kind_of). Yeni kod görüldüğünde yalnız
@@ -386,7 +388,10 @@ def interactive_model_retry_seconds(explicit: Optional[float]) -> float:
 
 
 def _wait_text(seconds: float) -> str:
-    """Bekleme süresini kısa Türkçe metne çevirir: '45 sn' ya da '3 dk'. Saf."""
+    """Bekleme süresini kısa Türkçe metne çevirir: '45 sn', '3 dk' ya da '7 gün'. Saf."""
+    if seconds >= 48 * 3600:
+        # Aylık kota gibi uzun bekleme istekleri '10562 dk' diye okunamaz hâle geliyordu.
+        return f"{seconds / 86400:.0f} gün"
     return f"{seconds / 60:.0f} dk" if seconds >= 120.0 else f"{seconds:.0f} sn"
 
 
@@ -394,6 +399,17 @@ def failure_label(info: ModelErrorInfo) -> str:
     """Kullanıcıya gösterilen kısa hata türü: 'hız sınırı (HTTP 429)'. Hata gövdesi taşımaz. Saf."""
     label: str = MODEL_ERROR_KIND_LABELS[info.kind]
     return f"{label} (HTTP {info.status_code})" if info.status_code is not None else label
+
+
+def is_context_overflow(info: ModelErrorInfo) -> bool:
+    """
+    Hatanın bağlam penceresi taşması olup olmadığı. Bu hata 'permanent' sınıfındadır ama KURTARILABİLİR:
+    çağıran mesaj listesini sıkıştırıp aynı profille yeniden deneyebilir (bkz. app/agent._compact_for_overflow).
+    Kod net olmayan sağlayıcıda ileti deseni karar verir. Saf fonksiyon.
+    """
+    if info.kind != "permanent":
+        return False
+    return info.code == "context_length_exceeded" or _CONTEXT_TEXT.search(info.detail) is not None
 
 
 def retry_status_text(backend: str, info: ModelErrorInfo, wait_seconds: float) -> str:
@@ -406,19 +422,32 @@ def retry_status_text(backend: str, info: ModelErrorInfo, wait_seconds: float) -
 
 def model_call_failure(
     backend: str, model: str, info: ModelErrorInfo, attempts: int, waited_seconds: float, fallback_hint: str,
+    *, budget_exceeded: bool = False,
 ) -> ModelCallFailed:
     """
     Son hatayı ve teşhis bağlamını taşıyan ModelCallFailed kurar (çağıran `raise ... from son_hata` yapar).
     fallback_hint: izin verilmediği için atlanan hazır yedekleri anlatan cümle (yoksa boş metin).
+    budget_exceeded: sunucunun istediği bekleme görevin yeniden deneme bütçesine sığmadı (ör. aylık kota).
+    Bu durumda "X sonra yeniden denenecek" cümlesi yanıltıcı olurdu: bekleme yapılmadan bitirildiği açıkça söylenir.
     """
     retry_hint: str = (
         f" Sunucu {_wait_text(info.retry_after)} sonra yeniden denenmesini istedi."
         if info.retry_after is not None else ""
     )
+    budget_hint: str = ""
+    if budget_exceeded:
+        budget_hint = " Sunucunun istediği bekleme bu görevin yeniden deneme bütçesine sığmadığı için beklemeden bitirildi."
+        if info.retry_after is not None and info.retry_after >= LONG_WAIT_SECONDS:
+            # Aylık kota gibi gün mertebesindeki beklemeler geçici bir yavaşlama değildir: kullanıcı
+            # "birazdan düzelir" sanmasın, modeli değiştirmesi ya da yedek izni vermesi gerektiğini görsün.
+            budget_hint += (
+                " Bu süre geçici bir yavaşlama değil (ör. aylık kullanım kotası): bu model seçili kaldıkça"
+                " görevler aynı hatayla düşer; başka bir model seçin ya da hazır bir yedek sağlayıcıya izin verin."
+            )
     declined_hint: str = f" {fallback_hint}" if fallback_hint else ""
     summary: str = (
         f"{backend} ({model}): {MODEL_ERROR_KIND_LABELS[info.kind]}; {attempts} deneme, "
-        f"{waited_seconds:.0f} sn beklendi.{retry_hint}{declined_hint} Son hata: {info.detail}"
+        f"{waited_seconds:.0f} sn beklendi.{retry_hint}{budget_hint}{declined_hint} Son hata: {info.detail}"
     )
     return ModelCallFailed(
         summary, backend=backend, kind=info.kind, attempts=attempts, waited_seconds=waited_seconds,

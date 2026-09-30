@@ -202,7 +202,7 @@ def route_tool_schemas(
     hedefteki tarihi 10 denemenin 5'inde yanlış kopyaladı, tek araçla 10/10 doğruydu.
     Fare/klavye adımları run_action_sequence, şablon tıklama smart_click içindedir.
     chrome_session: görev kullanıcının açık Chrome oturumunda yürüyor (bkz. chrome_session_route).
-    can_send_files: görevin dosya teslim kanalı (Telegram sohbeti) var; send_file yalnız o zaman görünür.
+    can_send_files: görevin dosya teslim kanalı (Telegram ya da iMessage sohbeti) var; send_file yalnız o zaman görünür.
     can_schedule: hedef zamanlama istiyor ve planları çalıştıracak Telegram köprüsü kurulu.
     """
     schemas: List[Dict[str, Any]] = [
@@ -299,6 +299,14 @@ def route_tool_schemas(
             "Node.js ile JavaScript çalıştırır. Tekrarlı görevde ilk satır '// omni:save ad' "
             "ile başarılı kodu görev boyunca sakla; '// omni:run ad' ve isteğe bağlı ikinci "
             "satır JSON ile yeniden çalıştır (JS process.argv[2] okur).",
+            {"code": {"type": "string", "description": "Kod veya görev içi yardımcı çağrısı."}},
+        ),
+        _function_schema(
+            "execute_python",
+            "Python 3 (python3) ile kod çalıştırır; hesaplama, dosya/veri işleme ve hata ayıklama için "
+            "kabuktan bağımsız hızlı yol (120 sn bütçe). Tekrarlı görevde ilk satır '# omni:save ad' ile "
+            "başarılı kodu görev boyunca sakla; '# omni:run ad' ve isteğe bağlı ikinci satır JSON ile "
+            "yeniden çalıştır (JSON, sys.argv[1] yolundaki dosyadan okunur).",
             {"code": {"type": "string", "description": "Kod veya görev içi yardımcı çağrısı."}},
         ),
         _function_schema(
@@ -435,7 +443,7 @@ def route_tool_schemas(
         # çakışır (araç listesi kısa tutulur). cua_get_app de dışarıdadır: öne getirme chrome_active_tab'dadır.
         excluded = {
             "browse_url", "discover_capabilities", "fetch_raw", "web_search",
-            "execute_shell", "execute_js", "process_list",
+            "execute_shell", "execute_js", "execute_python", "process_list",
             "smart_click", "cua_get_ax_state", "cua_click", "cua_get_app",
         }
         if skills_sh_goal(goal):
@@ -477,8 +485,8 @@ def route_tool_schemas(
     if can_send_files:
         schemas.append(_function_schema(
             "send_file",
-            "Bilgisayardaki dosyayı (belge, görsel, rapor, arşiv; en çok 50 MB) kullanıcının Telegram "
-            "sohbetine gönderir. Kullanıcı dosyayı istediğinde veya sonucu dosya olarak ürettiğinde kullan.",
+            "Bilgisayardaki dosyayı (belge, görsel, rapor, arşiv; en çok 50 MB) kullanıcının mesaj kanalına "
+            "(Telegram ya da iMessage sohbeti) gönderir. Kullanıcı dosyayı istediğinde veya sonucu dosya olarak ürettiğinde kullan.",
             {
                 "path": {"type": "string", "description": "Gönderilecek dosyanın yolu."},
                 "caption": {"type": ["string", "null"], "description": "Dosyanın altındaki kısa açıklama veya null."},
@@ -536,7 +544,7 @@ _CACHEABLE_TOOLS: frozenset[str] = frozenset({"process_list", "read_file", "web_
 # paralel bir okuma yazmadan önce bayat sonuç önbelleğe girmesin, eylem→gözlem sırası
 # korunsun); aralarındaki bağımsız salt okunur bloklar gerçek paralellikle çalışır.
 _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
-    "execute_shell", "write_file", "edit_file", "execute_js", "take_screenshot", "browse_url",
+    "execute_shell", "write_file", "edit_file", "execute_js", "execute_python", "take_screenshot", "browse_url",
     "cua_get_app", "cua_click", "smart_click", "run_action_sequence", "capture_photo",
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
     "cua_fill_field", "cua_click_text", "cua_scroll", "cua_read_scrollable",
@@ -557,7 +565,7 @@ _SCREEN_ACTION_TOOLS: frozenset[str] = frozenset({
 _GUI_VERIFICATION_TOOLS: frozenset[str] = _SCREEN_ACTION_TOOLS - frozenset({"chrome_active_tab"})
 _ACTION_RECEIPT_TOOLS: frozenset[str] = (_SCREEN_ACTION_TOOLS - frozenset({"cua_read_scrollable"})) | frozenset({"take_screenshot"})
 _DETERMINISTIC_PROGRESS_TOOLS: frozenset[str] = frozenset({
-    "write_file", "edit_file", "execute_js", "capture_photo", "user_memory", "send_file", "schedule_task",
+    "write_file", "edit_file", "execute_js", "execute_python", "capture_photo", "user_memory", "send_file", "schedule_task",
 })
 _READ_PROGRESS_TOOLS: frozenset[str] = frozenset({
     "web_search", "fetch_raw", "read_file", "browse_url", "cua_read_scrollable",

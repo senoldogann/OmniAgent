@@ -41,6 +41,10 @@ from omniagent.tools import (
 
 CALL_LABEL_ARGS_LIMIT: int = 100
 EVENT_RESULT_LIMIT: int = 4000
+# Modele giden araç çıktısının enjeksiyon anındaki baş/kuyruk sınırları: uzun çıktı (sayfa okuma,
+# log, JSON) bağlama girmeden kırpılır; kuyruk korunur çünkü en taze bilgi sondadır.
+TOOL_MESSAGE_HEAD_LIMIT: int = 6000
+TOOL_MESSAGE_TAIL_LIMIT: int = 2000
 
 
 def _tool_cache_key(name: str, arguments: Dict[str, Any]) -> str:
@@ -207,16 +211,27 @@ async def require_approval(tool: str, request: approval.ApprovalRequest) -> None
     """
     runtime: Optional[IntegrationRuntime] = CURRENT_RUNTIME.get()
     decision: str = "unavailable"
+    request_key = (request["category"], request["summary"])
+    if runtime is not None and request_key in runtime.denied_approval_requests:
+        raise ToolError("Kullanıcı bu işlemi reddetti; aynı işlem başka araçla yeniden yürütülmez.",
+                        approval.APPROVAL_DENIED_CODE, False)
+    draft = " ".join(runtime.gui_draft_text.split()) if runtime is not None else ""
+    denied_question = runtime is not None and any(
+        draft and draft in question for question in runtime.denied_confirmation_questions
+    )
 
     # BYPASS: (1) güvenli host/tutar, (2) sürekli mod → otomatik onay
-    if approval.should_auto_approve(request.get("url", ""), request.get("amount")):
+    if request["category"] == "communication" and denied_question:
+        decision = "denied"
+    elif approval.should_auto_approve(request.get("url", ""), request.get("amount")):
         decision = "auto_approved"
     elif runtime is not None and runtime.unattended and approval.AUTO_APPROVE_IN_CONTINUOUS_MODE:
         decision = "auto_approved"
-    elif runtime is not None and runtime.answer is not None and not runtime.unattended:
+    elif runtime is not None and runtime.answer is not None:
         try:
             answer: Dict[str, Any] = await runtime.ask(
                 request["title"], approval.approval_fields(request), approval.APPROVAL_TIMEOUT_SECONDS,
+                allow_unattended=True,
             )
         except TimeoutError:
             decision = "timeout"
@@ -227,6 +242,8 @@ async def require_approval(tool: str, request: approval.ApprovalRequest) -> None
         approval.audit_record(tool, request, decision, datetime.now(timezone.utc).isoformat()),
     )
     if decision not in ("approved", "auto_approved"):
+        if runtime is not None and decision == "denied":
+            runtime.denied_approval_requests.add(request_key)
         message, code = _APPROVAL_REFUSALS[decision]
         raise ToolError(message, code, False)
 
@@ -492,13 +509,46 @@ def _call_label(call: ToolCallDraft) -> str:
     return f"[{call['name']} {arguments[:CALL_LABEL_ARGS_LIMIT]}]"
 
 
+def _clip_tool_message(text: str) -> str:
+    """
+    Modele giden araç çıktısını baş-kuyruk korumalı kırpar: orta bölüm yerine kısa bir işaret konur.
+    Kuyruk korunur çünkü en taze bilgi (log sonu, sayfa sonu) sondadır. Saf fonksiyon.
+    """
+    if len(text) <= TOOL_MESSAGE_HEAD_LIMIT + TOOL_MESSAGE_TAIL_LIMIT:
+        return text
+    dropped: int = len(text) - TOOL_MESSAGE_HEAD_LIMIT - TOOL_MESSAGE_TAIL_LIMIT
+    return (
+        text[:TOOL_MESSAGE_HEAD_LIMIT]
+        + f"\n… [orta bölüm kırpıldı: {dropped} karakter] …\n"
+        + text[-TOOL_MESSAGE_TAIL_LIMIT:]
+    )
+
+
 def _tool_result_to_message(call: ToolCallDraft, result: ToolResult) -> Dict[str, Any]:
-    """Araç sonucunu, başında çağrı etiketiyle modele geri gönderilecek 'tool' mesajına çevirir."""
+    """
+    Araç sonucunu, başında çağrı etiketiyle modele geri gönderilecek 'tool' mesajına çevirir.
+    Başarısız sonuca hata kodu ve kurtarılabilirlik kararı eklenir: model artık hatanın geçici mi
+    kalıcı mı olduğunu düz metinden tahmin etmek zorunda kalmaz (bkz. tools/types.ToolError.recoverable).
+    Uzun çıktı bağlama girmeden kırpılır (bkz. _clip_tool_message).
+    """
     if result.get("ok"):
         content: str = result_text(result)
     else:
         content = f"HATA {result_text(result)}"
-    return {"role": "tool", "tool_call_id": call["id"], "content": f"{_call_label(call)}\n{content}"}
+        code: object = result.get("code")
+        if isinstance(code, str) and code:
+            recoverable: object = result.get("recoverable")
+            guidance: str = ""
+            # Yönlendirme bilinçli olarak NÖTR tutulur: 'farklı bir yol/yöntem seç' gibi ifadeler
+            # erişim engeli kurallarıyla çakışır (host o durumda kendi yönergesini verir; bkz.
+            # continuous.WALL_*); model yalnız hatanın geçici/kalıcı olduğunu öğrenir.
+            if recoverable is True:
+                guidance = " — kurtarılabilir: aynı yolu düzelterek yeniden deneyebilirsin"
+            elif recoverable is False:
+                guidance = " — kalıcı: aynı çağrıyı yineleme"
+            content = f"{content}\n[hata kodu: {code}{guidance}]"
+    return {"role": "tool", "tool_call_id": call["id"],
+            "content": f"{_call_label(call)}\n{_clip_tool_message(content)}"}
 
 
 def update_chrome_visits(

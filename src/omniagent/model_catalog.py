@@ -6,7 +6,7 @@ import hashlib
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -19,7 +19,8 @@ PROFILES: frozenset[str] = frozenset(
 )
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,159}$")
 CACHE_SECONDS = 15 * 60
-_CACHE: Dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+# Önbellek değeri: (zaman, model adları, bulut modellerinde ad→ollama.com adı eşlemesi).
+_CACHE: Dict[tuple[str, str], tuple[float, tuple[str, ...], Dict[str, str]]] = {}
 
 
 class ModelCatalogError(RuntimeError):
@@ -69,6 +70,33 @@ def _endpoint(provider: str, base_url: str) -> str:
     return base_url.rstrip("/") + "/models"
 
 
+def _is_cloud_entry(entry: Dict[str, Any], name: str) -> bool:
+    """
+    Yerel Ollama kaydının ollama.com üzerinden çalışıp çalışmadığı.
+
+    Modern Ollama bir bulut modelini iki biçimde bildirir: ad son ekiyle (`gemma4:cloud`,
+    `gpt-oss:20b-cloud`) ya da `remote_model`/`remote_host` alanlarıyla. Kullanıcı
+    `ollama pull` ile kaydettiğinde ad düz bir etiket kalabilir (ör. `satici/model:latest`
+    + remote_model `deepseek-v4.1-flash`); yalnız ad son ekine bakan eski süzgeç bu tür
+    bulut modellerini listeden tamamen gizliyordu.
+    """
+    for field in ("remote_model", "remote_host"):
+        value: Any = entry.get(field)
+        if isinstance(value, str) and value.strip():
+            return True
+    tag: str = name.rsplit(":", 1)[-1].casefold()
+    return tag == "cloud" or tag.endswith("-cloud")
+
+
+def _is_chat_entry(entry: Dict[str, Any]) -> bool:
+    """Sunucu yetenek listesi verdiyse yalnız sohbet edebilen kayıtları geçirir."""
+    capabilities: Any = entry.get("capabilities")
+    if not isinstance(capabilities, list) or not capabilities:
+        # Eski sunucular yetenek bildirmez; bilinmeyeni dışlamak yerine kabul ederiz.
+        return True
+    return "completion" in capabilities
+
+
 def _listed_ids(provider: str, payload: Any) -> tuple[str, ...]:
     """Sağlayıcı yanıtını araçlı sohbet için makul model kimliklerine indirger."""
     if not isinstance(payload, dict):
@@ -84,8 +112,7 @@ def _listed_ids(provider: str, payload: Any) -> tuple[str, ...]:
         if not isinstance(candidate, str) or not valid_model_id(candidate):
             continue
         if provider == "ollama-cloud":
-            tag: str = candidate.rsplit(":", 1)[-1]
-            if tag != "cloud" and not tag.endswith("-cloud"):
+            if not (_is_cloud_entry(entry, candidate) and _is_chat_entry(entry)):
                 continue
         if provider == "openai":
             # Modeller API'si ses, görsel ve gömme modellerini de listeler.
@@ -99,11 +126,41 @@ def _listed_ids(provider: str, payload: Any) -> tuple[str, ...]:
     return tuple(sorted(values, key=str.casefold))
 
 
+def _remote_targets(provider: str, payload: Any) -> Dict[str, str]:
+    """Bulut kaydının ollama.com'daki gerçek adını verir (ör. gemma4:cloud → gemma4:31b)."""
+    if provider != "ollama-cloud" or not isinstance(payload, dict):
+        return {}
+    entries: Any = payload.get("models")
+    if not isinstance(entries, list):
+        return {}
+    targets: Dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name: Any = entry.get("name")
+        remote: Any = entry.get("remote_model")
+        if not isinstance(name, str) or not isinstance(remote, str):
+            continue
+        remote = remote.strip()
+        if remote and remote != name:
+            targets[name] = remote
+    return targets
+
+
 def cached_models(provider: str, key: Optional[str]) -> tuple[str, ...]:
     """Geçerli önbelleği ağ çağrısı yapmadan döner."""
     cache_key = (provider, hashlib.sha256((key or "").encode()).hexdigest())
     record = _CACHE.get(cache_key)
     return record[1] if record and time.monotonic() - record[0] < CACHE_SECONDS else ()
+
+
+def cached_remote_targets(provider: str, key: Optional[str]) -> Dict[str, str]:
+    """Son listedeki bulut modellerinin ollama.com adlarını döner; ağ çağrısı yapmaz."""
+    cache_key = (provider, hashlib.sha256((key or "").encode()).hexdigest())
+    record = _CACHE.get(cache_key)
+    if not record or time.monotonic() - record[0] >= CACHE_SECONDS:
+        return {}
+    return dict(record[2])
 
 
 async def list_provider_models(
@@ -118,11 +175,18 @@ async def list_provider_models(
     endpoint = _endpoint(provider, base_url)
     headers = {"Authorization": "Bearer " + key} if key and provider != "ollama-cloud" else {}
     params = {"supported_parameters": "tools"} if provider == "openrouter" else None
+    targets: Dict[str, str] = {}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), follow_redirects=False) as client:
             response = await client.get(endpoint, headers=headers, params=params)
             response.raise_for_status()
-            models = _listed_ids(provider, response.json())
+            payload: Any = response.json()
+            models = _listed_ids(provider, payload)
+            listed: List[str] = list(models)
+            targets = {
+                name: remote for name, remote in _remote_targets(provider, payload).items()
+                if name in listed
+            }
     except (httpx.HTTPError, ValueError) as error:
         if isinstance(error, httpx.HTTPStatusError) and error.response.status_code in (401, 403):
             raise ModelCatalogError("API anahtarı veya model listeleme yetkisi geçersiz.") from None
@@ -130,5 +194,5 @@ async def list_provider_models(
     if not models:
         raise ModelCatalogError("Bu sağlayıcıda seçilebilir model bulunamadı.")
     digest = hashlib.sha256((key or "").encode()).hexdigest()
-    _CACHE[(provider, digest)] = (time.monotonic(), models)
+    _CACHE[(provider, digest)] = (time.monotonic(), models, targets)
     return models

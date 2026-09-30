@@ -6,12 +6,13 @@ import tkinter as tk
 import uuid
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from types import SimpleNamespace
+from typing import Any, List, Optional
 
 import pytest
 
 from omniagent.ui import app as ui
-from omniagent.ui import chats, rendering, theme
+from omniagent.ui import chats, composer, rendering, theme
 from tests.test_ui_conversation import app, pump  # noqa: F401  (gerçek Tk pencere fixture'ı yeniden kullanılır)
 
 NOW = datetime(2026, 9, 29, 10, 0, tzinfo=timezone(timedelta(hours=3)))
@@ -308,6 +309,19 @@ def test_composer_sits_in_one_rounded_card_with_menus_voice_and_send_and_a_room_
     assert strip.winfo_y() >= int(app._composer_card.cget("border_width"))  # kartın üst kenarlık çizgisini örtmez
 
 
+def test_placeholder_never_covers_the_caret(app: ui.OmniUI) -> None:
+    """
+    Yer tutucu opak bir etikettir ve imleç metin alanının en solunda (x=0) çizilir: yer tutucu tam
+    x=0'a konursa imleci örter ve boş composer'a tıklayan kullanıcı "imleç yanmıyor" görür. Bu yüzden
+    yer tutucu imlecin sağından başlar.
+    """
+    pump(app, 0.3)
+    caret = app.entry.widget.bbox("insert")
+    placeholder_x = int(app.entry._placeholder.place_info()["x"])
+    assert caret is not None and caret[0] < placeholder_x
+    assert placeholder_x == composer.PLACEHOLDER_CARET_GAP > int(app.entry.widget.cget("insertwidth")) - 1
+
+
 def test_composer_grows_with_the_content_and_shows_the_placeholder_only_when_empty(app: ui.OmniUI) -> None:
     pump(app, 0.3)
     assert app.entry.visible_lines() == theme.COMPOSER_MIN_LINES and app.entry._placeholder.place_info()
@@ -375,6 +389,57 @@ def test_composer_border_follows_focus(app: ui.OmniUI) -> None:
     assert app._composer_card.cget("border_color") == ui.COMPOSER_FOCUS_BORDER
     app._on_composer_focus(False)
     assert app._composer_card.cget("border_color") == ui.BORDER
+
+
+def _press(widget: tk.Misc) -> SimpleNamespace:
+    """Tk olayı yerine geçen tutucu: odak kararı yalnız `event.widget` alanını okur."""
+    return SimpleNamespace(widget=widget)
+
+
+def _containers(ctk_widget: Any) -> List[Any]:
+    """CTk bileşenini ve iç tuvalini birlikte döner: gerçek tıklama tuvale düşer."""
+    canvas: Any = getattr(ctk_widget, "_canvas", None)
+    return [ctk_widget, canvas] if canvas is not None else [ctk_widget]
+
+
+def test_clicking_anywhere_but_typing_surfaces_returns_focus_to_the_composer(
+    app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    CustomTkinter `<Button-1>`'i "all" düzeyinde bağlayıp odağı tıklanan bileşene verir: kartın dolgu
+    alanına (yuvarlak tuval), üst şeride, akış satırına ya da sohbete tıklayıp yazmaya başlayınca tuşlar
+    hiçbir yere gitmiyordu. Bırakma anında odak composer'a döner.
+    """
+    assert app.bind("<ButtonRelease-1>")  # bırakma bağlaması kurulu
+    assert str(app._composer_card) not in app._composer_card._canvas.bindtags()  # kart bağlaması tuvale ulaşmaz
+    focused: List[str] = []
+    monkeypatch.setattr(app.entry, "focus_set", lambda: focused.append("composer"))
+    app._text.tag_remove("sel", "1.0", "end")
+    targets: List[Any] = [*_containers(app._composer_card),
+                          app._header, app._activity, app._text, app.voice_btn, app.primary_btn]
+    for widget in targets:
+        app._keep_composer_focus(_press(widget))
+    assert focused == ["composer"] * len(targets)
+
+
+def test_focus_stays_where_the_user_is_typing_or_selecting(
+    app: ui.OmniUI, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Girişler, sohbet arama, mod/model menüleri ve transkriptteki metin seçimi kendi odağını korur."""
+    focused: List[str] = []
+    monkeypatch.setattr(app.entry, "focus_set", lambda: focused.append("composer"))
+    app._text.tag_remove("sel", "1.0", "end")
+    app._text.insert("end", "seçilecek metin")
+    for owner in (app.entry.widget, app._chat_search, app.mode_menu, app.backend_menu):
+        for widget in _containers(owner):
+            app._keep_composer_focus(_press(widget))
+    assert focused == []
+    app._text.tag_add("sel", "1.0", "1.4")
+    app._keep_composer_focus(_press(app._text))
+    assert focused == []  # seçim varken ⌘C odağın bulunduğu bileşenden kopyalar
+    app._text.tag_remove("sel", "1.0", "end")
+    app._keep_composer_focus(_press(app._text))
+    assert focused == ["composer"]
 
 
 def test_switching_chats_clears_the_previous_task_result_from_the_header(app: ui.OmniUI) -> None:

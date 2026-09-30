@@ -65,6 +65,11 @@ def save_json(path: Path, value: Any) -> None:
             os.unlink(name)
 
 
+def boolean_field(spec: object) -> bool:
+    """Soru alanı onay kutusu mu? Telegram ve iMessage bu alanı evet/hayır metniyle yanıtlatır. Saf."""
+    return isinstance(spec, dict) and spec.get("type") == "boolean"
+
+
 class IntegrationRuntime:
     """Dış araçların görev kapsamındaki iptal ve UI bağlantısı."""
     def __init__(self, emit: EventSink, should_stop: Callable[[], bool],
@@ -102,6 +107,9 @@ class IntegrationRuntime:
         self.user_input_timeout: Optional[float] = APPROVAL_TIMEOUT_SECONDS
         self.unattended: bool = False
         self.deferred_questions: set[str] = set()
+        self.gui_draft_text: str = ""
+        self.denied_confirmation_questions: set[str] = set()
+        self.denied_approval_requests: set[tuple[str, str]] = set()
 
     def check(self) -> None:
         if self.should_stop():
@@ -136,13 +144,15 @@ class IntegrationRuntime:
         finally:
             self.metrics["wait_seconds"] += time.monotonic() - start
 
-    async def ask(self, title: str, fields: Dict[str, Any], timeout: Optional[float]) -> Dict[str, Any]:
+    async def ask(
+        self, title: str, fields: Dict[str, Any], timeout: Optional[float], *, allow_unattended: bool = False,
+    ) -> Dict[str, Any]:
         """
         Kullanıcıdan arayüz/Telegram üzerinden yanıt bekler; bekleme süresi görev bütçesinden
         düşülür. timeout verilirse süre dolunca TimeoutError yükselir (onay/soru görevi
         sonsuza dek kilitlemesin); None kurulum akışlarında sınırsız bekler.
         """
-        if self.answer is None or self.unattended:
+        if self.answer is None or (self.unattended and not allow_unattended):
             raise InteractionRequired(title)
         start = time.monotonic()
         self.status("waiting_user", title)

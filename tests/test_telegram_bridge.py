@@ -16,6 +16,7 @@ from omniagent.core.conversation import make_exchange
 from omniagent.integrations.capabilities import CapabilityService
 from omniagent.paths import workspace_dir
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
+from omniagent.tools import filesystem
 from tests.test_fallback_egress import FakeProvider
 
 
@@ -30,11 +31,36 @@ class FakeAPI:
         self.reject_partial_markdown = False
         self.photos: list[Path] = []
         self.closed = False
+        self.buttons: list[tuple[str, list[list[tuple[str, str]]]]] = []
+        self.callback_answers: list[str] = []
+        self.edited_buttons: list[tuple[str, list[list[tuple[str, str]]]]] = []
+        self.commands: list[tuple[str, str]] = []
 
     async def send(self, chat_id: int, text: str) -> int:
         assert chat_id == 123
         self.sent.append(text)
         return len(self.sent)
+
+    async def send_buttons(self, chat_id: int, text: str, buttons: list[list[tuple[str, str]]]) -> int:
+        assert chat_id == 123 and all(len(data.encode()) <= 64 for row in buttons for _, data in row)
+        self.sent.append(text)
+        self.buttons.append((text, buttons))
+        return len(self.sent)
+
+    async def answer_callback(self, callback_id: str, text: str) -> None:
+        assert callback_id
+        self.callback_answers.append(text)
+
+    async def edit_buttons(
+        self, chat_id: int, message_id: int, text: str, buttons: list[list[tuple[str, str]]],
+    ) -> None:
+        assert chat_id == 123 and message_id > 0
+        assert all(len(data.encode()) <= 64 for row in buttons for _, data in row)
+        self.edited.append(text)
+        self.edited_buttons.append((text, buttons))
+
+    async def set_commands(self, commands: list[tuple[str, str]]) -> None:
+        self.commands = commands
 
     async def edit(self, chat_id: int, message_id: int, text: str) -> None:
         assert chat_id == 123 and message_id > 0
@@ -481,7 +507,9 @@ async def test_compact_tool_turn_hides_state_and_keeps_one_status(
     assert task is not None
     await task
     assert api.sent == []
-    assert api.html_sent == ["Sonuç: 4"]
+    # Canlı iş günlüğü adımı kalıcı iletide gösterir; son yanıt ayrı iletidir.
+    assert api.html_sent[-1] == "Sonuç: 4"
+    assert any("🟨 Node" in text for text in api.html_sent + api.html_edited)
     assert any("Kod çalıştırıyor" in draft.get("html", "") for _, draft in api.drafts)
     assert "STATE:" not in "\n".join(api.sent + api.edited + api.html_sent)
 
@@ -519,6 +547,300 @@ async def test_waiting_user_status_is_readable_and_reply_resumes(
     }
     await presenter.event(resumed)
     assert "Göreve devam ediliyor" in api.drafts[-1][1]["html"]
+
+
+def tap(data: str, user_id: int) -> dict[str, Any]:
+    """Eşleşmiş sohbetteki bir bot iletisinin butonuna dokunuş (callback_query güncellemesi)."""
+    return {"callback_query": {
+        "id": f"cb-{data}", "from": {"id": user_id}, "data": data,
+        "message": {"message_id": 7, "chat": {"id": 123, "type": "private"}, "text": "❔ Soru"},
+    }}
+
+
+def text_message(text: str) -> dict[str, Any]:
+    return {"message": {"chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": text}}
+
+
+@pytest.mark.asyncio
+async def test_permission_question_is_answered_by_button_and_stale_or_foreign_taps_do_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """İzin sorusu Onayla/Reddet butonlarıyla gelir; dokunuş yanıtlar ve iletiyi kararla günceller."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    fields: dict[str, Any] = {"onay": {"type": "boolean", "label": "Onaylıyorum", "default": False}}
+    first = asyncio.create_task(bridge.answer("Dosyalar silinsin mi?", fields))
+    await asyncio.sleep(0)
+    text, rows = api.buttons[-1]
+    assert "Dosyalar silinsin mi?" in text
+    assert [label for label, _ in rows[0]] == ["✅ Onayla", "❌ Reddet"]
+    approve: str = rows[0][0][1]
+    await bridge.handle(tap(approve, 999))
+    assert not first.done() and api.callback_answers == []
+    await bridge.handle(tap(approve, 456))
+    assert await first == {"onay": True}
+    assert api.edited[-1] == "❔ Soru\n\n→ ✅ Onayla"
+    # Önceki sorunun butonu yeni soruyu yanıtlamaz.
+    second = asyncio.create_task(bridge.answer("Tekrar silinsin mi?", fields))
+    await asyncio.sleep(0)
+    await bridge.handle(tap(approve, 456))
+    assert not second.done() and "artık geçerli değil" in api.callback_answers[-1]
+    await bridge.handle(tap(api.buttons[-1][1][0][1][1], 456))
+    assert await second == {"onay": False}
+
+
+@pytest.mark.asyncio
+async def test_text_question_offers_its_choices_as_buttons(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Hedef onayı gibi seçenekli metin sorusu seçenekleri buton olarak sunar; eksik olanı yazmak yine çalışır."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    fields: dict[str, Any] = {"yanit": {"type": "string", "label": "'evet' ya da eksik olan", "default": "",
+                                        "choices": ["Evet"]}}
+    waiting = asyncio.create_task(bridge.answer("Hedef gerçekleşti mi?", fields))
+    await asyncio.sleep(0)
+    rows = api.buttons[-1][1]
+    assert [label for label, _ in rows[0]] == ["Evet"]
+    await bridge.handle(tap(rows[0][0][1], 456))
+    assert await waiting == {"yanit": "Evet"}
+
+
+@pytest.mark.asyncio
+async def test_provider_picker_selects_a_provider_then_its_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """/provider hazır sağlayıcıları, dokunulanın kataloğundaki modelleri sayfalı sunar; seçim tercihe yazılır."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "apply_model_preferences", lambda: ())
+    catalog = tuple(f"gpt-test-{index}" for index in range(10))
+
+    async def fake_models(provider: str, base_url: str, key: str | None) -> tuple[str, ...]:
+        assert provider == telegram.BACKENDS["openai"]["provider"]
+        return catalog
+
+    monkeypatch.setattr(telegram, "list_provider_models", fake_models)
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.clients = {"ollama-cloud": object(), "openai": object()}  # type: ignore[dict-item]
+    await bridge.handle(text_message("/provider"))
+    labels = [label for row in api.buttons[-1][1] for label, _ in row]
+    assert labels[0] == "✓ Otomatik" and any(label.startswith("openai") for label in labels)
+    assert not any(label.startswith("openrouter") for label in labels)
+    await bridge.handle(tap("prov:openai", 456))
+    rows = api.edited_buttons[-1][1]
+    models = [label for row in rows for label, _ in row if not label.startswith(("◀", "▶"))]
+    assert models[0] == "✓ " + telegram.BACKENDS["openai"]["model"] and len(models) == telegram.MODEL_PAGE_SIZE
+    next_page = [data for row in rows for label, data in row if label.startswith("▶")][0]
+    await bridge.handle(tap(next_page, 456))
+    page_two = [(label, data) for row in api.edited_buttons[-1][1] for label, data in row
+                if not label.startswith(("◀", "▶"))]
+    assert page_two[-1][0] == "gpt-test-9"
+    await bridge.handle(tap(page_two[-1][1], 456))
+    assert bridge.backend == "openai" and "gpt-test-9" in api.callback_answers[-1]
+    assert json.loads((tmp_path / "model_preferences.json").read_text(encoding="utf-8"))["openai"] == "gpt-test-9"
+    # Kapanan seçicinin butonu ikinci kez işlemez.
+    await bridge.handle(tap(page_two[-1][1], 456))
+    assert "artık geçerli değil" in api.callback_answers[-1]
+    await bridge.handle(text_message("/model"))
+    await bridge.handle(tap("prov:auto", 456))
+    assert bridge.backend is None
+
+
+@pytest.mark.asyncio
+async def test_mode_picker_sets_the_next_task(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Argümansız /mode modları buton olarak sunar; dokunuş sonraki görevin modunu ayarlar."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    await bridge.handle(text_message("/mode"))
+    assert [label for row in api.buttons[-1][1] for label, _ in row][0] == "✓ Normal"
+    await bridge.handle(tap("mode:continuous", 456))
+    assert bridge.run_mode == "continuous"
+
+
+@pytest.mark.asyncio
+async def test_new_clears_history_and_status_reports_next_task_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """/new sohbet geçmişini sıfırlar; boştayken /status sonraki görevin modelini, modunu ve geçmişi gösterir."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.history = [make_exchange("eski hedef", "eski yanıt", [])]
+    await bridge.handle(text_message("/status"))
+    assert api.sent[-1].startswith("Hazır.") and "Otomatik" in api.sent[-1] and "1 konuşma" in api.sent[-1]
+    await bridge.handle(text_message("/new"))
+    assert bridge.history == [] and "temizlendi" in api.sent[-1]
+    assert telegram.read_json(telegram.history_path(), None) == []
+
+
+@pytest.mark.asyncio
+async def test_continuous_goal_prompt_has_buttons_and_approve_tap_closes_the_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Sürekli oturumun onay istemi butonlu kalıcı iletidir; Onayla oturumu kapatır, başka oturumun butonu işlemez."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "STATE_FILE", str(tmp_path / "memory.json"))
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {"ollama-cloud": object()})
+    monkeypatch.setattr(filesystem, "BACKUP_DIR", tmp_path / "backups")
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.integrations = CapabilityService(tmp_path)
+    bridge.run_mode = "continuous"
+    turns = 0
+
+    async def fake_model(
+        clients: Any, messages: Any, schemas: Any, session_id: str,
+        backend: str, emit: Any, should_stop: Any,
+    ) -> tuple[dict[str, Any], str]:
+        nonlocal turns
+        turns += 1
+        calls: dict[int, dict[str, str]] = {
+            1: {"id": "w1", "name": "write_file",
+                "arguments": json.dumps({"path": str(tmp_path / "plan.md"), "content": "plan"})},
+            2: {"id": "g1", "name": "report_goal_met",
+                "arguments": json.dumps({"summary": "Plan hazır.", "evidence_call_ids": ["w1"]})},
+        }
+        if turns in calls:
+            return {"content": "", "tool_calls": [calls[turns]], "finish_reason": "tool_calls",
+                    "usage": main.ZERO_USAGE}, backend
+        return {"content": "", "tool_calls": [], "finish_reason": "stopped", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    try:
+        await bridge.handle(text_message("Plan yaz"))
+        task = bridge.active
+        assert task is not None
+        for _ in range(100):
+            if api.buttons:
+                break
+            await asyncio.sleep(0.05)
+        text, rows = api.buttons[-1]
+        assert "Plan hazır." in text and "/approve" in text
+        assert [label for label, _ in rows[0]] == ["✅ Onayla", "⏹ Durdur"]
+        assert "Yanıtınız bekleniyor" in api.drafts[-1][1]["html"]
+        await bridge.handle(text_message("/status"))
+        assert "Çalışıyor: Plan yaz" in api.sent[-1] and "Token:" in api.sent[-1]
+        assert any("✍️ Yazıyor" in text for text in api.html_sent + api.html_edited)
+        await bridge.handle(tap("ctl:eskioturum:approve", 456))
+        assert "artık açık değil" in api.callback_answers[-1] and not task.done()
+        await bridge.handle(tap(rows[0][0][1], 456))
+        await asyncio.wait_for(task, timeout=5)
+    finally:
+        await bridge.integrations.close()
+    assert turns == 2
+    assert "Plan hazır." in "\n".join(api.sent + api.edited + api.html_sent + api.html_edited)
+
+
+async def finished_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+    """Tek metin yanıtı üreten ajan koşusu (sahte)."""
+    metrics = {"turns": 1, "tool_calls": 0, "elapsed_seconds": 0.1, "backend": "ollama-cloud",
+               "prompt_tokens": 10, "cached_tokens": 0, "completion_tokens": 5}
+    emit({"kind": "run_finished", "success": True, "outcome": "Bitti.", "reason": "", "metrics": metrics})
+    return {"outcome": "Bitti.", "success": True, "reason": "", "metrics": metrics,
+            "exchange": make_exchange(goal, "Bitti.", [])}
+
+
+@pytest.mark.asyncio
+async def test_control_prompt_falls_back_to_plain_text_when_its_buttons_cannot_be_sent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Butonlu istem gönderimi ağ/5xx ile düşse de saatlerdir süren oturum ölmez: uyarı + düz metin, koşu biter."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {"ollama-cloud": object()})
+    api = FakeAPI()
+
+    async def failing_buttons(chat_id: int, text: str, buttons: list[list[tuple[str, str]]]) -> int:
+        raise telegram.TelegramError("sendMessage: HTTP 503: Service Unavailable", 503)
+
+    api.send_buttons = failing_buttons
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    prompt = "Hedef doğrulandı. Onay için /approve yazın."
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        emit({"kind": "notice", "level": "info", "text": prompt, "code": telegram.AWAITING_APPROVAL_CODE})
+        return await finished_run(goal, emit, options, clients)
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    with caplog.at_level("WARNING"):
+        await bridge.handle(text_message("Bir şey yap"))
+        assert bridge.active is not None
+        await asyncio.wait_for(bridge.active, timeout=10)
+    assert prompt in api.sent and "Bitti." in api.html_sent
+    assert not any("Görev hatası" in text or "503" in text for text in [*api.sent, *api.edited, *api.html_sent])
+    warning = next(record for record in caplog.records
+                   if record.getMessage() == "Oturum istemi butonlarla gönderilemedi; düz metin gönderiliyor")
+    assert warning.status == 503 and warning.code == telegram.AWAITING_APPROVAL_CODE
+
+
+@pytest.mark.asyncio
+async def test_run_token_is_cleared_when_the_run_ends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Biten koşunun belirteci kalmaz: yeni koşu belirteç alana dek eski oturum butonları hiçbir göreve bağlanamaz."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {"ollama-cloud": object()})
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    during: list[str] = []
+
+    async def fake_run(goal: str, emit: Any, options: Any, clients: Any) -> Any:
+        during.append(bridge.run_token)
+        return await finished_run(goal, emit, options, clients)
+
+    monkeypatch.setattr(telegram, "run_agent_with_callback", fake_run)
+    await bridge.handle(text_message("Bir şey yap"))
+    assert bridge.active is not None
+    await asyncio.wait_for(bridge.active, timeout=10)
+    assert len(during) == 1 and during[0] != "" and bridge.run_token == ""
+
+
+@pytest.mark.asyncio
+async def test_expired_callback_query_does_not_skip_the_message_update(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Süresi geçmiş buton sorgusu (answerCallbackQuery reddi) iletiyi kararla güncellemeyi atlatmaz."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    api = FakeAPI()
+
+    async def expired(callback_id: str, text: str) -> None:
+        raise telegram.TelegramError("answerCallbackQuery: HTTP 400: query is too old", 400)
+
+    api.answer_callback = expired
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    fields: dict[str, Any] = {"onay": {"type": "boolean", "label": "Onaylıyorum", "default": False}}
+    waiting = asyncio.create_task(bridge.answer("Dosyalar silinsin mi?", fields))
+    await asyncio.sleep(0)
+    approve: str = api.buttons[-1][1][0][0][1]
+    with caplog.at_level("WARNING"):
+        await bridge.handle(tap(approve, 456))
+    assert await asyncio.wait_for(waiting, timeout=10) == {"onay": True}
+    assert api.edited[-1] == "❔ Soru\n\n→ ✅ Onayla"
+    assert any(record.getMessage() == "Buton dokunuşu yanıtlanamadı" for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_non_decimal_digits_in_picker_buttons_are_stale_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Sayfa/model dizini yalnız ondalık rakamdır: '²' gibi isdigit() rakamı int() hatasıyla köprüyü düşürmez."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "apply_model_preferences", lambda: ())
+
+    async def fake_models(provider: str, base_url: str, key: str | None) -> tuple[str, ...]:
+        return ("gpt-test-1",)
+
+    monkeypatch.setattr(telegram, "list_provider_models", fake_models)
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    await bridge.handle(tap("prov:openai", 456))
+    picker = bridge.model_picker
+    assert picker is not None
+    await bridge.handle(tap(f"page:{picker['token']}:²", 456))
+    assert "artık geçerli değil" in api.callback_answers[-1]
+    await bridge.handle(tap(f"pm:{picker['token']}:²", 456))
+    assert "artık geçerli değil" in api.callback_answers[-1] and bridge.model_picker is picker
 
 
 PROVIDER_SWITCH: dict[str, Any] = {
@@ -619,7 +941,9 @@ async def test_native_draft_animates_tools_and_preserves_markdown() -> None:
     await presenter.event({"kind": "run_finished", "success": True,
                            "outcome": "**Kalın** [kaynak](https://example.com)",
                            "reason": "", "metrics": {}})
-    assert api.html_sent == ['<b>Kalın</b> <a href="https://example.com">kaynak</a>']
+    # İlk ileti canlı iş günlüğüdür (kabuk adımı kod bloğunda); son yanıt ayrı iletidir.
+    assert api.html_sent[0].startswith("💻 Kabuk\n<pre>")
+    assert api.html_sent[-1] == '<b>Kalın</b> <a href="https://example.com">kaynak</a>'
     assert api.sent == []
     assert len({draft_id for draft_id, _ in api.drafts}) == 1
 

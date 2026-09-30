@@ -8,7 +8,6 @@ import html
 import json
 import logging
 import os
-import plistlib
 import re
 import secrets
 import subprocess
@@ -18,7 +17,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import httpx
 from keyring.backends.macOS import Keyring
@@ -32,16 +31,31 @@ from omniagent.config import (
 )
 from omniagent.core import schedule
 from omniagent.core.conversation import Exchange, trim_history
-from omniagent.core.events import AgentEvent, provider_fallback_text, tool_label
+from omniagent.core.events import (
+    AWAITING_APPROVAL_CODE, AWAITING_DIRECTION_CODE, AgentEvent, compact_count, provider_fallback_text, tool_label,
+)
+from omniagent.model_catalog import (
+    ModelCatalogError, list_provider_models, load_model_preferences, save_model_preferences, valid_model_id,
+)
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
+from omniagent.platform.macos import launch_agent
+# Testler ve eski çağıranlar bu sabitleri telegram modülünden okur (tests/test_telegram_service.py).
+from omniagent.platform.macos.launch_agent import (  # noqa: F401
+    BOOTSTRAP_ATTEMPTS, BOOTSTRAP_RETRY_SECONDS, SERVICE_POLL_SECONDS, SERVICE_UNLOAD_TIMEOUT_SECONDS,
+    LaunchAgentError,
+)
 from omniagent.platform.macos.permissions import accessibility_granted
 from omniagent.platform.macos.power import start_keep_awake, stop_keep_awake
 from omniagent.paths import project_root, resolve_output_path, schedules_file, telegram_settings_file
 from omniagent.tools.screen import screen_capture_granted, screen_session
 from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, source_version, sync_dependencies
-from .runtime import DeliveryFailed, IntegrationStopped, data_root, read_json, save_json
+from .runtime import DeliveryFailed, IntegrationStopped, boolean_field, data_root, read_json, save_json
+from .telegram_activity import (
+    ActivityEntry, activity_html, append_entry, elapsed_label, mark_failed, render_entries,
+)
 from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
+from omniagent.app.constants import RUN_MODE_PROFILES
 from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
 from omniagent.app.policy import screenshot_requested, source_change_expected
 from omniagent.app.tool_schema import AUTO_OBSERVATION_PREVIEW, VERIFICATION_OBSERVATION_PREVIEW
@@ -189,9 +203,111 @@ def authorized(message: Dict[str, Any], settings: TelegramSettings) -> bool:
     )
 
 
-def _boolean_field(spec: object) -> bool:
-    """Soru alanı onay kutusu mu? (Telegram'da evet/hayır metniyle yanıtlanır.) Saf."""
-    return isinstance(spec, dict) and spec.get("type") == "boolean"
+# Satır içi buton satırları: her buton (etiket, callback verisi); Telegram callback verisini 64 baytla sınırlar.
+ButtonRows = List[List[Tuple[str, str]]]
+# Kullanıcıyı bekleyen sürekli oturum istemlerinin butonları (etiket, eylem); veri "ctl:<görev belirteci>:<eylem>".
+CONTROL_PROMPT_BUTTONS: Dict[str, List[Tuple[str, str]]] = {
+    AWAITING_APPROVAL_CODE: [("✅ Onayla", "approve"), ("⏹ Durdur", "stop")],
+    AWAITING_DIRECTION_CODE: [("⏹ Durdur", "stop")],
+}
+# "/" menüsü: yalnız argümansız çalışan komutlar; argümanlı /btw, /verbose ve /unschedule /help metnindedir.
+BOT_COMMANDS: List[Tuple[str, str]] = [
+    ("provider", "Sağlayıcı ve model seç"),
+    ("mode", "Sonraki görevin çalışma modunu seç"),
+    ("new", "Yeni oturum: sohbet geçmişini temizle"),
+    ("stop", "Çalışan görevi durdur"),
+    ("status", "Görev, süre, model ve token durumu"),
+    ("approve", "Sürekli oturumun hedefini onayla"),
+    ("schedules", "Planlı görevleri listele"),
+    ("doctor", "Sürüm ve izinleri göster"),
+    ("help", "Komutlar ve kullanım"),
+]
+# Model seçicisinde sayfa başına model butonu.
+MODEL_PAGE_SIZE: int = 8
+# İş günlüğü iletisinin HTML üst sınırı (Telegram 4096'da keser) ve en sık düzenleme aralığı (hız sınırı).
+LOG_LIMIT: int = 3500
+LOG_EDIT_SECONDS: float = 1.5
+
+
+class QuestionReply(TypedDict):
+    """Soru butonunun etiketi ve dokunulunca ajana dönen yanıt."""
+    label: str
+    answer: Dict[str, Any]
+
+
+def question_replies(fields: Dict[str, Any], token: str) -> Dict[str, QuestionReply]:
+    """
+    Tek yanıt alanlı sorunun butonlarını callback verisiyle eşler: onay kutusu Onayla/Reddet, "choices" taşıyan
+    metin alanı seçenek başına bir buton olur; diğer sorular butonsuzdur (yanıt yazılır). Veri soruya özgü
+    belirteci taşır: eski sorunun butonu yenisini yanıtlayamaz. Saf.
+    """
+    if len(fields) != 1:
+        return {}
+    name, spec = next(iter(fields.items()))
+    if boolean_field(spec):
+        return {
+            f"q:{token}:1": {"label": "✅ Onayla", "answer": {name: True}},
+            f"q:{token}:0": {"label": "❌ Reddet", "answer": {name: False}},
+        }
+    choices: object = spec.get("choices") if isinstance(spec, dict) else None
+    if not isinstance(choices, list):
+        return {}
+    return {
+        f"q:{token}:{index}": {"label": str(choice)[:40], "answer": {name: str(choice)}}
+        for index, choice in enumerate(choices)
+    }
+
+
+def control_buttons(code: str, token: str) -> ButtonRows:
+    """Sürekli oturum isteminin butonları; veri istemi üreten görevin belirtecini taşır. Saf."""
+    return [[(label, f"ctl:{token}:{action}") for label, action in CONTROL_PROMPT_BUTTONS[code]]]
+
+
+def model_label(backend: Optional[str]) -> str:
+    """Model profilinin okunur adı: 'Otomatik' ya da 'profil · model'. Saf."""
+    return "Otomatik" if backend is None else f"{backend} · {BACKENDS[backend]['model']}"
+
+
+def provider_buttons(selected: Optional[str], ready: frozenset[str]) -> ButtonRows:
+    """Otomatik ve hazır sağlayıcı profillerinin seçici butonları (BACKENDS sırasıyla, seçili olan ✓). Saf."""
+    options: List[Optional[str]] = [None, *(name for name in BACKENDS if name in ready)]
+    return [[(("✓ " if name == selected else "") + model_label(name), f"prov:{name or 'auto'}")]
+            for name in options]
+
+
+class ModelPicker(TypedDict):
+    """Açık model seçicisi: profil, sayfalı model listesi ve eski butonları geçersiz kılan belirteç."""
+    token: str
+    profile: str
+    models: List[str]
+
+
+def model_page_buttons(picker: ModelPicker, page: int, current: str) -> ButtonRows:
+    """Model listesinin bir sayfası (seçili olan ✓) ve gerekiyorsa ◀ ▶ gezinme satırı. Saf."""
+    start: int = page * MODEL_PAGE_SIZE
+    rows: ButtonRows = [
+        [(("✓ " if model == current else "") + model[:60], f"pm:{picker['token']}:{index}")]
+        for index, model in enumerate(picker["models"][start:start + MODEL_PAGE_SIZE], start)
+    ]
+    navigation: List[Tuple[str, str]] = []
+    if page > 0:
+        navigation.append(("◀ Önceki", f"page:{picker['token']}:{page - 1}"))
+    if start + MODEL_PAGE_SIZE < len(picker["models"]):
+        navigation.append(("▶ Sonraki", f"page:{picker['token']}:{page + 1}"))
+    return rows + ([navigation] if navigation else [])
+
+
+def inline_keyboard(buttons: ButtonRows) -> Dict[str, List[List[Dict[str, str]]]]:
+    """Buton satırlarını Bot API satır içi klavye nesnesine çevirir. Saf."""
+    return {"inline_keyboard": [
+        [{"text": label, "callback_data": data} for label, data in row] for row in buttons
+    ]}
+
+
+def mode_buttons(selected: str) -> ButtonRows:
+    """Çalışma modu seçici butonları (seçili olan ✓). Saf."""
+    return [[(("✓ " if key == selected else "") + profile["label"], f"mode:{key}")]
+            for key, profile in RUN_MODE_PROFILES.items()]
 
 
 _INTEGRATION_STATUS_OVERRIDES: Dict[str, str] = {"waiting_user": "Yanıtınız bekleniyor"}
@@ -297,10 +413,36 @@ class TelegramAPI:
         raise TelegramError(f"{method}: hız sınırı devam ediyor.")
 
     async def send(self, chat_id: int, text: str) -> int:
-        result = await self.call("sendMessage", {"chat_id": chat_id, "text": text[:PAGE_LIMIT]})
+        return await self._send_message({"chat_id": chat_id, "text": text[:PAGE_LIMIT]})
+
+    async def send_buttons(self, chat_id: int, text: str, buttons: ButtonRows) -> int:
+        """Metni satır içi butonlarla gönderir; dokunuş callback_query güncellemesi olarak döner."""
+        return await self._send_message({
+            "chat_id": chat_id, "text": text[:PAGE_LIMIT], "reply_markup": inline_keyboard(buttons),
+        })
+
+    async def edit_buttons(self, chat_id: int, message_id: int, text: str, buttons: ButtonRows) -> None:
+        """İleti metnini ve butonlarını birlikte günceller (çok adımlı seçici)."""
+        await self.call("editMessageText", {
+            "chat_id": chat_id, "message_id": message_id, "text": text[:PAGE_LIMIT],
+            "reply_markup": inline_keyboard(buttons),
+        })
+
+    async def _send_message(self, payload: Dict[str, Any]) -> int:
+        result = await self.call("sendMessage", payload)
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
             raise TelegramError("sendMessage: ileti kimliği eksik.")
         return result["message_id"]
+
+    async def answer_callback(self, callback_id: str, text: str) -> None:
+        """Buton dokunuşunu kapatır (istemcideki bekleme göstergesi durur); metin kısa açılır bildirim olur."""
+        await self.call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:200]})
+
+    async def set_commands(self, commands: List[Tuple[str, str]]) -> None:
+        """Sohbette '/' yazınca açılan komut menüsünü kaydeder."""
+        await self.call("setMyCommands", {
+            "commands": [{"command": name, "description": description} for name, description in commands],
+        })
 
     async def edit(self, chat_id: int, message_id: int, text: str) -> None:
         await self.call("editMessageText", {
@@ -627,7 +769,7 @@ class TelegramDraftStream:
             self.fallback.message_id = None
 
 
-def _compact_tool_status(name: str, preview: str, output: str = "") -> tuple[str, Dict[str, str]]:
+def _compact_tool_status(name: str, preview: str, output: str, elapsed: str) -> tuple[str, Dict[str, str]]:
     """Araç olayunu kısa canlı durum ve güvenli zengin içeriğe çevirir."""
     labels = {
         "web_search": "Web’de arıyor…",
@@ -638,7 +780,7 @@ def _compact_tool_status(name: str, preview: str, output: str = "") -> tuple[str
         "read_file": "Dosya okuyor…",
         "write_file": "Dosyayı yazıyor…",
     }
-    label = labels.get(name, f"{tool_label(name)} çalışıyor…")
+    label = labels.get(name, f"{tool_label(name)} çalışıyor…") + f" · {elapsed}"
     detail = preview.strip()[:240]
     tail = output.strip()[-300:]
     visible = "⏳ " + label
@@ -654,11 +796,93 @@ def _compact_tool_status(name: str, preview: str, output: str = "") -> tuple[str
     return visible, {"html": rich}
 
 
+def message_is_not_modified(error: TelegramError) -> bool:
+    """editMessageText'in "içerik zaten aynı" yanıtı mı (400 'message is not modified')? Saf."""
+    return error.status == 400 and "message is not modified" in str(error)
+
+
+class ActivityLog:
+    """
+    Görevin canlı iş günlüğü: her araç adımı bir satır olarak tek iletide yerinde güncellenir. Düzenleme en sık
+    LOG_EDIT_SECONDS'ta bir yapılır; ileti LOG_LIMIT'i aşacaksa son hâliyle bırakılır ve yeni adımlar yeni iletide
+    sürer. Gösterim hatası ajan işini asla iptal etmez: geçici hata (ağ, hız sınırı, 5xx) sonraki düzenlemede yeniden
+    denenir; "message is not modified" başarıdır (içerik zaten görünüyor); kalıcı 4xx'te (ör. günlük iletisi silinmiş)
+    yeni ileti açılır, yeni ileti de reddedilirse günlük bu koşu için kapanır.
+    """
+
+    def __init__(self, api: TelegramAPI, chat_id: int) -> None:
+        self.api = api
+        self.chat_id = chat_id
+        self.entries: List[ActivityEntry] = []
+        self.message_id: Optional[int] = None
+        self.shown = ""
+        self.last_edit = 0.0
+        self.closed = False
+
+    async def started(self, call_id: str, name: str, preview: str) -> None:
+        """Başlayan adımı günlüğe ekler; ileti dolacaksa önceki iletiyi son hâliyle bırakıp yenisini açar."""
+        line: str = activity_html(name, preview)
+        candidate: List[ActivityEntry] = append_entry(self.entries, call_id, line)
+        if self.entries and len(render_entries(candidate)) > LOG_LIMIT:
+            await self.flush()
+            self.entries, self.message_id, self.shown = [], None, ""
+            candidate = append_entry([], call_id, line)
+        self.entries = candidate
+        await self.tick()
+
+    async def finished(self, call_id: str, ok: bool) -> None:
+        """Başarısız biten adımın satırını ⚠️ ile işaretler."""
+        if not ok:
+            self.entries = mark_failed(self.entries, call_id)
+            await self.tick()
+
+    async def tick(self) -> None:
+        """Bekleyen değişikliği düzenleme aralığı dolduysa gönderir."""
+        if time.monotonic() - self.last_edit >= LOG_EDIT_SECONDS:
+            await self.flush()
+
+    async def flush(self) -> None:
+        """Bekleyen değişikliği hemen gönderir; Telegram hatası yükseltilmez (bkz. sınıf açıklaması)."""
+        content: str = render_entries(self.entries)
+        if self.closed or not content or content == self.shown:
+            return
+        try:
+            if self.message_id is None:
+                self.message_id = await self.api.send_html(self.chat_id, content)
+            else:
+                await self.api.edit_html(self.chat_id, self.message_id, content)
+        except TelegramError as error:
+            if not message_is_not_modified(error):
+                self._absorb_failure(error)
+                return
+            # "message is not modified": içerik zaten görünüyor, gönderilmiş sayılır.
+        self.shown = content
+        self.last_edit = time.monotonic()
+
+    def _absorb_failure(self, error: TelegramError) -> None:
+        """
+        Gösterim hatasını soğurur ve uyarır: geçici hata sonraki düzenlemede yeniden denenir; iletiyi düzenleyemezsek
+        (silinmiş olabilir) sonraki gönderimde tam günlük yeni iletide açılır; yeni ileti de reddedilirse günlük kapanır.
+        """
+        self.last_edit = time.monotonic()
+        fields: Dict[str, object] = {"status": error.status, "error": str(error)[:200]}
+        if error.status is None or error.status == 429 or error.status >= 500:
+            logging.warning("İş günlüğü güncellenemedi; sonraki düzenlemede yeniden denenecek", extra=fields)
+        elif self.message_id is not None:
+            logging.warning("İş günlüğü iletisi düzenlenemedi; yeni ileti açılacak", extra=fields)
+            self.message_id, self.shown = None, ""
+        else:
+            logging.warning("İş günlüğü açılamadı; bu koşu için günlük kapatıldı", extra=fields)
+            self.closed = True
+
+
 class CompactPresenter:
-    """Kısa görünümde taslak durumunu ve biçimli son yanıtı yönetir."""
+    """Kısa görünümde canlı iş günlüğünü, süreli durum taslağını ve biçimli son yanıtı yönetir."""
 
     def __init__(self, stream: TelegramDraftStream) -> None:
         self.stream = stream
+        self.started_at = time.monotonic()
+        self.log = ActivityLog(stream.api, stream.chat_id)
         self.turn_text = ""
         self.hide_turn = False
         self.finished = False
@@ -692,19 +916,22 @@ class CompactPresenter:
             preview = event["preview"]
             call_id = event.get("call_id", "") if kind == "tool_started" else ""
             self.active_tool = (call_id, name, preview, "")
-            visible, rich = _compact_tool_status(name, preview)
+            visible, rich = _compact_tool_status(name, preview, "", self._elapsed())
             await self.stream.show(
                 visible, rich_message=rich, immediate=kind == "tool_started",
             )
+            if kind == "tool_started":
+                await self.log.started(call_id, name, preview)
         elif kind == "tool_output" and self.active_tool is not None:
             call_id, name, preview, output = self.active_tool
             if event["call_id"] != call_id:
                 return
             output = (output + event["text"])[-300:]
             self.active_tool = (call_id, name, preview, output)
-            visible, rich = _compact_tool_status(name, preview, output)
+            visible, rich = _compact_tool_status(name, preview, output, self._elapsed())
             await self.stream.show(visible, rich_message=rich)
         elif kind == "tool_finished":
+            await self.log.finished(event["call_id"], event["ok"])
             if self.active_tool is not None and event["call_id"] == self.active_tool[0]:
                 self.active_tool = None
                 label = "Tamamlandı" if event["ok"] else "Araç başarısız"
@@ -746,12 +973,35 @@ class CompactPresenter:
                 immediate=stage != self.last_status_stage,
             )
             self.last_status_stage = stage
+        elif event["kind"] == "notice" and event.get("code") in CONTROL_PROMPT_BUTTONS:
+            # İstemin kendisini köprü butonlu kalıcı ileti olarak gönderir; taslak eskiden "✓ Tamamlandı ·
+            # düşünüyor…" hâlinde takılı kalıp oturumun kullanıcıyı beklediğini gizliyordu.
+            await self.stream.show(
+                "⏸ Yanıtınız bekleniyor",
+                rich_message={"html": "<tg-thinking>Yanıtınız bekleniyor</tg-thinking>"},
+                immediate=True,
+            )
         elif kind == "run_finished":
             self.finished = True
+            await self.log.flush()
             answer = str(event["outcome"]).strip() or str(event["reason"]).strip() or "Yanıt yok."
             await self.stream.finish(answer if event["success"] else f"⚠️ {answer}")
 
+    def _elapsed(self) -> str:
+        return elapsed_label(time.monotonic() - self.started_at)
+
+    async def tick(self) -> None:
+        """Etkin aracın süresini tazeler ve bekleyen günlük düzenlemesini gönderir."""
+        if self.active_tool is not None:
+            _, name, preview, output = self.active_tool
+            visible, rich = _compact_tool_status(name, preview, output, self._elapsed())
+            await self.stream.show(visible, rich_message=rich)
+        else:
+            await self.stream.tick()
+        await self.log.tick()
+
     async def finish(self, report: RunReport) -> None:
+        await self.log.flush()
         if not self.finished:
             answer = str(report["outcome"]).strip() or str(report.get("reason", "")).strip() or "Yanıt yok."
             await self.stream.finish(answer if report["success"] else f"⚠️ {answer}")
@@ -779,6 +1029,17 @@ class TelegramBridge:
         self.stop_event = threading.Event()
         self.pending_answer: Optional[asyncio.Future[Dict[str, Any]]] = None
         self.pending_fields: Dict[str, Any] = {}
+        # Bekleyen sorunun butonları (callback verisi → yanıt); soru kapanınca boşalır, eski butonlar işlemez
+        self.pending_replies: Dict[str, QuestionReply] = {}
+        # Çalışan görevin belirteci: sürekli oturum butonları yalnız kendi görevini yönetir
+        self.run_token = ""
+        # Çalışan görevin /status özeti: başlangıç anı, son araç, gerçek model ve token toplamı
+        self.run_started = 0.0
+        self.run_tool = ""
+        self.run_model = ""
+        self.run_tokens = 0
+        # Açık model seçicisi (/provider → sağlayıcı → model); yeni seçici eskisinin butonlarını geçersiz kılar
+        self.model_picker: Optional[ModelPicker] = None
         self.backend: Optional[str] = None
         self.run_mode = "normal"
         self.active_run_mode = "normal"
@@ -795,8 +1056,8 @@ class TelegramBridge:
     async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
         Soruyu sohbete gönderir ve yetkili yanıtı bekler. "_" ile başlayan alanlar (açıklama,
-        bağlantı) yanıt alanı değildir, mesajda gösterilir. Tek onay kutusu alanı "evet/hayır"
-        metniyle yanıtlanır.
+        bağlantı) yanıt alanı değildir, mesajda gösterilir. Tek onay kutusu alanı Onayla/Reddet
+        butonuyla ya da "evet/hayır" metniyle, seçenekli metin alanı seçenek butonuyla ya da metinle yanıtlanır.
         """
         if self.pending_answer is not None:
             raise TelegramError("Zaten bir kullanıcı yanıtı bekleniyor.")
@@ -804,23 +1065,30 @@ class TelegramBridge:
         self.pending_answer = future
         answerable: Dict[str, Any] = {name: spec for name, spec in fields.items() if not name.startswith("_")}
         self.pending_fields = answerable
+        self.pending_replies = question_replies(answerable, secrets.token_hex(4))
         notes = "\n".join(str(fields[name]) for name in ("_help", "_url") if fields.get(name))
-        if len(answerable) == 1 and _boolean_field(next(iter(answerable.values()))):
-            instruction = "Onaylamak için 'evet', reddetmek için 'hayır' yazın. /stop iptal eder."
+        if len(answerable) == 1 and boolean_field(next(iter(answerable.values()))):
+            instruction = "Butona dokunun ya da onay için 'evet', ret için 'hayır' yazın. /stop iptal eder."
+        elif self.pending_replies:
+            instruction = "Butona dokunun ya da yanıtınızı yazın. /stop iptal eder."
         elif len(answerable) == 1:
             instruction = "Yanıtınızı yazın. /stop iptal eder."
         else:
             instruction = (f"Alanlar: {', '.join(answerable)}\n"
                            "Birden çok alan için JSON nesnesi gönderin. /stop iptal eder.")
-        await self.api.send(
-            self.settings["chat_id"],
-            f"❔ {title[:1800]}\n" + (f"{notes[:1500]}\n" if notes else "") + instruction,
-        )
+        text = f"❔ {title[:1800]}\n" + (f"{notes[:1500]}\n" if notes else "") + instruction
         try:
+            if self.pending_replies:
+                await self.api.send_buttons(self.settings["chat_id"], text, [
+                    [(reply["label"], data) for data, reply in self.pending_replies.items()],
+                ])
+            else:
+                await self.api.send(self.settings["chat_id"], text)
             return await future
         finally:
             self.pending_answer = None
             self.pending_fields = {}
+            self.pending_replies = {}
 
     async def deliver(self, path: Path, caption: str) -> None:
         """send_file aracının teslim kanalı: dosyayı eşleştirilmiş sohbete belge olarak gönderir."""
@@ -869,6 +1137,9 @@ class TelegramBridge:
                 logging.warning("Zamanlanmış görev bildirimi gönderilemedi", extra={"error": str(error)[:200]})
         # Ayarlar başka süreçte değişmiş olabilir; görev başında güncel modeli yükle.
         apply_model_preferences()
+        # Butonlu sürekli oturum istemleri bu göreve bağlanır; önceki görevin butonları işlemez.
+        self.run_token = secrets.token_hex(4)
+        self.run_started, self.run_tool, self.run_model, self.run_tokens = time.monotonic(), "", "", 0
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
         loop = asyncio.get_running_loop()
         # Ajan, boş çıktılı başarısız görevin kısmi raporunu run_finished çıktısı olarak yayınlamadan hemen önce
@@ -883,8 +1154,13 @@ class TelegramBridge:
             loop.call_soon_threadsafe(queue.put_nowait, event)
 
         def verbose_text(event: AgentEvent) -> str:
-            """Ayrıntılı görünüm metni; run_finished çıktısının birebir tekrarı olan uyarı atlanır."""
-            if event["kind"] == "notice" and event["text"] in finished_outcomes:
+            """
+            Ayrıntılı görünüm metni; run_finished çıktısının birebir tekrarı olan uyarı ve butonlu kalıcı ileti
+            olarak ayrıca gönderilen oturum istemi atlanır.
+            """
+            if event["kind"] == "notice" and (
+                event["text"] in finished_outcomes or event.get("code") in CONTROL_PROMPT_BUTTONS
+            ):
                 return ""
             return event_text(event)
 
@@ -922,6 +1198,19 @@ class TelegramBridge:
         live = TelegramDraftStream(self.api, self.settings["chat_id"], stream)
         compact = CompactPresenter(live)
         verbose = self.verbose
+
+        async def render(event: AgentEvent) -> None:
+            """Olayı seçili görünüme işler; kullanıcıyı bekleyen oturum istemi iki görünümde de butonlu kalıcı iletidir."""
+            self._track(event)
+            if event["kind"] == "notice" and event.get("code") in CONTROL_PROMPT_BUTTONS:
+                await self._send_control_prompt(event["text"], str(event.get("code")))
+            if verbose:
+                rendered = verbose_text(event)
+                if rendered:
+                    await stream.append(rendered)
+            else:
+                await compact.event(event)
+
         # Model ekrana bakmak için de take_screenshot çağırır; her gözlemi sohbete göndermek sohbeti
         # dolduruyordu. Ayrıntılı görünüm hepsini anında gönderir; kısa görünüm yalnız kullanıcı
         # görüntü istediyse ve görev sonunda son görüntüyü tek kez gönderir.
@@ -942,7 +1231,7 @@ class TelegramBridge:
                     if verbose:
                         await stream.flush()
                     else:
-                        await live.tick()
+                        await compact.tick()
                     continue
                 saw_finished = saw_finished or event["kind"] == "run_finished"
                 if (
@@ -962,12 +1251,7 @@ class TelegramBridge:
                             extra={"call_id": event["call_id"], "preview": event["preview"][:200],
                                    "error_type": type(error).__name__, "error": str(error)[:200]},
                         )
-                if verbose:
-                    rendered = verbose_text(event)
-                    if rendered:
-                        await stream.append(rendered)
-                else:
-                    await compact.event(event)
+                await render(event)
                 if event["kind"] == "tool_finished" and event["ok"]:
                     image = screenshot_paths.pop(event["call_id"], None)
                     if image is not None and verbose:
@@ -980,12 +1264,7 @@ class TelegramBridge:
             while not queue.empty():
                 event = queue.get_nowait()
                 saw_finished = saw_finished or event["kind"] == "run_finished"
-                if verbose:
-                    rendered = verbose_text(event)
-                    if rendered:
-                        await stream.append(rendered)
-                else:
-                    await compact.event(event)
+                await render(event)
             if verbose:
                 if not saw_finished:
                     await stream.append(
@@ -1023,10 +1302,30 @@ class TelegramBridge:
             self.goal = ""
             self.active = None
             self.active_run_mode = "normal"
+            self.run_token = ""
             try:
                 await stream.flush(force=True)
             except TelegramError:
                 pass
+
+    async def _send_control_prompt(self, text: str, code: str) -> None:
+        """
+        Sürekli oturum istemini butonlu kalıcı ileti olarak gönderir. Gösterim hatası (ağ, 429, 5xx) saatlerdir süren
+        oturumu iptal etmemeli: butonlar gönderilemezse uyarı loglanır ve istem düz metin gönderilir (kullanıcı
+        /approve ya da /stop yazabilir); düz metin de gönderilemezse yalnız uyarı loglanır.
+        """
+        chat_id: int = self.settings["chat_id"]
+        try:
+            await self.api.send_buttons(chat_id, text, control_buttons(code, self.run_token))
+            return
+        except TelegramError as error:
+            logging.warning("Oturum istemi butonlarla gönderilemedi; düz metin gönderiliyor",
+                            extra={"code": code, "status": error.status, "error": str(error)[:200]})
+        try:
+            await self.api.send(chat_id, text)
+        except TelegramError as error:
+            logging.warning("Oturum istemi gönderilemedi; oturum kullanıcının /approve ya da /stop yazmasını bekler",
+                            extra={"code": code, "status": error.status, "error": str(error)[:200]})
 
     async def _reply_to_question(self, text: str) -> None:
         future = self.pending_answer
@@ -1035,7 +1334,7 @@ class TelegramBridge:
         try:
             if len(self.pending_fields) == 1:
                 name, spec = next(iter(self.pending_fields.items()))
-                value = {name: approval_granted(text) if _boolean_field(spec) else text}
+                value = {name: approval_granted(text) if boolean_field(spec) else text}
             else:
                 value = json.loads(text)
                 if not isinstance(value, dict) or not all(name in value for name in self.pending_fields):
@@ -1045,6 +1344,172 @@ class TelegramBridge:
             return
         future.set_result(value)
         await self.api.send(self.settings["chat_id"], "Yanıt alındı; görev sürüyor.")
+
+    async def _handle_button(self, query: Dict[str, Any]) -> None:
+        """
+        Satır içi buton dokunuşunu işler; yalnız eşleşmiş kişinin özel sohbetindeki dokunuş kabul edilir.
+        Sonuç kısa açılır bildirim olarak gösterilir, ileti kararla güncellenir ve butonları kalkar.
+        """
+        message = query.get("message")
+        data = query.get("data")
+        callback_id = query.get("id")
+        if (
+            not isinstance(message, dict) or not isinstance(data, str) or not isinstance(callback_id, str)
+            or not authorized({"chat": message.get("chat"), "from": query.get("from")}, self.settings)
+        ):
+            return
+        kind, _, value = data.partition(":")
+        if kind in ("prov", "page") and value != "auto":
+            toast, text, buttons = await self._provider_screen(kind, value)
+        else:
+            outcome: str = self._button_outcome(data)
+            toast, text, buttons = outcome, f"{message.get('text', '')}\n\n→ {outcome}", []
+        message_id = message.get("message_id")
+        try:
+            await self.api.answer_callback(callback_id, toast)
+        except TelegramError as error:
+            # Eylem uygulandı; köprü kapalıyken birikmiş eski dokunuşun sorgusu zaman aşımına uğramış olabilir.
+            # İleti güncellemesi ayrı denenir: süresi geçmiş sorgu iletiyi eski hâliyle bırakmasın.
+            logging.warning("Buton dokunuşu yanıtlanamadı", extra={"error": str(error)[:200]})
+        try:
+            if isinstance(message_id, int) and buttons:
+                await self.api.edit_buttons(self.settings["chat_id"], message_id, text, buttons)
+            elif isinstance(message_id, int):
+                await self.api.edit(self.settings["chat_id"], message_id, text)
+        except TelegramError as error:
+            logging.warning("Buton sonucu gösterilemedi", extra={"error": str(error)[:200]})
+
+    def _button_outcome(self, data: str) -> str:
+        """Buton verisindeki eylemi uygular; kullanıcıya gösterilecek sonucu döner."""
+        kind, _, value = data.partition(":")
+        if kind == "q":
+            return self._answer_by_button(data)
+        if kind == "prov":
+            return self._select_model(value)
+        if kind == "pm":
+            return self._pick_model(value)
+        if kind == "mode":
+            return self._select_mode(value)
+        if kind == "ctl":
+            return self._control_by_button(value)
+        return "Bilinmeyen buton."
+
+    async def _provider_screen(self, kind: str, value: str) -> Tuple[str, str, ButtonRows]:
+        """
+        Sağlayıcı seçicisinin sonraki ekranı (bildirim, metin, butonlar): dokunulan sağlayıcının model listesi
+        (mevcut model başta) ya da listenin başka sayfası. Liste alınamazsa mevcut modelle seçim sunulur.
+        """
+        note = ""
+        if kind == "prov":
+            if value not in BACKENDS:
+                return "Bilinmeyen model profili.", "Bilinmeyen model profili.", []
+            try:
+                listed: Tuple[str, ...] = await self._catalog_models(value)
+            except ModelCatalogError as error:
+                listed, note = (), f" (liste alınamadı: {error})"
+            models: List[str] = [
+                model for model in dict.fromkeys((BACKENDS[value]["model"], *listed)) if valid_model_id(model)
+            ]
+            picker: ModelPicker = {"token": secrets.token_hex(4), "profile": value, "models": models}
+            self.model_picker = picker
+            page = 0
+        else:
+            token, _, number = value.partition(":")
+            current_picker: Optional[ModelPicker] = self.model_picker
+            if current_picker is None or current_picker["token"] != token or not number.isdecimal():
+                return "Bu seçici artık geçerli değil.", "Bu seçici artık geçerli değil.", []
+            picker, page = current_picker, int(number)
+        profile: str = picker["profile"]
+        return (
+            f"{profile}: {len(picker['models'])} model",
+            f"{profile} modelleri{note}. Sonraki görev için seçin:",
+            model_page_buttons(picker, page, BACKENDS[profile]["model"]),
+        )
+
+    async def _catalog_models(self, profile: str) -> Tuple[str, ...]:
+        """Profilin sağlayıcısındaki modeller; masaüstü Ayarlar ile aynı katalog ve önbellek."""
+        variable: Optional[str] = API_KEY_VARIABLES.get(profile)
+        return await list_provider_models(
+            BACKENDS[profile]["provider"], BACKENDS[profile]["base_url"],
+            load_api_key(variable) if variable else None,
+        )
+
+    def _pick_model(self, value: str) -> str:
+        """Seçicideki modeli profilin tercihi olarak kaydeder (masaüstüyle ortak) ve profili sonraki göreve seçer."""
+        token, _, number = value.partition(":")
+        picker: Optional[ModelPicker] = self.model_picker
+        if picker is None or picker["token"] != token or not number.isdecimal() or int(number) >= len(picker["models"]):
+            return "Bu seçici artık geçerli değil."
+        profile, model = picker["profile"], picker["models"][int(number)]
+        save_model_preferences({**load_model_preferences(), profile: model})
+        apply_model_preferences()
+        self.backend = profile
+        self.model_picker = None
+        return f"Sonraki görev modeli: {profile} · {model}."
+
+    def _track(self, event: AgentEvent) -> None:
+        """/status için çalışan görevin gerçek modelini, son aracını ve token toplamını izler."""
+        if event["kind"] == "run_started" or event["kind"] == "backend_changed":
+            self.run_model = f"{event['backend']} · {event['model']}"
+        elif event["kind"] == "tool_started":
+            self.run_tool = tool_label(event["name"])
+        elif event["kind"] == "model_finished":
+            self.run_tokens += event["usage"]["prompt_tokens"] + event["usage"]["completion_tokens"]
+
+    def _status_text(self) -> str:
+        """Çalışan görevi (süre, son araç, model, token) ve sonraki görevin ayarlarını özetler."""
+        upcoming: str = (
+            f"Sonraki görev: {model_label(self.backend)} · {RUN_MODE_PROFILES[self.run_mode]['label']} modu"
+        )
+        if self.active is None:
+            return f"Hazır. {upcoming} · Geçmiş: {len(self.history)} konuşma"
+        return (
+            f"Çalışıyor: {self.goal[:400]}\n"
+            f"Süre: {elapsed_label(time.monotonic() - self.run_started)} · Araç: {self.run_tool or '—'} · "
+            f"Model: {self.run_model or '—'} · Token: {compact_count(self.run_tokens)}\n{upcoming}"
+        )
+
+    def _answer_by_button(self, data: str) -> str:
+        """Bekleyen soruyu dokunulan butonun yanıtıyla kapatır; eski ya da kapanmış sorunun butonu işlemez."""
+        reply = self.pending_replies.get(data)
+        future = self.pending_answer
+        if reply is None or future is None or future.done():
+            return "Bu soru artık geçerli değil."
+        future.set_result(reply["answer"])
+        return reply["label"]
+
+    def _select_model(self, value: str) -> str:
+        """Sonraki görevin model profilini ayarlar ('auto' = Otomatik)."""
+        if value != "auto" and value not in BACKENDS:
+            return "Bilinmeyen model profili."
+        self.backend = None if value == "auto" else value
+        return f"Sonraki görev modeli: {model_label(self.backend)}."
+
+    def _select_mode(self, value: str) -> str:
+        """Sonraki görevin çalışma modunu ayarlar."""
+        if value not in RUN_MODE_PROFILES:
+            return "Mod: normal, long, autonomous veya surekli."
+        self.run_mode = value
+        return f"Sonraki görev modu: {RUN_MODE_PROFILES[value]['label']}."
+
+    def _control_by_button(self, value: str) -> str:
+        """Sürekli oturum istemi butonunu uygular; yalnız istemi üreten çalışan görevde geçerlidir."""
+        token, _, action = value.partition(":")
+        if self.active is None or token != self.run_token:
+            return "Bu oturum artık açık değil."
+        if action == "approve":
+            self.control_messages.put("/approve")
+            return "Onay iletildi; oturum kapanıyor."
+        if action == "stop":
+            self._request_stop()
+            return "Durdurma istendi."
+        return "Bilinmeyen buton."
+
+    def _request_stop(self) -> None:
+        """Çalışan görevi durdurur; yanıt bekleyen soru varsa iptal eder."""
+        self.stop_event.set()
+        if self.pending_answer is not None and not self.pending_answer.done():
+            self.pending_answer.set_exception(IntegrationStopped("Kullanıcı tarafından durduruldu."))
 
     async def scheduler_tick(self, now: datetime) -> None:
         """
@@ -1237,6 +1702,10 @@ class TelegramBridge:
         self.active = asyncio.create_task(self._execute(goal, [str(path)] if attachment["image"] else None))
 
     async def handle(self, update: Dict[str, Any]) -> None:
+        query = update.get("callback_query")
+        if isinstance(query, dict):
+            await self._handle_button(query)
+            return
         message = update.get("message")
         if not isinstance(message, dict) or not authorized(message, self.settings):
             return
@@ -1253,9 +1722,7 @@ class TelegramBridge:
             if self.active is None:
                 await self.api.send(chat_id, "Çalışan görev yok.")
             else:
-                self.stop_event.set()
-                if self.pending_answer is not None and not self.pending_answer.done():
-                    self.pending_answer.set_exception(IntegrationStopped("Kullanıcı tarafından durduruldu."))
+                self._request_stop()
                 await self.api.send(chat_id, "Durdurma istendi; çalışan işlem iptal ediliyor.")
             return
         if text.startswith("/btw ") or text == "/approve":
@@ -1270,8 +1737,15 @@ class TelegramBridge:
             await self._schedule_command(text)
             return
         if text == "/status":
-            state = f"Çalışıyor: {self.goal[:400]}" if self.active is not None else "Hazır."
-            await self.api.send(chat_id, state)
+            await self.api.send(chat_id, self._status_text())
+            return
+        if text == "/new":
+            if self.active is not None:
+                await self.api.send(chat_id, "Görev sürerken yeni oturum açılamaz; önce /stop.")
+                return
+            self.history = []
+            save_json(history_path(), self.history)
+            await self.api.send(chat_id, "Yeni oturum: sohbet geçmişi temizlendi.")
             return
         if text in ("/doctor", "/update", "/restart"):
             await self._maintenance_command(text)
@@ -1281,7 +1755,10 @@ class TelegramBridge:
                 chat_id,
                 "Hedefinizi yazın. /stop durdurur, /status durumu gösterir. "
                 "/verbose on ayrıntılı akışı açar; /verbose off kısa yanıtı kullanır. "
-                "/model <profil> ve /mode <normal|long|autonomous|surekli> sonraki görevi ayarlar; "
+                "/provider sağlayıcıyı ve modelini, /mode çalışma modunu butonla seçtirir "
+                "(yazarak da olur: /model <profil>, /mode <normal|long|autonomous|surekli>); "
+                "/new sohbet geçmişini temizler; "
+                "onay soruları Onayla/Reddet butonuyla ya da 'evet'/'hayır' yazarak yanıtlanır; "
                 "surekli, siz durdurana veya hedefi /approve ile onaylayana kadar çalışır; "
                 "çalışırken /btw <mesaj> ile yön verebilirsiniz. "
                 "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
@@ -1298,22 +1775,25 @@ class TelegramBridge:
             self.verbose = text.endswith("on")
             await self.api.send(chat_id, "Sonraki görev: ayrıntılı akış." if self.verbose else "Sonraki görev: kısa görünüm.")
             return
+        if text in ("/provider", "/model"):
+            await self.api.send_buttons(
+                chat_id, f"Sonraki görev modeli: {model_label(self.backend)}. Sağlayıcı seçin:",
+                provider_buttons(self.backend, frozenset(self.clients)),
+            )
+            return
         if text.startswith("/model "):
-            selected = text.split(None, 1)[1].strip()
-            if selected != "auto" and selected not in BACKENDS:
-                await self.api.send(chat_id, "Bilinmeyen model profili.")
-                return
-            self.backend = None if selected == "auto" else selected
-            await self.api.send(chat_id, f"Sonraki görev modeli: {selected}.")
+            await self.api.send(chat_id, self._select_model(text.split(None, 1)[1].strip()))
+            return
+        if text == "/mode":
+            await self.api.send_buttons(
+                chat_id, f"Sonraki görev modu: {RUN_MODE_PROFILES[self.run_mode]['label']}. Değiştirmek için seçin:",
+                mode_buttons(self.run_mode),
+            )
             return
         if text.startswith("/mode "):
             selected = text.split(None, 1)[1].strip()
             aliases = {"long": "extended", "surekli": "continuous", "sürekli": "continuous"}
-            if selected not in ("normal", "long", "extended", "autonomous", "surekli", "sürekli", "continuous"):
-                await self.api.send(chat_id, "Mod: normal, long, autonomous veya surekli.")
-                return
-            self.run_mode = aliases.get(selected, selected)
-            await self.api.send(chat_id, f"Sonraki görev modu: {selected}.")
+            await self.api.send(chat_id, self._select_mode(aliases.get(selected, selected)))
             return
         if self.active is not None:
             await self.api.send(chat_id, "Bir görev çalışıyor. /stop veya /status kullanın.")
@@ -1331,6 +1811,11 @@ class TelegramBridge:
         self.keep_awake = start_keep_awake(os.getpid())
         scheduler = asyncio.create_task(self._scheduler_loop())
         try:
+            try:
+                await self.api.set_commands(BOT_COMMANDS)
+            except TelegramError as error:
+                # Menü yalnız kolaylık: kaydedilemezse komutlar yazılarak yine çalışır.
+                logging.warning("Komut menüsü kaydedilemedi", extra={"error": str(error)[:200]})
             if announce:
                 version = await asyncio.to_thread(source_version, project_root())
                 try:
@@ -1342,7 +1827,7 @@ class TelegramBridge:
                 try:
                     updates = await self.api.call("getUpdates", {
                         "offset": self.offset, "timeout": POLL_SECONDS,
-                        "allowed_updates": ["message"],
+                        "allowed_updates": ["message", "callback_query"],
                     })
                 except TelegramError as error:
                     if error.status is not None and error.status < 500 and error.status != 429:
@@ -1430,11 +1915,6 @@ async def setup() -> None:
 
 
 SERVICE_LABEL = "com.omniagent.telegram"
-# bootout sonrası eski kaydın kalkmasını bekleme (launchd çıkış süresi 5 sn) ve bootstrap denemeleri
-SERVICE_UNLOAD_TIMEOUT_SECONDS: float = 15.0
-SERVICE_POLL_SECONDS: float = 0.25
-BOOTSTRAP_ATTEMPTS: int = 3
-BOOTSTRAP_RETRY_SECONDS: float = 1.0
 
 
 def bridge_command(announce: bool = False) -> List[str]:
@@ -1448,85 +1928,25 @@ def service_plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{SERVICE_LABEL}.plist"
 
 
-def build_launchd_record() -> Dict[str, Any]:
+def build_launchd_record() -> Dict[str, object]:
     """Kaynak dosya konumundan bağımsız launchd kaydını üretir."""
     root = data_root()
-    return {
-        "Label": SERVICE_LABEL,
-        "ProgramArguments": bridge_command(),
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "StandardOutPath": str(root / "telegram-stdout.log"),
-        "StandardErrorPath": str(root / "telegram-stderr.log"),
-    }
-
-
-def _write_service_plist(path: Path, record: Dict[str, Any]) -> None:
-    """Plist'i yarım dosya bırakmadan atomik biçimde yeniler."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    try:
-        temporary.write_bytes(plistlib.dumps(record))
-        temporary.chmod(0o600)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    return launch_agent.launchd_record(
+        SERVICE_LABEL, bridge_command(), root / "telegram-stdout.log", root / "telegram-stderr.log",
+    )
 
 
 def install_service() -> None:
     """LaunchAgent'i güncel paket koduyla idempotent biçimde kurar veya yeniler."""
     load_settings()
     load_token()
-    domain = f"gui/{os.getuid()}"
-    target = f"{domain}/{SERVICE_LABEL}"
-    path = service_plist_path()
     data_root().mkdir(parents=True, exist_ok=True)
-    _write_service_plist(path, build_launchd_record())
-
-    if _launchctl(["print", target]).returncode == 0:
-        stopped = _launchctl(["bootout", target])
-        if stopped.returncode != 0:
-            raise TelegramError(f"Eski Telegram hizmeti durdurulamadı: {stopped.stderr.strip()[:300]}")
-        _wait_until_unloaded(target)
-    _bootstrap_service(domain, path)
+    path = service_plist_path()
+    try:
+        launch_agent.install(SERVICE_LABEL, path, build_launchd_record(), "Telegram")
+    except LaunchAgentError as error:
+        raise TelegramError(str(error)) from error
     print(f"Telegram hizmeti kuruldu/güncellendi: {path}")
-
-
-def _launchctl(arguments: List[str]) -> "subprocess.CompletedProcess[str]":
-    """launchctl'i çıktısını yakalayarak çalıştırır; dönüş kodunu çağıran denetler."""
-    return subprocess.run(["launchctl", *arguments], capture_output=True, text=True, check=False)
-
-
-def _wait_until_unloaded(target: str) -> None:
-    """
-    bootout döndüğünde launchd eski köprüyü hâlâ kapatıyor olabilir; bu arada yapılan bootstrap
-    "5: Input/output error" ile düşüp hizmeti kapalı bırakıyordu (26 Eylül, canlı). Uzaktayken
-    bu, köprünün geri gelmemesi demekti. Kayıt kalkana kadar sınırlı süre beklenir.
-    """
-    deadline = time.monotonic() + SERVICE_UNLOAD_TIMEOUT_SECONDS
-    while _launchctl(["print", target]).returncode == 0:
-        if time.monotonic() >= deadline:
-            raise TelegramError(
-                f"Eski Telegram hizmeti {SERVICE_UNLOAD_TIMEOUT_SECONDS:.0f} sn içinde kalkmadı: {target}"
-            )
-        time.sleep(SERVICE_POLL_SECONDS)
-
-
-def _bootstrap_service(domain: str, path: Path) -> None:
-    """Kaydı yükler; launchd geçici hata verirse uyarıyla yeniden dener, sonunda son hatayı yükseltir."""
-    stderr = ""
-    for attempt in range(1, BOOTSTRAP_ATTEMPTS + 1):
-        result = _launchctl(["bootstrap", domain, str(path)])
-        if result.returncode == 0:
-            return
-        stderr = result.stderr.strip()[:300]
-        if attempt < BOOTSTRAP_ATTEMPTS:
-            logging.warning(
-                "launchd bootstrap başarısız; yeniden denenecek",
-                extra={"attempt": attempt, "returncode": result.returncode, "stderr": stderr},
-            )
-            time.sleep(BOOTSTRAP_RETRY_SECONDS)
-    raise TelegramError(f"launchd başlatılamadı ({BOOTSTRAP_ATTEMPTS} deneme): {stderr}")
 
 
 async def run_bridge(announce: bool = False) -> None:

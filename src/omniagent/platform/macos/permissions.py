@@ -17,6 +17,7 @@ from typing import Dict
 
 from omniagent import tools
 from omniagent.tools import gui_input
+from pathlib import Path
 
 
 def accessibility_granted() -> bool:
@@ -25,6 +26,21 @@ def accessibility_granted() -> bool:
         return bool(gui_input.AX.AXIsProcessTrusted())
     except Exception:
         return False
+
+
+MESSAGES_DATABASE: Path = Path.home() / "Library" / "Messages" / "chat.db"
+
+
+def messages_database_status(path: Path) -> str:
+    """iMessage köprüsünün okuduğu Messages veritabanı bu süreçten okunabiliyor mu (Tam Disk Erişimi)?"""
+    try:
+        with path.open("rb") as database:
+            database.read(1)
+    except FileNotFoundError:
+        return "veritabanı yok (Messages bu kullanıcıda hiç açılmamış)"
+    except PermissionError:
+        return "İZİN YOK (Tam Disk Erişimi: iMessage köprüsü için gerekli)"
+    return "izinli"
 
 
 def report() -> str:
@@ -36,6 +52,7 @@ def report() -> str:
         f"macOS          : {platform.mac_ver()[0]}",
         f"Ekran kaydı    : {'izinli' if granted else 'İZİN YOK'}",
         f"Erişilebilirlik: {'izinli' if accessible else 'İZİN YOK (fare/klavye olayları düşer)'}",
+        f"Tam Disk Erişimi: {messages_database_status(MESSAGES_DATABASE)}",
         f"Sorumlu uygulama: {owner['app_name'] or owner['parent_process'] or 'bilinmiyor'}",
         f"bundle kimliği : {owner['bundle_id'] or 'yok (arka plan süreci)'}",
         f"python ikilisi : {owner['python']}",

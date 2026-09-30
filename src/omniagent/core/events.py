@@ -137,10 +137,17 @@ class ProviderFallback(TypedDict):
     image_count: int
 
 
+# Sürekli oturum kullanıcıyı bekliyor: arayüz bu bildirimleri geçici durum satırında bırakmamalı, kullanıcı
+# görmezse oturum boşuna bekler. Onay istemi /approve ya da /btw, yön istemi /btw ile yanıtlanır.
+AWAITING_APPROVAL_CODE: str = "AWAITING_APPROVAL"
+AWAITING_DIRECTION_CODE: str = "AWAITING_DIRECTION"
+
+
 class Notice(TypedDict):
     kind: Literal["notice"]
     level: Literal["info", "warning", "error"]
     text: str
+    code: NotRequired[str]
 
 
 class RunFinished(TypedDict):

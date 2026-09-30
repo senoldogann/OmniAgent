@@ -96,10 +96,11 @@ async def test_click_text_resolved_to_payment_button_needs_approval(
         return {approval.APPROVAL_FIELD: False}
 
     assert (await _run(call, deny, False))["code"] == "APPROVAL_DENIED" and _pay_clicks(headless_page) == 0
-    assert (await _run(call, _confirm, True))["code"] == "APPROVAL_UNAVAILABLE"  # sürekli mod: kanal yok
+    assert (await _run(call, None, True))["code"] == "APPROVAL_UNAVAILABLE"  # kanal gerçekten yok
+    assert (await _run(call, _confirm, True))["ok"]  # sürekli modda açık onay kanalı kullanılabilir
     approved = await _run(call, _confirm, False)
-    assert approved["ok"] and _pay_clicks(headless_page) == 1
-    assert [record["decision"] for record in _audit(tmp_path)] == ["unavailable", "denied", "unavailable", "approved"]
+    assert approved["ok"] and _pay_clicks(headless_page) == 2
+    assert [record["decision"] for record in _audit(tmp_path)] == ["unavailable", "denied", "unavailable", "approved", "approved"]
     assert "odemeyi onayla" in ascii_fold(_audit(tmp_path)[-1]["summary"])
 
 
@@ -279,10 +280,10 @@ async def test_element_click_needs_approval_and_fires_exactly_once(
     assert cua.clicks == ["sıradan"] * 3
     for financial in (2, 5):  # ad ya da açıklama adayı ödeme düğmesi
         assert (await _run_with(toolbox, _element_call(financial), None, False))["code"] == "APPROVAL_UNAVAILABLE"
-        assert (await _run_with(toolbox, _element_call(financial), _confirm, True))["code"] == "APPROVAL_UNAVAILABLE"
+        assert (await _run_with(toolbox, _element_call(financial), None, True))["code"] == "APPROVAL_UNAVAILABLE"
         assert (await _run_with(toolbox, _element_call(financial), deny, False))["code"] == "APPROVAL_DENIED"
     assert cua.clicks == ["sıradan"] * 3 and "Pay now" in questions[0] and "DenemeUygulaması" in questions[0]
-    approved = await _run_with(toolbox, _element_call(2), _confirm, False)
+    approved = await _run_with(toolbox, _element_call(2), _confirm, True)
     assert approved["ok"] and cua.clicks[3:] == ["onaylı-tek-tetikleme"]
     assert [record["decision"] for record in _audit(tmp_path)].count("approved") == 1
 
@@ -344,7 +345,8 @@ async def test_generic_element_label_uses_static_text_context(tmp_path: Path, mo
     toolbox = _toolbox(cua)
     assert (await _run_with(toolbox, _element_call(1), None, False))["code"] == "APPROVAL_UNAVAILABLE"
     cua.elements = [_element(1, "AXButton", "Gönder"), _element(2, "AXStaticText", "Merhaba")]
-    assert (await _run_with(toolbox, _element_call(1), None, False))["ok"]
+    assert (await _run_with(toolbox, _element_call(1), None, False))["code"] == "APPROVAL_UNAVAILABLE"
+    assert (await _run_with(toolbox, _element_call(1), _confirm, True))["ok"]
 
 
 @pytest.mark.asyncio

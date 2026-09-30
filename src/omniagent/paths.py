@@ -53,6 +53,31 @@ def telegram_settings_file() -> Path:
     return data_root() / "telegram.json"
 
 
+def imessage_settings_file() -> Path:
+    """Eşleşmiş iMessage kanalının ayarları; varlığı köprünün kurulup eşleştiğini gösterir."""
+    return data_root() / "imessage.json"
+
+
+def imessage_pairing_file() -> Path:
+    """Kurulumun servise bıraktığı tek kullanımlık eşleştirme isteği (kod, son geçerlilik, taslak ayarlar)."""
+    return data_root() / "imessage-pairing.json"
+
+
+def companion_db_file() -> Path:
+    """iMessage yol arkadaşının SQLite deposu: mesaj arşivi, etkinlik günlüğü, durum."""
+    return data_root() / "companion.db"
+
+
+def persona_file() -> Path:
+    """Kullanıcının düzenleyebildiği karakter tanımı (isim, kişilik, konuşma tarzı)."""
+    return data_root() / "persona.md"
+
+
+def imessage_history_file() -> Path:
+    """iMessage'dan devredilen son görevlerin sohbet kayıtları (Exchange listesi)."""
+    return data_root() / "imessage-history.json"
+
+
 def backups_dir() -> Path:
     """Dosya düzenleme/yazma araçlarının zaman damgalı yedekleri."""
     return data_root() / "backups"

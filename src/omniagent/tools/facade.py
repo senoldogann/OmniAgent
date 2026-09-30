@@ -45,6 +45,7 @@ from omniagent.integrations.runtime import CURRENT_RUNTIME, DeliveryFailed
 from omniagent.approval import (
     AMOUNT_LINES_LIMIT, NO_CIRCUMVENTION_NOTE, TARGET_CHANGED_CODE, ApprovalRequest, ClickTarget, amount_lines,
     approval_granted, click_financial_reason, financial_cta_reason, gui_click_request,
+    communication_click_label, gui_communication_request,
 )
 
 from . import browser, filesystem, foreground, gui_input, screen, system, types as tool_types
@@ -57,7 +58,7 @@ from .types import (
     HISTORY_RESULT_LIMIT, INPUT_FOREGROUND_WAIT_SECONDS, JS_TIMEOUT_SECONDS,
     MAX_WAIT_SECONDS, MODEL_SCREEN_SIZE,
     PAGE_ACTION_TIMEOUT_MS, PAGE_ELEMENT_LIMIT,
-    PAGE_LOAD_TIMEOUT_MS, OCR_AFTER_INPUT_MIN_SECONDS, READ_EDGE_UNITS,
+    PAGE_LOAD_TIMEOUT_MS, OCR_AFTER_INPUT_MIN_SECONDS, PY_TIMEOUT_SECONDS, READ_EDGE_UNITS,
     READ_FIRST_STEP_SHARE, READ_GAP_MARKER,
     READ_MAX_PAGES, READ_OCR_LAG_PAGES, READ_OCR_WORKERS, READ_STEP_SHARE, READ_SYNC_DECISION_PAGES,
     READ_TEXT_LIMIT, READ_TOP_ATTEMPTS,
@@ -125,7 +126,7 @@ from .gui_input import (
     _ax_point, _ax_present, _ax_short_text, _ax_size,
     _bundle_name, _check_in_model_space, _front_app_owner, _post_unicode_chunk,
     _require_accessibility, _run_action_step, _visible_app_owners,
-    format_ax_listing, press_key_spec,
+    format_ax_listing, press_key_spec, resolve_running_app, restore_minimized_window,
     scan_ax_elements, type_unicode_text, unicode_chunks,
 )
 
@@ -264,6 +265,7 @@ class Toolbox:
         self.cua: CUA = CUA()
         self._browser_lock: asyncio.Lock = self._headless_browser._lock
         self._pending_input: Optional[PendingInput] = None
+        self._disabled_controls: List[ResolvedElement] = []
         self._memory_file: Optional[str] = memory_file
         self._allow_memory_mutation: bool = allow_memory_mutation
         self._history_file: Optional[str] = history_file
@@ -282,6 +284,7 @@ class Toolbox:
         self._visual_geometry: Optional[ScreenGeometry] = None
         self._visual_display_id: Optional[int] = None
         self._task_js: Dict[str, str] = {}
+        self._task_py: Dict[str, str] = {}
         # Son başarılı capture_photo dosyası; host sohbet kartı için okur, model aracı değildir.
         self.last_capture_path: Optional[str] = None
         # Bu görevde erişim engeli (CAPTCHA/bot doğrulaması) gösteren ana makineler: fetch_raw ve browse_url görevin
@@ -460,6 +463,8 @@ class Toolbox:
                 True,
             )
         if kind == "confirm":
+            if text in runtime.denied_confirmation_questions:
+                return "Kullanıcı bu isteği daha önce ONAYLAMADI. Eylemi yapma veya aynı onayı tekrar sorma."
             fields: Dict[str, object] = {
                 "onay": {"type": "boolean", "label": "Onaylıyorum", "default": False}
             }
@@ -469,7 +474,7 @@ class Toolbox:
             raise ToolError(
                 f"kind confirm veya text olmalı; alınan: {kind!r}", "INVALID_QUESTION", False
             )
-        if runtime.unattended:
+        if runtime.unattended and kind != "confirm":
             if text not in runtime.deferred_questions:
                 runtime.deferred_questions.add(text)
                 runtime.status("input_deferred", f"Yanıt bekleyen soru: {redact(_clip(text, 300))}")
@@ -480,7 +485,7 @@ class Toolbox:
             )
         timeout: Optional[float] = runtime.user_input_timeout
         try:
-            answer = await runtime.ask(redact(_clip(text, 1500)), fields, timeout)
+            answer = await runtime.ask(redact(text), fields, timeout, allow_unattended=kind == "confirm")
         except TimeoutError as error:
             raise ToolError(
                 f"Kullanıcı {(timeout or 0) / 60:.0f} dakika içinde yanıt vermedi; "
@@ -489,6 +494,8 @@ class Toolbox:
                 False,
             ) from error
         if kind == "confirm":
+            if not approval_granted(answer.get("onay")):
+                runtime.denied_confirmation_questions.add(text)
             return (
                 "Kullanıcı ONAYLADI."
                 if approval_granted(answer.get("onay"))
@@ -498,11 +505,11 @@ class Toolbox:
         return f"Kullanıcı yanıtı: {reply}" if reply else "Kullanıcı boş yanıt verdi."
 
     async def send_file(self, path: str, caption: Optional[str] = None) -> str:
-        """Bilgisayardaki dosyayı kullanıcının kanalına (Telegram sohbeti) gönderir."""
+        """Bilgisayardaki dosyayı kullanıcının kanalına (Telegram ya da iMessage sohbeti) gönderir."""
         runtime = CURRENT_RUNTIME.get()
         if runtime is None or runtime.deliver is None:
             raise ToolError(
-                "Dosya teslim kanalı yok (yalnız Telegram görevinde); dosyanın yolunu final yanıtında ver.",
+                "Dosya teslim kanalı yok (yalnız Telegram ya da iMessage görevinde); dosyanın yolunu final yanıtında ver.",
                 "DELIVERY_UNAVAILABLE",
                 False,
             )
@@ -514,7 +521,7 @@ class Toolbox:
             raise ToolError(f"Dosya boş, gönderilmedi: {target}", "FILE_EMPTY", False)
         if size > DELIVERY_MAX_BYTES:
             raise ToolError(
-                f"Dosya {size / 1_048_576:.1f} MB; Telegram sınırı {DELIVERY_MAX_BYTES // 1_048_576} MB. "
+                f"Dosya {size / 1_048_576:.1f} MB; gönderim sınırı {DELIVERY_MAX_BYTES // 1_048_576} MB. "
                 "Sıkıştır veya böl, sonra yeniden gönder.",
                 "FILE_TOO_LARGE",
                 False,
@@ -953,6 +960,7 @@ class Toolbox:
         _require_accessibility()
         self._require_input_target()
         type_unicode_text(text)
+        self._remember_gui_draft(text, append=True)
         return f"Yazıldı ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
 
     @_screen_input
@@ -989,7 +997,32 @@ class Toolbox:
         self._require_input_target()  # tıklama uygulamayı öne getirmiş olabilir: kısa yoklamayla beklenir
         press_key_spec("cmd+a")
         type_unicode_text(text)
-        return f"{clicked} Alan dolduruldu ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
+        self._remember_gui_draft(text)
+        actual = gui_input.focused_text_value(self._input_app)
+        if actual is not None:
+            deadline = time.monotonic() + tool_types.TEXT_READBACK_TIMEOUT_SECONDS
+            while actual != text and time.monotonic() < deadline:
+                time.sleep(0.025)
+                actual = gui_input.focused_text_value(self._input_app)
+                if actual is None:
+                    break
+            if actual is not None and actual != text:
+                raise ToolError(
+                    f"Alana {len(text)} karakter yazılmak istendi; geri okunan gerçek değer {len(actual)} "
+                    "karakter ve metin eşleşmiyor. Alan sınırını/odağını kontrol et, metni düzelt; "
+                    "henüz kaydetme veya gönderme.", "TEXT_VALUE_MISMATCH", True,
+                )
+            if actual == text:
+                return f"{clicked} Alan değeri geri okunup doğrulandı ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}"
+        return (
+            f"{clicked} Alana yazım girdisi gönderildi ({len(text)} karakter): {_clip(text, TYPED_TEXT_ECHO_LIMIT)}. "
+            "Değer geri okunmadı; kaydetmeden önce güncel alanı, sınırı ve karakter sayacını doğrula."
+        )
+
+    def _remember_gui_draft(self, text: str, append: bool = False) -> None:
+        runtime = CURRENT_RUNTIME.get()
+        if runtime is not None:
+            runtime.gui_draft_text = (runtime.gui_draft_text + text) if append else text
 
     def _scope_image(self, image_option: int) -> Tuple[object, ScreenGeometry]:
         """Etkin görsel kapsamın ham görüntüsünü ve geometrisini döner."""
@@ -1035,6 +1068,11 @@ class Toolbox:
         _reject_human_check_label(label)
         reason: Optional[str] = click_financial_reason(label, context_texts)
         if reason is None:
+            if communication_click_label(label):
+                runtime = CURRENT_RUNTIME.get()
+                draft = runtime.gui_draft_text if runtime is not None else ""
+                _request_click_approval(gate, gui_communication_request(tool, label, where, draft), label)
+                return True
             return False
         target: ClickTarget = {
             "tool": tool, "label": label, "requested": requested, "where": where,
@@ -1059,6 +1097,7 @@ class Toolbox:
         Nokta tıklamasından önce çevredeki OCR etiketini denetler: en yakın satır ödeme/sipariş düğmesiyse host onayı
         ister ve onaydan sonra aynı etiketin aynı noktada durduğunu doğrular. Host bağlamı yoksa hiçbir şey yapmaz.
         """
+        self._refuse_disabled_point(point, geometry)
         if approval_gate_blocking() is None:
             return
         _check_in_model_space(point[0], point[1], geometry)
@@ -1072,6 +1111,29 @@ class Toolbox:
             tool, line["text"], None, self._where(), [item["text"] for item in lines],
         ):
             self._require_label_at_point(line["text"], point, geometry)
+
+    def _refuse_disabled_point(self, point: Tuple[int, int], geometry: ScreenGeometry) -> None:
+        """AX'te pasif olduğu görülen düğme, koordinat yoluyla da basılamaz.
+
+        Her denemede canlı etkinlik durumu yeniden okunur; form düzeltildiğinde kilit kalkar.
+        Eski pencere/listenin artık bulunmaması yeni hedefi engellemez.
+        """
+        for target in list(self._disabled_controls):
+            try:
+                live = gui_input.read_live_element(target.ref, gui_input.AX_NODE_READER)
+            except ToolError:
+                live = target.live  # okunamadıysa önceki pasif hedef korunur
+            if live is None or live["enabled"]:
+                self._disabled_controls.remove(target)
+                continue
+            frame = live["frame"]
+            left, top = points_to_model(frame["x"], frame["y"], geometry)
+            right, bottom = points_to_model(frame["x"] + frame["w"], frame["y"] + frame["h"], geometry)
+            if left <= point[0] <= right and top <= point[1] <= bottom:
+                raise ToolError(
+                    "Bu düğme canlı AX kaydında hâlâ pasif; koordinat tıklaması yapılmadı. "
+                    "Önce formun hata/karakter sayacını ve alan değerlerini düzelt.", "ELEMENT_DISABLED", True,
+                )
 
     def _element_labels(self, target: ResolvedElement) -> List[str]:
         """
@@ -1097,7 +1159,8 @@ class Toolbox:
             _reject_human_check_label(label)
         if target.element["role"] not in COMMIT_ROLES:
             return None
-        return next((label for label in labels if click_financial_reason(label, context_texts) is not None), None)
+        return next((label for label in labels if click_financial_reason(label, context_texts) is not None
+                     or communication_click_label(label)), None)
 
     def _confirm_legacy_element_click(self, tool: str, app_name: str, element_id: int) -> None:
         """
@@ -1109,7 +1172,8 @@ class Toolbox:
         labels: List[str] = self.cua.element_labels(app_name, element_id)
         for item in labels:
             _reject_human_check_label(item)
-        label: Optional[str] = next((item for item in labels if financial_cta_reason(item) is not None), None)
+        label: Optional[str] = next((item for item in labels if financial_cta_reason(item) is not None
+                                     or communication_click_label(item)), None)
         if label is None:
             return
         self._guard_click(tool, label, None, app_name, [])
@@ -1274,6 +1338,7 @@ class Toolbox:
                 True,
             )
         x, y = st.box_center(chosen["box"])
+        self._refuse_disabled_point((x, y), geometry)
         # Çözümlenen gerçek etiket ödeme/sipariş onayı gibiyse tıklamadan ÖNCE host onayı; onay beklerken ekran değişebilir
         if self._guard_click(
             "cua_click_text", chosen["line_text"], text, self._where(), [line["text"] for line in lines],
@@ -1518,13 +1583,22 @@ class Toolbox:
     def cua_get_app(self, app_name: str) -> str:
         """
         Uygulamayı başlatır/öne getirir ve öne gelmesini (ile görünür penceresini) doğrular; sonraki klavye girdisinin
-        hedefi olarak kaydeder. Ön plana gelmezse FOREGROUND_MISMATCH yükselir ve hedef DEĞİŞMEZ. AX izni gerekir
-        (ön plan okuması ve sonraki AX araçları için); etkinleştirme yan etkisinden önce açık hata verir.
+        hedefi olarak kaydeder. Ad önce penceresi olan çalışan uygulamalara çözülür ('T3 Code' → 'T3 Code (Nightly)');
+        bütün pencereleri küçültülmüşse ilki geri açılır (küçültülmüş pencere ekran görüntüsünde görünmez). Ön plana
+        gelmezse FOREGROUND_MISMATCH yükselir ve hedef DEĞİŞMEZ. AX izni gerekir (ön plan okuması ve sonraki AX
+        araçları için); etkinleştirme yan etkisinden önce açık hata verir.
         """
         _require_accessibility()
-        message: str = self.cua.get_app(app_name)
-        readiness: AppReadiness = wait_app_ready(app_name, APP_ACTIVATION_WAIT_SECONDS)
-        self._input_app = app_name
+        target, running_pid = resolve_running_app(app_name)
+        message: str = self.cua.get_app(target)
+        # Tek penceresi küçültülmüş uygulamada ön plan okunamaz (AXFocusedApplication NoValue): önce geri aç, sonra bekle.
+        restored: bool = running_pid is not None and restore_minimized_window(running_pid)
+        readiness: AppReadiness = wait_app_ready(target, APP_ACTIVATION_WAIT_SECONDS)
+        self._input_app = target
+        if target != app_name:
+            message = f"{message} ('{app_name}' adı çalışan '{target}' uygulamasına eşlendi.)"
+        if restored:
+            message = f"{message} Küçültülmüş penceresi geri açıldı."
         if readiness["has_window"]:
             return message
         return (
@@ -1566,7 +1640,14 @@ class Toolbox:
         görüntünün uygulaması klavye girdisi hedefi olur; ön plan burada GEREKMEZ (tıklama merdiveni gerektiğinde
         uygulamayı bilerek öne alır). Fare eylemi olduğu için hassas uygulama reddi yoktur (yalnız klavye/yazma araçları).
         """
-        target: ResolvedElement = self.cua.prepare_target(snapshot, index)
+        try:
+            target: ResolvedElement = self.cua.prepare_target(snapshot, index)
+        except ToolError as error:
+            if error.code == "ELEMENT_DISABLED":
+                target = self.cua.resolve_element(snapshot, index)
+                if not any(item.ref == target.ref for item in self._disabled_controls):
+                    self._disabled_controls.append(target)
+            raise
         message: str = self._click_target(target, snapshot, index)
         self._input_app = target.captured.snapshot["app"]  # metin alanı odaklandıysa sonraki yazım bu uygulamaya gitmeli
         return message
@@ -1598,6 +1679,7 @@ class Toolbox:
         pid, app = self.cua.snapshot_owner(snapshot)
         require_target_not_sensitive(pid)
         message: str = self.cua.set_snapshot_text(snapshot, index, text)
+        self._remember_gui_draft(text)
         self._input_app = app
         return message
 
@@ -1663,6 +1745,8 @@ class Toolbox:
                     elif step.get("action") == "press":
                         self._require_key_target(str(step["key"]))
                     executed.append(_run_action_step(step, geometry))
+                    if step.get("action") == "type":
+                        self._remember_gui_draft(str(step["text"]))
                     if step.get("action") == "press":
                         self._forget_input_app_after_handoff(str(step["key"]))
             except (KeyError, TypeError, ValueError) as error:
@@ -1756,6 +1840,83 @@ class Toolbox:
             return note + f"STDOUT: {_clip(stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: 0"
         finally:
             for path in (temp_path, input_path, preload_path):
+                if path is not None and path.exists():
+                    path.unlink()
+
+    def execute_python(self, code: str) -> str:
+        """
+        Python 3 kodu çalıştırır: ajanın kendi hesaplama, dosya işleme ve hata ayıklama adımları için
+        kabuktan bağımsız hızlı yol (self-healing). execute_js ile aynı görev-içi geçici araç düzenini
+        taşır: '# omni:save ad' başarılı kodu görev boyunca saklar, '# omni:run ad' + isteğe bağlı ikinci
+        satır JSON ile yeniden çalıştırır (JSON, sys.argv[1] yolundaki dosyadan okunur).
+        """
+        if not isinstance(code, str):
+            raise ToolError("Python kodu metin olmalı.", "PY_INVALID", False)
+        script: str = code
+        label: Optional[str] = None
+        argument: Optional[str] = None
+        if code.startswith("# omni:save "):
+            header, separator, script = code.partition("\n")
+            label = header[len("# omni:save "):].strip()
+            if (
+                not separator
+                or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", label)
+                or not script.strip()
+                or len(script.encode("utf-8")) > 16000
+            ):
+                raise ToolError("Geçici araç adı/kodu geçersiz (en çok 16 KB).", "PY_INVALID", False)
+            if label not in self._task_py and len(self._task_py) >= 5:
+                raise ToolError("Bir görevde en çok 5 geçici araç tutulur.", "PY_LIMIT", False)
+        elif code.startswith("# omni:run "):
+            header, separator, payload = code.partition("\n")
+            name = header[len("# omni:run "):].strip()
+            if name not in self._task_py:
+                raise ToolError(f"Bu görevde '{name}' adlı geçici araç yok.", "PY_UNKNOWN", False)
+            script = self._task_py[name]
+            if separator and payload.strip():
+                if len(payload.encode("utf-8")) > 4000:
+                    raise ToolError("Geçici araç girdisi 4 KB sınırını aşıyor.", "PY_INVALID", False)
+                try:
+                    parsed = json.loads(payload)
+                except json.JSONDecodeError as error:
+                    raise ToolError(f"Geçici araç girdisi JSON olmalı: {error}", "PY_INVALID", False) from error
+                argument = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        temp_path: Optional[Path] = None
+        input_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", prefix="omni_", encoding="utf-8", delete=False,
+            ) as source:
+                temp_path = Path(source.name)
+                source.write(script)
+            command = ["python3", str(temp_path)]
+            if argument is not None:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", prefix="omni_input_", encoding="utf-8", delete=False,
+                ) as input_file:
+                    input_path = Path(input_file.name)
+                    input_file.write(argument)
+                command.append(str(input_path))
+            try:
+                returncode, stdout, stderr = run_streaming_process(command, False, PY_TIMEOUT_SECONDS)
+            except ToolError as error:
+                if error.code != "SHELL_TIMEOUT":
+                    raise
+                raise ToolError(
+                    f"Python {PY_TIMEOUT_SECONDS:.0f} saniyede tamamlanmadı.", "PY_TIMEOUT", True,
+                ) from error
+            if returncode != 0:
+                raise ToolError(
+                    f"Python çalıştırma başarısız: çıkış={returncode}, stderr={_clip(stderr.strip(), 1000)}",
+                    "PY_EXIT",
+                    True,
+                )
+            if label is not None:
+                self._task_py[label] = script
+            note = f"Geçici araç '{label}' kaydedildi.\n" if label is not None else ""
+            return note + f"STDOUT: {_clip(stdout, SHELL_STDOUT_LIMIT)}\nSTDERR: {_clip(stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: 0"
+        finally:
+            for path in (temp_path, input_path):
                 if path is not None and path.exists():
                     path.unlink()
 

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDic
 
 from omniagent.integrations.runtime import save_json
 from omniagent.paths import data_root
+from omniagent.core.text_norm import ascii_fold
 
 CONTINUOUS_MODE: str = "continuous"
 DEFAULT_MAX_HOURS: float = 8.0
@@ -21,9 +22,17 @@ CONTEXT_MAX_TURNS: int = 40
 CONTEXT_KEEP_TURNS: int = 20
 # Araç çalıştırmadan üst üste bu kadar rapor yazan modele yeni yol denemesi söylenir.
 MAX_IDLE_REPORTS: int = 3
+MAX_CONTINUOUS_REPLANS: int = 2
+# Ardışık ilerlemesiz tur sayısı (semantik ilerleme imzası değişmez): bu sayıya ulaşınca sürekli
+# görev yeniden planlar. Normal moddaki fast-loop faz makinesinin continuous karşılığıdır; faz/
+# teslim makinesi olmadan yalnız durgunluk yakalar ("kısmen başarılı ama etkisiz" döngüleri de).
+CONTINUOUS_STAGNATION_LIMIT: int = 6
 # Bir görevde kullanıcıya sorulacak hedef bildirimi sayısı. Sınırsızken ajan reddedildikten
 # sonra da "goal" bildirmeyi sürdürüyor ve kullanıcıyı boşa meşgul ediyordu.
 MAX_GOAL_REPORTS: int = 5
+# Sonuç kayıtları olan hedef uzak kanalda /approve beklerken host kilidini tutar; onay
+# ya da /btw gelmezse oturum onaylanmamış kapanır. Sessizlik başarı değildir.
+GOAL_APPROVAL_TIMEOUT_SECONDS: float = 300.0
 WINDOW_MARKER: str = "HOST — BAĞLAM PENCERESİ:"
 CONTINUE_PROMPT: str = (
     "HOST — SÜREKLİ MOD: Görev bitmedi; son yanıtın kullanıcıya ilerleme raporu olarak gösterildi.\n"
@@ -31,10 +40,65 @@ CONTINUE_PROMPT: str = (
     "yineleme, bağımlılığı çalışma kaydına yaz ve bağımsız somut adımları sürdür. "
     "API anahtarı, parola veya token'ı sohbetle isteme; kullanıcıdan ⚙ Ayarlar'a girmesini iste ve "
     "kind=confirm ile doğrulat.\n"
-    "- Aksi hâlde hedefe yaklaştıran sıradaki somut adımı gerçek bir araçla uygula.\n"
+    "- Onay gerekiyorsa sohbet metninde soru sormak yerine ask_user(kind=confirm) çağır. "
+    "Onay gelmeden o eylemi yapma; /btw ile verilen adresler yayın onayı değildir.\n"
+    "- Yeni bir sonuç üreten bağımsız adım kaldıysa gerçek araçla uygula; aynı planı, soruyu "
+    "ve başarı iddialarını tekrarlama. Bağımsız iş kalmadıysa ask_user ile yön bekle.\n"
     "- Hedefe ulaştığını önceki araç çıktılarıyla kanıtlayabiliyorsan report_goal_met çağır; "
     "kanıtsız başarı iddia etme."
 )
+
+
+def text_confirmation_question(content: str) -> Optional[str]:
+    """Modelin yalnız metinde bıraktığı açık onay isteğini gerçek host sorusuna çevirir.
+
+    Genel sorular ya da alıntı içindeki soru işaretleri onay değildir. STATE satırları
+    popup'a taşınmaz; taslak ve açıklama korunur ki kullanıcı neyi onayladığını görsün.
+    """
+    folded = content.casefold()
+    waiting = re.search(
+        r"(?:onay(?:ınızı|ınızı|ını|iniz[iı]|[ıi]n[ıi]z[ıi])?\s+bekliyorum|"
+        r"sizden\s+onay\s+bekliyorum|waiting\s+for\s+your\s+approval)", folded,
+    )
+    question = re.search(
+        r"(?:paylaş|yayınla|gönder|güncelle)[^\n?]{0,140}"
+        r"(?:ister\s+misiniz|[aıi]l[ıi]m\s+m[ıi]|[aıi]y[ıi]m\s+m[ıi])\s*\?"
+        r"|(?:do you approve|may i (?:publish|post|send)|shall i (?:publish|post|send))[^\n?]*\?",
+        folded,
+    )
+    if not waiting and not question:
+        return None
+    text = re.sub(r"(?im)^\s*STATE\s*:[^\n]*\n(?:[^\n]+\n)*\n?", "", content).strip()
+    return text or content.strip()
+
+
+def gui_progress_problem(content: str, steps: Sequence[Mapping[str, Any]]) -> Optional[str]:
+    """GUI tamamlanma iddiasını, yazım/tıklamadan sonraki gerçek okuma olmadan yayınlama."""
+    folded = ascii_fold(content)
+    claims = re.search(
+        r"\b(?:gonderdim|gonderildi|yayinladim|yayinlandi|paylastim|yorum biraktim)\b"
+        r"|\b(?:bio|profil)[^\n]{0,140}(?:guncellendi|guncelledim|optimize edildi|optimize ettim)"
+        r"|\b(?:posted|published|sent)\s+(?:the|your|a)\s+(?:post|reply|message)\b", folded,
+    )
+    if not claims:
+        return None
+    mutations = {
+        "cua_click_point", "cua_click_text", "cua_click_element", "cua_click", "smart_click",
+        "cua_type_text", "cua_fill_field", "cua_set_text_element", "cua_press_key",
+        "cua_submit_text", "run_action_sequence",
+    }
+    last = next((i for i in range(len(steps) - 1, -1, -1) if steps[i]["tool"] in mutations), None)
+    reads = {"cua_snapshot", "cua_read_visible_text", "cua_read_scrollable"}
+    if last is None or not steps[last]["ok"] or not any(
+        step["ok"] and step["tool"] in reads for step in steps[last + 1:]
+    ):
+        return (
+            "GUI sonucu doğrulanmadı: tıklama/yazım tamamlanma kanıtı değildir. "
+            "Başarı iddiasını göstermedim. Kaydedilen/yayınlanan sonucu cua_snapshot veya "
+            "okuma aracıyla kontrol et; yazar, içerik ve alan değerini karşılaştır. "
+            "Sonuç yoksa 'doğrulanmadı' diye bildir."
+        )
+    return None
 # Durgun sürekli görevde host'un yeniden planlama yönergesi ("HOST — YENİDEN PLANLA: <neden>. " önekiyle gider).
 REPLAN_GUIDANCE: str = (
     "Aynı başarısız çağrıyı aynı argümanlarla yineleme. Hatanın nedenini kullanarak farklı bir araç, "
@@ -122,7 +186,9 @@ def goal_report_problem(summary: str, evidence_ids: object, evidence: Mapping[st
     if unknown:
         recent: str = ", ".join(list(evidence)[-8:]) or "yok"
         return (
-            f"Bu id'ler görevdeki başarılı bir araç çağrısı değil: {', '.join(unknown)}. "
+            f"Bu id'ler görevdeki başarılı bir araç çağrısı değil veya yalnız eylem girdisi kaydı: {', '.join(unknown)}. "
+            "Tıklama/yazım/görüntü dosyası başarı kanıtı değildir; kaydedilen/yayınlanan sonucu "
+            "cua_snapshot ya da okuma aracıyla kontrol et. "
             f"Son başarılı çağrılar: {recent}."
         )
     return None

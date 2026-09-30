@@ -144,11 +144,15 @@ class MaintenanceAPI:
         self.sent: List[str] = []
         self.updates = list(updates or [])
         self.closed = False
+        self.commands: List[Tuple[str, str]] = []
 
     async def send(self, chat_id: int, text: str) -> int:
         assert chat_id == 123
         self.sent.append(text)
         return len(self.sent)
+
+    async def set_commands(self, commands: List[Tuple[str, str]]) -> None:
+        self.commands = commands
 
     async def call(self, method: str, payload: Dict[str, Any]) -> Any:
         if self.updates:
@@ -328,6 +332,8 @@ async def test_run_announces_restart_and_cleans_up_before_restarting(
         await bridge.run(announce=True)
     assert api.sent == ["✓ Köprü yeniden başladı: aaaaaaa · 26.09.2026 12:00", "Yeniden başlatılıyor…"]
     assert api.closed and bridge.loaded_commit == "a" * 40
+    # "/" menüsü açılışta kaydedilir; sağlayıcı/model seçici menüden bulunur
+    assert "provider" in [name for name, _ in api.commands]
     # Uyku engeli köprü süreciyle kuruldu ve execv'den önce kaldırıldı (yenisi birikmez)
     assert started == [os.getpid()] and stopped == [awake] and bridge.keep_awake is None
     # Yeni süreç /restart komutunu yeniden işlemez
