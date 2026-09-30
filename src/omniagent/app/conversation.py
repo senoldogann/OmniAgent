@@ -230,6 +230,13 @@ async def _full_task(decision, evidence, options, clients, emit):
     # user-priority/preemptible lock behavior; chat/read do not acquire this lock.
     completed_report = None
     completed_in_time = False
+    terminal_metrics = None
+    forward = _private_emit(emit)
+    def inner_emit(event):
+        nonlocal terminal_metrics
+        if event["kind"] == "run_finished":
+            terminal_metrics = event["metrics"]
+        forward(event)
     async def locked_task():
         nonlocal completed_report, completed_in_time
         async with options["task_context"]():
@@ -241,7 +248,7 @@ async def _full_task(decision, evidence, options, clients, emit):
                 full_options["max_total_tokens"] = max(1, budget.token_limit - budget.tokens)
             with _model_scope(decision):
                 completed_report = await run_agent_with_callback(
-                    decision.contract["subject"], _private_emit(emit), full_options, clients)
+                    decision.contract["subject"], inner_emit, full_options, clients)
                 completed_in_time = budget.remaining_seconds > 0
                 return completed_report
     # Cancellation/deadline covers acquisition too, and awaits context cleanup.
@@ -264,10 +271,16 @@ async def _full_task(decision, evidence, options, clients, emit):
             report = completed_report
         else:
             raise
-    budget.tools += report["metrics"]["tool_calls"]
-    budget.tool_seconds += report["metrics"]["tool_seconds"]
-    budget.model_seconds += report["metrics"]["model_seconds"]
-    decision.backend = report["metrics"]["backend"]
+    finally:
+        # The real engine emits final accounting even when cancellation propagates
+        # instead of returning a report. Consume it once, without publishing it.
+        accounting = completed_report["metrics"] if completed_report is not None else terminal_metrics
+        if accounting is not None:
+            budget.tools += accounting.get("tool_calls", 0)
+            budget.tool_seconds += accounting.get("tool_seconds", 0.0)
+            budget.model_seconds += accounting.get("model_seconds", 0.0)
+            if accounting.get("backend"):
+                decision.backend = accounting["backend"]
     # Provider attempts and usage were measured by the shared observer scope.
     return report
 
