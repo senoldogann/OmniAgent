@@ -541,3 +541,80 @@ async def test_hosted_notice_and_confirmation_mask_full_text_before_clipping():
     _, confirmed, _, _ = await agent.resolve_goal_report(call, 0, {"source": "read source"}, SimpleNamespace(ask=approve), events.append, frozenset(), 0)
     assert "opaque-summary-value" not in confirmed
     assert secret in call["arguments"]  # approval/execution input was not rewritten
+
+
+@pytest.mark.asyncio
+async def test_interleaved_output_callbacks_use_canonical_receipt_not_mixed_streams():
+    from omniagent.app.tool_execution import _run_tool_with_events
+    from omniagent.tools import TOOL_RUNTIME
+    events = []
+    secret = "opaque-user-password"
+    canonical = f"STDOUT: Password:\n{secret}\nSTDERR: diagnostic from stderr\n"
+    class Tools:
+        memory_mutation_allowed = False
+        async def execute_shell(self, command):
+            sink = TOOL_RUNTIME.get()["emit_output"]
+            sink("Password:\n")
+            sink("diagnostic from stderr\n")
+            sink(secret + "\n")
+            assert [event["kind"] for event in events] == ["tool_started"]
+            return canonical
+    call = {"id": "interleaved-output", "name": "execute_shell", "arguments": '{"command":"fixture"}'}
+    result = await _run_tool_with_events(0, call, "fixture", Tools(), {}, events.append, lambda: False)
+    assert result["result"] == canonical
+    assert all(secret not in str(event) for event in events)
+    assert any(event["kind"] == "tool_output" and "diagnostic from stderr" in event["text"] for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected", ["version", "artifact", "unreadable"])
+async def test_agent_rejected_evidence_recovery_preserves_original_bytes(tmp_path, monkeypatch, rejected):
+    from omniagent.app import agent
+    store, bundle = make_bundle(tmp_path)
+    result = "UNIQUE-ORIGINAL-RECEIPT" + ("x" * MAX_OBSERVATION_BYTES if rejected == "artifact" else "")
+    store.capture(bundle, "read_file", {"ok": True, "result": result})
+    bundle["delivery_status"] = "unknown"
+    store.save(bundle)
+    path = store.path_for(bundle["run_id"])
+    if rejected == "version":
+        path.write_text(json.dumps({**bundle, "version": 999}))
+    elif rejected == "artifact":
+        Path(bundle["observations"][0]["artifact_path"]).unlink()
+    else:
+        read = EvidenceStore._read
+        def unavailable(self, name, maximum):
+            if name == path.name:
+                raise PermissionError("fixture cannot read existing evidence")
+            return read(self, name, maximum)
+        monkeypatch.setattr(EvidenceStore, "_read", unavailable)
+    original = path.read_bytes()
+    events = []
+    report = await agent.run_agent_with_callback(bundle["contract"]["subject"], events.append,
+        {"requested_backend": "openai", "should_stop": lambda: False, "state_file": str(tmp_path / "state.json"), "history": [],
+         "request_contract": bundle["contract"], "evidence_run_id": bundle["run_id"]}, {})
+    assert path.read_bytes() == original
+    assert report["evidence"]["run_id"] != bundle["run_id"]
+    assert not report["evidence"]["complete"]
+    assert not report["success"]
+    assert events[-1]["kind"] == "run_finished"
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_evidence_normalizes_error_and_recovers_without_overwrite(tmp_path):
+    from omniagent.app import agent
+    store, bundle = make_bundle(tmp_path)
+    path = store.path_for(bundle["run_id"])
+    rejected_bytes = ("[" * 1100 + "0" + "]" * 1100).encode()
+    path.write_bytes(rejected_bytes)
+    with pytest.raises(ValueError):
+        store.load(bundle["run_id"])
+    assert store.cleanup() == 0
+    assert path.read_bytes() == rejected_bytes
+    events = []
+    report = await agent.run_agent_with_callback(bundle["contract"]["subject"], events.append,
+        {"requested_backend": "openai", "should_stop": lambda: False, "state_file": str(tmp_path / "state.json"), "history": [],
+         "request_contract": bundle["contract"], "evidence_run_id": bundle["run_id"]}, {})
+    assert path.read_bytes() == rejected_bytes
+    assert report["evidence"]["run_id"] != bundle["run_id"]
+    assert not report["success"]
+    assert events[-1]["kind"] == "run_finished"
