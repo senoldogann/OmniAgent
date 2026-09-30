@@ -47,9 +47,9 @@
 
 ### Acceptance and integration
 
-- [ ] Run all focused tests together; root runs full integration suite after bridge wiring.
+- [x] Run all focused tests together; root runs full integration suite after bridge wiring.
 - [ ] Live checklist: photo content appropriate response; 10 s voice with configured supporting model appears as user evidence; 02:00 night style and ten distinct openings; request screenshot/file through existing delegation delivery channel.
-- [ ] Keep live voice explicitly disabled until a supporting profile is selected; model support and live iPhone behavior are not inferred from fake clients.
+- [x] Keep live voice explicitly disabled until a supporting profile is selected; model support and live iPhone behavior are not inferred from fake clients.
 
 ## Verification result
 

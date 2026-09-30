@@ -29,6 +29,8 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 | Entegrasyon | `discover_capabilities` | Yerel kataloğu ve gerektiğinde kısa çevrimiçi keşfi kullanıp görev için uygun API/MCP/skill yolunu bulma |
 | Kullanıcı hafızası | `user_memory` | Açıkça istenen tercih, sık yol ve kararı atomik JSON dosyasında saklama, arama ve silme |
 | Kanıtlı kişisel hafıza | `personal_memory` (companion.db varsa) | Kullanıcının iMessage/Telegram/masaüstü sözlerinde ve alıntıyla kanıtlanan bilgilerde birebir arama; kullanıcı isteyince bilgiyi unutma (onaylı) |
+| iMessage fotoğraf ve ses | Deniz sohbeti | HEIC/JPEG fotoğraf girdisi; açık sağlayıcı/model seçimiyle ses dökümü; döküm kullanıcının kendi sözü olarak kanıtlı hafızaya girer |
+| iMessage kalp atışı | Deniz proaktifliği | Sessiz saat, susturma, iki cevapsız mesaj sınırı, dayanak denetimi, kullanıcı önceliği ve korumalı otonom iş; gece raporları sabaha bırakılır |
 | Telegram dosya teslimi | `send_file` (yalnız Telegram görevinde) | Bilgisayardaki dosyayı (en çok 50 MB) eşleştirilmiş sohbete belge olarak gönderme |
 | Zamanlanmış görevler | `schedule_task` (zamanlama niyetli hedefte, Telegram eşleştirilmişse) | Görevi bir kez, her gün, seçili günlerde veya aralıkla planlama; sonuç Telegram'a gelir |
 

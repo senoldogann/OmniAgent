@@ -51,8 +51,8 @@
 ### Task 5: Verification and handoff
 
 - [x] Run `uv run python -m pytest tests/test_companion_autonomy.py tests/test_companion_heartbeat.py tests/test_companion_delegate.py -q`.
-- [ ] Parent runs entire suite after integrating bridge and store APIs and verifies live service without sending unsolicited user messages during development.
-- [ ] Commit only owned code, tests and this plan with a focused feature commit; report API and material limits to parent.
+- [x] Parent runs entire suite after integrating bridge and store APIs and verifies live service without sending unsolicited user messages during development.
+- [x] Commit only owned code, tests and this plan with a focused feature commit; report API and material limits to parent.
 
 ## Verification evidence
 

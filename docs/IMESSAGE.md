@@ -30,6 +30,50 @@ iPhone'daki "Yeni konuşmaları şuradan başlat" adresini (telefon ↔ e-posta)
   öğrenme hatası.
 - `/hafıza`: kanıtlı hafızadaki etkin bilgiler, numaralarıyla.
 - `unut <numara>` ya da `/unut <numara>`: o bilgiyi unutur (istemden ve aramadan çıkar).
+- `/proaktif aç` ya da `/proaktif kapat`: kalp atışının kendiliğinden mesaj ve iş başlatmasını açar/kapatır.
+- `/sessiz 2`: proaktifliği iki saat susturur. Bu istekler doğal konuşmadan `mute` ve `set_proactive` araçlarıyla da
+  uygulanır.
+
+## Fotoğraf ve ses
+
+Fotoğraf ekleri (HEIC dahil) geçici JPEG'e çevrilir: en çok dört fotoğraf, dosya başına 5 MB, uzun kenar en çok
+1600 piksel. Görsel içerik sohbet turuna gider; kişisel hafızaya kanıt olarak girmez. Desteklemeyen sohbet profili
+yalnız mevcut sağlayıcı yedek izni ve `allow_images` açıkken başka profile geçebilir; geçiş denetim günlüğüne yazılır.
+
+Sesli mesaj için eşleşmeyi değiştirmeden proje kökünde çalıştır:
+
+```sh
+.venv/bin/python -m omniagent.integrations.imessage transcription
+```
+
+Komut, anahtarı kayıtlı profillerden sağlayıcıyı ve o sağlayıcının ses dökümü modelini seçtirir; ayarları kaydedip
+servisi yeniden başlatır. Sohbet modelinin adı ses modeli yerine kullanılmaz. `transcribe_backend` ve
+`transcribe_model` alanları eski kurulumda yoksa ses dökümü kapalıdır; `/durum` bunu gösterir. CAF/AMR gerektiğinde
+yerel `afconvert` ile M4A'ya çevrilir. Başarılı döküm `🎤 …` olarak kullanıcının kendi sözüne, özgün mesaj zamanıyla
+eklenir; sır süzgecinden geçmeyen söz arşivlenmez. Hata halinde Deniz "sesini açamadım, yazar mısın?" der.
+
+## Kalp atışı ve otonom işler
+
+Kalp atışı yerel saat, son konuşma, kanıtlı bilgiler, son işler/dersler, Mac'in boşta ve kilitli oluşu ve isteğe
+bağlı `kalp_atisi.md` kontrol listesini okur. Pencere başlıkları toplanmaz. Son 15 dakika içinde sohbet olmuşsa,
+proaktiflik kapalıysa veya susturma sürüyorsa yeni karar üretmez.
+
+- Sessiz saatlerde (kurulumda 23:30–09:00) kendiliğinden mesaj gönderilmez. İki cevapsız proaktif mesajdan sonra
+  kullanıcı yazana kadar yeni proaktif mesaj durur.
+- Her mesajın aktif bilgi dayanakları ve doğrulayıcı model denetimi vardır. Karar beklenirken yeni kullanıcı
+  mesajı gelirse eski karar uygulanmaz.
+- Otonom iş gerekçe taşır, aynı anda tek iş çalışır. Kullanıcı işi önceliklidir; otonom iş durdurma isteğini alır
+  ve kilidi bıraktığında kullanıcı işi başlar.
+- GUI araçları kilitli veya kullanıcının yeni dokunduğu Mac'te bekler. Silme, kamera ve kaynak kod değişikliği
+  otonom koşuda onay gerektirir. Sessiz saatte onay sorusu gönderilmez, adım yapılmaz ve rapora bırakılır.
+- Sessiz saatte biten işin raporu sabah veya kullanıcı yazınca gönderilir. Model raporu anlatamasa da gerçek
+  sonuç gönderilir. Rapor içindeki metin sohbet araçlarını çalıştıramaz.
+
+Öncelik işbirlikli durdurmaya bağlıdır. Kabuk koşuları, model beklemeleri ve otonom curl/Chrome alt süreçleri
+durdurma isteğini yoklar ve alt süreç bitmeden host kilidini bırakmaz. Başka bir bloklayan üçüncü taraf aracın
+durdurmaya uymaması halinde 15 saniyelik kullanıcı kilit beklemesi açık meşgul hatasıyla biter; bu süre canlıda
+ayrıca ölçülmelidir. GUI/silme/kaynak korumaları işletim sistemi sandbox'ı değildir; mevcut araç onay katmanını
+tamamlar.
 
 ## Faz A canlı kontrol listesi
 
@@ -64,3 +108,23 @@ iPhone'daki "Yeni konuşmaları şuradan başlat" adresini (telefon ↔ e-posta)
 - [ ] `/durum` "hafıza: N bilgi" satırını gösterir. Öğrenme hatası varsa zamanı ve türü de yazar.
 - [ ] `OMNI_LIVE_COMPANION=1 OMNI_LIVE_MEMORY_BACKEND=<memory_backend> uv run python -m pytest tests/test_memory_live.py -v`
       → PASS.
+
+## Faz D canlı kontrol listesi
+
+- [ ] JPEG ve HEIC fotoğraf gönder; yanıt görüntünün gerçek içeriğine uysun. Görülmeyen görüntü için tahmin yapılmasın.
+- [ ] Ses dökümü profilini seç, 10 saniyelik ses gönder; döküm cevaplanıp `/hafıza` öğrenme hattına girebilsin.
+- [ ] Gece 02:00'de yanıt sakin gece üslubunda; ardışık on yanıtta aynı açılış tekrar etmesin.
+- [ ] "ekranımı at" veya "o dosyayı gönder" isteği gerçek iş başlatıp iMessage teslim kanalını kullansın.
+
+## Faz C canlı kontrol listesi
+
+- [ ] `/proaktif kapat` ve `/sessiz 2` yeni proaktif kararı durdursun; `/durum` durumları göstersin.
+- [ ] İki cevapsız proaktif mesajdan sonra susulsun; yalnız eşleşmiş kullanıcının cevabı sayacı sıfırlasın.
+- [ ] Otonom iş sürerken iMessage, Telegram ve masaüstünden kullanıcı işi başlat; öncelik geçişini 15 saniye hedefiyle ölç.
+- [ ] Mac'e dokununca GUI işi beklesin; ekran kilitliyken girdi üretilmesin.
+- [ ] Otonom silme/kamera/kaynak değişikliği reddedilen onayla yürütülmesin; sessiz saatte onay istenmesin.
+- [ ] Gece biten işin sabah raporu ve rapora dayalı dersi kaydedilsin; kesin gönderim hatası yeniden denenebilsin,
+      belirsiz teslim otomatik yinelenmesin.
+
+Otomatik testler gerçek SQLite, macOS medya dönüşümü ve sahte model/taşıma sınırlarıyla doğrulanır. Canlı iPhone
+teslimi, doğal üslup, p50/p95 gecikme ve kullanıcı odağı bu kontrol listesindeki ayrı kabul ölçümleridir.
