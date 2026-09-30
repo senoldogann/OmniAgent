@@ -282,6 +282,14 @@ def _publication_check(budget, completed_presentation: bool) -> None:
         budget.check()
 
 
+def _failure_outcome(evidence: EvidenceBundle, reason: str, error: BaseException) -> str:
+    outcome = render_evidence(evidence) + "\nİşlem tamamlanamadı: " + reason
+    if isinstance(error, ConversationExhausted):
+        outcome += ("\nAynı konuda tam ajanla yeni bir çalışma başlatarak devam edebiliriz: "
+                    + evidence["contract"]["subject"])
+    return outcome
+
+
 async def run_conversation_with_callback(goal: str, emit: EventSink, options: RunOptions, clients) -> RunReport:
     """The existing agent signature, with one final publication after grounding."""
     decision = None
@@ -372,10 +380,7 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
             contract = (decision.contract if decision is not None else derive_request_contract(goal))
             evidence = new_evidence_bundle(contract)
         mark_incomplete(evidence, reason)
-        outcome = render_evidence(evidence) + "\nİşlem tamamlanamadı: " + reason
-        if isinstance(error, ConversationExhausted):
-            outcome += ("\nAynı konuda tam ajanla yeni bir çalışma başlatarak devam edebiliriz: "
-                        + evidence["contract"]["subject"])
+        outcome = _failure_outcome(evidence, reason, error)
     if store is not None:
         try:
             store.save(evidence)
@@ -394,7 +399,7 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
             success = False
             reason = sanitize_text(str(error))
             mark_incomplete(evidence, reason)
-            outcome = render_evidence(evidence) + "\nİşlem tamamlanamadı: " + reason
+            outcome = _failure_outcome(evidence, reason, error)
             if store is not None:
                 try:
                     store.save(evidence)
