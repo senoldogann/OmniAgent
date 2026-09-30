@@ -228,7 +228,10 @@ async def _full_task(decision, evidence, options, clients, emit):
         raise RuntimeError("Görev kanalı host kilidi sağlamadı; etkili iş başlatılmadı.")
     # The selected mode/provider/fallback/approvals are intact. The host supplies
     # user-priority/preemptible lock behavior; chat/read do not acquire this lock.
+    completed_report = None
+    completed_in_time = False
     async def locked_task():
+        nonlocal completed_report, completed_in_time
         async with options["task_context"]():
             budget.check(model=True)
             full_options = {**options, "request_contract": decision.contract, "evidence_run_id": evidence["run_id"],
@@ -237,16 +240,45 @@ async def _full_task(decision, evidence, options, clients, emit):
             if budget.token_limit is not None:
                 full_options["max_total_tokens"] = max(1, budget.token_limit - budget.tokens)
             with _model_scope(decision):
-                return await run_agent_with_callback(
+                completed_report = await run_agent_with_callback(
                     decision.contract["subject"], _private_emit(emit), full_options, clients)
+                completed_in_time = budget.remaining_seconds > 0
+                return completed_report
     # Cancellation/deadline covers acquisition too, and awaits context cleanup.
-    report = await budget.wait(locked_task(), bounded_operation=False)
+    try:
+        report = await budget.wait(locked_task(), bounded_operation=False)
+    except BaseException as error:
+        # The engine owns a separately loaded bundle. Its captured receipts must
+        # survive cancellation even when the budget wrapper discards its report.
+        try:
+            retained = EvidenceStore(options["state_file"]).load(evidence["run_id"])
+            evidence.clear()
+            evidence.update(retained)
+        except (OSError, ValueError):
+            pass
+        if (isinstance(error, ConversationExhausted) and completed_report is not None
+            and completed_report["success"] and completed_in_time and not budget.should_stop()):
+            # Spending the final token does not undo a verified completed effect.
+            # Further model presentation is still denied by the same budget.
+            report = completed_report
+        else:
+            raise
     budget.tools += report["metrics"]["tool_calls"]
     budget.tool_seconds += report["metrics"]["tool_seconds"]
     budget.model_seconds += report["metrics"]["model_seconds"]
     decision.backend = report["metrics"]["backend"]
     # Provider attempts and usage were measured by the shared observer scope.
     return report
+
+
+def _publication_check(budget, completed_presentation: bool) -> None:
+    if completed_presentation:
+        # Resource exhaustion in presentation cannot undo verified execution.
+        # An active cancellation still governs the final publication boundary.
+        if budget.should_stop():
+            raise IntegrationStopped("Kullanıcı tarafından durduruldu.")
+    else:
+        budget.check()
 
 
 async def run_conversation_with_callback(goal: str, emit: EventSink, options: RunOptions, clients) -> RunReport:
@@ -258,6 +290,7 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
     reason = ""
     outcome = ""
     inner = None
+    completed_presentation = False
     try:
         handed = options.get("conversation_decision")
         if handed is not None:
@@ -313,12 +346,20 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
                 success = True
             if success:
                 budget.phase = "verify"
-                outcome, checked = await ground_answer(outcome, evidence, store,
-                    lambda messages: _model(decision, clients, messages, [], emit))
+                try:
+                    outcome, checked = await ground_answer(outcome, evidence, store,
+                        lambda messages: _model(decision, clients, messages, [], emit))
+                except ConversationExhausted as error:
+                    if inner is None or not inner["success"]:
+                        raise
+                    completed_presentation = True
+                    checked = True
+                    reason = "Görev tamamlandı; modelle sunum bütçesi yetersiz: " + sanitize_text(str(error))
+                    outcome = render_evidence(evidence) + "\n" + reason + "\nDoğrulanmış işlem kaynakları doğrudan sunuldu."
                 success = success and checked
                 if not checked:
                     reason = "Yanıt doğrulaması tamamlanamadı; gözlemler doğrudan sunuldu."
-        budget.check()
+        _publication_check(budget, completed_presentation)
     except BaseException as error:
         import asyncio
         if not isinstance(error, (Exception, asyncio.CancelledError)):
@@ -346,7 +387,7 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
     # outcome at the publication boundary, replacing any private successful draft.
     if decision is not None:
         try:
-            decision.budget.check()
+            _publication_check(decision.budget, completed_presentation)
         except (IntegrationStopped, ConversationExhausted) as error:
             success = False
             reason = sanitize_text(str(error))
