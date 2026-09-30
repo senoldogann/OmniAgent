@@ -230,6 +230,41 @@ async def test_cancelled_full_task_keeps_captured_receipts_and_releases_context(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limit", ["turns", "tokens"])
+async def test_completed_effect_keeps_verified_verdict_when_presentation_budget_spent(
+    coordinator, scripted, tmp_path, monkeypatch, limit,
+):
+    target = tmp_path / "sample.txt"
+    @asynccontextmanager
+    async def lock():
+        yield
+    async def engine(goal, emit, opts, clients):
+        agent._MODEL_ATTEMPT.get()("ollama-cloud")
+        if limit == "tokens":
+            agent._MODEL_USAGE.get()({"prompt_tokens": 900, "completion_tokens": 100, "cached_tokens": 0})
+        target.write_text("verified actual effect")
+        store = EvidenceStore(opts["state_file"])
+        bundle = store.load(opts["evidence_run_id"])
+        store.capture(bundle, "write_file", {"ok": True, "result": "Created verified sample.txt"},
+                      arguments=json.dumps({"path": str(target)}))
+        report = failed_report(opts)
+        return {**report, "success": True, "reason": "verified done", "outcome": "Created verified sample.txt", "evidence": bundle}
+    monkeypatch.setattr(coordinator, "run_agent_with_callback", engine)
+    extra = {"max_iterations": 1} if limit == "turns" else {"max_total_tokens": 1000}
+    report, events = await run(coordinator, tmp_path, "Create sample.txt", {
+        "run_mode": "extended", "task_context": lock, **extra})
+    assert target.read_text() == "verified actual effect"
+    assert report["success"] and report["metrics"]["turns"] == 1
+    assert not scripted[1]
+    assert "Created verified sample.txt" in report["outcome"]
+    assert "sunum" in report["outcome"].casefold()
+    assert "İşlem tamamlanamadı" not in report["outcome"] and "yeni bir çalışma" not in report["outcome"]
+    assert report["exchange"]["answer"] == report["outcome"]
+    terminal = [e for e in events if e["kind"] == "run_finished"]
+    assert len(terminal) == 1 and terminal[0]["success"] and terminal[0]["outcome"] == report["outcome"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     coordinator, scripted, tmp_path, monkeypatch, verbose,
