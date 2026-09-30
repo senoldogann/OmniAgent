@@ -18,7 +18,7 @@ import statistics
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple, TypedDict
+from typing import Dict, Iterator, List, NotRequired, Optional, Set, Tuple, TypedDict
 
 from omniagent.core.text_norm import ascii_fold
 from omniagent.memory.user import sensitive_text
@@ -193,6 +193,7 @@ class EvidenceMessage(TypedDict):
     channel: str
     text: str
     created_at: str
+    raw_text: NotRequired[str]
 
 
 class LearningStatus(TypedDict):
@@ -396,7 +397,8 @@ class PersonalStore:
         with self.connection:
             self._raise_cursor(imsg_rowid)
 
-    def record_incoming(self, imsg_rowid: int, guid: str, text: str, created_at: str) -> Optional[int]:
+    def record_incoming(self, imsg_rowid: int, guid: str, text: str, created_at: str,
+                        attachments: Optional[List[Dict[str, str]]] = None) -> Optional[int]:
         """Kullanıcı mesajını arşivler ve imleci aynı işlemde ilerletir; aynı satır yeniden gelirse None."""
         with self.connection:
             inserted = self.connection.execute(
@@ -405,7 +407,61 @@ class PersonalStore:
                 (imsg_rowid, guid, text, created_at),
             )
             self._raise_cursor(imsg_rowid)
+            if inserted.rowcount == 1 and attachments:
+                self._put_state(f"incoming_media:{_row_id(inserted)}", json.dumps(attachments))
+                if any(Path(item["path"]).suffix.casefold() in {".caf", ".m4a", ".amr"} for item in attachments):
+                    self._put_state(f"audio_pending:{_row_id(inserted)}", created_at)
         return _row_id(inserted) if inserted.rowcount == 1 else None
+
+    def incoming_media(self, message_id: int) -> List[Dict[str, str]]:
+        """Attachment paths survive restart; binary content never enters the archive."""
+        raw = self.get_state(f"incoming_media:{message_id}")
+        return json.loads(raw) if raw else []
+
+    def message(self, message_id: int) -> Optional[ArchivedMessage]:
+        row = self.connection.execute(
+            "SELECT id, direction, kind, text, created_at, delivery FROM messages WHERE id = ?", (message_id,),
+        ).fetchone()
+        return _message(row) if row else None
+
+    def append_transcript(self, message_id: int, transcript: str) -> bool:
+        """Append the user's own words once, with the same secret filter as other channels."""
+        if not transcript.strip() or sensitive_text(transcript):
+            return False
+        with self.connection:
+            marker = f"transcribed:{message_id}"
+            if self.get_state(marker) is not None:
+                return False
+            changed = self.connection.execute(
+                "UPDATE messages SET text = text || ? WHERE id = ? AND direction = 'in' AND channel = 'imessage'",
+                ("\n🎤 " + transcript.strip(), message_id),
+            )
+            if changed.rowcount:
+                self._put_state(marker, "1")
+                self.connection.execute("DELETE FROM state WHERE key = ?", (f"audio_pending:{message_id}",))
+            return bool(changed.rowcount)
+
+    def finish_transcription(self, message_id: int) -> None:
+        with self.connection:
+            self.connection.execute("DELETE FROM state WHERE key = ?", (f"audio_pending:{message_id}",))
+
+    def messages_since(self, since: datetime) -> List[ArchivedMessage]:
+        """Chronological messages for rhythm analysis; channel histories remain separate."""
+        rows = self.connection.execute(
+            "SELECT id, direction, kind, text, created_at, delivery FROM messages "
+            "WHERE channel = 'imessage' AND created_at >= ? ORDER BY id", (utc_iso(since),),
+        ).fetchall()
+        return [_message(row) for row in rows]
+
+    def recent_activity(self, limit: int) -> List[ActivityRecord]:
+        rows = self.connection.execute(
+            f"SELECT {_ACTIVITY_COLUMNS} FROM activity ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+        return [_activity(row) for row in reversed(rows)]
+
+    def due_facts(self, now: datetime) -> List[FactRecord]:
+        return [fact for fact in self.active_facts() if fact["follow_up_at"] is not None
+                and datetime.fromisoformat(fact["follow_up_at"]) <= now]
 
     def record_channel_message(self, channel: str, text: str, created_at: str) -> int:
         """
@@ -635,10 +691,15 @@ class PersonalStore:
         """Öğrenme girdisi: `cursor`'dan sonraki kullanıcı ('in') mesajları, tüm kanallar, eskiden yeniye."""
         rows = self.connection.execute(
             "SELECT id, direction, channel, text, created_at FROM messages WHERE direction = 'in' AND id > ? "
-            "ORDER BY id LIMIT ?", (cursor, limit),
+            "AND id < COALESCE((SELECT MIN(CAST(substr(key, 15) AS INTEGER)) FROM state "
+            "WHERE key LIKE 'audio_pending:%' AND value >= ?), 9223372036854775807) "
+            "ORDER BY id LIMIT ?", (cursor, utc_iso(datetime.now(timezone.utc) - timedelta(hours=1)), limit),
         ).fetchall()
         return [{"id": int(row["id"]), "direction": str(row["direction"]), "channel": str(row["channel"]),
-                 "text": str(row["text"]), "created_at": str(row["created_at"])} for row in rows]
+                 "text": "\n".join(line for line in str(row["text"]).splitlines()
+                                    if not re.fullmatch(r"\[(?:fotoğraf|dosya): .*\]", line)),
+                 "raw_text": str(row["text"]),
+                 "created_at": str(row["created_at"])} for row in rows]
 
     def commit_learning(self, expected_cursor: int, new_cursor: int, facts: List[NewFact],
                         now: str) -> Optional[List[int]]:

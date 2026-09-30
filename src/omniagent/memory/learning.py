@@ -269,7 +269,8 @@ def passes_first_gate(candidate: Candidate, sources: Dict[int, EvidenceMessage],
         return False
     if sensitive_text(candidate["statement"]) or sensitive_text(candidate["quote"]):
         return False
-    return quote_supported(candidate["quote"], source["direction"], source["text"])
+    return (quote_supported(candidate["quote"], source["direction"], source["text"])
+            and quote_supported(candidate["quote"], source["direction"], source.get("raw_text", source["text"])))
 
 
 def follow_up_value(raw: Optional[str], said_at: str, tz: tzinfo) -> Optional[str]:

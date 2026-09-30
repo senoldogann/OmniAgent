@@ -335,7 +335,7 @@ async def test_photo_only_message_reaches_chat_as_photo_marker(parts: Parts,
     await bridge.on_message(photo)
     await settle(bridge)
     assert scripted.inputs[0].endswith("[fotoğraf: p.jpg]")
-    assert store.recent_messages(5)[0]["text"] == "[fotoğraf]"
+    assert store.recent_messages(5)[0]["text"] == "[fotoğraf: p.jpg]"
 
 
 @pytest.mark.asyncio

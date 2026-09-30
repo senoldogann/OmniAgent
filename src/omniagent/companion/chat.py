@@ -7,16 +7,26 @@ akış yeniden denenirse (stream_reset) gönderilmiş satırlar atlanır, balon 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import logging
+import math
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, NotRequired, Optional, Tuple, TypedDict
 
 from openai import AsyncOpenAI
 
 from omniagent.app.agent import call_model_with_retries
-from omniagent.app.types import ToolCallDraft
+from omniagent.app.model_retry import ModelCallFailed
+from omniagent.app.types import ModelTurn, ToolCallDraft
+from omniagent.approval import append_audit
+from omniagent.config import QUALITY_LADDER
+from omniagent.fallback_policy import (
+    count_image_parts, load_fallback_policy, permitted_fallbacks, provider_fallback_audit, provider_fallback_event,
+)
+from omniagent.memory.personal import utc_now_iso
+from omniagent.paths import data_root
 from omniagent.companion.bubbles import (
     MAX_BUBBLE_CHARS, MAX_BUBBLES, bubble_delay, clean_line, split_complete_lines,
 )
@@ -106,7 +116,16 @@ FORGET_TOOL: Dict[str, object] = {
         },
     },
 }
-CHAT_TOOLS: List[Dict[str, object]] = [START_TASK_TOOL, RECALL_TOOL, FORGET_TOOL]
+MUTE_TOOL: Dict[str, object] = {
+    "type": "function", "function": {"name": "mute", "description": "Kullanıcı isterse proaktifliği saat boyunca susturur.",
+        "parameters": {"type": "object", "properties": {"hours": {"type": "number", "exclusiveMinimum": 0}},
+                       "required": ["hours"]}},
+}
+PROACTIVE_TOOL: Dict[str, object] = {
+    "type": "function", "function": {"name": "set_proactive", "description": "Kullanıcının isteğiyle proaktifliği açar veya kapatır.",
+        "parameters": {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]}},
+}
+CHAT_TOOLS: List[Dict[str, object]] = [START_TASK_TOOL, RECALL_TOOL, FORGET_TOOL, MUTE_TOOL, PROACTIVE_TOOL]
 
 
 class ChatError(Exception):
@@ -119,6 +138,25 @@ class ChatResult(TypedDict):
     # Hafıza araçları (Faz B+) yalnız çağrıldıklarında bulunur; Faz A sözleşmesi ve sahteleri değişmez.
     recall: NotRequired[str]
     forget: NotRequired[List[int]]
+    mute: NotRequired[float]
+    proactive: NotRequired[bool]
+
+
+def control_calls(tool_calls: List[ToolCallDraft]) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for call in tool_calls:
+        if call["name"] not in {"mute", "set_proactive"}:
+            continue
+        arguments = _call_arguments(call)
+        if arguments is None:
+            continue
+        if call["name"] == "mute":
+            value = arguments.get("hours")
+            if isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value) and 0 < value <= 8760:
+                result["mute"] = float(value)
+        elif isinstance(arguments.get("enabled"), bool):
+            result["proactive"] = arguments["enabled"]
+    return result
 
 
 def history_messages(history: List[ArchivedMessage], starts: Dict[int, str],
@@ -160,6 +198,51 @@ def burst_turn(texts: List[str], images: List[str], situation: str) -> str:
     """Burst'ü (ve fotoğraf eklerini) durum bloğuyla tek kullanıcı mesajına çevirir. Saf."""
     lines: List[str] = [*texts, *(f"[fotoğraf: {Path(path).name}]" for path in images)]
     return f"{situation}\n\n" + "\n".join(lines)
+
+
+def image_turn(text: str, paths: List[Path]) -> ChatMessage:
+    """Only prepared JPEGs enter this turn; the archive retains text markers."""
+    if not paths:
+        return {"role": "user", "content": text}
+    parts: List[Dict[str, object]] = [{"type": "text", "text": text}]
+    for path in paths:
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+    return {"role": "user", "content": parts}
+
+
+def image_rejected(error: ModelCallFailed) -> bool:
+    return error.kind == "permanent" and bool(re.search(
+        r"(?:image|vision|multimodal).{0,90}(?:not support|unsupported|not allowed|not available)|"
+        r"(?:not support|unsupported).{0,90}(?:image|vision|multimodal)", str(error), re.IGNORECASE,
+    ))
+
+
+async def _chat_completion(
+    clients: Dict[str, AsyncOpenAI], messages: List[ChatMessage], tools: List[Dict[str, object]],
+    session_id: str, backend: str, emit: Callable[[AgentEvent], None], should_stop: Callable[[], bool],
+) -> Tuple[ModelTurn, str]:
+    """An explicitly rejected image may move only to an image permitted fallback."""
+    try:
+        return await call_model_with_retries(clients, messages, tools, session_id, backend, emit, should_stop)
+    except ModelCallFailed as error:
+        count = count_image_parts(messages)
+        if not count or not image_rejected(error):
+            raise
+        policy = load_fallback_policy()
+        permitted = permitted_fallbacks(frozenset(policy["backends"]), policy["allow_images"], count)
+        for candidate in QUALITY_LADDER:
+            if candidate == backend or candidate not in clients or candidate not in permitted:
+                continue
+            event = provider_fallback_event(backend, candidate, "sohbet profili görseli desteklemiyor", count)
+            append_audit(data_root() / "audit.jsonl", provider_fallback_audit(event, utc_now_iso()))
+            emit(event)
+            try:
+                return await call_model_with_retries(clients, messages, tools, session_id, candidate, emit, should_stop)
+            except ModelCallFailed as fallback_error:
+                if not image_rejected(fallback_error):
+                    raise
+        raise error
 
 
 def report_turn(goal: str, success: bool, outcome: str, situation: str) -> str:
@@ -279,7 +362,7 @@ async def _correction_calls(
         {"role": "assistant", "content": "\n".join(bubbles)},
         {"role": "user", "content": correction},
     ]
-    turn, _answered_by = await call_model_with_retries(
+    turn, _answered_by = await _chat_completion(
         clients, request, CHAT_TOOLS, session_id, backend, _ignore_event, should_stop,
     )
     return turn["tool_calls"]
@@ -460,7 +543,7 @@ async def respond(
 
     sending: asyncio.Task[None] = asyncio.create_task(sender())
     try:
-        turn, _answered_by = await call_model_with_retries(
+        turn, _answered_by = await _chat_completion(
             clients, [{"role": "system", "content": system}, *(messages if tools else without_tool_calls(messages))],
             tools, session_id, backend, emit, should_stop,
         )
@@ -486,11 +569,16 @@ async def respond(
     if not forget and textual_forgets:
         logging.info("Sohbet modeli unutmayı metin içinde çağırdı", extra={"calls": len(textual_forgets)})
         forget = textual_forgets
-    if not sent and start_task is None and recall is None and not forget and turn["finish_reason"] != "stopped":
+    controls = control_calls(turn["tool_calls"])
+    if not sent and start_task is None and recall is None and not forget and not controls and turn["finish_reason"] != "stopped":
         raise ChatError(f"Sohbet modeli boş yanıt döndürdü (finish_reason={turn['finish_reason']}).")
     result: ChatResult = {"bubbles": sent, "start_task": start_task}
     if recall is not None:
         result["recall"] = recall
     if forget:
         result["forget"] = forget
+    if "mute" in controls:
+        result["mute"] = float(controls["mute"])
+    if "proactive" in controls:
+        result["proactive"] = bool(controls["proactive"])
     return result

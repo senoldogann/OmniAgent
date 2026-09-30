@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 from typing import Dict, List, Optional
 
 from omniagent.approval import approval_granted
@@ -66,6 +67,20 @@ def parse_command(text: str) -> Optional[str]:
         return "stop"
     if folded in _STATUS_WORDS:
         return "status"
+    return None
+
+
+def parse_proactive_command(text: str) -> Optional[Dict[str, object]]:
+    folded = ascii_fold(text.strip())
+    if folded in {"/proaktif ac", "/proaktif kapat"}:
+        return {"proactive": folded.endswith(" ac")}
+    if folded.startswith("/sessiz "):
+        try:
+            hours = float(folded.split(maxsplit=1)[1].replace(",", "."))
+        except ValueError:
+            return None
+        if math.isfinite(hours) and 0 < hours <= 8760:
+            return {"mute": hours}
     return None
 
 

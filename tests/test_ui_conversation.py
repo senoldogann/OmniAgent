@@ -155,7 +155,7 @@ def test_stream_delta_is_visible_in_one_frame(app: ui.OmniUI) -> None:
     ("Normal", "25 tur · 10 dk"),
     ("Uzun", "50 tur · 20 dk"),
     ("Otonom", "100 tur · 45 dk"),
-    ("Sürekli", "kullanıcı onayı"),
+    ("Sürekli", "onay gerektiğinde bekler"),
 ])
 def test_mode_hint_explains_selected_budget(app: ui.OmniUI, label: str, expected: str) -> None:
     app.mode_menu.set(label)
