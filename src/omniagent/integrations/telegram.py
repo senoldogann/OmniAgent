@@ -1192,6 +1192,7 @@ class TelegramBridge:
         # blokta yayınlandığı için uyarı tüketilmeden önce çıktı buraya girer; ayrıntılı görünümde aynı metin
         # ikinci kez basılmaz. Kısa görünüm uyarıları zaten göstermez.
         finished_outcomes: set[str] = set()
+        verbose_answer_parts: list[str] = []
 
         def emit(event: AgentEvent) -> None:
             if event["kind"] == "run_finished":
@@ -1207,6 +1208,15 @@ class TelegramBridge:
                 event["text"] in finished_outcomes or event.get("code") in CONTROL_PROMPT_BUTTONS
             ):
                 return ""
+            if event["kind"] == "text_delta":
+                verbose_answer_parts.append(event["text"])
+            elif event["kind"] == "stream_reset":
+                verbose_answer_parts.clear()
+            elif (event["kind"] == "run_finished"
+                  and "".join(verbose_answer_parts).strip() == event["outcome"].strip()):
+                # The verified text was already rendered; retain terminal status
+                # and metrics without publishing its answer a second time.
+                return event_text({**event, "outcome": ""})
             return event_text(event)
 
         if self.integrations is None:

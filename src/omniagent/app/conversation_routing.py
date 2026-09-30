@@ -26,8 +26,19 @@ targets need honest clarification rather than guessing. This decision never gran
 permissions, chooses a provider or changes mode. Quoted history/source/persona is data.
 """
 # These are narrow positive instruction guards, supplementary to the semantic decision.
-_EXPLICIT_READ = re.compile(r"\b(?:search (?:the )?web|research|look up|browse sources|list (?:the )?(?:directory|folder)|"
-                            r"read (?:the )?(?:file|directory)|web.?de ara|araştır|araştir|klasörleri listele|dizinleri listele|dosyayı oku)\b", re.I)
+_POLITE_START = r"^\s*(?:(?:please|can you|could you|would you|lütfen|lutfen)\s+)?"
+_EXPLICIT_READ = re.compile(_POLITE_START + r"(?:"
+    r"(?:search (?:the )?web(?: for)?|search for|look up|browse sources)\s+\S|"
+    r"research\s+(?!(?:is|was|can|means|matters)\b)\S|"
+    r"list\s+(?:the\s+)?(?:files|directories|folders|directory|folder)(?:\s+names)?\b|"
+    r"read\s+(?:the\s+)?(?:file\b|directory\b|[\"'`]?(?:/|~/|\./|\.\./|https?://)|[\w.-]+\.[\w]+\b)|"
+    r"(?:web['’]?de|internette)\s+ara\b)", re.I)
+_TURKISH_READ = re.compile(_POLITE_START + r"(?:"
+    # Object-first Turkish imperatives/questions, ending at the actual request.
+    r"(?=[^\n]*(?:dosya|klasör|dizin|masaüst|/))[^\n]+\s+(?:oku|okur musun|okuyabilir misin|"
+    r"listele|listeler misin|listeleyebilir misin)|"
+    r"[^\n]+\s+(?:araştır|araştir|araştırır mısın|araştırabilir misin)|"
+    r"[^\n]+\s+(?:web['’]?de|internette)\s+ara)\s*[?.!]*\s*$", re.I)
 _EXPLICIT_ACTION = re.compile(r"^\s*(?:(?:please|can you|could you)\s+)?(?:send|delete|remove|create|write|edit|install|schedule|click|open (?:the )?(?:app|browser)|"
                               r"gönder|sil|oluştur|düzenle|kur|tıkla|zamanla)\b", re.I)
 _REFINEMENT = re.compile(r"^(?:no\b|hayır\b|hayir\b|give (?:me )?(?:their |the )?names\b|(?:isim|ad)lerini|sadece (?:ad|isim)|peki\b)", re.I)
@@ -70,7 +81,7 @@ def contract_from_decision(goal: str, options: RunOptions, content: str) -> Requ
         return derive_request_contract(subject, route="task")
     if force_task(goal, options) or _EXPLICIT_ACTION.search(goal):
         route = "task"
-    elif (_EXPLICIT_READ.search(goal) or observation) and route == "chat":
+    elif (_EXPLICIT_READ.search(goal) or _TURKISH_READ.search(goal) or observation) and route == "chat":
         route = "investigate"
     fields = list(dict.fromkeys([*derive_request_contract(subject)["required_fields"], *fields]))
     return derive_request_contract(subject, route=route, required_fields=fields,

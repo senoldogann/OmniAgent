@@ -18,6 +18,7 @@ from omniagent.app.conversation_grounding import authoritative_context, ground_a
 from omniagent.app.conversation_routing import contract_from_decision, force_task, routing_messages, subject_for_turn
 from omniagent.app.tool_schema import route_tool_schemas
 from omniagent.app.tool_execution import execute_tool, raw_result_text
+from omniagent.app.policy import final_verdict
 from omniagent.app.types import ModelTurn, RunOptions, RunReport
 from omniagent.config import BACKENDS, DEFAULT_BACKEND
 from omniagent.core.conversation import make_exchange, to_messages
@@ -96,6 +97,10 @@ async def _model(decision: ConversationDecision, clients, messages, tools, emit)
     decision.backend = backend
     if turn["finish_reason"] == "stopped":
         raise IntegrationStopped("Kullanıcı tarafından durduruldu.")
+    if turn["finish_reason"] in ("length", "content_filter"):
+        # A cut-off routing JSON, draft or tool argument is never a complete turn.
+        _, reason = final_verdict(turn["content"], turn["finish_reason"])
+        raise ValueError(reason)
     return turn
 
 
@@ -221,17 +226,21 @@ async def _full_task(decision, evidence, options, clients, emit):
     budget.check(model=True)
     if options.get("task_context") is None:
         raise RuntimeError("Görev kanalı host kilidi sağlamadı; etkili iş başlatılmadı.")
-    full_options = {**options, "request_contract": decision.contract, "evidence_run_id": evidence["run_id"],
-                    "max_iterations": max(1, budget.user_turns - budget.turns),
-                    "max_wall_clock_seconds": budget.remaining_seconds}
-    if budget.token_limit is not None:
-        full_options["max_total_tokens"] = max(1, budget.token_limit - budget.tokens)
     # The selected mode/provider/fallback/approvals are intact. The host supplies
     # user-priority/preemptible lock behavior; chat/read do not acquire this lock.
-    async with options["task_context"]():
-        with _model_scope(decision):
-            report = await budget.wait(run_agent_with_callback(
-                decision.contract["subject"], _private_emit(emit), full_options, clients), bounded_operation=False)
+    async def locked_task():
+        async with options["task_context"]():
+            budget.check(model=True)
+            full_options = {**options, "request_contract": decision.contract, "evidence_run_id": evidence["run_id"],
+                            "max_iterations": max(1, budget.user_turns - budget.turns),
+                            "max_wall_clock_seconds": budget.remaining_seconds}
+            if budget.token_limit is not None:
+                full_options["max_total_tokens"] = max(1, budget.token_limit - budget.tokens)
+            with _model_scope(decision):
+                return await run_agent_with_callback(
+                    decision.contract["subject"], _private_emit(emit), full_options, clients)
+    # Cancellation/deadline covers acquisition too, and awaits context cleanup.
+    report = await budget.wait(locked_task(), bounded_operation=False)
     budget.tools += report["metrics"]["tool_calls"]
     budget.tool_seconds += report["metrics"]["tool_seconds"]
     budget.model_seconds += report["metrics"]["model_seconds"]
@@ -333,6 +342,21 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
     metrics = decision.budget.metrics() if decision is not None else {
         "turns": 0, "tool_calls": 0, "elapsed_seconds": 0.0, "backend": options["requested_backend"] or DEFAULT_BACKEND,
         "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "model_seconds": 0.0, "tool_seconds": 0.0}
+    # Persistence and metrics can outlast the last model check. Commit one honest
+    # outcome at the publication boundary, replacing any private successful draft.
+    if decision is not None:
+        try:
+            decision.budget.check()
+        except (IntegrationStopped, ConversationExhausted) as error:
+            success = False
+            reason = sanitize_text(str(error))
+            mark_incomplete(evidence, reason)
+            outcome = render_evidence(evidence) + "\nİşlem tamamlanamadı: " + reason
+            if store is not None:
+                try:
+                    store.save(evidence)
+                except (OSError, ValueError):
+                    mark_incomplete(evidence, "Son kaynak kaydı diske yazılamadı.")
     exchange = make_exchange(goal, outcome, [])
     if inner is not None:
         exchange["tools"] = list(inner["exchange"]["tools"])
