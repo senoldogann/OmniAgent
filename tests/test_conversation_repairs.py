@@ -294,6 +294,27 @@ async def test_actual_engine_overrun_stays_failed_with_latest_receipts(coordinat
 
 
 @pytest.mark.asyncio
+async def test_quick_read_timeout_keeps_receipt_and_full_subject_continuation(coordinator, scripted, tmp_path):
+    scripts, requests = scripted
+    target = tmp_path / "report.txt"
+    target.write_text("ACTUAL captured identifiers: OpenAI and Anthropic")
+    goal = f"Please read {target} and list the exact identifiers for OpenAI and Anthropic"
+    async def waiting(emit, stop):
+        emit({"kind": "text_delta", "text": "UNVERIFIED timeout draft"})
+        await asyncio.sleep(10)
+    scripts.extend([route("investigate"), turn(calls=[call("read_file", path=str(target))]), waiting])
+    report, events = await run(coordinator, tmp_path, goal, {"max_wall_clock_seconds": .05})
+    assert not report["success"] and report["metrics"]["tool_calls"] == 1
+    assert len(requests) == report["metrics"]["turns"] == 3
+    assert "ACTUAL captured identifiers" in report["outcome"]
+    assert "UNVERIFIED" not in json.dumps(events)
+    assert f"Aynı konuda tam ajanla yeni bir çalışma başlatarak devam edebiliriz: {goal}" in report["outcome"]
+    assert report["exchange"]["answer"] == report["outcome"]
+    terminal = [e for e in events if e["kind"] == "run_finished"]
+    assert len(terminal) == 1 and terminal[0]["outcome"] == report["outcome"] and not terminal[0]["success"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("verbose", [False, True])
 async def test_real_telegram_consumers_receive_one_verified_final_and_controls(
     coordinator, scripted, tmp_path, monkeypatch, verbose,
