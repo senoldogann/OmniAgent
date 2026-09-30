@@ -23,7 +23,7 @@ Autonomy review: cancelled lock request workers stop; HID activity during tool s
 
 Live model checks: existing selected chat profile correctly recognized a synthetic red/blue image; actual heartbeat returned a valid decision; four existing live chat/memory tests passed. No iPhone delivery, p50/p95 or 15-second cross-channel user acceptance claim is inferred from these checks.
 
-Paired installation: chat profile remains the configured `ollama-cloud`, memory profile `openai`. Legacy transcription remains explicitly disabled until the user's provider/model selection; `omniagent-imessage transcription` configures it without re-pairing. Existing persona, paired address and quiet hours are preserved.
+Paired installation: chat profile remains the configured `ollama-cloud`, memory profile `openai`. The user explicitly selected `openai` / `gpt-4o-mini-transcribe`; the paired installation was configured through `omniagent-imessage transcription` without re-pairing and the iMessage service restarted. A real synthetic CAF audio conversion/upload returned the expected transcript through that model; the service is running and connected. Actual iPhone voice delivery remains a separate acceptance check. Existing persona, paired address and quiet hours are preserved.
 
 ## Required behavior
 
