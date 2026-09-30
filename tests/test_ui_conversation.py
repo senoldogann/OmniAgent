@@ -1456,3 +1456,16 @@ def test_verified_desktop_final_without_turn_started_is_presented(app):
     app._handle_event({"kind": "text_delta", "text": text})
     _drain(app)
     assert text.strip() in app._text.get("1.0", "end")
+
+
+def test_desktop_agent_success_without_presented_final_does_not_deliver_evidence(app, monkeypatch, tmp_path):
+    from omniagent.core.evidence import EvidenceStore
+    from omniagent.core.conversation_policy import derive_request_contract
+    monkeypatch.setattr(ui, "STATE_FILE", str(tmp_path / "selected" / "state.json"))
+    store = EvidenceStore(ui.STATE_FILE)
+    bundle = store.create(derive_request_contract("report", route="task"))
+    assert app._ensure_chat("report")
+    app._active_goal = "report"
+    app._on_run_done("", {"success":True, "reason":"", "outcome":"final", "exchange":make_exchange("report","final",[]), "evidence":bundle})
+    assert pump_until(app, lambda: app._chat_write.done(), 3)
+    assert store.load(bundle["run_id"])["delivery_status"] == "pending"
