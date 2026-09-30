@@ -171,3 +171,69 @@ def test_shared_style_and_contract_remain_channel_neutral():
     assert "source" in NATURAL_STYLE_POLICY.lower()
     with pytest.raises(ValueError):
         derive_request_contract("List folders", route="arbitrary")
+
+
+@pytest.mark.asyncio
+async def test_agent_captures_raw_results_before_step_and_model_clipping(tmp_path, monkeypatch):
+    from omniagent.app import agent
+    from omniagent.integrations.capabilities import CapabilityService
+    text = "a" * 22000 + "\nProjects/\nhttps://example.org/middle\npassword: do-not-store\n" + "b" * 22000
+    calls = 0
+    async def model(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"content": "", "tool_calls": [{"id": "call-1", "name": "execute_shell", "arguments": '{"command":"ls -F ~/Desktop"}'}],
+                    "finish_reason": "tool_calls", "usage": agent.ZERO_USAGE}, "openai"
+        assert "do-not-store" not in str(args[1])
+        return {"content": "Klasör: Projects", "tool_calls": [], "finish_reason": "stop", "usage": agent.ZERO_USAGE}, "openai"
+    async def execute(*args, **kwargs):
+        return [{"ok": True, "result": text}]
+    monkeypatch.setattr(agent, "_call_model_with_retries", model)
+    monkeypatch.setattr(agent, "_execute_tool_calls", execute)
+    service = CapabilityService(tmp_path)
+    try:
+        report = await agent.run_agent_with_callback("List directory names", lambda event: None,
+            {"requested_backend": "openai", "should_stop": lambda: False, "state_file": str(tmp_path / "state.json"),
+             "history": [], "integrations": service}, {"openai": object()})
+    finally:
+        await service.close()
+    bundle = report["evidence"]
+    source = bundle["observations"][0]["text"]
+    assert "Projects/" in source
+    assert "https://example.org/middle" in source
+    assert "do-not-store" not in source
+    assert len(source) > 40000
+    assert EvidenceStore(tmp_path / "state.json").load(bundle["run_id"]) == bundle
+
+
+@pytest.mark.asyncio
+async def test_automatic_observation_captures_receipt_before_archive_limit(tmp_path, monkeypatch):
+    from omniagent.app import agent
+    store, bundle = make_bundle(tmp_path)
+    raw = "camera metadata " + "a" * 14000 + " middle fact"
+    async def tool(*args, **kwargs):
+        return {"ok": False, "error_type": "ImageError", "error": raw}
+    monkeypatch.setattr(agent, "_run_tool_with_events", tool)
+    token = agent._EVIDENCE_CAPTURE.set(lambda call, result: store.capture(bundle, call["name"], result))
+    try:
+        _, step, digest = await agent._observe_after_actions("test-capture", 0, "preview", object(), {}, lambda event: None, lambda: False)
+    finally:
+        agent._EVIDENCE_CAPTURE.reset(token)
+    assert "middle fact" in bundle["observations"][0]["text"]
+    assert not digest
+    assert not step["ok"]
+
+
+@pytest.mark.asyncio
+async def test_agent_startup_failure_and_store_failure_still_finish(tmp_path, monkeypatch):
+    from omniagent.app import agent
+    def unavailable(*args, **kwargs):
+        raise OSError("unwritable evidence")
+    monkeypatch.setattr(agent.EvidenceStore, "save", unavailable)
+    events = []
+    report = await agent.run_agent_with_callback("Read folders", events.append,
+        {"requested_backend": "openai", "should_stop": lambda: False, "state_file": str(tmp_path / "state.json"), "history": []}, {})
+    assert not report["success"]
+    assert not report["evidence"]["complete"]
+    assert events[-1]["kind"] == "run_finished"
