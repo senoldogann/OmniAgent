@@ -257,7 +257,8 @@ async def _full_task(decision, evidence, options, clients, emit):
         except (OSError, ValueError):
             pass
         if (isinstance(error, ConversationExhausted) and completed_report is not None
-            and completed_report["success"] and completed_in_time and not budget.should_stop()):
+            and completed_report["success"] and completed_in_time and not budget.should_stop()
+            and (budget.token_limit is None or budget.tokens <= budget.token_limit)):
             # Spending the final token does not undo a verified completed effect.
             # Further model presentation is still denied by the same budget.
             report = completed_report
@@ -350,7 +351,8 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
                     outcome, checked = await ground_answer(outcome, evidence, store,
                         lambda messages: _model(decision, clients, messages, [], emit))
                 except ConversationExhausted as error:
-                    if inner is None or not inner["success"]:
+                    if (inner is None or not inner["success"]
+                        or (budget.token_limit is not None and budget.tokens > budget.token_limit)):
                         raise
                     completed_presentation = True
                     checked = True
