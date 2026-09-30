@@ -217,6 +217,10 @@ def test_worker_delivers_host_rejection_without_model_success_claim(
         backend: str, emit: Any, should_stop: Any,
     ) -> tuple[dict[str, Any], str]:
         nonlocal turns
+        if session_id == "conversation":
+            assert schemas == []
+            return {"content": json.dumps({"route": "task", "required_fields": [], "needs_observation": True}),
+                    "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
         turns += 1
         if turns == 1:
             return {
@@ -230,6 +234,7 @@ def test_worker_delivers_host_rejection_without_model_success_claim(
                 "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
 
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    monkeypatch.setattr(main, "call_model_with_retries", fake_model)
     app.entry.insert(0, f"sil: `{target}`")
     app._send_goal()
     deadline = time.monotonic() + 8
@@ -240,7 +245,8 @@ def test_worker_delivers_host_rejection_without_model_success_claim(
     _drain(app)
     assert app._agent_future is None
     visible = app._text.get("1.0", "end")
-    assert "Doğrulanmadı:" in visible
+    assert "Görev tamamlanamadı:" in visible
+    assert "silme komutu doğrulanmadı:" in visible
     assert "Hedef silindi." not in visible
     assert target.read_text(encoding="utf-8") == "koru"
 
@@ -1384,6 +1390,10 @@ def test_desktop_run_records_goal_typed_answer_and_report(app: ui.OmniUI, tmp_pa
     async def fake_model(clients: Any, messages: Any, schemas: Any, session_id: str, backend: str, emit: Any,
                          should_stop: Any) -> tuple[dict[str, Any], str]:
         nonlocal turns
+        if session_id == "conversation":
+            assert schemas == []
+            return {"content": json.dumps({"route": "task", "required_fields": [], "needs_observation": True}),
+                    "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
         turns += 1
         if turns == 1:
             return {"content": "", "tool_calls": [{"id": "ask-1", "name": "ask_user", "arguments": json.dumps(
@@ -1393,9 +1403,10 @@ def test_desktop_run_records_goal_typed_answer_and_report(app: ui.OmniUI, tmp_pa
         return {"content": "Tamam.", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
 
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    monkeypatch.setattr(main, "call_model_with_retries", fake_model)
     app.entry.insert(0, "aylık raporu hazırla")
     app._send_goal()
-    pump_until(app, lambda: bool(app._input_futures), 8)
+    assert pump_until(app, lambda: bool(app._input_futures), 8)
     request_id = next(iter(app._input_futures))
     app._answer_input(request_id, {"yanit": "Belgeler/Raporlar klasörüne"})
     deadline = time.monotonic() + 8
