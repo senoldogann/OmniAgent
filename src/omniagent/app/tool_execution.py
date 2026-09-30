@@ -396,9 +396,9 @@ async def execute_tool(
 
     method: Callable[..., Any] = dynamic["execute"] if dynamic else getattr(toolbox, name)
     integration_started = time.monotonic()
-    # Arbitrary chunks can split assignments, PEM blocks or typed echoes. Assemble
-    # before showing output; tool_started remains live while the operation runs.
-    output_parts: List[str] = []
+    # Text-only callbacks cannot distinguish interleaved stdout/stderr. Keep only
+    # bounded activity counters; present the canonical returned receipt at the end.
+    # tool_started remains live and the raw returned result stays unchanged.
     output_size = 0
     output_overflow = False
     output_lock = Lock()
@@ -411,10 +411,7 @@ async def execute_tool(
                 return
             output_size += len(text.encode("utf-8"))
             if output_size > OUTPUT_PRESENTATION_BUFFER_LIMIT:
-                output_parts.clear()
                 output_overflow = True
-            else:
-                output_parts.append(text)
 
     call_context: ToolRuntime = {
         "emit_output": buffer_output,
@@ -511,9 +508,11 @@ async def execute_tool(
         if output_overflow:
             emit({"kind": "tool_output", "call_id": call["id"],
                   "text": "Araç çıktısı gösterim sınırını aştı; ayrıntı için işlem sonucuna bakın.\n"})
-        elif output_parts:
-            emit({"kind": "tool_output", "call_id": call["id"],
-                  "text": sanitize_tool_text(name, call["arguments"], "".join(output_parts))})
+        elif output_size:
+            canonical = sanitize_tool_text(name, call["arguments"], raw_result_text(outcome))
+            if len(canonical.encode("utf-8")) > OUTPUT_PRESENTATION_BUFFER_LIMIT:
+                canonical = "Araç çıktısı gösterim sınırını aştı; ayrıntı için işlem sonucuna bakın.\n"
+            emit({"kind": "tool_output", "call_id": call["id"], "text": canonical})
     return outcome
 
 

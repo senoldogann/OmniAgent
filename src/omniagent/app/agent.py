@@ -1192,6 +1192,12 @@ async def run_agent_with_callback(
                 existing = evidence_store.load(evidence["run_id"])
             except FileNotFoundError:
                 evidence_store.save(evidence, create_only=True)
+            except (OSError, ValueError):
+                # Rejected/unreadable evidence belongs to the earlier report. Never
+                # keep its identity active for startup_failure or later persistence.
+                evidence = new_evidence_bundle(contract)
+                mark_incomplete(evidence, "Önceki kaynak kaydı okunamadı veya doğrulanamadı; eski dosya korundu ve yeni bir kayıt açıldı.")
+                evidence_store.save(evidence, create_only=True)
             else:
                 if existing["delivery_status"] != "pending" or existing["contract"] != contract:
                     # Never modify a delivered or uncertain report during a new run.
@@ -1203,6 +1209,10 @@ async def run_agent_with_callback(
         else:
             evidence_store.save(evidence, create_only=True)
     except (OSError, ValueError):
+        if options.get("evidence_run_id") == evidence["run_id"]:
+            # A missing-file race or store initialization failure must also leave
+            # the requested older identity untouched by subsequent save attempts.
+            evidence = new_evidence_bundle(contract)
         mark_incomplete(evidence, "Kaynak kaydı diske yazılamadı; bu yanıtın kaynakları yeniden yüklenemeyebilir.")
 
     def capture_source(call: ToolCallDraft, result: ToolResult) -> None:

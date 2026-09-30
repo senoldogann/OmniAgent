@@ -255,7 +255,7 @@ class EvidenceStore:
                 artifact = observation.get("artifact_path")
                 if artifact is not None and artifact != str(self.directory / self._artifact_name(identity, index)):
                     raise ValueError("Invalid evidence artifact path")
-        except (KeyError, TypeError, AttributeError) as error:
+        except (KeyError, TypeError, AttributeError, RecursionError) as error:
             raise ValueError("Malformed evidence payload") from error
         return bundle
 
@@ -287,13 +287,18 @@ class EvidenceStore:
 
     def load(self, run_id: str) -> EvidenceBundle:
         validate_run_id(run_id)
+        # Only a missing primary JSON means this run does not exist. A missing
+        # referenced artifact means an existing report was rejected, not a new run.
+        payload = self._read(self.path_for(run_id).name, MAX_RUN_BYTES)
         try:
-            bundle = self._validate(json.loads(self._read(self.path_for(run_id).name, MAX_RUN_BYTES)), run_id)
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ValueError("Malformed evidence JSON") from error
-        if len(_encoded(bundle)) + self._artifact_bytes(bundle) > MAX_RUN_BYTES:
-            raise ValueError("Evidence run exceeds storage budget")
-        return bundle
+            bundle = self._validate(json.loads(payload), run_id)
+            if len(_encoded(bundle)) + self._artifact_bytes(bundle) > MAX_RUN_BYTES:
+                raise ValueError("Evidence run exceeds storage budget")
+            return bundle
+        except FileNotFoundError as error:
+            raise ValueError("Evidence referenced artifact is unavailable") from error
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ValueError("Malformed or excessively nested evidence JSON") from error
 
     def capture(self, bundle: EvidenceBundle, tool: str, result: Mapping[str, Any], *,
                 source_reference: str = "", arguments: str = "") -> SourceObservation | None:

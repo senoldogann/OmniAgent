@@ -186,14 +186,23 @@ def test_fetch_raw_keeps_url_literal() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_error_is_explicit() -> None:
-    """Araç hatasını başarıdan ayırır, komut çıktısını canlı yayınlar, özel yöntemleri reddeder."""
+    """Araç hatası ve gerçek çıktı korunur; gösterilen kanonik makbuz sırları maskeler."""
     events: List[AgentEvent] = []
-    call: ToolCallDraft = {"id": "call-1", "name": "execute_shell", "arguments": '{"command":"echo canli; exit 7","use_sudo":false,"timeout_seconds":null}'}
+    secret = "opaque-user-password"
+    original_arguments = json.dumps({"command": "printf 'canli\nPassword:\n" + secret + "\n'; exit 7",
+                                     "use_sudo": False, "timeout_seconds": None})
+    call: ToolCallDraft = {"id": "call-1", "name": "execute_shell", "arguments": original_arguments}
     result = await execute_tool(call, Toolbox(), {}, events.append, lambda: False)
     assert result["tool_call_id"] == "call-1"
     assert result["ok"] is False
     assert result["error_type"] == "ToolError"
-    assert [e for e in events if e["kind"] == "tool_output"] == [{"kind": "tool_output", "call_id": "call-1", "text": "canli\n"}]
+    assert result["code"] == "SHELL_EXIT"
+    assert secret in result["error"]  # execution receipt remains available for source capture
+    assert call["arguments"] == original_arguments
+    output = [event for event in events if event["kind"] == "tool_output"]
+    assert len(output) == 1 and output[0]["call_id"] == "call-1"
+    assert "canli" in output[0]["text"] and "çıkış=7" in output[0]["text"]
+    assert all(secret not in str(event) for event in events)
     private: ToolCallDraft = {"id": "call-2", "name": "_read_full", "arguments": '{"path":"/etc/hosts"}'}
     assert (await execute_tool(private, Toolbox(), {}, events.append, lambda: False))["error_type"] == "UnknownTool"
 
