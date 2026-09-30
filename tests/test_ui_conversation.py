@@ -1448,3 +1448,11 @@ def test_desktop_evidence_confirmation_waits_for_rendered_final_persistence(app,
     pump(app, .1)
     saved = store.load(bundle["run_id"])
     assert saved["delivery_status"] == ("pending" if failure else "delivered")
+
+
+def test_verified_desktop_final_without_turn_started_is_presented(app):
+    assert app._turn is None
+    text = "Çınar verified final " * 500
+    app._handle_event({"kind": "text_delta", "text": text})
+    _drain(app)
+    assert text.strip() in app._text.get("1.0", "end")
