@@ -1,7 +1,9 @@
 # Shared conversation, evidence and activity across channels
 
 Date: 2026-09-30
-Status: Proposed design for user review; implementation has not started.
+Status: User accepted the proposed recommendations and instructed implementation to continue on 2026-09-30.
+
+This is the first delivery of the [approved hybrid personal-agent direction](2026-09-30-deniz-personal-agent-roadmap.md). Durable responsibilities and cloud/Mac execution are subsequent independently specified deliveries; they do not expand this implementation into remote infrastructure work.
 
 ## Objective
 
