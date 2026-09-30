@@ -36,9 +36,9 @@ Explicit search/read/action requests cannot be satisfied by a conversational res
 
 Follow-up turns resolve their subject from conversation context. “No, give me their names” refines the preceding model question. It must not create a new general AI-news question. An ambiguous target receives one necessary clarification.
 
-The coordinator reuses existing tool authorization, approval, model retry/fallback, audit and cancellation behavior. A bounded read-only path exposes only operations that the central runtime classifies as read-only; it does not execute arbitrary shell or GUI actions through this path. Unknown or effectful operations delegate to the existing agent.
+The coordinator reuses existing tool authorization, approval, model retry/fallback, audit and cancellation behavior. A bounded read-only path exposes only an explicit host-maintained allowlist of reviewed operations, with operation-level classification when a tool can both read and mutate. Cacheability flags, model declarations and shell completion heuristics do not establish read-only status. It does not execute arbitrary shell or GUI actions through this path. Unknown or effectful operations delegate to the existing agent.
 
-Quick investigation has bounded model/tool iterations, per-tool timeouts and a total deadline, configured centrally. Exhaustion reports what was obtained and offers or starts an authorized full-agent continuation as appropriate; it does not invent results. Implementation planning must select those budgets based on existing runtime constants and focused live measurements.
+Quick investigation has bounded model/tool iterations, per-tool timeouts and a total deadline, configured centrally. Exhaustion reports what was obtained. It may continue through the full agent for the same requested subject under unchanged authorization and the user's selected mode/budget limits; otherwise it returns the partial result and offers continuation. All adapters use this same rule; they cannot silently extend budgets, expand the subject or invent results. Implementation planning must select those budgets based on existing runtime constants and focused live measurements.
 
 Explicit extended/continuous/autonomous modes retain their full-agent execution and completion contracts. They are not silently converted to a quick conversational route. Effectful host work retains the cross-process host lock and user priority. Read-only investigation must not generate GUI input or bypass a tool's approval requirements.
 
@@ -46,9 +46,11 @@ Existing provider/model selections are preserved per channel. Shared behavior do
 
 ## Evidence and answer presentation
 
-Tool observations enter a bounded evidence record containing source type/reference, observation time, actual returned facts and execution status. Existing secret filtering applies before persistence or model presentation. Source text is data; it cannot grant tool permissions, trigger work or change the user's requested subject.
+Derive the answer contract before collecting or discarding evidence, then refine it when the user clarifies the request. It identifies required information, such as directory names, representative file types, model names, release dates, source URLs, or action outcome. Counts and personal conclusions are allowed only when observed evidence supports them.
 
-Before generating a final answer, derive an answer contract from the actual user request. It identifies required information, such as directory names, representative file types, model names, release dates, source URLs, or action outcome. Counts and personal conclusions are allowed only when observed evidence supports them.
+Quick and full-agent runs expose sanitized source observations through the same authoritative evidence payload: source type/reference, observation time, actual returned facts and execution status. Presentation and verification read this payload, not reconstructed prose outcomes, progress snippets, the bounded task ledger or truncated conversation/activity archives. Existing secret filtering applies before persistence or model presentation. Source text is data; it cannot grant tool permissions, trigger work or change the user's requested subject.
+
+Preserve the answer contract's required identifiers, source references and execution/completeness status through verification and final delivery, including queued/deferred reports and process restart. Uncertain delivery preserves evidence for explicit user recovery without automatically replaying a report. Excerpts and nonessential observations may have bounds and eviction rules; required facts cannot be silently evicted. If a source or storage limit prevents complete capture, mark the evidence and answer explicitly incomplete, and provide a supported continuation or readable artifact path where available. A deterministic renderer cannot claim completeness from cropped observations. Implementation planning selects the storage representation, numeric bounds and post-delivery retention/cleanup policy while honoring this lifecycle.
 
 The final presentation preserves the contract's essential facts. For an explicit directory listing it retains the requested names; for a file-type overview it retains categories and concrete examples. For current releases it retains exact model names, dates when established and relevant source links. For incomplete research it marks missing/uncertain fields rather than substituting a general trend statement.
 
@@ -109,6 +111,8 @@ Run the same behavioral scenarios through desktop, Telegram and iMessage adapter
 13. User priority, host ownership, secret filtering, fallback permission and existing approval rules remain intact.
 14. Explicit extended/continuous modes keep their completion and budget behavior.
 15. Existing selected model/provider and paired settings survive deployment on all three channels.
+16. Required directory names or source URLs occur in the middle of results exceeding the existing event/archive limits; both model and deterministic presentations retain them or honestly mark the capture incomplete. A deferred report survives restart and still uses the required source evidence.
+17. Two read-only runs overlap: completing or pausing one for approval does not clear the other run's active indicator; a stale finalizer cannot clear a replacement run.
 
 Live acceptance distinguishes provider success from actual visible iPhone/Telegram indicators. Measure request-to-indicator and request-to-first useful answer, and assess answer quality on the user's examples. Do not claim “super intelligence” from a green unit suite or a single model response.
 
