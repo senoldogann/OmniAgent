@@ -234,7 +234,7 @@ async def _full_task(decision, evidence, options, clients, emit):
     forward = _private_emit(emit)
     def inner_emit(event):
         nonlocal terminal_metrics
-        if event["kind"] == "run_finished":
+        if event["kind"] == "run_finished" and isinstance(event.get("metrics"), dict):
             terminal_metrics = event["metrics"]
         forward(event)
     async def locked_task():
