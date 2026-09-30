@@ -40,6 +40,8 @@ from omniagent.core.log_format import StructuredFormatter
 from omniagent.ui import native_macos
 from omniagent.platform.macos.desktop_status import MenuBarTaskStatus, app_is_active, is_backgrounded, notify_finished, set_dock_badge
 from omniagent.platform.macos.host_lock import host_task_lock
+from omniagent.memory.channels import record_report, record_user_message, recording_answer
+from omniagent.memory.personal import utc_now_iso
 from omniagent.platform.macos.visibility import (
     GlobalVisibilityHotkey, VisibilityHotkeyError, application_is_hidden, set_application_hidden,
 )
@@ -2968,6 +2970,8 @@ class OmniUI(ctk.CTk):
             "answer": self._request_input,
             "run_mode": selected_mode,
         }
+        # Yazılı soru yanıtları kanıtlı hafızaya kaydedilir (kullanıcının kendi sözleri; onaylar kaydedilmez).
+        options["answer"] = recording_answer("desktop", self._request_input)
         if selected_mode == "continuous":
             options["pop_control_messages"] = self._drain_control_messages
         self._agent_future = asyncio.run_coroutine_threadsafe(
@@ -2990,6 +2994,8 @@ class OmniUI(ctk.CTk):
 
     async def _run_exclusive(self, goal: str, options: RunOptions) -> RunReport:
         """Telegram ile aynı makineyi eşzamanlı kullanma çakışmasını önler."""
+        # Kanıtlı hafıza: kullanıcının hedef metni. Bağlantı iş parçacığında açılıp kapanır; hata görevi durdurmaz.
+        await asyncio.to_thread(record_user_message, "desktop", goal, utc_now_iso())
         with host_task_lock():
             return await run_agent_with_callback(goal, self._post, options, self._clients)
 
@@ -3151,6 +3157,10 @@ class OmniUI(ctk.CTk):
                              "error": f"{type(error).__name__}: {error}", "report": None})
         else:
             self._inbox.put({"event": None, "done": True, "error": "", "report": report})
+            if report is not None:
+                # İş günlüğü (companion.db, channel=desktop): yazım Tk'yi ve olay döngüsünü bekletmesin diye ayrı iş
+                # parçacığında; kayıt hatası görevi etkilemez (record_report yükseltmez).
+                threading.Thread(target=record_report, args=("desktop", report), daemon=True).start()
 
     def _on_run_done(self, error: str, report: Optional[RunReport]) -> None:
         background = is_backgrounded(

@@ -46,7 +46,10 @@ from omniagent.platform.macos.launch_agent import (  # noqa: F401
 )
 from omniagent.platform.macos.permissions import accessibility_granted
 from omniagent.platform.macos.power import start_keep_awake, stop_keep_awake
-from omniagent.paths import project_root, resolve_output_path, schedules_file, telegram_settings_file
+from omniagent.paths import (
+    companion_db_file, imessage_settings_file, memory_learning_lock_file, project_root, resolve_output_path,
+    schedules_file, telegram_settings_file,
+)
 from omniagent.tools.screen import screen_capture_granted, screen_session
 from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, source_version, sync_dependencies
 from .runtime import DeliveryFailed, IntegrationStopped, boolean_field, data_root, read_json, save_json
@@ -54,6 +57,10 @@ from .telegram_activity import (
     ActivityEntry, activity_html, append_entry, elapsed_label, mark_failed, render_entries,
 )
 from .transcription import TranscriptionFailed, TranscriptionUnavailable, transcribe_audio
+from omniagent.integrations.imessage_settings import memory_backend_if_paired
+from omniagent.memory import channels, learning
+from omniagent.memory.personal import local_timezone
+from omniagent.memory.profile import MemoryCommand, parse_memory_command
 from omniagent.app.agent import RunOptions, RunReport, STATE_FILE, close_model_clients, create_model_clients, run_agent_with_callback
 from omniagent.app.constants import RUN_MODE_PROFILES
 from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
@@ -190,6 +197,38 @@ def load_token() -> str:
     register_secret("telegram_bot_token", token)
     return token
 
+
+# iMessage köprüsü servisi: /update ve /restart onu da yeniden başlatır (iki köprü aynı kod ve companion.db şemasıyla).
+IMESSAGE_SERVICE_LABEL: str = "com.omniagent.imessage"
+
+
+def restart_companion_service() -> Optional[str]:
+    """
+    Kuruluysa iMessage köprüsü servisini yeni kodla yeniden başlatır; sonucu kullanıcıya gidecek not olarak döner (kurulu
+    değilse None). Başarısızlık Telegram'ın yeniden başlamasını engellemez; not ve yapılandırılmış uyarı olarak görünür.
+    """
+    if not launch_agent.plist_path(IMESSAGE_SERVICE_LABEL).exists():
+        return None
+    result = launch_agent.launchctl(["kickstart", "-k", f"gui/{os.getuid()}/{IMESSAGE_SERVICE_LABEL}"])
+    if result.returncode == 0:
+        return "iMessage servisi de yeni kodla yeniden başlatıldı."
+    logging.warning("iMessage servisi yeniden başlatılamadı",
+                    extra={"returncode": result.returncode, "stderr": str(result.stderr)[:200]})
+    return (f"iMessage servisi yeniden başlatılamadı (launchctl {result.returncode}); elle: "
+            f"launchctl kickstart -k gui/$(id -u)/{IMESSAGE_SERVICE_LABEL}")
+
+
+def forwarded(message: Dict[str, Any]) -> bool:
+    """İletilen (forward) mesaj mı? İçerik başkasının sözüdür; kullanıcının kanıtı sayılmaz. Saf."""
+    return "forward_origin" in message or "forward_date" in message
+
+
+def learning_backend() -> Optional[str]:
+    """
+    Kanıtlı hafıza öğrenme modeli: iMessage kurulumundaki memory_backend. iMessage kurulu değilse None döner ve öğrenme
+    kapalıdır (açık durum, varsayılan model yok); kullanıcı sözleri yine de kaydedilir.
+    """
+    return memory_backend_if_paired(imessage_settings_file(), BACKENDS.keys())
 
 def authorized(message: Dict[str, Any], settings: TelegramSettings) -> bool:
     """Yalnız eşleştirilmiş kişinin özel sohbetindeki mesajları kabul eder."""
@@ -1172,7 +1211,7 @@ class TelegramBridge:
             "should_stop": self.stop_event.is_set,
             "state_file": STATE_FILE,
             "history": trim_history(self.history),
-            "answer": self.answer,
+            "answer": channels.recording_answer("telegram", self.answer),
             "deliver": self.deliver,
             "run_mode": self.run_mode,
             # Kullanıcı makinenin başında değil: kısa ağ kopmalarında görev düşmez, model çağrısı bekler.
@@ -1276,6 +1315,8 @@ class TelegramBridge:
                 await compact.finish(report)
             self.history = trim_history(self.history + [report["exchange"]])
             save_json(history_path(), self.history)
+            # İş günlüğü (companion.db, kanal etiketli): Deniz Telegram'dan yaptırılan işi bilir.
+            await asyncio.to_thread(channels.record_report, "telegram", report)
         except (HostBusyError, TelegramError) as error:
             try:
                 if verbose:
@@ -1457,16 +1498,21 @@ class TelegramBridge:
             self.run_tokens += event["usage"]["prompt_tokens"] + event["usage"]["completion_tokens"]
 
     def _status_text(self) -> str:
-        """Çalışan görevi (süre, son araç, model, token) ve sonraki görevin ayarlarını özetler."""
+        """
+        Çalışan görevi (süre, son araç, model, token), sonraki görevin ayarlarını ve varsa kanıtlı hafıza hatasını
+        özetler.
+        """
         upcoming: str = (
             f"Sonraki görev: {model_label(self.backend)} · {RUN_MODE_PROFILES[self.run_mode]['label']} modu"
         )
+        failure: Optional[str] = channels.record_failure_line(local_timezone())
+        memory_note: str = f"\n⚠️ {failure}" if failure is not None else ""
         if self.active is None:
-            return f"Hazır. {upcoming} · Geçmiş: {len(self.history)} konuşma"
+            return f"Hazır. {upcoming} · Geçmiş: {len(self.history)} konuşma{memory_note}"
         return (
             f"Çalışıyor: {self.goal[:400]}\n"
             f"Süre: {elapsed_label(time.monotonic() - self.run_started)} · Araç: {self.run_tool or '—'} · "
-            f"Model: {self.run_model or '—'} · Token: {compact_count(self.run_tokens)}\n{upcoming}"
+            f"Model: {self.run_model or '—'} · Token: {compact_count(self.run_tokens)}\n{upcoming}{memory_note}"
         )
 
     def _answer_by_button(self, data: str) -> str:
@@ -1652,6 +1698,9 @@ class TelegramBridge:
             notes = await self._update_notes() if text == "/update" else []
             if notes is None:
                 return
+            companion: Optional[str] = await asyncio.to_thread(restart_companion_service)
+            if companion is not None:
+                notes = notes + [companion]
             await self.api.send(chat_id, "\n".join(notes + ["Yeniden başlatılıyor…"]))
         finally:
             self.maintenance = False
@@ -1700,6 +1749,10 @@ class TelegramBridge:
         self.active_run_mode = self.run_mode
         self.control_messages = Queue()
         self.active = asyncio.create_task(self._execute(goal, [str(path)] if attachment["image"] else None))
+        # Kanıtlı hafıza: ekin açıklaması ya da sesli mesaj dökümü kullanıcının sözüdür; varsayılan ek isteği değildir.
+        spoken_or_written: str = caption or (goal if attachment["kind"] == "sesli mesaj" else "")
+        if spoken_or_written and not forwarded(message):
+            await channels.record_user_message_async("telegram", spoken_or_written)
 
     async def handle(self, update: Dict[str, Any]) -> None:
         query = update.get("callback_query")
@@ -1730,11 +1783,20 @@ class TelegramBridge:
                 await self.api.send(chat_id, "Bu komut çalışan Sürekli oturumda kullanılabilir.")
             else:
                 self.control_messages.put(text)
+                if text.startswith("/btw "):
+                    # Sürekli oturuma verilen yön kullanıcının kendi sözüdür (kanıtlı hafızaya).
+                    await channels.record_user_message_async("telegram", text[len("/btw "):])
                 await self.api.send(chat_id, "Yönlendirme oturuma eklendi." if text.startswith("/btw ")
                                     else "Onay isteği oturuma iletildi; kanıt bekliyorsa kapanacak.")
             return
         if text == "/schedules" or text.startswith("/unschedule"):
             await self._schedule_command(text)
+            return
+        memory_command: Optional[MemoryCommand] = parse_memory_command(text)
+        if memory_command is not None:
+            # Kullanıcının doğrudan hafıza komutu; depo iş parçacığında kısa ömürlü bağlantıyla açılır.
+            await self.api.send(chat_id, await asyncio.to_thread(
+                channels.run_memory_command, companion_db_file(), memory_command))
             return
         if text == "/status":
             await self.api.send(chat_id, self._status_text())
@@ -1764,6 +1826,7 @@ class TelegramBridge:
                 "Fotoğraf, belge, ses veya video da gönderebilirsiniz: açıklaması görev olur; "
                 "ajan istediğiniz dosyaları size buradan geri gönderebilir. "
                 "\"Her sabah 9'da …\" gibi görevler planlanır; /schedules listeler, /unschedule <kimlik> siler. "
+                "/hafıza kanıtlı hafızadaki bilgileri listeler, /unut <numara> bir bilgiyi unutturur. "
                 "/update kodu günceller ve köprüyü yeniden başlatır, /restart yalnız yeniden başlatır, "
                 "/doctor sürümü ve izinleri gösterir.",
             )
@@ -1803,6 +1866,10 @@ class TelegramBridge:
         self.active_run_mode = self.run_mode
         self.control_messages = Queue()
         self.active = asyncio.create_task(self._execute(text))
+        # Kanıtlı hafıza: kullanıcının kendi hedef metni. Görev başladıktan sonra yazılır; kayıt hatası görevi
+        # durdurmaz. `self.active` denetimi ile atama arasına await girmez (zamanlayıcı yarışı, bkz. scheduler_tick).
+        if not forwarded(message):
+            await channels.record_user_message_async("telegram", text)
 
     async def run(self, announce: bool = False) -> None:
         """Güncellemeleri yoklar. `announce`: /update veya /restart sonrası açılışı sohbete bildirir."""
@@ -1810,6 +1877,9 @@ class TelegramBridge:
         self.loaded_commit = await asyncio.to_thread(head_commit, project_root())
         self.keep_awake = start_keep_awake(os.getpid())
         scheduler = asyncio.create_task(self._scheduler_loop())
+        # Kanıtlı hafıza öğrenme hattı (iMessage köprüsüyle ortak kilit ve imleç); iMessage kurulu değilse kapalı.
+        learner = asyncio.create_task(
+            learning.learning_loop(learning_backend, companion_db_file(), memory_learning_lock_file()))
         try:
             try:
                 await self.api.set_commands(BOT_COMMANDS)
@@ -1854,6 +1924,8 @@ class TelegramBridge:
             self.keep_awake = None
             scheduler.cancel()
             await asyncio.gather(scheduler, return_exceptions=True)
+            learner.cancel()
+            await asyncio.gather(learner, return_exceptions=True)
             self.stop_event.set()
             if self.active is not None:
                 try:

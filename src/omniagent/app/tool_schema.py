@@ -96,6 +96,22 @@ GOAL_REPORT_SCHEMA: Dict[str, Any] = _function_schema(
 )
 
 
+# Kanallar arası kanıtlı kişisel hafıza (companion.db). Şema route_tool_schemas'ta değildir: ajan döngüsü dosya varken
+# her turun araç listesine ekler (app/agent.py). Adı TOOL_NAMES'tedir.
+PERSONAL_MEMORY_TOOL: str = "personal_memory"
+PERSONAL_MEMORY_SCHEMA: Dict[str, object] = _function_schema(
+    PERSONAL_MEMORY_TOOL,
+    "Kullanıcının kendi sözlerinden oluşan kanallar arası kanıtlı hafıza (iMessage, Telegram, masaüstü). recall: query "
+    "ile mesajlarda ve kanıtlı bilgilerde arar, en çok 8 birebir parça tarihiyle döner; yalnız 'kullanıcı' satırları ve "
+    "[#numara] bilgiler kanıttır. forget: fact_id'li bilgiyi unutur; yalnız kullanıcı isterse kullan.",
+    {
+        "action": {"type": "string", "enum": ["recall", "forget"]},
+        "query": {"type": ["string", "null"], "description": "recall: aranacak kelimeler; forget'ta null."},
+        "fact_id": {"type": ["integer", "null"], "description": "forget: KANITLI PROFİL'deki [#numara]; recall'da null."},
+    },
+)
+
+
 def camera_photo_goal(goal: str) -> bool:
     """Tek kare kamera çekimi hedeflerinde özel aracı açar; diğer görevleri sade tutar."""
     lowered: str = goal.casefold()
@@ -534,7 +550,7 @@ TOOL_NAMES: frozenset[str] = frozenset(
     for schema in route_tool_schemas(
         sample, True, active_chrome_session_goal(sample), can_send_files=True, can_schedule=True,
     )
-)
+) | frozenset({PERSONAL_MEMORY_TOOL})
 
 # Salt okunur araçlar aynı (ad + argüman) için önbelleklenebilir. Canlı durum (AX listesi)
 # önbelleklenmez; her başarılı yan etkili çağrıdan sonra önbellek tamamen temizlenir.
@@ -549,7 +565,7 @@ _SIDE_EFFECT_TOOLS: frozenset[str] = frozenset({
     "chrome_active_tab", "cua_click_point", "cua_type_text", "cua_press_key", "cua_submit_text",
     "cua_fill_field", "cua_click_text", "cua_scroll", "cua_read_scrollable",
     "cua_click_element", "cua_set_text_element",
-    "user_memory", "ask_user", "send_file", "schedule_task",
+    "user_memory", "ask_user", "send_file", "schedule_task", PERSONAL_MEMORY_TOOL,
 })
 
 # Ekranı değiştiren araçlar. Bunlardan sonra görüntü alınmadıysa tur sonunda ekran

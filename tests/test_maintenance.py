@@ -170,6 +170,8 @@ def message(text: str) -> Dict[str, Any]:
 
 def new_bridge(api: MaintenanceAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> telegram.TelegramBridge:
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    # Bu Mac'te iMessage servisi gerçekten kurulu olabilir: /restart ve /update testleri canlı servise dokunmasın.
+    monkeypatch.setattr(telegram.launch_agent, "plist_path", lambda label: tmp_path / "LaunchAgents" / f"{label}.plist")
     return telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})  # type: ignore[arg-type]
 
 
@@ -359,3 +361,26 @@ def test_main_replaces_the_process_with_the_announcing_bridge(monkeypatch: pytes
     telegram.main()
     assert announced == [False, True]
     assert telegram.build_launchd_record()["ProgramArguments"] == telegram.bridge_command()
+
+
+@pytest.mark.asyncio
+async def test_restart_also_restarts_the_installed_imessage_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """/restart (ve /update) kuruluysa iMessage servisini de yeni kodla başlatır: iki köprü aynı companion.db şemasıyla."""
+    api = MaintenanceAPI([])
+    bridge = new_bridge(api, tmp_path, monkeypatch)
+    plist = tmp_path / "LaunchAgents" / "com.omniagent.imessage.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("kurulu", encoding="utf-8")
+    calls: List[List[str]] = []
+
+    def fake_launchctl(arguments: List[str]) -> SimpleNamespace:
+        calls.append(arguments)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(telegram.launch_agent, "launchctl", fake_launchctl)
+    with pytest.raises(telegram.RestartRequested):
+        await bridge.handle(message("/restart"))
+    assert calls == [["kickstart", "-k", f"gui/{os.getuid()}/com.omniagent.imessage"]]
+    assert "iMessage servisi" in api.sent[-1]

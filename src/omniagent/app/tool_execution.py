@@ -152,6 +152,13 @@ def approval_request_for_call(
         if action in ("remember", "forget") and not memory_mutation_allowed:
             return approval.memory_request(arguments)
         return None
+    if name == "personal_memory":
+        # Kanıtlı hafızadan unutma da istenmemiş hafıza değişikliğidir: hedef istemediyse kullanıcıya sorulur.
+        if str(arguments.get("action", "")).strip().casefold() == "forget" and not memory_mutation_allowed:
+            return {"category": "memory",
+                    "title": f"Kanıtlı hafızadan #{arguments.get('fact_id')} numaralı bilgi unutulsun mu?",
+                    "summary": approval.call_summary("personal_memory", arguments)}
+        return None
     if dynamic is not None:
         if dynamic["readonly"]:
             return None

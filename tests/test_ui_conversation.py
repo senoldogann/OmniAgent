@@ -21,6 +21,7 @@ from omniagent.ui import app as ui
 from omniagent.app import agent as main
 from omniagent.config import DEFAULT_BACKEND, register_secret
 from omniagent.core.conversation import make_exchange
+from omniagent.memory.personal import opened_store
 from omniagent.core.events import AgentEvent, ArtifactReady, ProviderFallback, provider_fallback_text
 from omniagent.app.agent import ZERO_USAGE
 from omniagent.app.agent import artifact_event_for_call, merge_artifact
@@ -1371,3 +1372,45 @@ def test_failed_chat_creation_keeps_the_previous_failed_dot(
     assert app._chat_record["last_outcome"] == "failed"
     marker = app._chat_rows[chat_id]["marker"]
     assert (marker.cget("text"), marker.cget("text_color")) == ("●", ui.ERROR)
+
+
+def test_desktop_run_records_goal_typed_answer_and_report(app: ui.OmniUI, tmp_path: Path,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """Masaüstü yalnız kaydeder: hedef ve yazılı yanıt 'in' mesajı, rapor iş günlüğü (channel=desktop)."""
+    app._clients = {"ollama-cloud": object()}
+    monkeypatch.setattr(ui, "STATE_FILE", str(tmp_path / "cognitive_memory.json"))
+    turns = 0
+
+    async def fake_model(clients: Any, messages: Any, schemas: Any, session_id: str, backend: str, emit: Any,
+                         should_stop: Any) -> tuple[dict[str, Any], str]:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return {"content": "", "tool_calls": [{"id": "ask-1", "name": "ask_user", "arguments": json.dumps(
+                {"question": "Raporu hangi klasöre koyayım?", "kind": "text"})}],
+                "finish_reason": "tool_calls", "usage": main.ZERO_USAGE}, backend
+        emit({"kind": "text_delta", "text": "Tamam."})
+        return {"content": "Tamam.", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    app.entry.insert(0, "aylık raporu hazırla")
+    app._send_goal()
+    pump_until(app, lambda: bool(app._input_futures), 8)
+    request_id = next(iter(app._input_futures))
+    app._answer_input(request_id, {"yanit": "Belgeler/Raporlar klasörüne"})
+    deadline = time.monotonic() + 8
+    while app._agent_future is not None and time.monotonic() < deadline:
+        app.update()
+        time.sleep(0.01)
+    database = tmp_path / "companion.db"
+    tasks: list[Any] = []
+    deadline = time.monotonic() + 5
+    while not tasks and time.monotonic() < deadline:
+        with opened_store(database) as store:
+            tasks = store.recent_tasks(5)
+        time.sleep(0.05)
+    with opened_store(database) as store:
+        evidence = store.pending_evidence(0, 10)
+    assert [(item["channel"], item["text"]) for item in evidence] == [
+        ("desktop", "aylık raporu hazırla"), ("desktop", "Belgeler/Raporlar klasörüne")]
+    assert [(task["channel"], task["goal"]) for task in tasks] == [("desktop", "aylık raporu hazırla")]

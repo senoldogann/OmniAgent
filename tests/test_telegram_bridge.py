@@ -1,6 +1,7 @@
 """Telegram uzaktan erişim, akış ve tek görev kilidinin regresyon testleri."""
 import asyncio
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ from omniagent.app import agent as main
 from omniagent.app.model_retry import REMOTE_MODEL_RETRY_SECONDS
 from omniagent.core.conversation import make_exchange
 from omniagent.integrations.capabilities import CapabilityService
+from omniagent.memory import channels
+from omniagent.memory.personal import opened_store, utc_now_iso
 from omniagent.paths import workspace_dir
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
 from omniagent.tools import filesystem
@@ -1354,3 +1357,143 @@ async def test_partial_report_notice_and_run_finished_show_the_report_once(
     # Kullanıcının sohbette gördüğü son hâl: ara düzenlemeler değil, her iletinin son metni
     final_pages = [*api.html_sent, *(api.edited[-1:] or api.sent[-1:])]
     assert sum(page.count(marker) for page in final_pages) == 1, final_pages
+
+
+def memory_bridge(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[telegram.TelegramBridge, FakeAPI]:
+    """Kanıtlı hafıza kancaları için köprü: yalıtılmış veri kökü, sahte Bot API, gerçek ajan döngüsü."""
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(telegram, "STATE_FILE", str(tmp_path / "cognitive_memory.json"))
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {"ollama-cloud": object()})
+    monkeypatch.setattr(channels, "_record_health", {})
+    api = FakeAPI()
+    bridge = telegram.TelegramBridge(api, {"chat_id": 123, "user_id": 456})
+    bridge.integrations = CapabilityService(tmp_path)
+    return bridge, api
+
+
+def text_update(text: str) -> dict[str, Any]:
+    return {"message": {"chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": text}}
+
+
+def companion_rows(database: Path) -> list[tuple[str, str, str]]:
+    connection = sqlite3.connect(database)
+    try:
+        return [(str(channel), str(direction), str(text)) for channel, direction, text in
+                connection.execute("SELECT channel, direction, text FROM messages ORDER BY id")]
+    finally:
+        connection.close()
+
+
+def final_answer_model(text: str) -> Any:
+    async def model(clients: Any, messages: Any, schemas: Any, session_id: str, backend: str, emit: Any,
+                    should_stop: Any) -> tuple[dict[str, Any], str]:
+        emit({"kind": "text_delta", "text": text})
+        return {"content": text, "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+    return model
+
+
+@pytest.mark.asyncio
+async def test_goal_typed_answer_and_report_reach_personal_memory(monkeypatch: pytest.MonkeyPatch,
+                                                                  tmp_path: Path) -> None:
+    bridge, _api = memory_bridge(monkeypatch, tmp_path)
+    turns = 0
+
+    async def fake_model(clients: Any, messages: Any, schemas: Any, session_id: str, backend: str, emit: Any,
+                         should_stop: Any) -> tuple[dict[str, Any], str]:
+        nonlocal turns
+        turns += 1
+        if turns == 1:
+            return {"content": "", "tool_calls": [{"id": "ask-1", "name": "ask_user", "arguments": json.dumps(
+                {"question": "Raporu hangi klasöre koyayım?", "kind": "text"})}],
+                "finish_reason": "tool_calls", "usage": main.ZERO_USAGE}, backend
+        emit({"kind": "text_delta", "text": "Tamam."})
+        return {"content": "Tamam.", "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+
+    monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
+    try:
+        await bridge.handle(text_update("aylık raporu hazırla"))
+        active = bridge.active
+        assert active is not None
+        for _ in range(250):
+            if bridge.pending_answer is not None:
+                break
+            await asyncio.sleep(0.02)
+        await bridge.handle(text_update("Belgeler/Raporlar klasörüne, hep oraya koy"))
+        await active
+    finally:
+        await bridge.integrations.close()
+    assert companion_rows(tmp_path / "companion.db") == [
+        ("telegram", "in", "aylık raporu hazırla"), ("telegram", "in", "Belgeler/Raporlar klasörüne, hep oraya koy")]
+    with opened_store(tmp_path / "companion.db") as store:
+        assert [(task["channel"], task["goal"]) for task in store.recent_tasks(5)] == [
+            ("telegram", "aylık raporu hazırla")]
+
+
+@pytest.mark.asyncio
+async def test_memory_commands_and_a_broken_memory_never_stop_the_task(monkeypatch: pytest.MonkeyPatch,
+                                                                       tmp_path: Path) -> None:
+    bridge, api = memory_bridge(monkeypatch, tmp_path)
+    database = tmp_path / "companion.db"
+    try:
+        await bridge.handle(text_update("/hafıza"))
+        assert api.sent[-1] == "kanıtlı hafızada bilgi yok"
+        with opened_store(database) as store:
+            source = store.record_channel_message("telegram", "kızımın adı Ela", utc_now_iso())
+            inserted = store.commit_learning(0, source, [
+                {"statement": "Kullanıcının kızının adı Ela.", "quote": "kızımın adı Ela", "message_id": source,
+                 "category": "kisi", "supersedes": None, "follow_up_at": None}], utc_now_iso())
+        assert inserted is not None
+        await bridge.handle(text_update("/hafıza"))
+        assert "Kullanıcının kızının adı Ela." in api.sent[-1]
+        await bridge.handle(text_update(f"/unut {inserted[0]}"))
+        assert api.sent[-1] == f"#{inserted[0]} unutuldu"
+        for suffix in ("", "-wal", "-shm"):
+            Path(f"{database}{suffix}").unlink(missing_ok=True)
+        database.write_bytes(b"bu bir sqlite dosyasi degil" * 40)
+        monkeypatch.setattr(main, "_call_model_with_retries", final_answer_model("Not aldım."))
+        await bridge.handle(text_update("kızımın adı Ela"))
+        active = bridge.active
+        assert active is not None
+        await active
+    finally:
+        await bridge.integrations.close()
+    transcript = "\n".join(api.sent + api.edited + api.html_sent + api.html_edited)
+    assert "Görev hatası" not in transcript
+    assert "Kanıtlı hafıza kaydı başarısız" in bridge._status_text()
+
+
+@pytest.mark.asyncio
+async def test_btw_direction_is_recorded_as_the_users_own_words(monkeypatch: pytest.MonkeyPatch,
+                                                               tmp_path: Path) -> None:
+    bridge, api = memory_bridge(monkeypatch, tmp_path)
+    blocker = asyncio.Event()
+    running = asyncio.create_task(blocker.wait())
+    bridge.active = running
+    bridge.active_run_mode = "continuous"
+    try:
+        await bridge.handle(text_update("/btw önce faturaları kontrol et"))
+    finally:
+        blocker.set()
+        await running
+        await bridge.integrations.close()
+    assert bridge._drain_control_messages() == ["/btw önce faturaları kontrol et"]
+    assert api.sent[-1] == "Yönlendirme oturuma eklendi."
+    assert companion_rows(tmp_path / "companion.db") == [("telegram", "in", "önce faturaları kontrol et")]
+
+
+@pytest.mark.asyncio
+async def test_forwarded_words_are_not_recorded_as_the_users_own(monkeypatch: pytest.MonkeyPatch,
+                                                                 tmp_path: Path) -> None:
+    """İletilen (forward) mesaj görevi başlatır ama kullanıcının kendi sözü olarak kanıtlı hafızaya yazılmaz."""
+    bridge, _api = memory_bridge(monkeypatch, tmp_path)
+    monkeypatch.setattr(main, "_call_model_with_retries", final_answer_model("Tamam."))
+    update = {"message": {"chat": {"id": 123, "type": "private"}, "from": {"id": 456}, "text": "İzmir'e taşındım",
+                          "forward_origin": {"type": "user", "date": 1}}}
+    try:
+        await bridge.handle(update)
+        active = bridge.active
+        assert active is not None
+        await active
+    finally:
+        await bridge.integrations.close()
+    assert companion_rows(tmp_path / "companion.db") == []

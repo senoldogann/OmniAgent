@@ -28,6 +28,7 @@ yoluna geçebilir. Kullanıcının görüntüsü yeni bir canlı testte alınmad
 | Ekran metni ve kaydırma (her GUI yolunda) | `cua_click_text`, `cua_scroll`, `cua_read_scrollable` | Görünür metni OCR ile bulup tam ortasına tıklama; paneli kaydırıp içeriğin kayıp kaymadığını (liste/sayfa sonu) ölçme; paneli baştan sona kaydırarak tüm metni tek sonuçta okuma |
 | Entegrasyon | `discover_capabilities` | Yerel kataloğu ve gerektiğinde kısa çevrimiçi keşfi kullanıp görev için uygun API/MCP/skill yolunu bulma |
 | Kullanıcı hafızası | `user_memory` | Açıkça istenen tercih, sık yol ve kararı atomik JSON dosyasında saklama, arama ve silme |
+| Kanıtlı kişisel hafıza | `personal_memory` (companion.db varsa) | Kullanıcının iMessage/Telegram/masaüstü sözlerinde ve alıntıyla kanıtlanan bilgilerde birebir arama; kullanıcı isteyince bilgiyi unutma (onaylı) |
 | Telegram dosya teslimi | `send_file` (yalnız Telegram görevinde) | Bilgisayardaki dosyayı (en çok 50 MB) eşleştirilmiş sohbete belge olarak gönderme |
 | Zamanlanmış görevler | `schedule_task` (zamanlama niyetli hedefte, Telegram eşleştirilmişse) | Görevi bir kez, her gün, seçili günlerde veya aralıkla planlama; sonuç Telegram'a gelir |
 

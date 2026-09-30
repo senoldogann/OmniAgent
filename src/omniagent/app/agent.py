@@ -187,6 +187,8 @@ from omniagent import approval
 from omniagent.memory import experience
 from omniagent.core import state as sm
 from omniagent.memory import user as user_memory
+from omniagent.app.tool_schema import PERSONAL_MEMORY_SCHEMA
+from omniagent.memory.channels import companion_db_beside, load_agent_profile
 from omniagent.core.conversation import Exchange, make_exchange, to_messages
 from omniagent.core.task_ledger import (
     TaskLedger, empty_task_ledger, facts_changed, record_tool_receipt, record_tool_result,
@@ -1261,6 +1263,9 @@ async def run_agent_with_callback(
         state: sm.StateDict = sm.load_state(options["state_file"])
         experience_state: experience.ExperienceState = experience.load_experience(experience_file)
         memory_block: str = user_memory.memory_prompt_block(user_memory.load_memory(memory_file))
+        # Kanallar arası kanıtlı profil (companion.db) USER MEMORY'nin ardından gelir: kanıttır, talimat değildir.
+        personal_db: Path = companion_db_beside(memory_file)
+        memory_block += load_agent_profile(personal_db)
         # Hedefle yüksek örtüşen az sayıda geçmiş görev özeti bağlam olarak eklenir (bkz. core/state.relevant_episodes).
         episodic_hint: str = sm.episodic_hint_text(
             sm.relevant_episodes(state, goal, sm.EPISODIC_HINT_LIMIT, sm.EPISODIC_HINT_MIN_SCORE)
@@ -1548,6 +1553,9 @@ async def run_agent_with_callback(
             tool_schemas = route_tool_schemas(goal, allow_edit, chrome_session, can_send_files, can_schedule) + [
                 entry["schema"] for name, entry in runtime.published.items() if name != "discover_capabilities"
             ] + ([GOAL_REPORT_SCHEMA] if continuous else [])
+            if personal_db.is_file():
+                # Kanıtlı kişisel hafıza varsa ana ajan personal_memory ile arar ve (onayla) unutur.
+                tool_schemas = tool_schemas + [PERSONAL_MEMORY_SCHEMA]
             runtime.allowed_tools = frozenset(entry["function"]["name"] for entry in tool_schemas)
             messages = _trim_old_turns(messages)
             if continuous:

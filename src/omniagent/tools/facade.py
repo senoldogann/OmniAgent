@@ -37,6 +37,7 @@ import Quartz
 import types as _py_types
 
 from omniagent.memory import user as memory
+from omniagent.memory.channels import PersonalMemoryUnavailable, companion_db_beside, personal_memory_action
 from omniagent.platform.macos import screen_text as st
 from omniagent.config import redact
 from omniagent.core import schedule, state as sm
@@ -442,6 +443,31 @@ class Toolbox:
                 ensure_ascii=False,
             )
         )
+
+    def personal_memory(self, action: str, query: Optional[str], fact_id: Optional[int]) -> str:
+        """
+        Kanallar arası kanıtlı hafıza (kullanıcı hafızası dosyasının yanındaki companion.db).
+        - recall: kullanıcının iMessage/Telegram/masaüstü sözlerinde ve kanıtlı bilgilerde arar, en çok 8 birebir
+          parça döner.
+        - forget: bir bilgiyi unutur. user_memory gibi yalnız hedef istediyse ya da kullanıcı onayladıysa çalışır.
+        """
+        if not self._memory_file:
+            raise ToolError("Bu görev için kanıtlı kişisel hafıza etkin değil.", "MEMORY_UNAVAILABLE", False)
+        normalized_action: str = action.strip().casefold()
+        if normalized_action == "forget" and not (self._allow_memory_mutation or _call_approved()):
+            raise ToolError(
+                "Bu görev hafıza değiştirme yetkisiyle başlatılmadı ve kullanıcı onayı alınmadı.",
+                "MEMORY_MUTATION_NOT_ALLOWED", False,
+            )
+        try:
+            return redact(personal_memory_action(
+                companion_db_beside(self._memory_file), normalized_action, query, fact_id,
+            ))
+        except ValueError as error:
+            raise ToolError(f"Kanıtlı hafıza işlemi reddedildi: {error}", "MEMORY_INVALID", False) from error
+        except PersonalMemoryUnavailable as error:
+            raise ToolError(str(error), "MEMORY_UNAVAILABLE", False) from error
+
 
     async def ask_user(self, question: str, kind: str) -> str:
         """Görev sırasında UI/Telegram kanalından kullanıcı girdisi bekler."""
