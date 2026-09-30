@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple, TypedDict, cast
 
+from omniagent.core.text_norm import ascii_fold
+
 
 MAX_PREFERENCES: int = 50
 MAX_KEY_LENGTH: int = 80
@@ -35,6 +37,9 @@ _SENSITIVE_TERMS: Tuple[str, ...] = (
 _SECRET_VALUE_PATTERN = re.compile(
     r"(?i)(?:sk|pk|ghp|gho|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{16,}"
 )
+# Terimler ascii_fold biçiminde karşılaştırılır: "ŞİFREM", "GİZLİ" ve Türkçe harfsiz "sifrem" de yakalanır
+# (casefold "İ"yi birleşik noktalı i yapıp eşleşmeyi kaçırıyordu). Kural aynı, yalnız karşılaştırma biçimi.
+_FOLDED_SENSITIVE_TERMS: Tuple[str, ...] = tuple(ascii_fold(term) for term in _SENSITIVE_TERMS)
 
 
 class PreferenceRecord(TypedDict):
@@ -77,10 +82,19 @@ def _text(value: object, field: str, limit: int) -> str:
     return normalized
 
 
+def sensitive_text(value: str) -> bool:
+    """
+    Metin parola/token/API anahtarı gibi gizli bilgi terimi ya da gizli değer kalıbı içeriyor mu? Kalıcı kullanıcı
+    hafızası (user_memory), kanıtlı hafıza (companion.db kanal kayıtları, arama) ve öğrenme hattı bu tek kuraldan
+    geçer; kopya kural yazılmaz. Saf.
+    """
+    folded: str = ascii_fold(value)
+    return any(term in folded for term in _FOLDED_SENSITIVE_TERMS) or _SECRET_VALUE_PATTERN.search(value) is not None
+
+
 def _safe_memory_text(key: str, value: str) -> None:
     """Kimlik bilgisi benzeri değerlerin kalıcılaştırılmasını engeller."""
-    combined: str = f"{key} {value}".casefold()
-    if any(term in combined for term in _SENSITIVE_TERMS) or _SECRET_VALUE_PATTERN.search(value):
+    if sensitive_text(f"{key} {value}"):
         raise ValueError("Parola, token, API anahtarı veya kimlik bilgisi kalıcı hafızaya yazılamaz.")
 
 

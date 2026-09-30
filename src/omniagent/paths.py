@@ -8,6 +8,8 @@ from typing import Dict
 
 
 APP_NAME = "OmniAgent"
+# Kanıtlı kişisel hafızanın dosya adı; ana ajan görevin state_file'ının yanındakini okur (memory/channels.py).
+COMPANION_DB_NAME: str = "companion.db"
 
 
 def data_root() -> Path:
@@ -64,8 +66,13 @@ def imessage_pairing_file() -> Path:
 
 
 def companion_db_file() -> Path:
-    """iMessage yol arkadaşının SQLite deposu: mesaj arşivi, etkinlik günlüğü, durum."""
-    return data_root() / "companion.db"
+    """Tüm kanalların kanıtlı kişisel hafızası (SQLite): iMessage arşivi, kanal sözleri, iş günlüğü, bilgiler, durum."""
+    return data_root() / COMPANION_DB_NAME
+
+
+def memory_learning_lock_file() -> Path:
+    """Kanıtlı hafıza öğrenme hattının süreçler arası kilidi (iMessage ve Telegram köprüleri; bloklamadan alınır)."""
+    return data_root() / "memory-learning.lock"
 
 
 def persona_file() -> Path:
