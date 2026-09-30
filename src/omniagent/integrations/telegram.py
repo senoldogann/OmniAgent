@@ -74,6 +74,7 @@ TOKEN_ACCOUNT = "bot_token"
 PAGE_LIMIT = 3500
 EDIT_INTERVAL = 1.1
 POLL_SECONDS = 20
+MAINTENANCE_FINISH_TIMEOUT_SECONDS = 5
 # Zamanlanmış görevlerin denetim aralığı (dakika çözünürlüğü için yeterli)
 SCHEDULER_TICK_SECONDS = 30
 # Bot API getFile yalnız 20 MB'a kadar dosya indirir
@@ -1957,6 +1958,13 @@ class TelegramBridge:
                     if consumer.done():
                         raise  # Normal işleyici hatası yoklama hatası gibi sonsuz yeniden denenmez.
                     if error.status is not None and error.status < 500 and error.status != 429:
+                        # Kabul edilmiş /restart, eşzamanlı yoklama hatasından önce kapanışı
+                        # tamamlayabilsin. Takılmış bakım ağ hatasını süresiz gizlemez.
+                        if self.maintenance:
+                            done, _ = await asyncio.wait(
+                                {consumer}, timeout=MAINTENANCE_FINISH_TIMEOUT_SECONDS)
+                            if consumer in done:
+                                consumer.result()
                         raise
                     failures += 1
                     await asyncio.sleep(min(8, 2 ** min(failures - 1, 3)))
@@ -1982,8 +1990,9 @@ class TelegramBridge:
                     # Stop bayrağı ağdaki bildirimi beklemeden, sonraki güncellemeden önce uygulanır.
                     await asyncio.sleep(0)
         finally:
-            if polling is not None and not polling.done():
-                polling.cancel()
+            if polling is not None:
+                if not polling.done():
+                    polling.cancel()
                 await asyncio.gather(polling, return_exceptions=True)
             consumer.cancel()
             await asyncio.gather(consumer, return_exceptions=True)

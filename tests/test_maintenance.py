@@ -317,8 +317,9 @@ async def test_doctor_reports_version_permissions_and_capabilities_even_during_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("poll_fails_during_restart", [False, True])
 async def test_run_announces_restart_and_cleans_up_before_restarting(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, poll_fails_during_restart: bool,
 ) -> None:
     monkeypatch.setattr(telegram, "create_model_clients", lambda: {})
     monkeypatch.setattr(telegram, "head_commit", lambda root: "a" * 40)
@@ -328,7 +329,24 @@ async def test_run_announces_restart_and_cleans_up_before_restarting(
     stopped: List[Any] = []
     monkeypatch.setattr(telegram, "start_keep_awake", lambda pid: started.append(pid) or awake)
     monkeypatch.setattr(telegram, "stop_keep_awake", lambda process: stopped.append(process))
-    api = MaintenanceAPI([{"update_id": 41, **message("/restart")}])
+    restart_started = asyncio.Event()
+    release_restart = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def restart_companion() -> None:
+        loop.call_soon_threadsafe(restart_started.set)
+        assert release_restart.wait(2)
+
+    class RestartAPI(MaintenanceAPI):
+        async def call(self, method: str, payload: Dict[str, Any]) -> Any:
+            if not self.updates and poll_fails_during_restart:
+                await restart_started.wait()
+                release_restart.set()
+            return await super().call(method, payload)
+
+    if poll_fails_during_restart:
+        monkeypatch.setattr(telegram, "restart_companion_service", restart_companion)
+    api = RestartAPI([{"update_id": 41, **message("/restart")}])
     bridge = new_bridge(api, tmp_path, monkeypatch)
     with pytest.raises(telegram.RestartRequested):
         await bridge.run(announce=True)
@@ -340,6 +358,40 @@ async def test_run_announces_restart_and_cleans_up_before_restarting(
     assert started == [os.getpid()] and stopped == [awake] and bridge.keep_awake is None
     # Yeni süreç /restart komutunu yeniden işlemez
     assert telegram.read_json(telegram.offset_path(), {}) == {"offset": 42}
+
+
+@pytest.mark.asyncio
+async def test_fatal_poll_failure_does_not_wait_forever_for_stalled_maintenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(telegram, "create_model_clients", lambda: {})
+    monkeypatch.setattr(telegram, "head_commit", lambda root: None)
+    monkeypatch.setattr(telegram, "start_keep_awake", lambda pid: None)
+    monkeypatch.setattr(telegram, "stop_keep_awake", lambda process: None)
+    monkeypatch.setattr(telegram, "MAINTENANCE_FINISH_TIMEOUT_SECONDS", 0.01)
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class StalledAPI(MaintenanceAPI):
+        async def call(self, method: str, payload: Dict[str, Any]) -> Any:
+            if not self.updates:
+                await started.wait()
+            return await super().call(method, payload)
+
+    api = StalledAPI([{"update_id": 1, **message("/restart")}])
+    bridge = new_bridge(api, tmp_path, monkeypatch)
+
+    async def stalled_handler(update: Dict[str, Any]) -> None:
+        bridge.maintenance = True
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(bridge, "handle", stalled_handler)
+    with pytest.raises(telegram.TelegramError, match="HTTP 401"):
+        await asyncio.wait_for(bridge.run(), timeout=1)
+    assert cancelled.is_set() and api.closed
 
 
 def test_main_replaces_the_process_with_the_announcing_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
