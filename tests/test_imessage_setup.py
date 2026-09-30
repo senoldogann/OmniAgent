@@ -136,3 +136,45 @@ def test_messages_database_status(tmp_path: Path) -> None:
         assert "İZİN YOK" in messages_database_status(database)
     finally:
         database.chmod(0o600)
+
+
+def test_pairing_preserves_transcription_selection():
+    selected = {**draft(), "transcribe_backend": "openai", "transcribe_model": "whisper-1"}
+    paired = imessage_setup.paired_settings(selected, USER)
+    assert paired["transcribe_backend"] == "openai" and paired["transcribe_model"] == "whisper-1"
+
+
+def test_transcription_selector_uses_keyed_profiles_and_explicit_model(monkeypatch):
+    monkeypatch.setattr(imessage_setup, "refresh_api_keys", lambda: ("ollama-cloud", "openai", "opencode"))
+    selections = []
+    def choose(prompt, allowed):
+        selections.append(allowed)
+        return "openai"
+    monkeypatch.setattr(imessage_setup, "ask_choice", choose)
+    monkeypatch.setattr(imessage_setup, "ask_text", lambda prompt: "whisper-1")
+    assert imessage_setup.ask_transcription() == ("openai", "whisper-1")
+    assert set(selections[0]) == {"kapalı", "openai", "opencode"}
+
+
+def test_transcription_selector_no_keys_is_disabled(monkeypatch):
+    monkeypatch.setattr(imessage_setup, "refresh_api_keys", lambda: ("ollama-cloud",))
+    assert imessage_setup.ask_transcription() == (None, None)
+
+
+def test_transcription_cli_keeps_pairing_and_restarts_service(tmp_path, monkeypatch):
+    monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
+    before = imessage_setup.paired_settings(draft(), USER)
+    save_settings(tmp_path / "imessage.json", before)
+    monkeypatch.setattr(imessage_setup, "ask_transcription", lambda: ("openai", "whisper-1"))
+    restarted = []
+    monkeypatch.setattr(imessage_setup, "install_service", lambda: restarted.append(True))
+    imessage_setup.transcription()
+    loaded = load_settings(tmp_path / "imessage.json", ("openai", "opencode"))
+    assert loaded["handle"] == USER and loaded["chat_backend"] == before["chat_backend"]
+    assert loaded["transcribe_backend"] == "openai" and loaded["transcribe_model"] == "whisper-1"
+    assert (tmp_path / "imessage.json").stat().st_mode & 0o777 == 0o600
+    assert restarted == [True]
+    monkeypatch.setattr(imessage_setup, "ask_transcription", lambda: (None, None))
+    imessage_setup.transcription()
+    assert load_settings(tmp_path / "imessage.json", ("openai", "opencode"))["transcribe_backend"] is None
+    assert restarted == [True, True]

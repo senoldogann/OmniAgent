@@ -85,3 +85,26 @@ def test_memory_backend_is_known_only_when_imessage_is_paired(tmp_path: Path) ->
     assert memory_backend_if_paired(path, BACKENDS) is None
     save_settings(path, parse_settings(valid_settings(), BACKENDS))
     assert memory_backend_if_paired(path, BACKENDS) == "opencode"
+
+
+def test_legacy_transcription_is_explicitly_disabled():
+    settings = parse_settings(valid_settings(), BACKENDS)
+    assert settings["transcribe_backend"] is None and settings["transcribe_model"] is None
+    raw = {**valid_settings(), "transcribe_backend": None, "transcribe_model": None}
+    assert parse_settings(raw, BACKENDS) == settings
+
+
+@pytest.mark.parametrize("backend,model", [("unknown", "whisper-1"), ("", "whisper-1"), (42, "whisper-1"),
+                                          ("openai", None), ("openai", ""), ("openai", 42), (None, "whisper-1")])
+def test_transcription_requires_explicit_valid_profile_and_model(backend, model):
+    raw = {**valid_settings(), "transcribe_backend": backend, "transcribe_model": model}
+    with pytest.raises(ImessageConfigError, match="transcribe"):
+        parse_settings(raw, BACKENDS)
+
+
+def test_transcription_roundtrip_preserves_explicit_model(tmp_path):
+    raw = {**valid_settings(), "transcribe_backend": "openai", "transcribe_model": " whisper-1 "}
+    settings = parse_settings(raw, BACKENDS)
+    save_settings(tmp_path / "imessage.json", settings)
+    loaded = load_settings(tmp_path / "imessage.json", BACKENDS)
+    assert loaded["transcribe_backend"] == "openai" and loaded["transcribe_model"] == "whisper-1"

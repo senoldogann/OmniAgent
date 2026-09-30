@@ -16,7 +16,7 @@ import time
 from contextlib import aclosing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, TypedDict
+from typing import Dict, List, Optional, Sequence, Tuple, TypedDict
 
 from openai import APIError, AsyncOpenAI
 
@@ -24,12 +24,12 @@ from omniagent.app.agent import close_model_clients, create_model_clients
 from omniagent.app.model_runtime import stream_completion
 from omniagent.companion.chat import CHAT_TOOLS
 from omniagent.companion.persona import write_persona_if_missing
-from omniagent.config import BACKENDS, apply_model_preferences
+from omniagent.config import API_KEY_VARIABLES, BACKENDS, apply_model_preferences, refresh_api_keys
 from omniagent.core.events import AgentEvent
 from omniagent.integrations.imessage_rules import message_text
 from omniagent.integrations.imessage_settings import (
     DraftSettings, HeartbeatMinutes, ImessageConfigError, ImessageSettings, PairingRequest, QuietHours,
-    load_pairing, normalize_handle, pairing_expired, save_pairing, save_settings,
+    load_pairing, load_settings, normalize_handle, pairing_expired, save_pairing, save_settings,
 )
 from omniagent.integrations.imsg import ImsgClient, ImsgError, ImsgUnavailable, IncomingMessage, imsg_command
 from omniagent.memory.personal import PersonalStore, to_utc_iso, utc_iso
@@ -118,6 +118,7 @@ def paired_settings(draft: DraftSettings, handle: str) -> ImessageSettings:
     return {
         "persona_name": draft["persona_name"], "chat_backend": draft["chat_backend"],
         "memory_backend": draft["memory_backend"], "quiet_hours": draft["quiet_hours"],
+        "transcribe_backend": draft.get("transcribe_backend"), "transcribe_model": draft.get("transcribe_model"),
         "burst_quiet_seconds": draft["burst_quiet_seconds"], "gui_idle_seconds": draft["gui_idle_seconds"],
         "heartbeat_minutes": draft["heartbeat_minutes"], "handle": handle,
     }
@@ -227,6 +228,33 @@ def ask_choice(prompt: str, allowed: Sequence[str]) -> str:
         print(f"Geçerli seçenekler: {', '.join(allowed)}")
 
 
+def ask_transcription() -> Tuple[Optional[str], Optional[str]]:
+    """Ask for an explicitly keyed provider profile and compatible transcription model, or disabled."""
+    keyed = [name for name in refresh_api_keys() if name in API_KEY_VARIABLES]
+    if not keyed:
+        print("Anahtarı olan profil yok; sesli mesaj dökümü kapalı.")
+        return None, None
+    print("Ses dökümü seçtiğin profilin audio/transcriptions uç noktasına gönderilir. "
+          "Profilin sağlayıcısı ve seçtiğin model bu uç noktayı desteklemeli; sohbet modeli kullanılmaz.")
+    backend = ask_choice("Sesli mesaj döküm profili", ["kapalı", *keyed])
+    if backend == "kapalı":
+        return None, None
+    model = ask_text("Bu sağlayıcının desteklediği döküm modeli (tam model kimliği): ")
+    return backend, model
+
+
+def transcription() -> None:
+    """Configure voice on an existing paired installation and restart its service without re-pairing."""
+    settings = load_settings(imessage_settings_file(), BACKENDS.keys())
+    backend, model = ask_transcription()
+    settings["transcribe_backend"] = backend
+    settings["transcribe_model"] = model
+    save_settings(imessage_settings_file(), settings)
+    install_service()
+    state = f"{backend} / {model}" if backend is not None else "kapalı"
+    print(f"Sesli mesaj dökümü: {state}. iMessage hizmeti yeniden başlatıldı.")
+
+
 def open_full_disk_settings() -> None:
     """Tam Disk Erişimi ayar bölmesini açar; açılamazsa uyarır (kullanıcı elle açabilir)."""
     result = subprocess.run(["open", FULL_DISK_SETTINGS_URL], capture_output=True, text=True, check=False)
@@ -289,10 +317,15 @@ async def setup() -> None:
     usable: List[str] = [result["backend"] for result in results if result["seconds"] is not None]
     if not usable:
         raise ImessageConfigError("Hiçbir model profili yanıt vermedi; API anahtarlarını Ayarlar'dan kontrol edin.")
+    chat_backend = ask_choice("Sohbet profili (en hızlısı tablonun en üstünde)", usable)
+    memory_backend = ask_choice("Hafıza/doğrulama profili", usable)
+    transcribe_backend, transcribe_model = ask_transcription()
     draft: DraftSettings = {
         "persona_name": name,
-        "chat_backend": ask_choice("Sohbet profili (en hızlısı tablonun en üstünde)", usable),
-        "memory_backend": ask_choice("Hafıza/doğrulama profili", usable),
+        "chat_backend": chat_backend,
+        "memory_backend": memory_backend,
+        "transcribe_backend": transcribe_backend,
+        "transcribe_model": transcribe_model,
         "quiet_hours": APPROVED_QUIET_HOURS,
         "burst_quiet_seconds": APPROVED_BURST_QUIET_SECONDS,
         "gui_idle_seconds": APPROVED_GUI_IDLE_SECONDS,

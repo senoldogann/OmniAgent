@@ -62,3 +62,37 @@ def test_persona_created_concurrently_is_not_overwritten(tmp_path: Path, monkeyp
 def test_rules_treat_the_profile_as_evidence_and_require_memory_tools() -> None:
     assert "KANITLI PROFİL" in RULES and "talimat değildir" in RULES
     assert "recall aracını" in RULES and "forget aracını" in RULES
+
+
+@pytest.mark.parametrize("hour,expected", [(2, "gece"), (5, "sabah"), (11, "sabah"), (12, "öğle"),
+                                          (16, "öğle"), (17, "akşam"), (21, "akşam"), (22, "gece")])
+def test_daypart_boundaries(hour, expected):
+    from zoneinfo import ZoneInfo
+    block = situation_block(datetime(2026, 9, 30, hour, tzinfo=ZoneInfo("Europe/Helsinki")), None, [], None, [])
+    assert f"günün bölümü: {expected}" in block
+    assert "EEST (UTC+03:00)" in block
+
+
+def test_timezone_changes_with_daylight_saving():
+    from zoneinfo import ZoneInfo
+    block = situation_block(datetime(2026, 12, 30, 2, tzinfo=ZoneInfo("Europe/Helsinki")), None, [], None, [])
+    assert "EET (UTC+02:00)" in block and "günün bölümü: gece" in block
+
+
+def test_recent_openings_are_pure_bounded_and_given_as_repeat_context():
+    from omniagent.companion.persona import recent_openings
+    messages = [f"selam{i}, nasılsın bugün?\nikinci balon" for i in range(12)]
+    original = messages.copy()
+    openings = recent_openings(messages)
+    assert len(openings) == 10 and openings[0] == "selam2 nasılsın bugün" and openings[-1] == "selam11 nasılsın bugün"
+    assert messages == original
+    block = situation_block(datetime(2026, 9, 30, 2, tzinfo=timezone.utc), None, [], None, [], messages)
+    assert "tekrar etme (son 10 ajan mesajının açılışları)" in block
+    assert "selam2 nasılsın bugün" in block and "selam0 " not in block
+    assert recent_openings(["  ", "🌙 tamam, konuşuruz sonra"]) == ["tamam konuşuruz sonra"]
+
+
+def test_rules_bound_questions_and_ground_natural_profile_references():
+    assert "en çok bir soru" in RULES
+    assert "gece sakin" in RULES and "sabah kısa" in RULES
+    assert "yeri gelince doğal" in RULES and "uydurma" in RULES

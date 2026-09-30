@@ -1,7 +1,8 @@
 """iMessage kanalı ayarlarının doğrulanmış sözleşmesi ve kurulumun servise bıraktığı eşleştirme isteği.
 
-Tüm alanlar zorunludur, kodda varsayılan yoktur: kurulum kullanıcının onayladığı değerleri yazar, doğrulama
+Temel alanlar zorunludur, kodda varsayılan yoktur: kurulum kullanıcının onayladığı değerleri yazar, doğrulama
 eksik veya geçersiz alanda açık hata verir (docs/superpowers/specs/2026-09-29-imessage-companion-design.md).
+Döküm alanlarının bulunmadığı eski eşleşmelerde döküm açıkça kapalıdır (None); model varsayılmaz.
 """
 from __future__ import annotations
 
@@ -41,6 +42,8 @@ class DraftSettings(TypedDict):
     persona_name: str
     chat_backend: str
     memory_backend: str
+    transcribe_backend: Optional[str]
+    transcribe_model: Optional[str]
     quiet_hours: QuietHours
     burst_quiet_seconds: float
     gui_idle_seconds: int
@@ -130,10 +133,19 @@ def _heartbeat(raw: object) -> HeartbeatMinutes:
 def parse_draft(raw: object, backends: Collection[str]) -> DraftSettings:
     """Eşleştirme öncesi alanları doğrular ve normalize eder; geçersizde ImessageConfigError. Saf."""
     settings: Dict[str, object] = _mapping(raw, "imessage")
+    transcribe_backend: Optional[str] = None
+    transcribe_model: Optional[str] = None
+    if settings.get("transcribe_backend") is not None:
+        transcribe_backend = _backend(settings, "transcribe_backend", backends)
+        transcribe_model = _text(settings, "transcribe_model")
+    elif settings.get("transcribe_model") is not None:
+        raise ImessageConfigError("iMessage ayarı 'transcribe_model' için 'transcribe_backend' de seçilmeli.")
     return {
         "persona_name": _text(settings, "persona_name"),
         "chat_backend": _backend(settings, "chat_backend", backends),
         "memory_backend": _backend(settings, "memory_backend", backends),
+        "transcribe_backend": transcribe_backend,
+        "transcribe_model": transcribe_model,
         "quiet_hours": _quiet_hours(settings.get("quiet_hours")),
         "burst_quiet_seconds": _seconds(settings, "burst_quiet_seconds", 0.5, 10.0),
         "gui_idle_seconds": _integer(settings, "gui_idle_seconds", 30, 3600),
@@ -149,6 +161,8 @@ def parse_settings(raw: object, backends: Collection[str]) -> ImessageSettings:
         "persona_name": draft["persona_name"],
         "chat_backend": draft["chat_backend"],
         "memory_backend": draft["memory_backend"],
+        "transcribe_backend": draft["transcribe_backend"],
+        "transcribe_model": draft["transcribe_model"],
         "quiet_hours": draft["quiet_hours"],
         "burst_quiet_seconds": draft["burst_quiet_seconds"],
         "gui_idle_seconds": draft["gui_idle_seconds"],
