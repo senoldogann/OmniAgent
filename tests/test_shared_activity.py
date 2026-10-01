@@ -185,3 +185,96 @@ def test_strict_snapshot_schema_private_bounds_restart_and_selected_state(tmp_pa
     os.chmod(path, 0o600)
     assert store.load()[0]['stage'] == 'interrupted'
     os.chmod(store.directory, 0o755); assert store.load() == []
+
+
+def test_snapshot_admission_serializes_two_independent_stores_at_capacity(tmp_path, monkeypatch):
+    import concurrent.futures
+    import threading
+    from omniagent.core import activity
+    state = str(tmp_path / 'concurrent.json')
+    seed = ActivityStore(state)
+    for _ in range(activity.MAX_SNAPSHOTS - 1):
+        seed.start('desktop', 'still live')
+    first_at_publication, release_first = threading.Event(), threading.Event()
+    real_mkstemp = activity.tempfile.mkstemp
+    def held_publication(*args, **kwargs):
+        if threading.current_thread().name.startswith('first'):
+            first_at_publication.set()
+            assert release_first.wait(2)
+        return real_mkstemp(*args, **kwargs)
+    monkeypatch.setattr(activity.tempfile, 'mkstemp', held_publication)
+    def admit():
+        try:
+            ActivityStore(state).start('telegram', 'new live')
+            return 'admitted'
+        except (OSError, ValueError):
+            return 'unavailable'
+    with concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix='first') as a:
+        with concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix='second') as b:
+            first = a.submit(admit)
+            assert first_at_publication.wait(2)
+            second = b.submit(admit)
+            second.result(timeout=2)
+            release_first.set()
+            first.result(timeout=2)
+    assert len(list(seed.directory.glob('*.json'))) <= activity.MAX_SNAPSHOTS
+    assert len(seed.load()) == activity.MAX_SNAPSHOTS
+    # A terminal owner makes room again without evicting any live owner.
+    terminal = seed.load()[0]; terminal['stage'] = 'terminal'; seed.save(terminal)
+    seed.start('imessage', 'after capacity')
+    assert len(seed.load()) == activity.MAX_SNAPSHOTS
+
+
+def _process_snapshot_admit(state, ready, release, results):
+    ready.put(True)
+    release.wait(5)
+    try:
+        ActivityStore(state).start('telegram', 'process observation')
+        results.put('admitted')
+    except (OSError, ValueError):
+        results.put('unavailable')
+
+
+def test_snapshot_capacity_serializes_actual_process_writers(tmp_path):
+    import multiprocessing
+    from omniagent.core import activity
+    state = str(tmp_path / 'processes.json')
+    store = ActivityStore(state)
+    for _ in range(activity.MAX_SNAPSHOTS - 1):
+        store.start('desktop', 'live parent observation')
+    context = multiprocessing.get_context('spawn')
+    ready, results, release = context.Queue(), context.Queue(), context.Event()
+    writers = [context.Process(target=_process_snapshot_admit, args=(state, ready, release, results)) for _ in range(2)]
+    try:
+        for writer in writers:
+            writer.start()
+        ready.get(timeout=5); ready.get(timeout=5)
+        release.set()
+        outcomes = [results.get(timeout=5), results.get(timeout=5)]
+        for writer in writers:
+            writer.join(5)
+            assert writer.exitcode == 0
+        assert sorted(outcomes) == ['admitted', 'unavailable']
+        assert len(store.load()) == activity.MAX_SNAPSHOTS
+    finally:
+        for writer in writers:
+            if writer.is_alive():
+                writer.terminate()
+                writer.join(5)
+        ready.close(); results.close()
+
+
+def test_snapshot_overflow_is_unavailable_and_recovers_only_from_terminal_rows(tmp_path, monkeypatch):
+    from omniagent.core import activity
+    store = ActivityStore(str(tmp_path / 'recovery.json'))
+    monkeypatch.setattr(activity, 'MAX_SNAPSHOTS', 3)
+    rows = [store.start('desktop', f'owner {index}') for index in range(3)]
+    monkeypatch.setattr(activity, 'MAX_SNAPSHOTS', 2)
+    assert store.load() == []
+    assert 'kullanılamıyor' in store.status()
+    with pytest.raises(ValueError):
+        store.start('imessage', 'no free capacity')
+    for row in rows[:2]:
+        row['stage'] = 'terminal'; store.save(row)
+    new = store.start('imessage', 'new observation')
+    assert {row['run_id'] for row in store.load()} == {rows[2]['run_id'], new['run_id']}

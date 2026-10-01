@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Protocol, Set, Tuple, TypedDict, Union
 
 from openai import AsyncOpenAI
 
-from omniagent.core.activity import ActivityController, ActivityStore, LABELS, RenewalIndicator, run_owned, status_question
+from omniagent.core.activity import ActivityController, ActivityStore, LABELS, RenewalIndicator, join_owned_cleanup, run_owned, status_question
 from omniagent.app.agent import STATE_FILE, close_model_clients, create_model_clients
 from omniagent.app.conversation import ConversationDecision, decide_conversation
 from omniagent.app.model_retry import ModelCallFailed
@@ -184,8 +184,9 @@ class ImessageBridge:
         self.task_history: Optional[List[Exchange]] = None
         self.task_activity = None
         self.chat_activity = None
-        self.task_start_ready = asyncio.Event()
-        self.task_start_ready.set()
+        self.task_reply_id = None
+        self.chat_runs = set()
+        self._close_task = None
         self.typing_generation = None
         self.typing_supported = False
         self.activity_indicator = RenewalIndicator(self._send_typing)
@@ -280,6 +281,8 @@ class ImessageBridge:
 
     async def on_message(self, message: IncomingMessage) -> None:
         """Canlı izlemedeki satır: komut anında işlenir, bekleyen soruya cevap olur ya da burst'e eklenir."""
+        if self.closing:
+            return
         ingested = self._ingest(message)
         if ingested is None:
             return
@@ -619,7 +622,12 @@ class ImessageBridge:
 
     async def _chat_turn(self, ids: List[int], texts: List[str], images: List[str],
                          burst_end: Optional[float]) -> None:
-        await run_owned(self._chat_turn_owned(ids, texts, images, burst_end))
+        owner = asyncio.current_task()
+        self.chat_runs.add(owner)
+        try:
+            await run_owned(self._chat_turn_owned(ids, texts, images, burst_end))
+        finally:
+            self.chat_runs.discard(owner)
 
     async def _chat_turn_owned(self, ids: List[int], texts: List[str], images: List[str],
                                burst_end: Optional[float]) -> None:
@@ -939,6 +947,8 @@ class ImessageBridge:
         history: Optional[List[Exchange]] = None, reply_id: Optional[int] = None,
     ) -> bool:
         """İşi başlatır; shared route kararı varsa aynı karar task runner'a devredilir."""
+        if self.closing:
+            return False
         if self.task is not None and self.task_origin == "autonomous":
             self.stop_event.set()
             self._cancel_question(IntegrationStopped("Kullanıcı işi öncelikli."))
@@ -955,19 +965,8 @@ class ImessageBridge:
         self.task_decision = decision
         self.task_history = list(history) if history is not None else None
         self.task_activity = self.chat_activity or ActivityController(STATE_FILE).start("imessage", goal)
-        self.task_start_ready.clear()
+        self.task_reply_id = reply_id
         self._launch_task(goal, images)
-        try:
-            # Commit happened above; optional ACK never cancels or replays that job.
-            if reply_id is None and not await self._typing_available():
-                try:
-                    reply_id = await self._send(chat.TASK_ACK, "chat")
-                except Exception as error:
-                    logging.warning("iMessage work acknowledgment unavailable", extra={"error_type": type(error).__name__})
-            if reply_id is not None:
-                self.store.record_task_start(reply_id, goal)
-        finally:
-            self.task_start_ready.set()
         return True
 
     async def _run_task(self, goal: str, images: List[str], origin: str = "user", rationale: str = "") -> None:
@@ -983,14 +982,35 @@ class ImessageBridge:
         olduğu için koşu, bildirim ve rapor hataları burada loglanır ("Task exception was never retrieved" olarak
         sızmaz); başarısız, meşgul ve çöken işler de etkinliğe yazılır.
         """
-        await self.task_start_ready.wait()
         activity = self.task_activity if origin == "user" else None
         started_at: str = utc_iso(datetime.now(timezone.utc))
         generation = self.task_generation
+        reply_id = self.task_reply_id if origin == "user" else None
+        ready_called = False
         decision = self.task_decision if origin == "user" else None
         conversation_history = (
             list(self.task_history) if origin == "user" and self.task_history is not None else list(self.history)
         )
+        async def execution_ready():
+            nonlocal reply_id, ready_called
+            if ready_called:
+                return
+            if self.closing or self.task_generation != generation or self.stop_event.is_set():
+                raise IntegrationStopped("İş durduruldu.")
+            ready_called = True
+            # Effectful work owns the budgeted host lock here; read-only work
+            # reached its lock-free execution boundary. Await ACK before work.
+            if reply_id is None and not await self._typing_available():
+                try:
+                    reply_id = await self._send(chat.TASK_ACK, "chat")
+                except Exception as error:
+                    logging.warning("iMessage work acknowledgment unavailable", extra={"error_type": type(error).__name__})
+            if reply_id is not None:
+                try:
+                    self.store.record_task_start(reply_id, goal)
+                except Exception as error:
+                    logging.warning("iMessage work start observation unavailable", extra={"error_type": type(error).__name__})
+
         def progress(line: str) -> None:
             if self.task_generation == generation:
                 self._on_progress(line)
@@ -1011,6 +1031,7 @@ class ImessageBridge:
                 options["activity_origin"] = "imessage"
                 if activity is not None:
                     options["activity_session"] = activity
+                    options["on_execution_ready"] = execution_ready
                 if decision is not None:
                     options["requested_backend"] = decision.requested_backend
                     options["conversation_decision"] = decision
@@ -1052,7 +1073,9 @@ class ImessageBridge:
                 self.task_origin = "user"
                 self.task_decision = None
                 self.task_history = None
-                self.stop_event.clear()
+                self.task_reply_id = None
+                if not self.closing:
+                    self.stop_event.clear()
         try:
             if isinstance(result, str):
                 if origin == "autonomous":
@@ -1183,15 +1206,22 @@ class ImessageBridge:
                                 extra={"message_ids": expired})
 
     async def close(self) -> None:
-        """Çalışan işi durdurur, bekleyen soruyu iptal eder, zamanlayıcıyı ve entegrasyonları kapatır."""
-        self.closing = True
+        """One shared teardown; every caller joins all work before cancellation propagates."""
+        if self._close_task is None:
+            self.closing = True
+            self.stop_event.set()
+            self._cancel_question(IntegrationStopped("Köprü kapanıyor."))
+            self._close_task = asyncio.create_task(self._close_owned())
+        await join_owned_cleanup(self._close_task)
+
+    async def _close_owned(self) -> None:
         await self.activity_indicator.close()
-        self.stop_event.set()
-        self._cancel_question(IntegrationStopped("Köprü kapanıyor."))
-        timer: Optional[asyncio.Task[None]] = self.burst_timer
-        if timer is not None:
-            timer.cancel()
-            await asyncio.gather(timer, return_exceptions=True)
+        chats = set(self.chat_runs)
+        if self.burst_timer is not None:
+            chats.add(self.burst_timer)
+        for chat_turn in chats:
+            chat_turn.cancel()
+        await asyncio.gather(*chats, return_exceptions=True)
         tasks = self.task_runs | self.notification_tasks
         if self.task is not None:
             tasks.add(self.task)

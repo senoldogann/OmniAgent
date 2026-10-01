@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import logging
 import math
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from itertools import islice
 from pathlib import Path
 from typing import Callable
@@ -80,6 +82,11 @@ async def _join_cleanup(task):
         raise asyncio.CancelledError
 
 
+async def join_owned_cleanup(task):
+    """Join a shared teardown without cancelling it when a caller is cancelled."""
+    return await _join_cleanup(task)
+
+
 async def run_owned(coroutine, *, on_cancel=None):
     """Cancel an owned lifecycle once and join it despite repeated caller cancellation."""
     task = asyncio.create_task(coroutine)
@@ -135,20 +142,45 @@ class ActivityStore:
         self.save(row)
         return row
 
+    @contextmanager
+    def _admission(self):
+        self._directory(create=True)
+        descriptor = os.open(self.directory / '.admission.lock',
+                             os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077 or info.st_nlink != 1):
+                raise ValueError('Activity admission lock is not private')
+            # Optional observations may be unavailable under contention. Never
+            # block a live model/tool or race the cross-process admission bound.
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._directory()
+            yield
+        finally:
+            os.close(descriptor)
+
     def save(self, row):
         self._validate(row)
-        self._directory(create=True)
+        with self._admission():
+            self._save_locked(row)
+
+    def _save_locked(self, row):
         path = self.directory / (row['run_id'] + '.json')
         if path.is_symlink():
             raise ValueError('Activity snapshot is a symlink')
         # Never evict another live owner to admit a new optional observation.
-        files = list(islice(self.directory.glob('*.json'), MAX_SNAPSHOTS + 1))
+        files = list(islice(self.directory.glob('*.json'), MAX_SNAPSHOTS + 2))
+        if not path.exists() and len(files) > MAX_SNAPSHOTS + 1:
+            raise ValueError('Activity snapshot capacity exceeded')
         if not path.exists() and len(files) >= MAX_SNAPSHOTS:
-            removable = [row for row in self.load() if row['stage'] in {'terminal', 'interrupted'}]
-            if not removable:
+            removable = sorted((row for row in self.load(_capacity_recovery=True)
+                                if row['stage'] in {'terminal', 'interrupted'}), key=lambda row: row['last_update'])
+            needed = len(files) - MAX_SNAPSHOTS + 1
+            if len(removable) < needed:
                 raise ValueError('Activity snapshot capacity reached')
-            oldest = min(removable, key=lambda row: row['last_update'])
-            (self.directory / (oldest['run_id'] + '.json')).unlink()
+            for old in removable[:needed]:
+                (self.directory / (old['run_id'] + '.json')).unlink()
         fd, temporary = tempfile.mkstemp(prefix='.activity-', dir=self.directory)
         try:
             with os.fdopen(fd, 'w') as handle:
@@ -158,11 +190,11 @@ class ActivityStore:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def load(self):
+    def load(self, *, _capacity_recovery=False):
         try:
             self._directory()
             paths = list(islice(self.directory.glob('*.json'), MAX_SNAPSHOTS + 1))
-            if len(paths) > MAX_SNAPSHOTS:
+            if len(paths) > MAX_SNAPSHOTS and not _capacity_recovery:
                 return []
             rows = []
             for path in paths:
@@ -186,6 +218,14 @@ class ActivityStore:
             return []
 
     def status(self, exclude=None):
+        try:
+            self._directory()
+        except FileNotFoundError:
+            return 'Şu anda kayıtlı etkin bir çalışma yok.'
+        except (OSError, ValueError):
+            return 'Etkinlik durumu kullanılamıyor.'
+        if len(list(islice(self.directory.glob('*.json'), MAX_SNAPSHOTS + 1))) > MAX_SNAPSHOTS:
+            return 'Etkinlik kayıt sınırı aşıldı; güncel durum kullanılamıyor.'
         rows = [row for row in self.load() if row['run_id'] != exclude and row['stage'] != 'terminal']
         return ('\n'.join(f"{row['origin']}: {LABELS[row['stage']]} · {row['subject']}" for row in rows)
                 or 'Şu anda kayıtlı etkin bir çalışma yok.')

@@ -64,6 +64,8 @@ class AutonomyGuards(TypedDict):
 class RunOptions(TypedDict):
     activity_session: NotRequired[ActivitySession]
     activity_origin: NotRequired[str]
+    # Host-only notice after execution admission, awaited within the run budget.
+    on_execution_ready: NotRequired[Callable[[], Awaitable[None]]]
     requested_backend: Optional[str]
     # Host owned factory: only the task route may acquire exclusive ownership.
     task_context: NotRequired[Callable[[], AsyncContextManager[object]]]

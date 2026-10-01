@@ -179,9 +179,20 @@ def _memory_context(options: RunOptions) -> str:
             + ActivityStore(options["state_file"]).status(getattr(options.get("activity_session"), "run_id", None)))
 
 
+async def _execution_ready(decision, options):
+    """Host-only readiness notice, within the existing execution budget."""
+    decision.budget.check()
+    hook = options.get("on_execution_ready")
+    if hook is not None:
+        await decision.budget.wait(hook(), bounded_operation=False)
+    decision.budget.check()
+
+
 async def _investigate(decision, evidence, store, options, clients, emit):
     budget = decision.budget
     budget.phase = "generate"
+    budget.check(model=True)
+    await _execution_ready(decision, options)
     decision.runtime.allowed_tools = INVESTIGATION_TOOLS
     decision.runtime.cancellable_reads = True
     toolbox = Toolbox(memory_file=options.get("memory_file"), allow_memory_mutation=False,
@@ -253,6 +264,7 @@ async def _full_task(decision, evidence, options, clients, emit):
         nonlocal completed_report, completed_in_time
         async with options["task_context"]():
             budget.check(model=True)
+            await _execution_ready(decision, options)
             full_options = {**options, "request_contract": decision.contract, "evidence_run_id": evidence["run_id"],
                             "max_iterations": max(1, budget.user_turns - budget.turns),
                             "max_wall_clock_seconds": budget.remaining_seconds}

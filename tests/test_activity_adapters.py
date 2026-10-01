@@ -91,8 +91,10 @@ async def test_imessage_actual_ingress_single_post_commit_ack_and_local_read(par
             assert bridge.task is not None and bridge.task_activity is not None
         return await original(handle, text)
     transport.send_text = send
-    await bridge.on_message(incoming(30, f'Read the file {target}', HANDLE))
-    await settle(bridge)
+    from omniagent.platform.macos.host_lock import host_task_lock
+    with host_task_lock():
+        await bridge.on_message(incoming(30, f'Read the file {target}', HANDLE))
+        await settle(bridge)
     assert transport.texts[0] == chat.TASK_ACK and transport.texts.count(chat.TASK_ACK) == 1
     assert 'IMESSAGE_LOCAL_IDENTIFIER' in '\n'.join(transport.texts[1:])
     assert len(observed) == 4 and not turns
@@ -142,6 +144,7 @@ async def test_ack_unknown_does_not_cancel_committed_job_or_replay(parts, monkey
     bridge, transport, _ = parts
     completed = asyncio.Event()
     async def run(goal, options, progress):
+        await options["on_execution_ready"]()
         completed.set()
         return delegate.failure_outcome(goal, 'observed failure', '2026-09-30T12:00:00+00:00')
     monkeypatch.setattr(delegate, 'run_task', run)
@@ -458,3 +461,144 @@ async def test_imessage_status_observes_real_concurrent_telegram_read_and_verifi
     await tg.active
     assert not turns and all(row['stage'] == 'terminal' for row in ActivityStore(state).load())
     await tg.integrations.close(); await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_imessage_rejected_real_host_lock_sends_no_work_ack_or_start_record(parts, tmp_path, monkeypatch, script):
+    from omniagent.platform.macos.host_lock import host_task_lock
+    bridge, transport, store = parts
+    state = str(tmp_path / 'busy-real.json')
+    monkeypatch.setattr(imessage, 'STATE_FILE', state)
+    monkeypatch.setattr(delegate, 'STATE_FILE', state)
+    monkeypatch.setattr(imessage, 'decide_conversation', conversation.decide_conversation)
+    class Client:
+        async def close(self):
+            pass
+    clients = {'openai': Client()}
+    bridge.chat_clients = clients
+    monkeypatch.setattr(delegate, 'create_model_clients', lambda: clients)
+    turns, requests = script
+    turns.append(route('task'))
+    with host_task_lock():
+        await bridge.on_message(incoming(90, 'Open the Calculator app', HANDLE))
+        await settle(bridge)
+    assert len(requests) == 1 and not turns
+    assert chat.TASK_ACK not in transport.texts
+    outgoing = [row['id'] for row in store.recent_messages(20) if row['direction'] == 'out']
+    assert store.task_starts(outgoing) == {}
+    assert 'tamamlanamadı' in transport.texts[-1].casefold()
+    await bridge.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('concurrent', [False, True])
+async def test_imessage_whole_close_joins_classifier_and_activity_on_repeated_cancel(parts, tmp_path, monkeypatch, script, concurrent):
+    bridge, transport, _ = parts
+    monkeypatch.setattr(imessage, 'STATE_FILE', str(tmp_path / 'shutdown.json'))
+    monkeypatch.setattr(imessage, 'decide_conversation', conversation.decide_conversation)
+    bridge.chat_clients = {'openai': object()}
+    classifier_entered, typing_entered, cleaning, release = (asyncio.Event() for _ in range(4))
+    async def capability():
+        return {'typing_indicators': True, 'v2_ready': True}
+    async def typing(handle):
+        typing_entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+    transport.activity_capabilities = capability; transport.send_typing = typing
+    async def classifier(emit, stop):
+        classifier_entered.set()
+        await asyncio.Event().wait()
+    turns, _ = script; turns.append(classifier)
+    await bridge.on_message(incoming(91, 'Merhaba', HANDLE))
+    await asyncio.wait_for(classifier_entered.wait(), 1)
+    await asyncio.wait_for(typing_entered.wait(), 1)
+    activity = bridge.chat_activity
+    notification_cleaning, release_notification = asyncio.Event(), asyncio.Event()
+    async def notification():
+        while not bridge.closing:
+            await asyncio.sleep(0)
+        notification_cleaning.set()
+        await release_notification.wait()
+    pending_notice = asyncio.create_task(notification())
+    bridge.notification_tasks.add(pending_notice)
+    pending_notice.add_done_callback(bridge.notification_tasks.discard)
+    first = asyncio.create_task(bridge.close())
+    await cleaning.wait()
+    prompt_stop = bridge.stop_event.is_set()
+    first.cancel(); await asyncio.sleep(0); first.cancel()
+    cleanup = bridge._close_task
+    second = asyncio.create_task(bridge.close()) if concurrent else None
+    await asyncio.sleep(0)
+    assert not first.done() and (second is None or not second.done())
+    release.set()
+    await notification_cleaning.wait()
+    await asyncio.sleep(0)
+    assert not first.done() and (second is None or not second.done())
+    release_notification.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    if second is not None:
+        await asyncio.wait_for(second, 2)
+    await bridge.close()
+    assert bridge._close_task is cleanup
+    assert prompt_stop and bridge.stop_event.is_set() and bridge.closing
+    assert activity.closed and activity.heartbeat.done()
+    assert (bridge.burst_timer is None or bridge.burst_timer.done()) and not bridge.chat_lock.locked()
+    assert not bridge.activity_indicator.running
+    assert pending_notice.done() and not bridge.task_runs and not bridge.notification_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('unknown', [False, True])
+async def test_task_readiness_owns_host_lock_and_awaits_ack_before_engine(parts, tmp_path, monkeypatch, script, unknown):
+    from omniagent.platform.macos.host_lock import host_task_lock, HostBusyError
+    from tests.test_imessage_bridge import report_for
+    bridge, transport, store = parts
+    state = str(tmp_path / 'ready.json')
+    monkeypatch.setattr(imessage, 'STATE_FILE', state)
+    monkeypatch.setattr(delegate, 'STATE_FILE', state)
+    monkeypatch.setattr(imessage, 'decide_conversation', conversation.decide_conversation)
+    class Client:
+        async def close(self):
+            pass
+    clients = {'openai': Client()}; bridge.chat_clients = clients
+    monkeypatch.setattr(delegate, 'create_model_clients', lambda: clients)
+    turns, _ = script; turns.append(route('task'))
+    entered, release = asyncio.Event(), asyncio.Event()
+    order, attempts = [], []
+    original = transport.send_text
+    async def send(handle, text):
+        attempts.append(text)
+        if text == chat.TASK_ACK:
+            with pytest.raises(HostBusyError):
+                with host_task_lock():
+                    pass
+            entered.set()
+            await release.wait()
+            order.append('ack')
+            if unknown:
+                raise DeliveryUnknown('optional acknowledgment unknown')
+        return await original(handle, text)
+    transport.send_text = send
+    async def engine(goal, emit, options, clients):
+        order.append('engine')
+        with pytest.raises(HostBusyError):
+            with host_task_lock():
+                pass
+        return report_for(goal, 'Engine observed failure', False)
+    monkeypatch.setattr(conversation, 'run_agent_with_callback', engine)
+    await bridge.on_message(incoming(92, 'Open the Calculator app', HANDLE))
+    await asyncio.wait_for(entered.wait(), 2)
+    assert order == [] and bridge.task is not None
+    ack_ids = [row['id'] for row in store.recent_messages(20) if row['text'] == chat.TASK_ACK]
+    assert store.task_starts(ack_ids) == {}
+    release.set()
+    await settle(bridge)
+    assert order == ['ack', 'engine'] and attempts.count(chat.TASK_ACK) == 1
+    assert store.task_starts(ack_ids) == {ack_ids[0]: 'Open the Calculator app'}
+    with host_task_lock():
+        pass
+    await bridge.close()
