@@ -133,9 +133,24 @@ async def test_quick_search_owns_isolated_local_worker_until_reaped(coordinator,
             await asyncio.gather(canceller, return_exceptions=True)
 
 
-def test_search_worker_protocol_preserves_existing_search_and_uses_owned_fd_streams(tmp_path):
-    script = """
+WORKER_IMPORT_GUARD = """
 import sys
+class RejectStartupImports:
+    def find_spec(self, fullname, path=None, target=None):
+        native_or_gui = {'ApplicationServices', 'AppKit', 'Quartz', 'cv2', 'pyautogui',
+                         'customtkinter', 'tkinter'}
+        if (fullname.split('.')[0] in native_or_gui
+                or fullname in {'omniagent.tools.facade', 'omniagent.platform.macos.api_keys'}):
+            raise ModuleNotFoundError('worker imported startup dependency: ' + fullname)
+        return None
+sys.meta_path.insert(0, RejectStartupImports())
+"""
+
+
+def test_search_worker_protocol_preserves_existing_search_and_uses_owned_fd_streams(tmp_path):
+    script = WORKER_IMPORT_GUARD + """
+import sys
+sys.argv = ['worker', '--internal-readonly-worker']
 from omniagent.tools import readonly_worker as worker
 class Search:
     def __enter__(self): return self
@@ -158,19 +173,17 @@ worker.main()
 
 
 def test_frozen_internal_dispatch_rejects_effect_request_before_ui_startup(tmp_path):
-    script = """
+    script = WORKER_IMPORT_GUARD + """
 import sys
-from omniagent.ui import app
-def no_ui(*args): raise AssertionError('worker reached UI startup')
-app.OmniUI = app.configure_ui_logging = no_ui
+import runpy
 sys.argv = ['OmniAgent', '--internal-readonly-worker']
 sys.frozen = True
 sys.stdin = sys.stdout = sys.stderr = None
-app.main()
+runpy.run_module('omniagent.ui.app', run_name='__main__')
 """
     result = subprocess.run([sys.executable, "-c", script], input=b'{"query":"x","command":"forbidden"}',
                             capture_output=True, timeout=5)
-    assert result.returncode == 0
+    assert result.returncode == 0 and result.stderr == b""
     response = json.loads(result.stdout)
     assert response["ok"] is False and response["code"] == "INVALID_ARGUMENTS"
 
