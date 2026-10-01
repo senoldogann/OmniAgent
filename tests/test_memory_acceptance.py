@@ -11,6 +11,8 @@ import pytest
 from openai import AsyncOpenAI
 
 from omniagent.app import agent as main
+from omniagent.app.conversation_routing import ROUTING_POLICY
+from omniagent.app.conversation_grounding import VERIFY_POLICY
 from omniagent.app.types import ModelTurn
 from omniagent.companion import chat
 from omniagent.core.events import AgentEvent
@@ -69,6 +71,26 @@ def final_answer(text: str) -> Callable[..., Awaitable[Tuple[Dict[str, Any], str
     return model
 
 
+@pytest.fixture(autouse=True)
+def conversation_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model boundary fixture for current coordinator plus authorized legacy full engine."""
+    monkeypatch.setattr(main, "load_fallback_policy", lambda: {"backends": [], "allow_images": False})
+    async def classify(clients, messages, schemas, session_id, backend, emit, should_stop):
+        system = str(messages[0].get("content", ""))
+        if system.startswith(ROUTING_POLICY):
+            goal = str(messages[-1].get("content", ""))
+            # Recall intentionally exercises the authorized full-agent capability;
+            # personal_memory remains absent from quick investigation tools.
+            route = "task" if "İzmir" in goal and "ne zaman" in goal else "chat"
+            content = json.dumps({"route": route, "required_fields": [], "needs_observation": route == "task"})
+        elif system.startswith(VERIFY_POLICY):
+            content = json.dumps({"ok": True, "facts": [], "missing_fields": [], "unsupported_claims": []})
+        else:
+            return await main._call_model_with_retries(clients, messages, schemas, session_id, backend, emit, should_stop)
+        return {"content": content, "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+    monkeypatch.setattr(main, "call_model_with_retries", classify)
+
+
 class DenizCapture:
     """chat.respond sınırında sahte Deniz: sistem istemini saklar, tek balonla cevap verir."""
 
@@ -120,7 +142,7 @@ async def test_a_telegram_words_become_a_quoted_fact_deniz_knows(tmp_path: Path,
     monkeypatch.setattr(chat, "respond", capture)
     store = PersonalStore(database)
     try:
-        deniz = imessage.ImessageBridge(FakeTransport(), settings(), store, {}, "# Deniz\nyakın arkadaş", "test")
+        deniz = imessage.ImessageBridge(FakeTransport(), settings(), store, {"openai": ClosableClient()}, "# Deniz\nyakın arkadaş", "test")
         await deniz.on_message(incoming(1, "kızımın adı neydi", HANDLE))
         await settle(deniz)
     finally:
@@ -137,7 +159,7 @@ async def test_b_words_told_to_deniz_are_recalled_verbatim_by_the_telegram_agent
     monkeypatch.setattr(chat, "respond", DenizCapture("süper, iyi yolculuklar"))
     store = PersonalStore(database)
     try:
-        deniz = imessage.ImessageBridge(FakeTransport(), settings(), store, {}, "# Deniz\nyakın arkadaş", "test")
+        deniz = imessage.ImessageBridge(FakeTransport(), settings(), store, {"openai": ClosableClient()}, "# Deniz\nyakın arkadaş", "test")
         await deniz.on_message(incoming(1, "cuma İzmir’e gidiyorum", HANDLE))
         await settle(deniz)
     finally:

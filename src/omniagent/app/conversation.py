@@ -16,14 +16,14 @@ from omniagent.app import agent
 from omniagent.app.agent import run_agent_with_callback
 from omniagent.app.conversation_budget import ConversationBudget, ConversationExhausted, QUICK_TOOLS
 from omniagent.app.conversation_grounding import authoritative_context, ground_answer
-from omniagent.app.conversation_routing import contract_from_decision, force_task, routing_messages, subject_for_turn
+from omniagent.app.conversation_routing import contract_from_decision, force_task, routing_messages, subject_for_turn, needs_external_observation, host_time_context
 from omniagent.app.tool_schema import route_tool_schemas
 from omniagent.app.tool_execution import execute_tool, raw_result_text
 from omniagent.app.policy import final_verdict
 from omniagent.app.types import ModelTurn, RunOptions, RunReport
 from omniagent.config import BACKENDS, DEFAULT_BACKEND
 from omniagent.core.conversation import make_exchange, to_messages
-from omniagent.core.conversation_policy import NATURAL_STYLE_POLICY, derive_request_contract, render_evidence
+from omniagent.core.conversation_policy import NATURAL_STYLE_POLICY, derive_request_contract, render_evidence, primary_source_gaps
 from omniagent.core.evidence import EvidenceBundle, EvidenceStore, RequestContract, mark_incomplete, new_evidence_bundle, sanitize_text
 from omniagent.core.events import AWAITING_APPROVAL_CODE, AWAITING_DIRECTION_CODE, EventSink, preview_arguments
 from omniagent.integrations.runtime import CURRENT_RUNTIME, IntegrationRuntime, IntegrationStopped
@@ -39,6 +39,10 @@ excerpts; say when full pages weren't inspected. If essential target is ambiguou
 clarification and do not invent. Missing/failed tools mean inspection is unavailable. Do not
 promise a task has run. List actual directory names and file types/examples when requested;
 an empty structured directory is valid and means zero entries. Use enough detail to answer.
+For current official model releases, use the trusted host date. Batch independent provider
+searches in one turn, then fetch_raw the relevant official release pages in one turn, then answer.
+Search is discovery only: requested official verification requires primary pages for every
+requested provider. Respect the remaining quick budget; report unavailable pages honestly.
 """
 
 
@@ -136,7 +140,8 @@ async def _decide(decision, goal, emit, options, clients) -> ConversationDecisio
     classification. Selection/retries/accounting use the existing provider policy.
     """
     if force_task(goal, options):
-        decision.contract = derive_request_contract(subject_for_turn(goal, options), route="task")
+        decision.contract = derive_request_contract(subject_for_turn(goal, options), route="task",
+                                                    needs_observation=needs_external_observation(goal, options))
     elif status_question(goal):
         decision.contract = derive_request_contract(goal, route="chat")
     else:
@@ -198,13 +203,26 @@ async def _investigate(decision, evidence, store, options, clients, emit):
     toolbox = Toolbox(memory_file=options.get("memory_file"), allow_memory_mutation=False,
                       history_file=options["state_file"])
     schemas = [schema for schema in route_tool_schemas(None, False, False) if schema["function"]["name"] in INVESTIGATION_TOOLS]
-    messages = [{"role": "system", "content": INVESTIGATION_POLICY + NATURAL_STYLE_POLICY + _memory_context(options)},
+    messages = [{"role": "system", "content": INVESTIGATION_POLICY + host_time_context() + NATURAL_STYLE_POLICY + _memory_context(options)},
                 *to_messages(options["history"]),
                 {"role": "user", "content": json.dumps(decision.contract, ensure_ascii=False)}]
+    primary_reminder_sent = False
     try:
         while True:
             turn = await _model(decision, clients, messages, schemas, emit)
             if not turn["tool_calls"]:
+                gaps = primary_source_gaps(evidence)
+                if gaps and not primary_reminder_sent and budget.tools < QUICK_TOOLS:
+                    primary_reminder_sent = True
+                    messages.append({"role": "assistant", "content": turn["content"]})
+                    messages.append({"role": "system", "content": "TRUSTED HOST: " + " ".join(gaps)
+                        + " Read relevant official pages with fetch_raw before verified claims. Batch independent reads. "
+                        + "If unavailable, report partial inspection and exact gaps. No new subject or tools."})
+                    continue
+                if gaps:
+                    for gap in gaps:
+                        mark_incomplete(evidence, gap)
+                    return render_evidence(evidence)
                 return turn["content"]
             messages.append({"role": "assistant", "content": turn["content"], "tool_calls": [
                 {"id": call["id"], "type": "function", "function": {

@@ -247,7 +247,9 @@ def test_tool_message_masks_secret_values_before_model_boundary() -> None:
 
     assert SECRET not in main._tool_result_to_message(call, success)["content"]
     assert SECRET not in main._tool_result_to_message(call, failure)["content"]
-    assert config.SECRET_PLACEHOLDER in main._tool_result_to_message(call, success)["content"]
+    from omniagent.core.observation_filter import SENSITIVE_PLACEHOLDER
+    assert SENSITIVE_PLACEHOLDER in main._tool_result_to_message(call, success)["content"]
+    assert config.SECRET_PLACEHOLDER in main._tool_result_to_message(call, failure)["content"]
 
 
 def test_short_values_are_not_masked() -> None:

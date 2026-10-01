@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+from urllib.parse import urlsplit
 from typing import Iterable, Literal, TypedDict
 
 from omniagent.core.evidence import EvidenceBundle, RequestContract, SourceObservation, sanitize_text
@@ -49,6 +50,8 @@ def derive_request_contract(subject: str, *, route: Literal["chat", "investigate
         if any(word in lowered for word in ("folder", "directory", "klasör", "dizin")) and any(
             word in lowered for word in ("list", "name", "liste", "adları", "isim")):
             fields.append("directory_names")
+            if any(word in lowered for word in ("files", "dosya")):
+                fields.append("file_names")
         if any(word in lowered for word in ("model names", "model adları", "model isim")):
             fields.append("model_names")
         if any(word in lowered for word in ("source", "sources", "kaynak", "links", "url")):
@@ -94,6 +97,82 @@ def _directory_identifiers(observation: SourceObservation) -> list[str]:
             if line.strip().endswith("/") and not line.lstrip().startswith(("…", "http://", "https://"))]
 
 
+
+def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
+    """Official verification needs real page receipts, not snippets or model assertions."""
+    subject = bundle["contract"]["subject"].casefold()
+    if not bundle["contract"]["needs_observation"] or not re.search(r"\b(?:official|resmi)\b", subject):
+        return []
+    domains = [domain for provider, domain in (("openai", "openai.com"), ("anthropic", "anthropic.com"))
+               if provider in subject]
+    domains.extend(urlsplit(url).hostname for url in _URL.findall(subject) if urlsplit(url).hostname)
+    domains = list(dict.fromkeys(domains))
+    read_hosts = set()
+    for source in bundle["observations"]:
+        if source["tool"] != "fetch_raw" or not source["ok"] or not source["complete"]:
+            continue
+        try:
+            reference = json.loads(source["source_reference"])
+            url = reference.get("url", "") if isinstance(reference, dict) else ""
+        except ValueError:
+            url = source["source_reference"]
+        host = urlsplit(url).hostname
+        if host:
+            read_hosts.add(host.casefold())
+    if not domains:
+        return ["Resmi kaynak yetkilisi belirlenemedi; birincil sayfa doğrulaması eksik."]
+    return [f"{domain}: resmi birincil kaynak sayfası okunamadı; doğrulama eksik."
+            for domain in domains if not any(host == domain or host.endswith("." + domain) for host in read_hosts)]
+
+
+def _search_records(text: str) -> list[dict] | None:
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, list) and all(isinstance(item, dict) for item in data):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return [item for item in data["results"] if isinstance(item, dict)]
+    return None
+
+
+def relevant_search_records(bundle: EvidenceBundle, text: str) -> list[dict] | None:
+    """Select candidate references by authenticated subject, never source directives."""
+    records = _search_records(text)
+    if records is None:
+        return None
+    subject = bundle["contract"]["subject"].casefold()
+    providers = [name for name in ("openai", "anthropic", "claude") if name in subject]
+    model_request = bool(re.search(r"\bmodels?\b", subject))
+    selected = []
+    for record in records:
+        prose = "\n".join(str(record.get(key, "")) for key in ("title", "body", "content", "snippet"))
+        lowered = prose.casefold()
+        reference = str(record.get("url") or record.get("href") or "").casefold()
+        if providers and not any(name in lowered or name in reference for name in providers):
+            continue
+        if model_request and not re.search(r"\b(?:model|gpt|claude)\b|gpt[- ]|claude[- ]", lowered):
+            continue
+        selected.append(record)
+    return selected
+
+def supported_source_urls(bundle: EvidenceBundle) -> list[str]:
+    """Only real, successful, subject-relevant source references can support answer links."""
+    urls = []
+    for source in bundle["observations"]:
+        if not source["ok"]:
+            continue
+        records = relevant_search_records(bundle, source["text"]) if source["tool"] == "web_search" else None
+        if records is not None:
+            urls.extend(str(record.get("url") or record.get("href")) for record in records
+                        if record.get("url") or record.get("href"))
+        else:
+            urls.extend(_URL.findall(source["text"]))
+            urls.extend(_URL.findall(source["source_reference"]))
+    return list(dict.fromkeys(url.rstrip(".,;:") for url in urls))
+
+
 def _field_identifiers(bundle: EvidenceBundle) -> dict[str, list[str]]:
     fields = set(bundle["contract"]["required_fields"])
     found: dict[str, list[str]] = {field: [] for field in fields}
@@ -101,15 +180,36 @@ def _field_identifiers(bundle: EvidenceBundle) -> dict[str, list[str]]:
         if not observation["ok"]:
             continue
         text = observation["text"]
-        if "source_urls" in fields:
-            found["source_urls"].extend(url.rstrip(".,;:") for url in _URL.findall(text))
-            found["source_urls"].extend(url.rstrip(".,;:") for url in _URL.findall(observation["source_reference"]))
+        records = relevant_search_records(bundle, text) if observation["tool"] == "web_search" else None
+        if records is not None:
+            text = "\n".join("\n".join(str(record.get(key, "")) for key in ("title", "body", "content", "snippet"))
+                             for record in records)
+        if "source_urls" in fields and records is None:
+            references = _URL.findall(observation["source_reference"])
+            # A fetched page's navigation URLs are not mandatory references.
+            # Its host-recorded requested URL identifies the actual page read.
+            urls = references if observation["tool"] == "fetch_raw" and references else [*references, *_URL.findall(text)]
+            found["source_urls"].extend(url.rstrip(".,;:") for url in urls)
         if "model_names" in fields:
             found["model_names"].extend(_MODEL.findall(text))
         if "release_dates" in fields:
-            found["release_dates"].extend(_DATE.findall(text))
+            # Publication timestamps and navigation dates are not release dates.
+            web_source = records is not None or observation["tool"] in ("web_search", "fetch_raw", "web_fetch")
+            lines = text.splitlines() if web_source else [text]
+            found["release_dates"].extend(date for line in lines
+                if not web_source or re.search(r"release|launch|introduced|çıkış|yayın", line, re.I)
+                for date in _DATE.findall(line))
+            # User-specified exact dates remain required when an actual source supports them.
+            found["release_dates"].extend(date for date in _DATE.findall(bundle["contract"]["subject"]) if date in text)
         if "directory_names" in fields:
             found["directory_names"].extend(_directory_identifiers(observation))
+        if "file_names" in fields and observation["tool"] == "list_directory":
+            try:
+                listing = json.loads(observation["text"])
+                found["file_names"].extend(entry["name"] for entry in listing.get("entries", [])
+                                          if isinstance(entry, dict) and isinstance(entry.get("name"), str))
+            except (ValueError, AttributeError):
+                pass
     return {field: list(dict.fromkeys(values)) for field, values in found.items()}
 
 
@@ -120,7 +220,7 @@ def required_identifiers(bundle: EvidenceBundle) -> list[str]:
 
 
 def render_evidence(bundle: EvidenceBundle) -> str:
-    """Readable deterministic fallback retains all captured receipts and identifiers."""
+    """Readable fallback; full sanitized receipts remain in the private evidence store."""
     lines = [f"İstek: {bundle['contract']['subject']}"]
     if not bundle["observations"] and bundle["contract"]["needs_observation"]:
         lines.append("Sonuç eksik: kaynak gözlemi alınamadı; istenen incelemeye devam edilmesi gerekiyor.")
@@ -131,10 +231,47 @@ def render_evidence(bundle: EvidenceBundle) -> str:
     for index, observation in enumerate(bundle["observations"], 1):
         lines.append(f"\nKaynak {index}: {observation['tool']} — {'başarılı' if observation['ok'] else 'başarısız'} ({observation['observed_at']})")
         if observation["source_reference"]:
-            lines.append(f"Kaynak adresi veya işlem: {observation['source_reference']}")
+            reference = observation["source_reference"]
+            try:
+                metadata = json.loads(reference)
+                if isinstance(metadata, dict):
+                    reference = " · ".join(str(metadata[key]) for key in ("url", "path", "query", "command") if key in metadata)
+            except ValueError:
+                pass
+            if reference:
+                lines.append("Kaynak adresi veya işlem: " + reference)
         if not observation["complete"]:
             lines.append("Bu kaynağın bilgisi eksik; incelemeye devam edin veya varsa dosyadan okuyun.")
-        lines.append(observation["text"])
+        records = relevant_search_records(bundle, observation["text"]) if observation["tool"] == "web_search" else None
+        if records is not None:
+            lines.append("Arama bulguları (eksik keşif bilgisi; birincil sayfa doğrulaması değildir):")
+            if not records:
+                lines.append("İstenen konuya ilişkin kaynak bulunamadı.")
+            seen = set()
+            for record in records:
+                url = str(record.get("url") or record.get("href") or "")
+                if url and url in seen:
+                    continue
+                seen.add(url)
+                title = str(record.get("title") or "Arama sonucu")
+                prose = str(record.get("body") or record.get("content") or record.get("snippet") or "")
+                lines.append("- " + title + (": " + prose if prose else ""))
+                if url:
+                    lines.append("  Kaynak bağlantısı: " + url)
+        elif observation["tool"] == "list_directory" and observation["ok"]:
+            try:
+                listing = json.loads(observation["text"])
+                entries = listing.get("entries")
+                if not isinstance(entries, list):
+                    raise ValueError("invalid listing")
+                if not entries:
+                    lines.append("Dizin boş; 0 giriş var.")
+                for entry in entries:
+                    lines.append("- " + str(entry["name"]) + " (" + str(entry["type"]) + ")")
+            except (ValueError, KeyError, TypeError, AttributeError):
+                lines.append(observation["text"])
+        else:
+            lines.append(observation["text"])
         if observation.get("artifact_path"):
             lines.append(f"Okunabilir kaynak dosyası: {observation['artifact_path']}")
     return sanitize_text("\n".join(lines))
@@ -177,7 +314,15 @@ def check_grounded_answer(answer: str, bundle: EvidenceBundle, *, claims: Iterab
     missing = [identifier for identifier in required_identifiers(bundle) if identifier not in answer]
     source = "\n".join(observation["text"] for observation in bundle["observations"] if observation["ok"])
     unsupported = [claim for claim in claims if claim not in source]
-    missing_fields = [field for field in ("directory_names", "model_names", "source_urls", "release_dates")
+    supported_urls = supported_source_urls(bundle)
+    unsupported.extend(url.rstrip(".,;:") for url in _URL.findall(answer)
+                       if url.rstrip(".,;:") not in supported_urls)
+    unsupported = list(dict.fromkeys(unsupported))
+    if "source_urls" in found and not found["source_urls"]:
+        # Structured search candidates establish available links without requiring
+        # every discovered link in the final. Exact selected links are checked by the verifier.
+        found["source_urls"] = [url for url in supported_urls if url in answer]
+    missing_fields = [field for field in ("directory_names", "file_names", "model_names", "source_urls", "release_dates")
                       if field in found and not found[field]]
     limits: list[str] = []
     lowered = answer.casefold()
