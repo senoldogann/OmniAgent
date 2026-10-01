@@ -14,6 +14,7 @@ from omniagent.integrations.runtime import AnswerSink, DeliverSink
 
 if TYPE_CHECKING:
     from omniagent.app.conversation import ConversationDecision
+    from omniagent.core.activity import ActivitySession
 
 
 class RunModeProfile(TypedDict):
@@ -61,6 +62,8 @@ class AutonomyGuards(TypedDict):
 
 
 class RunOptions(TypedDict):
+    activity_session: NotRequired[ActivitySession]
+    activity_origin: NotRequired[str]
     requested_backend: Optional[str]
     # Host owned factory: only the task route may acquire exclusive ownership.
     task_context: NotRequired[Callable[[], AsyncContextManager[object]]]

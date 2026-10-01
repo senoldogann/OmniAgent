@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from typing import Dict, List, Optional, Protocol, Set, Tuple, TypedDict, Union
 
 from openai import AsyncOpenAI
 
+from omniagent.core.activity import ActivityController, ActivityStore, LABELS, RenewalIndicator, run_owned, status_question
 from omniagent.app.agent import STATE_FILE, close_model_clients, create_model_clients
 from omniagent.app.conversation import ConversationDecision, decide_conversation
 from omniagent.app.model_retry import ModelCallFailed
@@ -68,7 +70,7 @@ from omniagent.platform.macos.power import start_keep_awake, stop_keep_awake
 
 CONFIRM_WINDOW_SECONDS: float = 60.0
 UNANSWERED_MAX_AGE_SECONDS: float = 3600.0
-INTERIM_AFTER_SECONDS: float = 300.0
+INTERIM_AFTER_SECONDS: float = 30.0
 SWEEP_SECONDS: float = 30.0
 RESTART_DELAYS_SECONDS: Tuple[float, ...] = (1.0, 2.0, 4.0)
 STABLE_CONNECTION_SECONDS: float = 60.0
@@ -180,6 +182,14 @@ class ImessageBridge:
         self.task_progress: List[str] = []
         self.task_decision: Optional[ConversationDecision] = None
         self.task_history: Optional[List[Exchange]] = None
+        self.task_activity = None
+        self.chat_activity = None
+        self.task_start_ready = asyncio.Event()
+        self.task_start_ready.set()
+        self.typing_generation = None
+        self.typing_supported = False
+        self.activity_indicator = RenewalIndicator(self._send_typing)
+
         self.stop_event: threading.Event = threading.Event()
         self.question: Optional[PendingQuestion] = None
         self.integrations: Optional[CapabilityService] = None
@@ -329,6 +339,7 @@ class ImessageBridge:
         today = [item for item in self.store.activities_since(midnight) if item["kind"] == "task"]
         lines: List[str] = status_lines(self.task_goal or None, self.task_progress, len(today),
                                         sum(item["tokens"] for item in today), self.store.latency_p50())
+        lines.append(ActivityStore(STATE_FILE).status())
         lines = lines + [memory_status_line(len(self.store.active_facts()), self.store.learning_failure(),
                                             local_timezone())]
         backend = self.settings.get("transcribe_backend")
@@ -515,6 +526,8 @@ class ImessageBridge:
         Evidence yalnız tamamı gönderilmiş grubun bütün own-echo'ları sonrası delivered olur.
         Belirsiz veya kısmi gönderimde unknown kalır.
         """
+        if self.chat_activity is not None:
+            await self.activity_indicator.update(self.chat_activity.run_id, "terminal")
         message_id: int = self.store.record_outgoing(text, kind, utc_iso(datetime.now(timezone.utc)))
         evidence_key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
         if evidence_run_id is not None:
@@ -575,46 +588,96 @@ class ImessageBridge:
             # Arka plan görev sınırı: hata kök nedeniyle (traceback) loglanır, köprü sonraki mesajları işlemeye devam eder.
             logging.exception("iMessage sohbet turu başarısız", extra={"message_ids": ids})
 
+    async def _typing_available(self) -> bool:
+        generation = (id(self.transport), getattr(self.transport, "generation", 0),
+                      tuple(getattr(self.transport, "command", ())))
+        if self.typing_generation != generation:
+            self.typing_generation = generation
+            self.typing_supported = False
+            probe = getattr(self.transport, "activity_capabilities", None)
+            if probe is not None:
+                try:
+                    capabilities = await probe()
+                    self.typing_supported = (isinstance(capabilities, dict)
+                        and capabilities.get("typing_indicators") is True
+                        and capabilities.get("v2_ready") is True
+                        and callable(getattr(self.transport, "send_typing", None)))
+                except Exception as error:
+                    logging.warning("iMessage activity capability unavailable", extra={"error_type": type(error).__name__})
+        return self.typing_supported
+
+    async def _send_typing(self) -> None:
+        if await self._typing_available():
+            await self.transport.send_typing(self.settings["handle"])
+
+    async def _activity_event(self, activity, event):
+        if activity.closed or self.closing:
+            return
+        activity.event(event)
+        if await self._typing_available() and not activity.closed and not self.closing:
+            await self.activity_indicator.update(activity.run_id, activity.stage)
+
     async def _chat_turn(self, ids: List[int], texts: List[str], images: List[str],
                          burst_end: Optional[float]) -> None:
-        async with self.chat_lock:
-            texts, audio_failed = await self._transcribe_messages(ids, texts)
-            meaningful = any(line.strip() and not line.startswith("[dosya:")
-                             for text in texts for line in text.splitlines())
-            if audio_failed and not meaningful and not images:
-                await self._send(media.AUDIO_FAILURE_TEXT, "chat")
-                return
-            recent: List[ArchivedMessage] = self.store.recent_messages(chat.HISTORY_LIMIT + len(ids))
-            history: List[ArchivedMessage] = [item for item in recent if item["id"] not in ids][-chat.HISTORY_LIMIT:]
-            goal = "\n".join(texts).strip() or ("Gönderdiğim görseli incele." if images else "Yanıtla.")
-            if self.integrations is None:
-                self.integrations = CapabilityService()
-            route_history = self._conversation_history(history)
-            route_options = delegate.run_options(
-                self.answer, self.deliver, route_history, images, self.stop_event.is_set, self.integrations,
-            )
-            route_options["requested_backend"] = self.settings["chat_backend"]
-            route_options["conversation_persona"] = self.persona_text
-            decision = await decide_conversation(goal, lambda event: None, route_options, self.chat_clients)
-            if decision.error is not None or decision.contract["route"] != "chat":
-                ack_id = await self._send(chat.TASK_ACK, "chat")
-                if await self._start_task(goal, images, decision, route_history):
-                    self.store.record_task_start(ack_id, goal)
-                if audio_failed:
-                    await self._send(media.AUDIO_FAILURE_TEXT, "chat")
-                return
+        await run_owned(self._chat_turn_owned(ids, texts, images, burst_end))
 
-            turn: str = chat.burst_turn(texts, images, self._situation())
-            prepared = await prepare_turn_images(images)
-            with prepared:
-                if prepared.failures:
-                    turn = "[HOST: bazı fotoğraflar açılamadı; görülmeyen içeriği tahmin etme]\n" + turn
-                messages: List[chat.ChatMessage] = self._history(history) + [chat.image_turn(turn, prepared.image_paths)]
-                reply: Optional[ModelReply] = await self._respond(messages, chat.CHAT_TOOLS, burst_end, "chat")
-                if reply is not None:
-                    await self._act(reply, messages, "\n".join(texts), images[:media.MAX_IMAGE_FILES], burst_end)
-                if audio_failed:
-                    await self._send(media.AUDIO_FAILURE_TEXT, "chat")
+    async def _chat_turn_owned(self, ids: List[int], texts: List[str], images: List[str],
+                               burst_end: Optional[float]) -> None:
+        # Called only after ingress authentication, including private/group checks.
+        async with self.chat_lock:
+            activity = ActivityController(STATE_FILE).start("imessage", "\n".join(texts) or "Görsel inceleme")
+            self.chat_activity = activity
+            try:
+                await self._activity_event(activity, {"kind": "integration_status", "stage": "preparing"})
+                await self._chat_turn_active(ids, texts, images, burst_end, activity)
+            finally:
+                self.chat_activity = None
+                if self.task_activity is not activity:
+                    await self.activity_indicator.update(activity.run_id, "terminal")
+                    await activity.close()
+
+    async def _chat_turn_active(self, ids: List[int], texts: List[str], images: List[str],
+                         burst_end: Optional[float], activity) -> None:
+        texts, audio_failed = await self._transcribe_messages(ids, texts)
+        meaningful = any(line.strip() and not line.startswith("[dosya:")
+                         for text in texts for line in text.splitlines())
+        if audio_failed and not meaningful and not images:
+            await self._send(media.AUDIO_FAILURE_TEXT, "chat")
+            return
+        recent: List[ArchivedMessage] = self.store.recent_messages(chat.HISTORY_LIMIT + len(ids))
+        history: List[ArchivedMessage] = [item for item in recent if item["id"] not in ids][-chat.HISTORY_LIMIT:]
+        goal = "\n".join(texts).strip() or ("Gönderdiğim görseli incele." if images else "Yanıtla.")
+        if self.integrations is None:
+            self.integrations = CapabilityService()
+        route_history = self._conversation_history(history)
+        route_options = delegate.run_options(
+            self.answer, self.deliver, route_history, images, self.stop_event.is_set, self.integrations,
+        )
+        route_options["requested_backend"] = self.settings["chat_backend"]
+        route_options["conversation_persona"] = self.persona_text
+        if status_question(goal) and not images:
+            await self.activity_indicator.update(activity.run_id, "terminal")
+            await self._send(ActivityStore(STATE_FILE).status(activity.run_id), "chat")
+            return
+        route_options["activity_session"] = activity
+        decision = await decide_conversation(goal, activity.event, route_options, self.chat_clients)
+        if decision.error is not None or decision.contract["route"] != "chat":
+            await self._start_task(goal, images, decision, route_history)
+            if audio_failed:
+                await self._send(media.AUDIO_FAILURE_TEXT, "chat")
+            return
+
+        turn: str = chat.burst_turn(texts, images, self._situation())
+        prepared = await prepare_turn_images(images)
+        with prepared:
+            if prepared.failures:
+                turn = "[HOST: bazı fotoğraflar açılamadı; görülmeyen içeriği tahmin etme]\n" + turn
+            messages: List[chat.ChatMessage] = self._history(history) + [chat.image_turn(turn, prepared.image_paths)]
+            reply: Optional[ModelReply] = await self._respond(messages, chat.CHAT_TOOLS, burst_end, "chat")
+            if reply is not None:
+                await self._act(reply, messages, "\n".join(texts), images[:media.MAX_IMAGE_FILES], burst_end)
+            if audio_failed:
+                await self._send(media.AUDIO_FAILURE_TEXT, "chat")
 
     async def _transcribe_messages(self, ids: List[int], texts: List[str]) -> Tuple[List[str], bool]:
         """Transcribe only accepted audio; restart reuses the archived words."""
@@ -678,10 +741,14 @@ class ImessageBridge:
         değildir: karar çağıranındır (`_delegate`; yalnız kullanıcı turundan iş başlar). Model hatasını dürüstçe
         söyler ve None döner.
         """
+        if self.chat_activity is not None:
+            await self._activity_event(self.chat_activity, {"kind": "integration_status", "stage": "composing"})
         first_sent: List[float] = []
         sent_ids: List[int] = tracked_ids if tracked_ids is not None else []
 
         async def send_bubble(bubble: str) -> None:
+            if self.chat_activity is not None:
+                await self.activity_indicator.update(self.chat_activity.run_id, "terminal")
             sent_ids.append(await self._send(bubble, kind, propagate_unknown=True))
             if not first_sent:
                 first_sent.append(time.monotonic())
@@ -830,10 +897,7 @@ class ImessageBridge:
         if goal is None:
             return
         sent_ids: List[int] = list(reply["sent_ids"])
-        if not result["bubbles"]:
-            sent_ids.append(await self._send(chat.TASK_ACK, "chat"))
-        if await self._start_task(goal, images):
-            self.store.record_task_start(sent_ids[-1], goal)
+        await self._start_task(goal, images, reply_id=sent_ids[-1] if sent_ids else None)
 
     async def _recover_promise(self, messages: List[chat.ChatMessage], bubbles: List[str]) -> Optional[str]:
         """Söz verilip çağrılmayan işi tek düzeltme çağrısıyla kurtarır; model hatası da tutulamamış söz sayılır."""
@@ -863,7 +927,7 @@ class ImessageBridge:
         return persona.situation_block(now_local, self.task_goal or None, self.task_progress, pending,
                                        task_lines(self.store.recent_tasks(RECENT_TASKS), now_local),
                                        [item["text"] for item in self.store.recent_messages(50)
-                                        if item["direction"] == "out"][-10:])
+                                        if item["direction"] == "out"][-10:]) + "\nHOST güncel durum:\n" + ActivityStore(STATE_FILE).status(getattr(self.chat_activity, "run_id", None))
 
     def _is_closing(self) -> bool:
         return self.closing
@@ -872,7 +936,7 @@ class ImessageBridge:
 
     async def _start_task(
         self, goal: str, images: List[str], decision: Optional[ConversationDecision] = None,
-        history: Optional[List[Exchange]] = None,
+        history: Optional[List[Exchange]] = None, reply_id: Optional[int] = None,
     ) -> bool:
         """İşi başlatır; shared route kararı varsa aynı karar task runner'a devredilir."""
         if self.task is not None and self.task_origin == "autonomous":
@@ -890,15 +954,37 @@ class ImessageBridge:
         self.task_progress = []
         self.task_decision = decision
         self.task_history = list(history) if history is not None else None
+        self.task_activity = self.chat_activity or ActivityController(STATE_FILE).start("imessage", goal)
+        self.task_start_ready.clear()
         self._launch_task(goal, images)
+        try:
+            # Commit happened above; optional ACK never cancels or replays that job.
+            if reply_id is None and not await self._typing_available():
+                try:
+                    reply_id = await self._send(chat.TASK_ACK, "chat")
+                except Exception as error:
+                    logging.warning("iMessage work acknowledgment unavailable", extra={"error_type": type(error).__name__})
+            if reply_id is not None:
+                self.store.record_task_start(reply_id, goal)
+        finally:
+            self.task_start_ready.set()
         return True
 
     async def _run_task(self, goal: str, images: List[str], origin: str = "user", rationale: str = "") -> None:
+        owner = asyncio.current_task()
+        def stop_owned():
+            if self.task is None or self.task is owner:
+                self.stop_event.set()
+        await run_owned(self._run_task_owned(goal, images, origin, rationale), on_cancel=stop_owned)
+
+    async def _run_task_owned(self, goal: str, images: List[str], origin: str = "user", rationale: str = "") -> None:
         """
         İş sınırı: işi koşturur, sonucu ya da hatayı kullanıcıya bildirir ve etkinlik günlüğüne yazar. Arka plan görevi
         olduğu için koşu, bildirim ve rapor hataları burada loglanır ("Task exception was never retrieved" olarak
         sızmaz); başarısız, meşgul ve çöken işler de etkinliğe yazılır.
         """
+        await self.task_start_ready.wait()
+        activity = self.task_activity if origin == "user" else None
         started_at: str = utc_iso(datetime.now(timezone.utc))
         generation = self.task_generation
         decision = self.task_decision if origin == "user" else None
@@ -908,6 +994,7 @@ class ImessageBridge:
         def progress(line: str) -> None:
             if self.task_generation == generation:
                 self._on_progress(line)
+        activity_updates = set()
         interim = asyncio.create_task(self._interim_after(INTERIM_AFTER_SECONDS)) if origin == "user" else None
         result: Union[delegate.TaskOutcome, str]  # koşu sonucu ya da kullanıcıya söylenecek hata metni
         try:
@@ -921,13 +1008,26 @@ class ImessageBridge:
                                                [str(path) for path in prepared.image_paths], self.stop_event.is_set,
                                                self.integrations, guards)
                 options["conversation_persona"] = self.persona_text
+                options["activity_origin"] = "imessage"
+                if activity is not None:
+                    options["activity_session"] = activity
                 if decision is not None:
                     options["requested_backend"] = decision.requested_backend
                     options["conversation_decision"] = decision
                 if origin == "autonomous":
                     result = await delegate.run_task(goal, options, progress, origin=origin, rationale=rationale)
                 else:
-                    result = await delegate.run_task(goal, options, progress)
+                    def actual_event(event):
+                        if activity is not None and self.task_generation == generation:
+                            activity.event(event)
+                            if self.typing_supported:
+                                task = asyncio.create_task(self._activity_event(activity, event))
+                                activity_updates.add(task)
+                                task.add_done_callback(activity_updates.discard)
+                    if "on_event" in inspect.signature(delegate.run_task).parameters:
+                        result = await delegate.run_task(goal, options, progress, on_event=actual_event)
+                    else:
+                        result = await delegate.run_task(goal, options, progress)
         except HostBusyError:
             result = HOST_BUSY_TEXT
         except Exception as error:
@@ -935,15 +1035,24 @@ class ImessageBridge:
             logging.exception("iMessage işi beklenmedik hatayla bitti", extra={"goal_chars": len(goal)})
             result = f"iş yarıda kaldı: {type(error).__name__}: {redact(str(error))[:200]}"
         finally:
+            if activity is not None:
+                await activity.close()
+                for pending in activity_updates:
+                    pending.cancel()
+                await asyncio.gather(*activity_updates, return_exceptions=True)
+                await self.activity_indicator.update(activity.run_id, "terminal")
+                if self.task_activity is activity:
+                    self.task_activity = None
             if interim is not None:
                 interim.cancel()
                 await asyncio.gather(interim, return_exceptions=True)
-            self._cancel_question(IntegrationStopped("İş bitti."))
-            self.task, self.task_goal, self.task_progress = None, "", []
-            self.task_origin = "user"
-            self.task_decision = None
-            self.task_history = None
-            self.stop_event.clear()
+            if self.task_generation == generation:
+                self._cancel_question(IntegrationStopped("İş bitti."))
+                self.task, self.task_goal, self.task_progress = None, "", []
+                self.task_origin = "user"
+                self.task_decision = None
+                self.task_history = None
+                self.stop_event.clear()
         try:
             if isinstance(result, str):
                 if origin == "autonomous":
@@ -1046,8 +1155,12 @@ class ImessageBridge:
 
     async def _interim_after(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
-        last: str = self.task_progress[-1] if self.task_progress else "devam ediyor"
-        await self._send(f"hâlâ üzerindeyim: {last[:160]}", "chat")
+        activity = self.task_activity
+        if activity is not None and not activity.closed and activity.stage not in {"terminal", "waiting-user"}:
+            try:
+                await self._send(LABELS[activity.stage] + ": " + activity.row["subject"], "chat")
+            except Exception as error:
+                logging.warning("iMessage activity update unavailable", extra={"error_type": type(error).__name__})
 
     def _on_progress(self, line: str) -> None:
         self.task_progress = (self.task_progress + [line])[-delegate.PROGRESS_LIMIT:]
@@ -1072,6 +1185,7 @@ class ImessageBridge:
     async def close(self) -> None:
         """Çalışan işi durdurur, bekleyen soruyu iptal eder, zamanlayıcıyı ve entegrasyonları kapatır."""
         self.closing = True
+        await self.activity_indicator.close()
         self.stop_event.set()
         self._cancel_question(IntegrationStopped("Köprü kapanıyor."))
         timer: Optional[asyncio.Task[None]] = self.burst_timer
@@ -1099,6 +1213,32 @@ class ImsgSession:
     def __init__(self, command: List[str]) -> None:
         self.command: List[str] = command
         self.client: Optional[ImsgClient] = None
+        self.generation = 0
+        self._activity_cache = None
+        self._activity_command = None
+
+    async def activity_capabilities(self) -> Dict[str, object]:
+        """Read the installed bridge status once per connection; RPC names prove nothing."""
+        if self._activity_cache is None or self._activity_command != tuple(self.command):
+            self._activity_command = tuple(self.command)
+            self._activity_cache = {"typing_indicators": False, "v2_ready": False}
+            if len(self.command) == 2 and self.command[-1] == "rpc":
+                process = None
+                try:
+                    process = await asyncio.create_subprocess_exec(self.command[0], "status", "--json",
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    output, _ = await asyncio.wait_for(process.communicate(), timeout=3)
+                    if process.returncode == 0 and len(output) <= 16384:
+                        status = json.loads(output)
+                        if isinstance(status, dict):
+                            self._activity_cache = {key: status.get(key) is True for key in ("typing_indicators", "v2_ready")}
+                except Exception as error:
+                    logging.warning("Installed iMessage activity status unavailable", extra={"error_type": type(error).__name__})
+                finally:
+                    if process is not None and process.returncode is None:
+                        process.kill()
+                        await process.wait()
+        return dict(self._activity_cache)
 
     def _current(self) -> ImsgClient:
         if self.client is None:
@@ -1124,6 +1264,8 @@ class ImsgSession:
             try:
                 await client.start()
                 self.client = client
+                self.generation += 1
+                self._activity_cache = None
                 bridge.store.set_state("bridge_status", "connected")
                 missed, cursor = await client.catch_up(bridge.store.cursor())
                 for message in missed:

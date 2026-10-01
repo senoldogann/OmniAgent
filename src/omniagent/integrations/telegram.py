@@ -55,6 +55,7 @@ from omniagent.paths import (
 from omniagent.tools.screen import screen_capture_granted, screen_session
 from .maintenance import DoctorFacts, doctor_lines, head_commit, pull_updates, source_version, sync_dependencies
 from .runtime import DeliveryFailed, IntegrationStopped, boolean_field, data_root, read_json, save_json
+from omniagent.core.activity import ActivityController, ActivityStore, RenewalIndicator, run_owned, stage_for_event, status_question
 from .telegram_activity import (
     ActivityEntry, activity_html, append_entry, elapsed_label, mark_failed, render_entries,
 )
@@ -424,6 +425,9 @@ class TelegramAPI:
     async def close(self) -> None:
         if self.owns_client:
             await self.client.aclose()
+
+    async def send_chat_action(self, chat_id: int) -> None:
+        await self.call("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
     async def call(self, method: str, payload: Dict[str, Any]) -> Any:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
@@ -1082,6 +1086,7 @@ class TelegramBridge:
         self.run_tool = ""
         self.run_model = ""
         self.run_tokens = 0
+        self.activity_indicator = RenewalIndicator(self._send_typing)
         # Açık model seçicisi (/provider → sağlayıcı → model); yeni seçici eskisinin butonlarını geçersiz kılar
         self.model_picker: Optional[ModelPicker] = None
         self.backend: Optional[str] = None
@@ -1096,6 +1101,9 @@ class TelegramBridge:
         self.maintenance = False
         # Köprü açıkken prizdeki Mac'in uyumasını engelleyen caffeinate süreci (run() yönetir)
         self.keep_awake: Optional["subprocess.Popen[bytes]"] = None
+
+    async def _send_typing(self) -> None:
+        await self.api.send_chat_action(self.settings["chat_id"])
 
     async def answer(self, title: str, fields: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1173,6 +1181,15 @@ class TelegramBridge:
     async def _execute(
         self, goal: str, images: Optional[List[str]] = None, scheduled_id: Optional[str] = None,
     ) -> None:
+        owner = asyncio.current_task()
+        def stop_owned():
+            if self.active is None or self.active is owner:
+                self.stop_event.set()
+        await run_owned(self._execute_owned(goal, images, scheduled_id), on_cancel=stop_owned)
+
+    async def _execute_owned(
+        self, goal: str, images: Optional[List[str]] = None, scheduled_id: Optional[str] = None,
+    ) -> None:
         if scheduled_id is not None:
             # Bildirim görevin içinde gider: zamanlayıcı görevi await etmeden atar, araya mesaj giremez
             try:
@@ -1183,6 +1200,7 @@ class TelegramBridge:
         apply_model_preferences()
         # Butonlu sürekli oturum istemleri bu göreve bağlanır; önceki görevin butonları işlemez.
         self.run_token = secrets.token_hex(4)
+        owned_run_token = self.run_token
         self.run_started, self.run_tool, self.run_model, self.run_tokens = time.monotonic(), "", "", 0
         started_at = utc_now_iso()
         queue: asyncio.Queue[AgentEvent] = asyncio.Queue()
@@ -1221,7 +1239,13 @@ class TelegramBridge:
 
         if self.integrations is None:
             self.integrations = CapabilityService()
+        activity = ActivityController(STATE_FILE).start("scheduled" if scheduled_id is not None else "telegram", goal)
+        foreground = scheduled_id is None
+        if foreground:
+            await self.activity_indicator.update(activity.run_id, "preparing")
         options: RunOptions = {
+            "activity_session": activity,
+            "activity_origin": "telegram",
             "integrations": self.integrations,
             "requested_backend": self.backend,
             "should_stop": self.stop_event.is_set,
@@ -1257,7 +1281,15 @@ class TelegramBridge:
 
         async def render(event: AgentEvent) -> None:
             """Olayı seçili görünüme işler; kullanıcıyı bekleyen oturum istemi iki görünümde de butonlu kalıcı iletidir."""
-            self._track(event)
+            stage = stage_for_event(event)
+            if foreground:
+                # text_delta is the coordinator's verified publication boundary.
+                if event["kind"] == "text_delta":
+                    await self.activity_indicator.update(activity.run_id, "terminal")
+                elif stage is not None:
+                    await self.activity_indicator.update(activity.run_id, stage)
+            if self.run_token == owned_run_token:
+                self._track(event)
             if event["kind"] == "notice" and event.get("code") in CONTROL_PROMPT_BUTTONS:
                 await self._send_control_prompt(event["text"], str(event.get("code")))
             if verbose:
@@ -1324,6 +1356,7 @@ class TelegramBridge:
                 event = queue.get_nowait()
                 saw_finished = saw_finished or event["kind"] == "run_finished"
                 await render(event)
+            await self.activity_indicator.update(activity.run_id, "terminal")
             if verbose:
                 if not saw_finished:
                     await stream.append(
@@ -1347,6 +1380,7 @@ class TelegramBridge:
             self.history = trim_history(self.history + [report["exchange"]])
             save_json(history_path(), self.history)
         except (HostBusyError, TelegramError) as error:
+            await self.activity_indicator.update(activity.run_id, "terminal")
             try:
                 if verbose:
                     await stream.append(f"\n✗ {error}\n")
@@ -1355,6 +1389,7 @@ class TelegramBridge:
             except TelegramError:
                 pass
         except Exception as error:
+            await self.activity_indicator.update(activity.run_id, "terminal")
             try:
                 message = f"Görev hatası: {type(error).__name__}: {str(error)[:300]}"
                 if verbose:
@@ -1364,8 +1399,11 @@ class TelegramBridge:
             except TelegramError:
                 pass
         finally:
+            await self.activity_indicator.update(activity.run_id, "terminal")
+            await activity.close()
             if not worker.done():
-                self.stop_event.set()
+                if self.run_token == owned_run_token:
+                    self.stop_event.set()
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
             if report is None:
@@ -1376,11 +1414,12 @@ class TelegramBridge:
                     error_type = "CancelledError" if worker.cancelled() else type(worker.exception()).__name__
                     await asyncio.to_thread(channels.record_failed_task, "telegram", goal, error_type,
                                             started_at, self.run_tokens)
-            self.stop_event.clear()
-            self.goal = ""
-            self.active = None
-            self.active_run_mode = "normal"
-            self.run_token = ""
+            if self.run_token == owned_run_token:
+                self.stop_event.clear()
+                self.goal = ""
+                self.active = None
+                self.active_run_mode = "normal"
+                self.run_token = ""
             try:
                 await stream.flush(force=True)
             except TelegramError:
@@ -1544,6 +1583,7 @@ class TelegramBridge:
         )
         failure: Optional[str] = channels.record_failure_line(local_timezone())
         memory_note: str = f"\n⚠️ {failure}" if failure is not None else ""
+        memory_note += "\n" + ActivityStore(STATE_FILE).status()
         if self.active is None:
             return f"Hazır. {upcoming} · Geçmiş: {len(self.history)} konuşma{memory_note}"
         return (
@@ -1841,7 +1881,7 @@ class TelegramBridge:
             await self.api.send(chat_id, await asyncio.to_thread(
                 channels.run_memory_command, companion_db_file(), memory_command))
             return
-        if text == "/status":
+        if text in {"/status", "/durum"} or (self.run_mode == "normal" and status_question(text)):
             await self.api.send(chat_id, self._status_text())
             return
         if text == "/new":
@@ -2014,6 +2054,7 @@ class TelegramBridge:
                     # Stop bayrağı ağdaki bildirimi beklemeden, sonraki güncellemeden önce uygulanır.
                     await asyncio.sleep(0)
         finally:
+            await self.activity_indicator.close()
             if polling is not None:
                 if not polling.done():
                     polling.cancel()

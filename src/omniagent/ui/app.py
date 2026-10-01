@@ -62,6 +62,7 @@ from omniagent.app.agent import (
     RUN_MODE_PROFILES, STATE_FILE, RunOptions, RunReport, close_model_clients,
     create_model_clients,
 )
+from omniagent.core.activity import LABELS, stage_for_event
 from omniagent.app.conversation import run_conversation_with_callback as run_agent_with_callback
 from omniagent.app.continuous import (
     ContinuousLimits, continuous_limits_path, load_continuous_limits, parse_continuous_limits,
@@ -2321,8 +2322,18 @@ class OmniUI(ctk.CTk):
         self._dirty_tools[view["region"]] = view
 
     def _handle_event(self, event: AgentEvent) -> None:
+        previous = self._activity_verb
+        try:
+            self._handle_event_data(event)
+        finally:
+            stage = stage_for_event(event)
+            self._activity_verb = LABELS[stage] if stage is not None else previous
+
+    def _handle_event_data(self, event: AgentEvent) -> None:
         if event["kind"] == "integration_status":
-            self._activity_verb = event["text"]
+            self._activity_verb = LABELS.get(stage_for_event(event), event["text"])
+            if event["stage"] in LABELS:
+                return
             self._new_region([(event["text"] + "\n", ("notice_info",))])
         elif event["kind"] == "user_input_required":
             self._on_input_required(event["request_id"], event["title"], event["fields"])

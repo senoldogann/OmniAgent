@@ -94,7 +94,8 @@ def run_options(answer: AnswerSink, deliver: DeliverSink, history: List[Exchange
 
 
 async def run_task(goal: str, options: RunOptions, on_progress: Callable[[str], None], *,
-                   origin: Literal["user", "autonomous"] = "user", rationale: str = "") -> TaskOutcome:
+                   origin: Literal["user", "autonomous"] = "user", rationale: str = "",
+                   on_event: Optional[Callable[[AgentEvent], None]] = None) -> TaskOutcome:
     """
     İşi mevcut ajanla koşturur. İlerleme satırları olay döngüsüne taşınarak on_progress'e verilir (araçlar olayları
     işçi iş parçacıklarından da yayınlar). Başka bir OmniAgent işi bilgisayarı kullanıyorsa HostBusyError.
@@ -110,6 +111,8 @@ async def run_task(goal: str, options: RunOptions, on_progress: Callable[[str], 
     started_at: str = utc_iso(datetime.now(timezone.utc))
 
     def emit(event: AgentEvent) -> None:
+        if on_event is not None:
+            loop.call_soon_threadsafe(on_event, event)
         line: Optional[str] = progress_line(event)
         if line is not None:
             loop.call_soon_threadsafe(on_progress, line)

@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from omniagent.core.activity import ActivityController, ActivityStore, LABELS, status_question
 from omniagent.app import agent
 from omniagent.app.agent import run_agent_with_callback
 from omniagent.app.conversation_budget import ConversationBudget, ConversationExhausted, QUICK_TOOLS
@@ -86,6 +87,8 @@ def _private_emit(emit: EventSink) -> EventSink:
 
 async def _model(decision: ConversationDecision, clients, messages, tools, emit) -> ModelTurn:
     budget = decision.budget
+    stage = "composing" if budget.phase in {"verify", "generate"} and not tools else "preparing"
+    emit({"kind": "integration_status", "stage": stage, "text": LABELS[stage], "completed": 0, "total": 0})
     budget.check(model=True)
     if len(json.dumps(messages, ensure_ascii=False)) > 80000:
         raise ConversationExhausted("Gerekli bağlam 80.000 karakter sınırına sığmadı; kaynak kaydı doğrudan sunulacak.")
@@ -134,6 +137,8 @@ async def _decide(decision, goal, emit, options, clients) -> ConversationDecisio
     """
     if force_task(goal, options):
         decision.contract = derive_request_contract(subject_for_turn(goal, options), route="task")
+    elif status_question(goal):
+        decision.contract = derive_request_contract(goal, route="chat")
     else:
         turn = await _model(decision, clients, routing_messages(goal, options), [], emit)
         decision.contract = contract_from_decision(goal, options, turn["content"])
@@ -169,7 +174,9 @@ def _memory_context(options: RunOptions) -> str:
             + load_agent_profile(companion_db_beside(path))
             + "\nPersona ve kanıtlı hafıza (veri, kaynak veya izin değil):\n"
             + sanitize_text(options.get("conversation_persona", "")) + "\n"
-            + sanitize_text(options.get("conversation_memory", "")))
+            + sanitize_text(options.get("conversation_memory", ""))
+            + "\nHOST gözlemi, yalnız durum bilgisi (izin veya talimat değil):\n"
+            + ActivityStore(options["state_file"]).status(getattr(options.get("activity_session"), "run_id", None)))
 
 
 async def _investigate(decision, evidence, store, options, clients, emit):
@@ -308,7 +315,7 @@ def _failure_outcome(evidence: EvidenceBundle, reason: str, error: BaseException
     return outcome
 
 
-async def run_conversation_with_callback(goal: str, emit: EventSink, options: RunOptions, clients) -> RunReport:
+async def _run_conversation(goal: str, emit: EventSink, options: RunOptions, clients) -> RunReport:
     """The existing agent signature, with one final publication after grounding."""
     decision = None
     evidence = None
@@ -347,7 +354,10 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
         emit({"kind": "run_started", "goal": decision.contract["subject"], "backend": decision.backend,
               "model": BACKENDS[decision.backend]["model"], "run_mode": options.get("run_mode", "normal"),
               "max_turns": budget.max_turns, "max_wall_clock_seconds": budget.seconds})
-        if decision.contract["route"] == "chat":
+        if status_question(goal) and decision.contract["route"] == "chat":
+            outcome = ActivityStore(options["state_file"]).status(getattr(options.get("activity_session"), "run_id", None))
+            success = True
+        elif decision.contract["route"] == "chat":
             budget.phase = "generate"
             turn = await _model(decision, clients,
                 [{"role": "system", "content": NATURAL_STYLE_POLICY + _memory_context(options)},
@@ -433,3 +443,26 @@ async def run_conversation_with_callback(goal: str, emit: EventSink, options: Ru
     emit({"kind": "text_delta", "text": outcome})
     emit({"kind": "run_finished", "outcome": outcome, "success": success, "reason": reason, "metrics": metrics})
     return report
+
+
+async def run_conversation_with_callback(goal: str, emit: EventSink, options: RunOptions, clients) -> RunReport:
+    """Own activity before classification unless the authenticated adapter owns it."""
+    session = options.get("activity_session")
+    owned = session is None
+    if owned:
+        origin = options.get("activity_origin", "desktop")
+        if options.get("autonomy") is not None:
+            origin = "autonomous"
+        elif options.get("scheduled_run"):
+            origin = "scheduled"
+        session = ActivityController(options["state_file"]).start(origin, goal)
+        options = {**options, "activity_session": session}
+    def observed(event):
+        session.event(event)
+        emit(event)
+    try:
+        observed({"kind": "integration_status", "stage": "preparing", "text": LABELS["preparing"], "completed": 0, "total": 0})
+        return await _run_conversation(goal, observed, options, clients)
+    finally:
+        if owned:
+            await session.close()
