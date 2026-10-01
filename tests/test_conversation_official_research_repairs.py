@@ -55,7 +55,7 @@ async def test_official_planning_precedes_search_and_post_search_generation(coor
         return json.dumps([{ "title": "OpenAI model release" if "openai" in query else "Anthropic model release",
                              "url": urls[0] if "openai" in query else urls[1], "body": "Specific model announcement."}])
     monkeypatch.setattr(agent.Toolbox, "web_search", search)
-    monkeypatch.setattr(agent.Toolbox, "fetch_raw", lambda self, url: "model: " + ("GPT Real" if "openai" in url else "Claude Real"))
+    monkeypatch.setattr(agent.Toolbox, "fetch_raw", lambda self, url: "Introducing " + ("GPT Real" if "openai" in url else "Claude Real") + ".\nmodel: " + ("GPT Real" if "openai" in url else "Claude Real"))
     scripts, requests = scripted
     snapshots = []
     def capture(item):
@@ -75,6 +75,10 @@ async def test_official_planning_precedes_search_and_post_search_generation(coor
     first = "\n".join(message["content"] for message in snapshots[0] if message["role"] == "system")
     second = "\n".join(message["content"] for message in snapshots[1] if message["role"] == "system")
     assert 'category="text"' in first and "site:openai.com/index/" in first and "site:anthropic.com/news/" in first
+    year = str(datetime.now(timezone.utc).year)
+    assert "site:openai.com/index/ " + year + " new model release GPT" in first
+    assert "site:anthropic.com/news/ " + year + " new model release Claude" in first
+    assert "hardware standards" in first
     assert "READ SPECIFIC PRIMARY PAGES NOW" in second and urls[0] in second and urls[1] in second
     assert "not news indexes" in second and datetime.now(timezone.utc).date().isoformat() in second
 
@@ -200,3 +204,34 @@ def test_missing_retained_artifact_is_honest_and_does_not_certify(tmp_path):
     rendered = render_evidence(bundle, store)
     assert "Tam kaynak dosyası okunamadı" in rendered
     assert "Kaynakta bulunan istenen bilgiler" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url,text", [
+    ("https://developers.openai.com/cookbook/examples/realtime_prompting_guide", "Realtime prompting guide. OpenAI released GPT-5. " + "Use this model in this cookbook tutorial. " * 2400),
+    ("https://support.claude.com/en/articles/12138966-release-notes", "Claude Opus 5 release notes."),
+    ("https://www.anthropic.com/news/model-hardware-standard-research-preview", "Introducing the Model Hardware Standard research preview. We release the model hardware standard for inference. Claude is our model family."),
+], ids=["cookbook", "support", "hardware-standard"])
+async def test_non_release_live_pages_cannot_certify_named_provider_models(tmp_path, url, text):
+    from omniagent.app.conversation_grounding import ground_answer
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract(RESEARCH, route="investigate", required_fields=["model_names", "release_dates", "source_urls"]))
+    store.capture(bundle, "fetch_raw", {"ok": True, "result": text}, arguments=json.dumps({"url": url}))
+    gaps = primary_source_gaps(bundle)
+    assert any("openai.com" in gap for gap in gaps) and any("anthropic.com" in gap for gap in gaps)
+    async def no_model(messages):
+        pytest.fail("arbitrary documentation or standards cannot certify model releases")
+    answer, success = await ground_answer("Official models verified", bundle, store, no_model)
+    assert not success and "Resmi duyuru sayfaları okundu" not in answer
+    assert len(answer) < 1800
+
+
+@pytest.mark.parametrize("provider,url,text", [
+    ("OpenAI", "https://openai.com/index/introducing-gpt-5-3/", "Introducing GPT-5.3. Our new model is now available."),
+    ("Anthropic", "https://www.anthropic.com/news/claude-opus-5", "Introducing Claude Opus 5. Our new model is available today."),
+])
+def test_specific_named_model_announcement_is_primary_without_synthetic_labels(tmp_path, provider, url, text):
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("Verify " + provider + " official model release names", route="investigate", required_fields=["model_names"]))
+    store.capture(bundle, "fetch_raw", {"ok": True, "result": text}, arguments=json.dumps({"url": url}))
+    assert not primary_source_gaps(bundle)

@@ -146,20 +146,43 @@ def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
             for domain in domains if not any(host == domain or host.endswith("." + domain) for host in read_hosts)]
 
 
+def model_announcement_url(url: str) -> bool:
+    """Known provider release research uses article pages, not developer/support docs."""
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").casefold()
+    path = parsed.path.casefold()
+    for domain, prefix in (("openai.com", "/index/"), ("anthropic.com", "/news/")):
+        if host == domain or host.endswith("." + domain):
+            if host not in {domain, "www." + domain} or not path.startswith(prefix):
+                return False
+    if path.strip("/") in {"", "news", "index", "blog", "research", "announcements", "models"}:
+        return False
+    return not re.search(r"/(?:careers?|about|contact|privacy|terms|policies|login|docs|cookbook|support)(?:/|$)|(?:^|[-/])(?:hardware|standard|protocol)(?:[-/]|$)", path)
+
+
 def model_page_relevant(bundle: EvidenceBundle, source: SourceObservation, url: str) -> bool:
-    """A model-release request cannot be verified by an arbitrary provider page."""
+    """Require a named model announcement, rather than model/release words anywhere."""
     subject = bundle["contract"]["subject"].casefold()
     if not (re.search(r"\bmodels?\b", subject) or set(bundle["contract"]["required_fields"]) & {"model_names", "release_dates"}):
         return True
-    path = urlsplit(url).path.casefold()
-    if path.strip("/") in {"", "news", "index", "blog", "research", "announcements", "models"}:
-        return False  # provider feeds are discovery, not complete announcement pages
-    if re.search(r"/(?:careers?|about|contact|privacy|terms|policies|login)(?:/|$)", path):
+    if not model_announcement_url(url):
         return False
     text = essential_web_text(source["text"])
-    return bool(re.search(r"\b(?:models?|gpt|claude)\b|gpt[- ]|claude[- ]", text, re.I)
-                and (re.search(r"release|launch|introduc|announc|çıkış|yayın|duyur", text, re.I)
-                     or _MODEL.search(text)))
+    host = urlsplit(url).hostname or ""
+    names = []
+    if host == "openai.com" or host.endswith(".openai.com"):
+        names = [r"GPT[- ](?:[a-z0-9])", r"o[1-9]\b"]
+    elif host == "anthropic.com" or host.endswith(".anthropic.com"):
+        names = [r"Claude[- ](?:[a-z0-9])", r"(?:Opus|Sonnet|Haiku)\s+\d"]
+    else:
+        names = [re.escape(match.group(1)) for match in _MODEL.finditer(text)]
+    if not names:
+        return False
+    named = r"(?:" + "|".join(names) + r")"
+    release = r"(?:releas(?:ed|ing|e)|launch(?:ed|ing)?|introduc(?:ed|ing|es)|announc(?:ed|ing|es)|unveil(?:ed|ing)|yayınlandı|duyuruldu)"
+    # Association stays within a short clause. Exact facts are still quote-checked later.
+    return bool(re.search(r"\b" + release + r"\b[^\n.!?;]{0,100}\b" + named, text, re.I)
+                or re.search(r"\b" + named + r"[^\n!?;]{0,80}\b(?:is now available|was released|has been released|launched)\b", text, re.I))
 
 
 def essential_web_text(text: str) -> str:

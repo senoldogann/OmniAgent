@@ -101,7 +101,7 @@ async def test_host_date_and_batched_primary_pages_within_quick_budget(coordinat
     urls = ["https://openai.com/index/test-model/", "https://www.anthropic.com/news/test-model"]
     monkeypatch.setattr(agent.Toolbox, "web_search", lambda self, query, **kwargs: json.dumps([
         {"title": "Official model release", "url": url, "body": "Release information"} for url in urls]))
-    monkeypatch.setattr(agent.Toolbox, "fetch_raw", lambda self, url: "model: " + ("GPT Example" if "openai" in url else "Claude Example"))
+    monkeypatch.setattr(agent.Toolbox, "fetch_raw", lambda self, url: "Introducing " + ("GPT Example" if "openai" in url else "Claude Example") + ".\nmodel: " + ("GPT Example" if "openai" in url else "Claude Example"))
     scripts.extend([route("investigate", ["model_names", "source_urls"]),
         turn(calls=[call("web_search", query="OpenAI official latest models"), call("web_search", query="Anthropic official latest models")]),
         turn(calls=[call("fetch_raw", url=url) for url in urls]),
