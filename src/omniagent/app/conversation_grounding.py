@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from omniagent.app.types import ModelTurn
-from omniagent.app.policy import screen_inspection_requested, capability_inspection_requested
+from omniagent.app.policy import screen_inspection_requested, capability_audit_only_requested
 from omniagent.app.conversation_routing import host_time_context
 from omniagent.core.conversation_policy import NATURAL_STYLE_POLICY, check_grounded_answer, render_evidence, primary_source_gaps, official_model_research, primary_observation
 from omniagent.core.evidence import EvidenceBundle, EvidenceStore, sanitize_text
@@ -149,7 +149,7 @@ def _local_capability_presentation(bundle: EvidenceBundle) -> str | None:
     """
     contract, sources = bundle["contract"], bundle["observations"]
     if (contract["route"] != "investigate" or contract["required_fields"]
-        or not capability_inspection_requested(contract["subject"])
+        or not capability_audit_only_requested(contract["subject"])
         or not bundle["complete"] or bundle["limitations"]
         or bundle.get("omitted_observations", 0) or len(sources) != 1):
         return None

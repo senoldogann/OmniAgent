@@ -37,6 +37,38 @@ async def test_complete_local_audit_is_readable_authoritative_without_model(tmp_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('subject', [
+    'Bilgisayarda tam disk erişimi açık mı ve OpenAI yeni model çıkardı mı?',
+    'Bilgisayarda tam disk erişimi açık mı? Ayrıca hava durumunu araştır.',
+    'Tam disk erişimi açık mı? OpenAI yeni model çıkardı mı?',
+])
+async def test_compound_question_is_not_completed_by_permission_receipt_alone(tmp_path, subject):
+    store, bundle = audit(tmp_path)
+    bundle['contract']['subject'] = subject
+    calls = []
+    async def model(messages):
+        calls.append(messages)
+        return {'content': '{"ok":false,"facts":[],"missing_fields":[],"unsupported_claims":["other question unanswered"]}'}
+    _, ok = await ground_answer('Only permission audit', bundle, store, model)
+    assert calls and not ok
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('subject', [
+    'Bilgisayarımda neler yapabilirsin ne gibi yetkilerin var? Yalnız mevcut araçları ve izin durumunu kontrol et; izin değiştirme ve herhangi bir uygulamayı açma.',
+    'Tam disk erişimi açık mı ve erişilebilirlik izni açık mı?',
+])
+async def test_readonly_constraints_and_multiple_permissions_remain_local_audit(tmp_path, subject):
+    store, bundle = audit(tmp_path)
+    bundle['contract']['subject'] = subject
+    async def model(messages):
+        pytest.fail('Only local permissions requested')
+    answer, ok = await ground_answer('Untrusted draft', bundle, store, model)
+    assert ok and 'Tam Disk Erişimi: izinli' in answer
+    assert 'Erişilebilirlik: izinli' in answer
+
+
+@pytest.mark.asyncio
 async def test_exact_full_disk_question_runs_actual_audit_and_answers_its_scope(tmp_path, coordinator, scripted, monkeypatch):
     from omniagent.platform.macos import permissions
     from tests.test_shared_conversation import turn, call, run

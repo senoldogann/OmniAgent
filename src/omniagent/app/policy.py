@@ -207,6 +207,27 @@ def capability_inspection_requested(goal: str) -> bool:
                 and re.search(r"(?:yetki|izin|erisilebilir\s+arac|kurulu\s+arac|sistem\s+analiz)", subject))
 
 
+def capability_audit_only_requested(goal: str) -> bool:
+    """Conservative scope for receipt-only presentation, not a route classifier.
+
+    A mixed request still gets the audit tool, but its whole answer must pass
+    normal semantic verification. Readonly constraints are not extra questions.
+    """
+    if not capability_inspection_requested(goal):
+        return False
+    parts = re.split(r"\b(?:ve|ayrica|sonra|and|also|then|mi)\b|[?;\n]", _inspection_subject(goal))
+    for part in parts:
+        if not part.strip():
+            continue
+        if re.search(r"(?:tam\s+disk\s+erisimi|ekran\s+(?:kaydi|kayit)|erisilebilirlik|yetki|izin|"
+                     r"(?:mevcut|kurulu)\s+arac|neler\s+yapabil|sistem\s+analiz)", part):
+            continue
+        if re.fullmatch(r"\s*(?:herhangi\s+bir\s+)?uygulamayi\s+acma[.!\s]*", part):
+            continue
+        return False
+    return True
+
+
 _MUTATION_VERBS: re.Pattern[str] = re.compile(
     r"\b(?:sil|silebilir|siler|kaldır|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
     r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|uygula|"

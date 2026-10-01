@@ -2,6 +2,7 @@
 """Yerel macOS uygulama paketi; derleme komutu packaging/build_macos.sh içindedir."""
 
 from pathlib import Path
+import os
 import tomllib
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
@@ -9,6 +10,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parent
 VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+SIGNING_IDENTITY = os.environ.get("OMNIAGENT_CODESIGN_IDENTITY") or None
 datas, binaries, hiddenimports = collect_all("customtkinter")
 hiddenimports += collect_submodules("omniagent")
 
@@ -40,7 +42,7 @@ executable = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch="arm64",
-    codesign_identity=None,
+    codesign_identity=SIGNING_IDENTITY,
     entitlements_file=None,
 )
 collected = COLLECT(
