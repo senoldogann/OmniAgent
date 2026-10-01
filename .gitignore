@@ -24,5 +24,6 @@ python_versions.txt
 .ccm/
 data/.ccm-generations/
 data/ccm_current
+data/.ccm-activation.flock
 .omni_runs/
 .audit/
