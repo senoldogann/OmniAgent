@@ -199,7 +199,10 @@ def screen_inspection_requested(goal: str) -> bool:
 def capability_inspection_requested(goal: str) -> bool:
     """An actual local permission/tool audit, rather than general ability chat."""
     subject = _inspection_subject(goal)
-    return bool(re.search(r"\b(?:bilgisayar(?:daki|imda)|sistem(?:deki|imde)|"
+    if re.search(r"\b(?:tam\s+disk\s+erisimi|ekran\s+(?:kaydi|kayit\s+izni)|erisilebilirlik(?:\s+izni)?)\b", subject) and re.search(
+        r"\b(?:acik|kapali|izinli|verilmis|durumu|kontrol\s+et)\b", subject):
+        return True
+    return bool(re.search(r"\b(?:bilgisayar(?:da|daki|imda)|sistem(?:deki|imde)|"
                           r"(?:mevcut|kurulu)\s+(?:arac|yetki|izin))", subject)
                 and re.search(r"(?:yetki|izin|erisilebilir\s+arac|kurulu\s+arac|sistem\s+analiz)", subject))
 

@@ -203,14 +203,13 @@ async def test_local_capability_audit_uses_permission_receipt_without_blocking_b
     scripts, requests = scripted
     scripts.extend([turn('Her şeye erişiyorum.'),
                     turn(calls=[call('inspect_host_capabilities')]),
-                    turn('Kurulu araç kataloğunu inceledim; işletim sistemi izinlerini ayrıca kontrol etmek gerekiyor.'),
-                    turn(json.dumps({'ok': True, 'facts': [], 'missing_fields': [], 'unsupported_claims': []}))])
+                    turn('Kurulu araç kataloğunu inceledim; işletim sistemi izinlerini ayrıca kontrol etmek gerekiyor.')])
     with host_task_lock():
         report, events = await run(coordinator, tmp_path,
             'Bilgisayarımda neler yapabilirsin ne gibi yetkilerin var?',
             {'task_context': task_context})
     assert report['success'], report['outcome']
-    assert report['metrics']['tool_calls'] == 1 and len(requests) == 4
+    assert report['metrics']['tool_calls'] == 1 and len(requests) == 3
     assert report['evidence']['observations'][0]['tool'] == 'inspect_host_capabilities'
     assert 'Her şeye erişiyorum' not in json.dumps(events)
 

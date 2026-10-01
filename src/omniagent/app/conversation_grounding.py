@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from omniagent.app.types import ModelTurn
-from omniagent.app.policy import screen_inspection_requested
+from omniagent.app.policy import screen_inspection_requested, capability_inspection_requested
 from omniagent.app.conversation_routing import host_time_context
 from omniagent.core.conversation_policy import NATURAL_STYLE_POLICY, check_grounded_answer, render_evidence, primary_source_gaps, official_model_research, primary_observation
 from omniagent.core.evidence import EvidenceBundle, EvidenceStore, sanitize_text
@@ -141,6 +141,53 @@ def semantic_check(answer: str, bundle: EvidenceBundle, content: str, source_tex
         return False, "Kaynak denetimi geçerli yapılandırılmış sonuç döndürmedi."
 
 
+def _local_capability_presentation(bundle: EvidenceBundle) -> str | None:
+    """Present a complete host audit from its receipt, never from model claims.
+
+    This narrow structured tool cannot certify additional observations or answer
+    other requested fields. All other answers retain semantic verification.
+    """
+    contract, sources = bundle["contract"], bundle["observations"]
+    if (contract["route"] != "investigate" or contract["required_fields"]
+        or not capability_inspection_requested(contract["subject"])
+        or not bundle["complete"] or bundle["limitations"]
+        or bundle.get("omitted_observations", 0) or len(sources) != 1):
+        return None
+    source = sources[0]
+    if (source["tool"] != "inspect_host_capabilities" or not source["ok"]
+        or not source["complete"] or source["completeness"] != "full"):
+        return None
+    try:
+        data = parse_complete_json(source["text"])
+        if not isinstance(data, dict) or set(data) != {"permission_report", "registered_tools", "scope", "limitations"}:
+            return None
+        report, tools, scope, limits = (data[key] for key in
+            ("permission_report", "registered_tools", "scope", "limitations"))
+        if (not isinstance(report, str) or not report.strip()
+            or not isinstance(scope, str) or not scope.strip()
+            or not isinstance(tools, list) or not tools
+            or any(not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", name) for name in tools)
+            or not isinstance(limits, list) or not limits
+            or any(not isinstance(limit, str) or not limit.strip() for limit in limits)):
+            return None
+    except (ValueError, TypeError):
+        return None
+    subject = contract["subject"].casefold()
+    permissions = [label for label, matches in (
+        ("Tam Disk Erişimi", "tam disk" in subject),
+        ("Erişilebilirlik", "erişilebilirlik" in subject or "erisilebilirlik" in subject),
+        ("Ekran kaydı", "ekran kay" in subject)) if matches]
+    requested_permission = permissions[0] if len(permissions) == 1 else None
+    if requested_permission is not None:
+        line = next((line.strip() for line in report.splitlines()
+                     if line.partition(":")[0].strip().casefold() == requested_permission.casefold()), None)
+        if line:
+            return sanitize_text(line + "\n\n" + scope + "\n" + "\n".join(limits))
+    return sanitize_text("Mevcut araçları ve bu uygulama sürecinin izin durumunu kontrol ettim.\n\n"
+        "İzin durumu\n" + report + "\n\nKayıtlı araçlar\n" + ", ".join(tools)
+        + "\n\nDenetimin kapsamı\n" + scope + "\n" + "\n".join("• " + limit for limit in limits))
+
+
 async def ground_answer(answer: str, bundle: EvidenceBundle, store: EvidenceStore | None,
                         model: Callable[[list[dict]], Awaitable[ModelTurn]], *,
                         visual_observation: dict | None = None) -> tuple[str, bool]:
@@ -151,6 +198,9 @@ async def ground_answer(answer: str, bundle: EvidenceBundle, store: EvidenceStor
             bundle = store.authoritative_bundle(bundle)
     except (OSError, ValueError):
         return render_evidence(original_bundle) + "\nTam kaynak dosyası okunamadı; doğrulama eksik.", False
+    local_audit = _local_capability_presentation(bundle)
+    if local_audit is not None:
+        return local_audit, True
     if screen_inspection_requested(bundle["contract"]["subject"]) and visual_observation is not None:
         return await _ground_screen_answer(answer, bundle, visual_observation, model)
     gaps = primary_source_gaps(bundle)
