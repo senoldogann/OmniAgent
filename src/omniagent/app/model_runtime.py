@@ -219,7 +219,9 @@ async def stream_completion(
     headers, extra_body = model_request_overrides(profile, session_id)
     request: Dict[str, Any] = {
         "model": profile["model"],
-        "messages": messages,
+        "messages": [({**entry, "content": ""} if entry.get("role") == "assistant"
+                       and entry.get("tool_calls") and entry.get("content") is None else entry)
+                      for entry in messages] if profile["provider"] == "ollama-cloud" else messages,
         (
             "max_completion_tokens"
             if profile["provider"] == "openai"

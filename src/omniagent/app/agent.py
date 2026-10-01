@@ -135,6 +135,7 @@ from omniagent.app.policy import (
     has_action_evidence,
     next_quality_backend,
     screenshot_requested,
+    screen_inspection_requested, capability_inspection_requested,
     source_change_expected,
     unmet_explicit_deletion,
     explicit_deletion_target,
@@ -1275,7 +1276,7 @@ async def run_agent_with_callback(
             return
         try:
             captured = evidence_store.capture(evidence, call["name"], result, arguments=call["arguments"])
-            if call["name"] == "take_screenshot":
+            if call["name"] == "take_screenshot" and result.get("ok"):
                 mark_incomplete(evidence, "Ekran görüntüsünün işlem kaydı korundu; geçici görüntü içeriği bu kaynak kaydında tutulmuyor.")
                 if captured is not None:
                     captured["complete"] = False
@@ -1458,6 +1459,7 @@ async def run_agent_with_callback(
     unexecuted_tool_recoveries: int = 0
     awaiting_real_tool_call: bool = False
     delivery_recoveries: int = 0
+    inspection_recoveries: int = 0
     file_receipts: Tuple[FileReceipt, ...] = ()
     artifacts: Tuple[ArtifactReady, ...] = ()
     head_len: int = len(messages)
@@ -1865,6 +1867,22 @@ async def run_agent_with_callback(
                     outcome, reason, success = "", "", False
                     finish_guarded_turn()
                     continue
+                inspection_tool = ("take_screenshot" if screen_inspection_requested(goal) else
+                                   "inspect_host_capabilities" if capability_inspection_requested(goal) else None)
+                if success and inspection_tool and not any(step["tool"] == inspection_tool and step["ok"] for step in steps):
+                    failed = [step for step in steps if step["tool"] == inspection_tool and not step["ok"]]
+                    if not failed and inspection_recoveries < 1:
+                        inspection_recoveries += 1
+                        messages.append({"role": "user", "content": (
+                            "HOST: Kullanıcı mevcut bilgisayar durumunu incelemeni istedi; henüz gerçek gözlem yok. "
+                            + inspection_tool + " aracını API tool_calls ile çalıştır. Tahmin veya genel yetenek listesi verme. "
+                            "Araç veya izin kullanılamıyorsa somut engeli bildir; gözlemediğin durumu görmüş gibi anlatma.")})
+                        outcome, reason, success = "", "", False
+                        finish_guarded_turn()
+                        continue
+                    success = False
+                    reason = (failed[-1]["detail"] if failed else "İstenen bilgisayar incelemesi için gerçek gözlem alınmadı.")
+                    outcome = "İnceleme tamamlanamadı: " + reason
                 # Erişim engelinde dürüstçe durma: kanıt kapıları yeniden deneme turu istemez, yanıtı değiştirmez
                 wall_stop: bool = success and stopped_at_access_wall(outcome, steps)
                 navigation_gap = requested_chrome_navigation_gap(goal, steps) if success and not wall_stop else None
@@ -2276,6 +2294,9 @@ async def run_agent_with_callback(
                 for call, result in zip(turn["tool_calls"], results, strict=True)
             )
             for shot_call in pending_shots:
+                if options.get("on_visual_observation") is not None:
+                    # A newer unreadable snapshot must not reuse an earlier image.
+                    options["on_visual_observation"]({})
                 observation, digest = await _requested_screenshot_observation(
                     shot_call, allow_source_relative=must_change_source, emit=emit,
                 )
@@ -2285,6 +2306,8 @@ async def run_agent_with_callback(
                     # yoksa ilerleme sayılmaz, bu yüzden tekrar eden başarısızlığı hızlı döngü durdurur.
                     messages.append(observation)
                     continue
+                if options.get("on_visual_observation") is not None:
+                    options["on_visual_observation"](observation)
                 observations += 1
                 turn_observation_digests.append(digest)
                 previous_observation_digest = last_observation_digest

@@ -74,6 +74,8 @@ class RunOptions(TypedDict):
     conversation_memory: NotRequired[str]
     request_contract: NotRequired[RequestContract]
     evidence_run_id: NotRequired[str]
+    # Private in-process image handoff, never serialized into reports/history.
+    on_visual_observation: NotRequired[Callable[[dict], None]]
     should_stop: Callable[[], bool]
     state_file: str
     memory_file: NotRequired[str]

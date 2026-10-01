@@ -640,6 +640,18 @@ class Toolbox:
             f"STDERR: {_clip(stderr, SHELL_STDERR_LIMIT)}\nÇıkış Kodu: {returncode}"
         )
 
+    def inspect_host_capabilities(self) -> str:
+        """Read this process's native permissions and registered tools; never request access."""
+        from omniagent.app.tool_schema import route_tool_schemas
+        from omniagent.platform.macos.permissions import report
+        registered = [schema["function"]["name"] for schema in
+                      route_tool_schemas(None, True, False, can_send_files=True, can_schedule=True)]
+        return json.dumps({"permission_report": report(), "registered_tools": registered,
+                           "scope": "İzin denetimi bu çalışan sürece aittir. Kayıtlı araçlar tüm görevlerde kullanılabilir veya tüm hedeflerde yetkilidir anlamına gelmez.",
+                           "limitations": ["Her dosya/klasörün erişimi ayrı kontrol edilmelidir.",
+                                           "Tarayıcı oturumu, API anahtarları ve uzak hizmet erişimi bu denetimde doğrulanmadı.",
+                                           "İşlemler mevcut kullanıcı onayı ve görev güvenliği kurallarına tabidir."]}, ensure_ascii=False)
+
     def process_list(self) -> str:
         result = subprocess.run(
             ["ps", "-eo", "pid,ppid,user,%cpu,%mem,comm"],

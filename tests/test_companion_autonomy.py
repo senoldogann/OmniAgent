@@ -78,7 +78,7 @@ def test_user_job_cannot_be_preempted(tmp_path, monkeypatch):
         with pytest.raises(HostBusyError):
             with host_task_lock_preempting(timeout_seconds=1):
                 pass
-        assert time.monotonic() - started < .5
+        assert .9 <= time.monotonic() - started < 1.5
     assert not (tmp_path / "host-preempt.request").exists()
 
 

@@ -17,7 +17,7 @@ def final_message(text: str) -> str:
 FINAL_CHUNK_CHARS: int = 3500
 
 
-def final_chunks(text: str, limit: int = FINAL_CHUNK_CHARS) -> List[str]:
+def final_chunks(text: str, limit: int = FINAL_CHUNK_CHARS, *, normalize: bool = True) -> List[str]:
     """Lossless transport chunks, preferring paragraphs, sentences, then whitespace.
 
     Newlines inside a short final remain in one message. Boundary whitespace stays
@@ -26,7 +26,7 @@ def final_chunks(text: str, limit: int = FINAL_CHUNK_CHARS) -> List[str]:
     """
     if limit < 1:
         raise ValueError("chunk limit must be positive")
-    remaining = final_message(text)
+    remaining = final_message(text) if normalize else text
     chunks: List[str] = []
     while len(remaining) > limit:
         window = remaining[:limit]

@@ -17,6 +17,7 @@ from omniagent.core.activity import ActivityController, ActivityStore, LABELS, s
 from omniagent.app import agent
 from omniagent.app.agent import run_agent_with_callback
 from omniagent.app.conversation_budget import ConversationBudget, ConversationExhausted, QUICK_TOOLS
+from omniagent.app.policy import capability_inspection_requested, screen_inspection_requested
 from omniagent.app.conversation_grounding import authoritative_context, ground_answer
 from omniagent.app.conversation_routing import contract_from_decision, force_task, routing_messages, subject_for_turn, needs_external_observation, host_time_context
 from omniagent.app.tool_schema import route_tool_schemas
@@ -91,12 +92,23 @@ def _private_emit(emit: EventSink) -> EventSink:
     return filtered
 
 
-async def _model(decision: ConversationDecision, clients, messages, tools, emit) -> ModelTurn:
+async def _model(decision: ConversationDecision, clients, messages, tools, emit, *, trusted_images=()) -> ModelTurn:
     budget = decision.budget
     stage = "composing" if budget.phase in {"verify", "generate"} and not tools else "preparing"
     emit({"kind": "integration_status", "stage": stage, "text": LABELS[stage], "completed": 0, "total": 0})
     budget.check(model=True)
-    if len(json.dumps(messages, ensure_ascii=False)) > 80000:
+    measured = messages
+    if trusted_images:
+        # Only identity-matched JPEG parts produced by this run's screenshot
+        # encoder are separate image input. Untrusted tool text keeps its 80k cap.
+        if len(trusted_images) > 2 or any(len(part.get("image_url", {}).get("url", "")) > 16 * 1024 * 1024 for part in trusted_images):
+            raise ConversationExhausted("Geçici ekran görüntüsü model girdi sınırını aştı.")
+        measured = [{**message, "content": [
+            {"type": "image_url", "image_url": {"url": "[private host screenshot]"}}
+            if any(part is expected for expected in trusted_images) else part
+            for part in message["content"]]} if isinstance(message.get("content"), list) else message
+            for message in messages]
+    if len(json.dumps(measured, ensure_ascii=False)) > 80000:
         raise ConversationExhausted("Gerekli bağlam 80.000 karakter sınırına sığmadı; kaynak kaydı doğrudan sunulacak.")
     decision.runtime.model_retry_until = min(budget.started + budget.seconds,
                                              time.monotonic() + 30.0)
@@ -144,6 +156,8 @@ async def _decide(decision, goal, emit, options, clients) -> ConversationDecisio
     if force_task(goal, options):
         decision.contract = derive_request_contract(subject_for_turn(goal, options), route="task",
                                                     needs_observation=needs_external_observation(goal, options))
+    elif capability_inspection_requested(goal):
+        decision.contract = derive_request_contract(goal, route="investigate")
     elif status_question(goal):
         decision.contract = derive_request_contract(goal, route="chat")
     else:
@@ -245,15 +259,17 @@ async def _investigate(decision, evidence, store, options, clients, emit):
     budget.phase = "generate"
     budget.check(model=True)
     await _execution_ready(decision, options)
-    decision.runtime.allowed_tools = INVESTIGATION_TOOLS
+    allowed_tools = INVESTIGATION_TOOLS | ({"inspect_host_capabilities"} if capability_inspection_requested(decision.contract["subject"]) else set())
+    decision.runtime.allowed_tools = allowed_tools
     decision.runtime.cancellable_reads = True
     toolbox = Toolbox(memory_file=options.get("memory_file"), allow_memory_mutation=False,
                       history_file=options["state_file"])
-    schemas = [schema for schema in route_tool_schemas(None, False, False) if schema["function"]["name"] in INVESTIGATION_TOOLS]
+    schemas = [schema for schema in route_tool_schemas(None, False, False) if schema["function"]["name"] in allowed_tools]
     messages = [{"role": "system", "content": INVESTIGATION_POLICY + host_time_context() + NATURAL_STYLE_POLICY + _memory_context(options)},
                 *to_messages(options["history"]),
                 {"role": "user", "content": json.dumps(decision.contract, ensure_ascii=False)}]
     primary_reminder_sent = False
+    audit_reminder_sent = False
     try:
         while True:
             plan = _official_research_plan(decision, evidence, store)
@@ -261,6 +277,10 @@ async def _investigate(decision, evidence, store, options, clients, emit):
                 messages.append({"role": "system", "content": plan})
             turn = await _model(decision, clients, messages, schemas, emit)
             if not turn["tool_calls"]:
+                if "inspect_host_capabilities" in allowed_tools and not evidence["observations"] and not audit_reminder_sent:
+                    audit_reminder_sent = True
+                    messages.append({"role": "system", "content": "TRUSTED HOST: Kullanıcı bu bilgisayarın mevcut yetki ve araçlarını soruyor. inspect_host_capabilities aracını gerçekten çağır. Genel yetenek veya tüm erişimler verilmiş iddiası sunma. İzinler bu çalışan sürece ve kontrol edilen hedeflere aittir."})
+                    continue
                 gaps = primary_source_gaps(store.authoritative_bundle(evidence) if store is not None else evidence)
                 if gaps and not primary_reminder_sent and budget.tools < QUICK_TOOLS:
                     primary_reminder_sent = True
@@ -279,7 +299,7 @@ async def _investigate(decision, evidence, store, options, clients, emit):
                     "name": call["name"], "arguments": call["arguments"]}} for call in turn["tool_calls"]]})
             for index, call in enumerate(turn["tool_calls"]):
                 budget.check()
-                if call["name"] not in INVESTIGATION_TOOLS:
+                if call["name"] not in allowed_tools:
                     result = {"ok": False, "error_type": "ToolUnavailable",
                               "error": "Bu incelemede yalnız izinli salt okunur araçlar kullanılabilir."}
                 else:
@@ -311,7 +331,7 @@ async def _investigate(decision, evidence, store, options, clients, emit):
         await toolbox.close_browser()
 
 
-async def _full_task(decision, evidence, options, clients, emit):
+async def _full_task(decision, evidence, options, clients, emit, visual_observations=None):
     budget = decision.budget
     budget.use_full_task_limits()
     budget.check(model=True)
@@ -330,12 +350,20 @@ async def _full_task(decision, evidence, options, clients, emit):
         forward(event)
     async def locked_task():
         nonlocal completed_report, completed_in_time
+        from omniagent.platform.macos.host_lock import host_owner
+        if host_owner() is not None:
+            emit({"kind": "notice", "level": "info", "text": "Bilgisayarı kullanan diğer görevin bitmesini kısa süre bekliyorum."})
         async with options["task_context"]():
             budget.check(model=True)
             await _execution_ready(decision, options)
             full_options = {**options, "request_contract": decision.contract, "evidence_run_id": evidence["run_id"],
                             "max_iterations": max(1, budget.user_turns - budget.turns),
                             "max_wall_clock_seconds": budget.remaining_seconds}
+            if visual_observations is not None:
+                def retain_visual(observation):
+                    visual_observations.clear()
+                    visual_observations.append(observation)
+                full_options["on_visual_observation"] = retain_visual
             if budget.token_limit is not None:
                 full_options["max_total_tokens"] = max(1, budget.token_limit - budget.tokens)
             with _model_scope(decision):
@@ -388,7 +416,11 @@ def _publication_check(budget, completed_presentation: bool) -> None:
 
 
 def _failure_outcome(evidence: EvidenceBundle, reason: str, error: BaseException, store=None) -> str:
-    outcome = render_evidence(evidence, store) + "\nİşlem tamamlanamadı: " + reason
+    if not evidence["observations"]:
+        return "İşlem tamamlanamadı: " + reason
+    outcome = render_evidence(evidence, store)
+    if reason and reason not in outcome:
+        outcome += "\nİşlem tamamlanamadı: " + reason
     if isinstance(error, ConversationExhausted):
         outcome += ("\nAynı konuda tam ajanla yeni bir çalışma başlatarak devam edebiliriz: "
                     + evidence["contract"]["subject"])
@@ -405,6 +437,7 @@ async def _run_conversation(goal: str, emit: EventSink, options: RunOptions, cli
     outcome = ""
     inner = None
     completed_presentation = False
+    visual_observations = []
     try:
         handed = options.get("conversation_decision")
         if handed is not None:
@@ -447,14 +480,14 @@ async def _run_conversation(goal: str, emit: EventSink, options: RunOptions, cli
             outcome, success = sanitize_text(turn["content"]), True
         else:
             if decision.contract["route"] == "task":
-                inner = await _full_task(decision, evidence, options, clients, emit)
+                inner = await _full_task(decision, evidence, options, clients, emit, visual_observations)
                 evidence = inner.get("evidence", evidence)
                 outcome = inner["outcome"]
                 success, reason = inner["success"], inner["reason"]
                 if not success:
                     # Failed/cancelled engine verdict stays failed, even if prose
                     # sounds successful. No model rewrite can promote it.
-                    outcome = render_evidence(evidence, store) + "\nGörev tamamlanamadı: " + sanitize_text(reason)
+                    outcome = _failure_outcome(evidence, sanitize_text(reason), RuntimeError(reason), store)
                     if (budget.turns >= budget.max_turns or budget.remaining_seconds <= 0
                         or "ConversationExhausted" in reason):
                         outcome += "\nAynı konuda yeni bir çalışma başlatarak devam edebiliriz: " + decision.contract["subject"]
@@ -465,9 +498,12 @@ async def _run_conversation(goal: str, emit: EventSink, options: RunOptions, cli
                 budget.phase = "verify"
                 try:
                     outcome, checked = await ground_answer(outcome, evidence, store,
-                        lambda messages: _model(decision, clients, messages, [], emit))
+                        lambda messages: _model(decision, clients, messages, [], emit, trusted_images=tuple(
+                            part for part in visual_observations[-1].get("content", []) if isinstance(part, dict) and part.get("type") == "image_url")
+                            if visual_observations else ()),
+                        visual_observation=visual_observations[-1] if visual_observations else None)
                 except ConversationExhausted as error:
-                    if (inner is None or not inner["success"]
+                    if (screen_inspection_requested(decision.contract["subject"]) or inner is None or not inner["success"]
                         or (budget.token_limit is not None and budget.tokens > budget.token_limit)):
                         raise
                     completed_presentation = True

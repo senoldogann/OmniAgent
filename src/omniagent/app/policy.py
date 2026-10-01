@@ -185,6 +185,25 @@ def screenshot_requested(goal: str) -> bool:
     return bool(_SCREENSHOT_REQUEST.search(goal))
 
 
+def _inspection_subject(goal: str) -> str:
+    return goal.casefold().translate(str.maketrans("çğıöşü", "cgiosu"))
+
+
+def screen_inspection_requested(goal: str) -> bool:
+    """Current visible screen inspection, distinct from asking for an image file."""
+    return bool(re.search(r"\b(?:ekran(?:da|imda)\s+ne\s+(?:var|goruyorsun|gorunuyor)|"
+                          r"(?:su\s+an(?:ki)?\s+)?ekrani\s+(?:incele|analiz\s+et|oku)|"
+                          r"what\s+(?:do\s+you\s+see|is)\s+on\s+(?:my|the)\s+screen)\b", _inspection_subject(goal)))
+
+
+def capability_inspection_requested(goal: str) -> bool:
+    """An actual local permission/tool audit, rather than general ability chat."""
+    subject = _inspection_subject(goal)
+    return bool(re.search(r"\b(?:bilgisayar(?:daki|imda)|sistem(?:deki|imde)|"
+                          r"(?:mevcut|kurulu)\s+(?:arac|yetki|izin))", subject)
+                and re.search(r"(?:yetki|izin|erisilebilir\s+arac|kurulu\s+arac|sistem\s+analiz)", subject))
+
+
 _MUTATION_VERBS: re.Pattern[str] = re.compile(
     r"\b(?:sil|silebilir|siler|kaldır|temizle|boşalt|boşaltır|taşı|kaydet|kopyala|gönder|"
     r"kur|yükle|indir|başlat|çalıştır|değiştir|düzelt|güncelle|oluştur|ekle|uygula|"

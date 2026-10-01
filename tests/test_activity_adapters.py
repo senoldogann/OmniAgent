@@ -467,6 +467,8 @@ async def test_imessage_status_observes_real_concurrent_telegram_read_and_verifi
 async def test_imessage_rejected_real_host_lock_sends_no_work_ack_or_start_record(parts, tmp_path, monkeypatch, script):
     from omniagent.platform.macos.host_lock import host_task_lock
     bridge, transport, store = parts
+    from omniagent.platform.macos.host_lock import async_host_task_lock_preempting
+    monkeypatch.setattr(delegate, 'async_host_task_lock_preempting', lambda: async_host_task_lock_preempting(timeout_seconds=.1))
     state = str(tmp_path / 'busy-real.json')
     monkeypatch.setattr(imessage, 'STATE_FILE', state)
     monkeypatch.setattr(delegate, 'STATE_FILE', state)

@@ -76,6 +76,8 @@ async def test_busy_host_is_reported_without_running(tmp_path: Path, monkeypatch
         async with options["task_context"]():
             raise AssertionError("kilit meşgulken task branch çalışmamalı")
 
+    from omniagent.platform.macos.host_lock import async_host_task_lock_preempting
+    monkeypatch.setattr(delegate, "async_host_task_lock_preempting", lambda: async_host_task_lock_preempting(timeout_seconds=.1))
     monkeypatch.setattr(delegate, "run_agent_with_callback", must_not_run)
     integrations = CapabilityService()
     ignored: List[str] = []

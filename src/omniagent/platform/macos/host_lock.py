@@ -82,11 +82,12 @@ def _acquire(target: Path, origin: str, timeout_seconds: float = 0,
                 if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                     raise
                 owner = _read(target)
-                if origin != "user" or timeout_seconds <= 0 or owner.get("origin") != "autonomous":
+                if origin != "user" or timeout_seconds <= 0:
                     raise HostBusyError("Başka bir OmniAgent görevi çalışıyor; bitince yeniden deneyin.") from error
                 if time.monotonic() >= deadline:
-                    raise HostBusyError("Otonom görev henüz durmadı; bitince yeniden deneyin.") from error
-                _write_request(target, owner)
+                    raise HostBusyError("Bilgisayar başka bir OmniAgent görevine ayrılmış; kısa bekleme süresi doldu. Çalışan görevin bulunduğu kanaldan durumunu kontrol et; varsa onay sorusunu yanıtla veya o görevi durdur.") from error
+                if owner.get("origin") == "autonomous":
+                    _write_request(target, owner)
                 time.sleep(POLL_SECONDS)
         if cancelled is not None and cancelled.is_set():
             raise HostBusyError("Kilit bekleyişi iptal edildi.")

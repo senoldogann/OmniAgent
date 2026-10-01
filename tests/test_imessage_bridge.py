@@ -107,7 +107,7 @@ class ScriptedChat:
     async def __call__(self, clients: Dict[str, AsyncOpenAI], backend: str, system: str,
                        messages: List[Dict[str, str]], tools: List[Dict[str, object]],
                        send_bubble: Callable[[str], Awaitable[None]],
-                       should_stop: Callable[[], bool], session_id: str) -> chat.ChatResult:
+                       should_stop: Callable[[], bool], session_id: str, **kwargs) -> chat.ChatResult:
         self.tool_lists.append(tools)
         self.inputs.append(messages[-1]["content"])
         self.conversations.append(list(messages))
@@ -262,7 +262,7 @@ async def test_message_during_chat_turn_becomes_next_burst(parts: Parts, monkeyp
     async def slow(clients: Dict[str, AsyncOpenAI], backend: str, system: str, messages: List[Dict[str, str]],
                    tools: List[Dict[str, object]],
                    send_bubble: Callable[[str], Awaitable[None]], should_stop: Callable[[], bool],
-                   session_id: str) -> chat.ChatResult:
+                   session_id: str, **kwargs) -> chat.ChatResult:
         inputs.append(messages[-1]["content"])
         if len(inputs) == 1:
             await gate.wait()
@@ -357,6 +357,8 @@ async def test_busy_host_is_reported_to_user(parts: Parts, monkeypatch: pytest.M
         async with options["task_context"]():
             raise AssertionError("kilit meşgulken task branch çalışmamalı")
 
+    from omniagent.platform.macos.host_lock import async_host_task_lock_preempting
+    monkeypatch.setattr(delegate, "async_host_task_lock_preempting", lambda: async_host_task_lock_preempting(timeout_seconds=.1))
     monkeypatch.setattr(delegate, "run_agent_with_callback", must_not_run)
     monkeypatch.setattr(chat, "respond", ScriptedChat([([], "ekran görüntüsü al")]))
     with host_task_lock():
@@ -387,7 +389,7 @@ async def test_model_failure_is_reported_honestly(parts: Parts, monkeypatch: pyt
     async def failing(clients: Dict[str, AsyncOpenAI], backend: str, system: str, messages: List[Dict[str, str]],
                    tools: List[Dict[str, object]],
                       send_bubble: Callable[[str], Awaitable[None]], should_stop: Callable[[], bool],
-                      session_id: str) -> chat.ChatResult:
+                      session_id: str, **kwargs) -> chat.ChatResult:
         raise chat.ChatError("Sohbet modeli boş yanıt döndürdü (finish_reason=stop).")
 
     monkeypatch.setattr(chat, "respond", failing)
@@ -864,7 +866,7 @@ class MemoryChat:
     async def __call__(self, clients: Dict[str, AsyncOpenAI], backend: str, system: str,
                        messages: List[Dict[str, object]], tools: List[Dict[str, object]],
                        send_bubble: Callable[[str], Awaitable[None]],
-                       should_stop: Callable[[], bool], session_id: str) -> chat.ChatResult:
+                       should_stop: Callable[[], bool], session_id: str, **kwargs) -> chat.ChatResult:
         self.systems.append(system)
         self.conversations.append(list(messages))
         result = self.turns.pop(0)

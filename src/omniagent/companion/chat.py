@@ -474,7 +474,7 @@ def parse_memory_calls(tool_calls: List[ToolCallDraft]) -> Tuple[Optional[str], 
 async def respond(
     clients: Dict[str, AsyncOpenAI], backend: str, system: str, messages: List[ChatMessage],
     tools: List[Dict[str, object]], send_bubble: Callable[[str], Awaitable[None]], should_stop: Callable[[], bool],
-    session_id: str,
+    session_id: str, *, presentation: Optional[Callable[[str], str]] = None,
 ) -> ChatResult:
     """
     Tek model turu. Stream yalnız geçici taslaktır; kullanıcıya semantik cevap ancak model turu başarıyla
@@ -517,7 +517,9 @@ async def respond(
         content = final_message("\n".join(visible_lines))
 
     sent: List[str] = []
-    for chunk in final_chunks(content):
+    # Adapt complete native display before splitting; canonical model content stays private.
+    display = presentation(content) if presentation is not None else content
+    for chunk in final_chunks(display, normalize=presentation is None):
         if should_stop():
             return {"bubbles": sent, "start_task": None}
         await send_bubble(chunk)

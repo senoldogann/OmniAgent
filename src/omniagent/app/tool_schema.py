@@ -222,6 +222,7 @@ def route_tool_schemas(
     can_schedule: hedef zamanlama istiyor ve planları çalıştıracak Telegram köprüsü kurulu.
     """
     schemas: List[Dict[str, Any]] = [
+        _function_schema("inspect_host_capabilities", "Bu çalışan sürecin macOS ekran kaydı, erişilebilirlik ve Messages veritabanı okuma izinlerini ve kayıtlı araçları salt okunur biçimde denetler. İzin istemez/değiştirmez. Katalog, her hedefe erişim veya işlem yetkisi kanıtı değildir.", {}),
         _function_schema("execute_shell", "Sistem kabuğunda (/bin/sh, macOS BSD araçları) komut çalıştırır.", {
             "command": {"type": "string", "description": "Çalıştırılacak kabuk komutu."},
             "use_sudo": {"type": "boolean", "description": "Komut sudo ile mi çalıştırılsın."},

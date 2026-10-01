@@ -5,7 +5,7 @@ import re
 from typing import Any
 from datetime import datetime, timezone
 
-from omniagent.app.policy import memory_mutation_requested, source_change_expected
+from omniagent.app.policy import memory_mutation_requested, source_change_expected, screen_inspection_requested, capability_inspection_requested
 from omniagent.app.tool_schema import chrome_session_route, scheduling_goal, skills_sh_goal
 from omniagent.app.types import RunOptions
 from omniagent.core.conversation import to_messages
@@ -83,7 +83,8 @@ def needs_external_observation(goal: str, options: RunOptions) -> bool:
     """
     subject = subject_for_turn(goal, options)
     return bool(_EXTERNAL_TARGET.search(subject) or _EFFECT.search(subject)
-                or force_task_effect(goal, options) or pure_read_requested(subject))
+                or force_task_effect(goal, options) or pure_read_requested(subject)
+                or screen_inspection_requested(subject) or capability_inspection_requested(subject))
 
 
 def force_task_effect(goal: str, options: RunOptions) -> bool:
@@ -102,7 +103,7 @@ def subject_for_turn(goal: str, options: RunOptions) -> str:
 def force_task(goal: str, options: RunOptions) -> bool:
     return bool(options.get("run_mode", "normal") != "normal" or options.get("autonomy") is not None
                 or options.get("unattended") or options.get("scheduled_run") or options.get("images")
-                or force_task_effect(goal, options))
+                or force_task_effect(goal, options) or screen_inspection_requested(goal))
 
 
 def routing_messages(goal: str, options: RunOptions) -> list[dict[str, Any]]:
@@ -129,6 +130,8 @@ def contract_from_decision(goal: str, options: RunOptions, content: str) -> Requ
         return derive_request_contract(subject, route=route)
     if force_task(goal, options) or _EXPLICIT_ACTION.search(goal):
         route = "task"
+    elif capability_inspection_requested(goal):
+        route, observation = "investigate", True
     elif pure_read_requested(goal):
         route, observation = "investigate", True
     elif observation and route == "chat":

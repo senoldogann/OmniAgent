@@ -65,6 +65,7 @@ from omniagent.paths import (
     persona_file, project_root, user_memory_file,
 )
 from omniagent.platform.macos.host_lock import HostBusyError, host_task_lock
+from omniagent.core.message_presentation import imessage_plain_text
 from omniagent.platform.macos.launch_agent import LaunchAgentError
 from omniagent.platform.macos.power import start_keep_awake, stop_keep_awake
 
@@ -522,6 +523,7 @@ class ImessageBridge:
     async def _send(
         self, text: str, kind: str, *, evidence_run_id: Optional[str] = None,
         propagate_unknown: bool = False, evidence_group_id: Optional[str] = None,
+        presented: bool = False,
     ) -> int:
         """
         Balonu arşive 'pending' yazıp gönderir ve arşiv kimliğini döner. Çok parçalı sohbet ve iş raporları
@@ -531,6 +533,8 @@ class ImessageBridge:
         """
         if self.chat_activity is not None:
             await self.activity_indicator.update(self.chat_activity.run_id, "terminal")
+        if not presented:
+            text = imessage_plain_text(text)
         message_id: int = self.store.record_outgoing(text, kind, utc_iso(datetime.now(timezone.utc)))
         evidence_key = EVIDENCE_DELIVERY_PREFIX + str(message_id)
         if evidence_run_id is not None:
@@ -757,14 +761,14 @@ class ImessageBridge:
         async def send_bubble(bubble: str) -> None:
             if self.chat_activity is not None:
                 await self.activity_indicator.update(self.chat_activity.run_id, "terminal")
-            sent_ids.append(await self._send(bubble, kind, propagate_unknown=True))
+            sent_ids.append(await self._send(bubble, kind, propagate_unknown=True, presented=True))
             if not first_sent:
                 first_sent.append(time.monotonic())
 
         try:
             result: chat.ChatResult = await chat.respond(
                 self.chat_clients, self.settings["chat_backend"], self._system_prompt(), messages, tools, send_bubble,
-                self._is_closing, self.session_id,
+                self._is_closing, self.session_id, presentation=imessage_plain_text,
             )
         except (ModelCallFailed, FallbackNotPermitted, chat.ChatError) as error:
             logging.error("Sohbet modeli yanıt veremedi",
@@ -1138,7 +1142,7 @@ class ImessageBridge:
 
     async def _present_report(self, outcome: delegate.TaskOutcome) -> None:
         report = outcome["report"]
-        chunks = final_chunks(self._report_text(outcome))
+        chunks = final_chunks(imessage_plain_text(self._report_text(outcome)), normalize=False)
         run_id = self._evidence_run_id(report)
         async with self.chat_lock:
             group_id = uuid.uuid4().hex if run_id else None
@@ -1153,7 +1157,7 @@ class ImessageBridge:
                     if self._is_closing():
                         raise DeliveryUnknown("Rapor teslimi tamamlanmadan köprü kapandı.")
                     await self._send(chunk, "task_report", evidence_run_id=run_id,
-                                     evidence_group_id=group_id, propagate_unknown=True)
+                                     evidence_group_id=group_id, propagate_unknown=True, presented=True)
                 except DeliveryUnknown:
                     if group_id:
                         self._mark_group_unknown(group_id)
