@@ -8,7 +8,7 @@ from typing import Awaitable, Callable
 
 from omniagent.app.types import ModelTurn
 from omniagent.app.conversation_routing import host_time_context
-from omniagent.core.conversation_policy import NATURAL_STYLE_POLICY, check_grounded_answer, render_evidence, primary_source_gaps
+from omniagent.core.conversation_policy import NATURAL_STYLE_POLICY, check_grounded_answer, render_evidence, primary_source_gaps, official_model_research, primary_observation
 from omniagent.core.evidence import EvidenceBundle, EvidenceStore, sanitize_text
 from omniagent.core.structured_response import parse_complete_json
 
@@ -26,6 +26,9 @@ must come from actual successful source receipts. Model prose is not a source re
 For a factual model-release answer, facts must quote the requested model names and release
 dates actually asserted. An empty facts list cannot certify factual release claims. Quote added
 numeric claims (parameters, prices, counts) as well; numbers in navigation are not support.
+When official verification is requested, model-name and release-date facts must cite that
+same complete relevant official fetch_raw receipt. A different official page never upgrades
+search snippets, news indexes, third-party excerpts or failed/incomplete receipts.
 """
 
 
@@ -101,9 +104,12 @@ def semantic_check(answer: str, bundle: EvidenceBundle, content: str, source_tex
                 or not isinstance(field, str) or not isinstance(value, str) or not value
                 or not isinstance(quote, str) or value not in quote or quote not in source_texts[index]):
                 return False, "Modelin kaynak alıntısı gerçek makbuzla eşleşmedi."
+            if (official_model_research(bundle) and field in {"model_names", "release_dates"}
+                and not primary_observation(bundle, bundle["observations"][index])):
+                return False, "Resmi model adı/tarih iddiası aynı tamamlanmış birincil sayfa makbuzuyla doğrulanmalı; arama özeti yeterli değil."
             semantic_fields.add(field)
             verified_quotes.append(quote)
-            if any(date in answer for date in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", quote)):
+            if (not official_model_research(bundle) or primary_observation(bundle, bundle["observations"][index])) and any(date in answer for date in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", quote)):
                 semantic_fields.add("release_dates")
             if field in bundle["contract"]["required_fields"] and value not in answer:
                 semantic_missing.append(value)
@@ -142,7 +148,10 @@ async def ground_answer(answer: str, bundle: EvidenceBundle, store: EvidenceStor
     """One verify, one correction, one reverify; budget errors bubble to caller."""
     gaps = primary_source_gaps(bundle)
     if gaps:
-        return render_evidence(bundle) + "\n" + "\n".join(gaps), False
+        outcome = render_evidence(bundle)
+        if not official_model_research(bundle):
+            outcome += "\n" + "\n".join(gaps)
+        return outcome, False
     if not bundle["contract"]["needs_observation"] and not bundle["observations"]:
         return sanitize_text(answer), True
     if bundle["contract"]["needs_observation"] and not any(source["ok"] for source in bundle["observations"]):

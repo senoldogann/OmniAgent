@@ -98,29 +98,50 @@ def _directory_identifiers(observation: SourceObservation) -> list[str]:
 
 
 
-def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
-    """Official verification needs real page receipts, not snippets or model assertions."""
+def official_source_domains(bundle: EvidenceBundle) -> list[str] | None:
     subject = bundle["contract"]["subject"].casefold()
     if not bundle["contract"]["needs_observation"] or not re.search(r"\b(?:official|resmi)\b", subject):
-        return []
+        return None
     domains = [domain for provider, domain in (("openai", "openai.com"), ("anthropic", "anthropic.com"))
                if provider in subject]
     domains.extend(urlsplit(url).hostname for url in _URL.findall(subject) if urlsplit(url).hostname)
-    domains = list(dict.fromkeys(domains))
-    read_hosts = set()
-    for source in bundle["observations"]:
-        if source["tool"] != "fetch_raw" or not source["ok"] or not source["complete"]:
-            continue
-        try:
-            reference = json.loads(source["source_reference"])
-            url = reference.get("url", "") if isinstance(reference, dict) else ""
-        except ValueError:
-            url = source["source_reference"]
-        host = urlsplit(url).hostname
-        if host and model_page_relevant(bundle, source, url):
-            read_hosts.add(host.casefold())
+    return list(dict.fromkeys(domains))
+
+
+def official_model_research(bundle: EvidenceBundle) -> bool:
+    return official_source_domains(bundle) is not None and bool(
+        re.search(r"\bmodels?\b", bundle["contract"]["subject"], re.I)
+        or set(bundle["contract"]["required_fields"]) & {"model_names", "release_dates"})
+
+
+def source_receipt_url(source: SourceObservation) -> str:
+    try:
+        reference = json.loads(source["source_reference"])
+        return reference.get("url", "") if isinstance(reference, dict) else ""
+    except ValueError:
+        return source["source_reference"]
+
+
+def primary_observation(bundle: EvidenceBundle, source: SourceObservation) -> bool:
+    """Primary status belongs to this complete receipt, never a different page read."""
+    if source["tool"] != "fetch_raw" or not source["ok"] or not source["complete"]:
+        return False
+    url = source_receipt_url(source)
+    host = urlsplit(url).hostname
+    domains = official_source_domains(bundle)
+    return bool(host and domains and any(host == domain or host.endswith("." + domain) for domain in domains)
+                and model_page_relevant(bundle, source, url))
+
+
+def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
+    """Official verification needs real page receipts, not snippets or model assertions."""
+    domains = official_source_domains(bundle)
+    if domains is None:
+        return []
     if not domains:
         return ["Resmi kaynak yetkilisi belirlenemedi; birincil sayfa doğrulaması eksik."]
+    read_hosts = {urlsplit(source_receipt_url(source)).hostname for source in bundle["observations"]
+                  if primary_observation(bundle, source)}
     return [f"{domain}: resmi birincil kaynak sayfası okunamadı; doğrulama eksik."
             for domain in domains if not any(host == domain or host.endswith("." + domain) for host in read_hosts)]
 
@@ -128,9 +149,11 @@ def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
 def model_page_relevant(bundle: EvidenceBundle, source: SourceObservation, url: str) -> bool:
     """A model-release request cannot be verified by an arbitrary provider page."""
     subject = bundle["contract"]["subject"].casefold()
-    if not re.search(r"\bmodels?\b", subject):
+    if not (re.search(r"\bmodels?\b", subject) or set(bundle["contract"]["required_fields"]) & {"model_names", "release_dates"}):
         return True
     path = urlsplit(url).path.casefold()
+    if path.strip("/") in {"", "news", "index", "blog", "research", "announcements", "models"}:
+        return False  # provider feeds are discovery, not complete announcement pages
     if re.search(r"/(?:careers?|about|contact|privacy|terms|policies|login)(?:/|$)", path):
         return False
     text = essential_web_text(source["text"])
@@ -211,6 +234,9 @@ def _field_identifiers(bundle: EvidenceBundle) -> dict[str, list[str]]:
     for observation in bundle["observations"]:
         if not observation["ok"]:
             continue
+        if (official_model_research(bundle) and observation["tool"] in {"web_search", "fetch_raw", "web_fetch"}
+            and not primary_observation(bundle, observation)):
+            continue
         text = essential_web_text(observation["text"]) if observation["tool"] == "fetch_raw" else observation["text"]
         records = relevant_search_records(bundle, text) if observation["tool"] == "web_search" else None
         if records is not None:
@@ -251,8 +277,65 @@ def required_identifiers(bundle: EvidenceBundle) -> list[str]:
     return list(dict.fromkeys(value for field in bundle["contract"]["required_fields"] for value in found.get(field, [])))
 
 
+
+def render_official_research(bundle: EvidenceBundle) -> str:
+    """A partial professional answer; discovery/feed bodies remain private receipts."""
+    lines = ["İstek: " + bundle["contract"]["subject"]]
+    gaps = primary_source_gaps(bundle)
+    if gaps:
+        lines.extend(["Resmi kaynak doğrulaması eksik:", *["- " + gap for gap in gaps]])
+    else:
+        lines.append("Resmi duyuru sayfaları okundu; yanıtın tüm iddialarının doğrulaması tamamlanamadı.")
+    other_limits = [limit for limit in bundle["limitations"] if limit not in gaps]
+    if other_limits:
+        lines.append("İncelemenin sınırları: " + "; ".join(other_limits))
+    for source in bundle["observations"]:
+        if primary_observation(bundle, source):
+            lines.append("\nOkunan resmi duyuru: " + source_receipt_url(source))
+            single = {**bundle, "observations": [source]}
+            identifiers = required_identifiers(single)
+            if identifiers:
+                lines.append("Kaynakta bulunan istenen bilgiler: " + "; ".join(identifiers))
+            passages = [line.strip() for line in essential_web_text(source["text"]).splitlines()
+                        if re.search(r"\b(?:model|gpt|claude)\b|gpt[- ]|claude[- ]|\d{4}-\d{2}-\d{2}", line, re.I)]
+            if passages:
+                excerpt = "\n".join(passages)
+                lines.append("İlgili kaynak alıntısı:\n" + excerpt[:1200])
+                if len(excerpt) > 1200:
+                    lines.append("Alıntı gösterimi eksik; tam metin özel kaynak kaydında korundu.")
+        elif source["tool"] == "fetch_raw":
+            url = source_receipt_url(source)
+            if not source["ok"]:
+                detail = source["text"]
+                lines.append("\nOkunamayan sayfa: " + url + " — " + detail[:240])
+                if len(detail) > 240:
+                    lines.append("Hata ayrıntısının gösterimi eksik; tam hata kaynak kaydında korundu.")
+            else:
+                lines.append("\n" + url + ": belirli bir model duyurusunu doğrulayan tamamlanmış birincil makbuz sağlamadı.")
+    candidates = []
+    domains = official_source_domains(bundle) or []
+    for source in bundle["observations"]:
+        if source["tool"] != "web_search" or not source["ok"]:
+            continue
+        for record in relevant_search_records(bundle, source["text"]) or []:
+            url = str(record.get("url") or record.get("href") or "")
+            host = urlsplit(url).hostname
+            if host and any(host == domain or host.endswith("." + domain) for domain in domains):
+                if url not in candidates:
+                    candidates.append(url)
+    if candidates and gaps:
+        lines.append("\nHenüz okunmamış resmi arama bağlantıları (doğrulanmış sonuç değil):")
+        lines.extend("- " + url for url in candidates[:4])
+        if len(candidates) > 4:
+            lines.append("Diğer keşif bağlantıları özel kaynak kaydında korundu; bağlantı gösterimi eksik.")
+    lines.append("\nArama özetleri veya haber indeksleri resmi model adı/tarih doğrulaması yerine geçmez. "
+                 "Eksik sağlayıcılar için belirli resmi duyuru sayfaları okunmalı; tam alınan makbuzlar özel kaynak kaydında korundu.")
+    return sanitize_text("\n".join(lines))
+
 def render_evidence(bundle: EvidenceBundle) -> str:
     """Readable fallback; full sanitized receipts remain in the private evidence store."""
+    if official_model_research(bundle):
+        return render_official_research(bundle)
     lines = [f"İstek: {bundle['contract']['subject']}"]
     if not bundle["observations"] and bundle["contract"]["needs_observation"]:
         lines.append("Sonuç eksik: kaynak gözlemi alınamadı; istenen incelemeye devam edilmesi gerekiyor.")
