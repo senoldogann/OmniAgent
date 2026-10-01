@@ -143,8 +143,9 @@ def _permission_help(title: str, settings_url: str, pane: str, requested: bool) 
         lines.append("Bu süreç izni bir kez sistem istemiyle de sordu; istemi onaylamak uygulamayı listeye ekler.")
     return "\n".join(lines)
 
-def screen_capture_help() -> str:
-    return _permission_help("Ekran kaydı izni yok.", SCREEN_SETTINGS_URL, "Ekran ve Sistem Sesi Kaydı", True)
+def screen_capture_help(*, requested: Optional[bool] = None) -> str:
+    attempted = _SCREEN_CAPTURE_REQUESTED[0] if requested is None else requested
+    return _permission_help("Ekran kaydı izni yok.", SCREEN_SETTINGS_URL, "Ekran ve Sistem Sesi Kaydı", attempted)
 
 def accessibility_help() -> str:
     return _permission_help(

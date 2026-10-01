@@ -25,7 +25,7 @@ class RecordingChat:
     def __init__(self):
         self.messages = []
 
-    async def __call__(self, clients, backend, system, messages, tools, send_bubble, should_stop, session_id):
+    async def __call__(self, clients, backend, system, messages, tools, send_bubble, should_stop, session_id, *, presentation=None):
         self.messages.append(messages)
         await send_bubble("tamam, duydum")
         return {"bubbles": ["tamam, duydum"], "start_task": None}

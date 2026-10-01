@@ -135,3 +135,36 @@ def test_report_shows_accessibility_status_and_help(monkeypatch: pytest.MonkeyPa
     assert "Privacy_Accessibility" in text
     monkeypatch.setattr(gui_input, "AX", SimpleNamespace(AXIsProcessTrusted=lambda: True))
     assert "Erişilebilirlik: izinli" in permissions.report()
+
+
+def test_readonly_host_capability_audit_never_claims_or_requests_a_prompt(monkeypatch, terminal_owner, tmp_path):
+    import json
+    from types import SimpleNamespace
+    from omniagent.platform.macos import permissions
+    from omniagent.tools import gui_input
+    quartz = FakeQuartz()
+    monkeypatch.setattr(tools, 'Quartz', quartz)
+    monkeypatch.setattr(tools, '_SCREEN_CAPTURE_REQUESTED', [False])
+    monkeypatch.setattr(gui_input, 'AX', SimpleNamespace(AXIsProcessTrusted=lambda: False))
+    monkeypatch.setattr(permissions, 'MESSAGES_DATABASE', tmp_path / 'absent-chat.db')
+    receipt = json.loads(tools.Toolbox().inspect_host_capabilities())
+    text = receipt['permission_report']
+    assert 'Ekran kaydı    : İZİN YOK' in text
+    assert 'Sistem Ayarları' in text and 'Terminal' in text
+    assert 'Bu süreç izni bir kez sistem istemiyle de sordu' not in text
+    assert quartz.requests == []
+
+
+def test_permissions_cli_explicit_request_preserves_real_prompt_and_help(monkeypatch, terminal_owner, tmp_path, capsys):
+    from types import SimpleNamespace
+    from omniagent.platform.macos import permissions
+    from omniagent.tools import gui_input
+    quartz = FakeQuartz()
+    monkeypatch.setattr(tools, 'Quartz', quartz)
+    monkeypatch.setattr(tools, '_SCREEN_CAPTURE_REQUESTED', [False])
+    monkeypatch.setattr(gui_input, 'AX', SimpleNamespace(AXIsProcessTrusted=lambda: False))
+    monkeypatch.setattr(permissions, 'MESSAGES_DATABASE', tmp_path / 'absent-chat.db')
+    monkeypatch.setattr(sys, 'argv', ['omniagent-permissions', '--request'])
+    permissions.main()
+    assert quartz.requests == [True]
+    assert 'Bu süreç izni bir kez sistem istemiyle de sordu' in capsys.readouterr().out

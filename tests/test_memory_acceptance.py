@@ -101,7 +101,7 @@ class DenizCapture:
     async def __call__(self, clients: Dict[str, AsyncOpenAI], backend: str, system: str,
                        messages: List[Dict[str, object]], tools: List[Dict[str, object]],
                        send_bubble: Callable[[str], Awaitable[None]],
-                       should_stop: Callable[[], bool], session_id: str) -> chat.ChatResult:
+                       should_stop: Callable[[], bool], session_id: str, *, presentation=None) -> chat.ChatResult:
         self.systems.append(system)
         await send_bubble(self.bubble)
         return {"bubbles": [self.bubble], "start_task": None}

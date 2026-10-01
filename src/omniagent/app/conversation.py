@@ -415,12 +415,15 @@ def _publication_check(budget, completed_presentation: bool) -> None:
         budget.check()
 
 
-def _failure_outcome(evidence: EvidenceBundle, reason: str, error: BaseException, store=None) -> str:
+def _failure_outcome(evidence: EvidenceBundle, reason: str, error: BaseException, store=None, *, task_failure=False) -> str:
+    caption = "Görev tamamlanamadı:" if task_failure else "İşlem tamamlanamadı:"
     if not evidence["observations"]:
-        return "İşlem tamamlanamadı: " + reason
+        return caption + " " + reason
     outcome = render_evidence(evidence, store)
     if reason and reason not in outcome:
-        outcome += "\nİşlem tamamlanamadı: " + reason
+        outcome += "\n" + caption + " " + reason
+    elif task_failure:
+        outcome = caption + "\n" + outcome
     if isinstance(error, ConversationExhausted):
         outcome += ("\nAynı konuda tam ajanla yeni bir çalışma başlatarak devam edebiliriz: "
                     + evidence["contract"]["subject"])
@@ -487,7 +490,7 @@ async def _run_conversation(goal: str, emit: EventSink, options: RunOptions, cli
                 if not success:
                     # Failed/cancelled engine verdict stays failed, even if prose
                     # sounds successful. No model rewrite can promote it.
-                    outcome = _failure_outcome(evidence, sanitize_text(reason), RuntimeError(reason), store)
+                    outcome = _failure_outcome(evidence, sanitize_text(reason), RuntimeError(reason), store, task_failure=True)
                     if (budget.turns >= budget.max_turns or budget.remaining_seconds <= 0
                         or "ConversationExhausted" in reason):
                         outcome += "\nAynı konuda yeni bir çalışma başlatarak devam edebiliriz: " + decision.contract["subject"]

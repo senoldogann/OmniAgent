@@ -43,7 +43,7 @@ def messages_database_status(path: Path) -> str:
     return "izinli"
 
 
-def report() -> str:
+def report(*, requested: bool = False) -> str:
     """Ekran kaydı ve erişilebilirlik izninin durumunu ve izin verilecek hedefi tek metinde toplar."""
     owner: Dict[str, str] = tools.screen_capture_owner()
     granted: bool = tools.screen_capture_granted()
@@ -60,7 +60,7 @@ def report() -> str:
     ]
     if not granted:
         lines.append("")
-        lines.append(tools.screen_capture_help())
+        lines.append(tools.screen_capture_help(requested=requested))
     if not accessible:
         lines.append("")
         lines.append(tools.accessibility_help())
@@ -75,7 +75,7 @@ def main() -> None:
     if arguments.request and not tools.screen_capture_granted(request=True):
         print("Ekran kaydı izni hâlâ yok. Açılan istemi onaylayın ya da yukarıdaki adımları izleyin.",
               file=sys.stderr)
-    print(report())
+    print(report(requested=arguments.request))
 
 
 if __name__ == "__main__":
