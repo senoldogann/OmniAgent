@@ -24,7 +24,7 @@ from omniagent.approval import (
     communication_click_label, gui_communication_request,
 )
 from omniagent.core.text_norm import curl_http_statuses
-from .process import run_preemptible_process
+from .process import run_preemptible_process, read_retry_delay, check_read_stop
 
 from .bot_wall import (
     AccessChallenge, access_challenge_error, bypass_note, classify_access_challenge, is_bypass_enabled,
@@ -233,6 +233,7 @@ def _fetch_with_retries(url: str) -> subprocess.CompletedProcess[bytes]:
     FETCH_RETRY_WAIT_SECONDS bekleyerek yeniden dener; her yeniden deneme yapısal uyarı loglar. Sonuncusu da başarısızsa
     onun sonucu döner (çağıran son hatayı yükseltir).
     """
+    check_read_stop()
     result: subprocess.CompletedProcess[bytes] = _run_curl(url)
     for attempt in range(1, FETCH_MAX_RETRIES + 1):
         if result.returncode not in _CURL_TRANSIENT_EXIT_CODES:
@@ -242,7 +243,8 @@ def _fetch_with_retries(url: str) -> subprocess.CompletedProcess[bytes]:
             extra={"host": urlsplit(url).hostname, "exit_code": result.returncode, "attempt": attempt,
                    "max_retries": FETCH_MAX_RETRIES, "wait_seconds": FETCH_RETRY_WAIT_SECONDS},
         )
-        time.sleep(FETCH_RETRY_WAIT_SECONDS)
+        read_retry_delay(FETCH_RETRY_WAIT_SECONDS)
+        check_read_stop()
         result = _run_curl(url)
     return result
 

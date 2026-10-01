@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -172,3 +173,104 @@ app.main()
     assert result.returncode == 0
     response = json.loads(result.stdout)
     assert response["ok"] is False and response["code"] == "INVALID_ARGUMENTS"
+
+
+def test_internal_worker_import_avoids_gui_and_credential_startup():
+    script = """
+import sys
+sys.argv = ['OmniAgent', '--internal-readonly-worker']
+from omniagent.tools import readonly_worker
+blocked = {'omniagent.tools.facade', 'omniagent.ui.app', 'omniagent.platform.macos.api_keys',
+           'cv2', 'pyautogui', 'AppKit', 'customtkinter'}
+assert not blocked.intersection(sys.modules)
+readonly_worker.main()
+"""
+    result = subprocess.run([sys.executable, "-c", script], input=b'{"query":"x","command":"forbidden"}',
+                            capture_output=True, timeout=5)
+    assert result.returncode == 0 and result.stderr == b""
+    assert json.loads(result.stdout) == {"ok": False, "code": "INVALID_ARGUMENTS", "recoverable": False}
+
+
+@pytest.mark.asyncio
+async def test_double_cancel_owns_actual_read_worker_until_cleanup_finishes(coordinator, scripted, tmp_path, monkeypatch):
+    scripts, _ = scripted
+    pid_path = tmp_path / "double-cancel.pid"
+    cleaning, release, completed = threading.Event(), threading.Event(), threading.Event()
+    def local_transport(url):
+        try:
+            return run_preemptible_process([sys.executable, "-c",
+                "import os,time,pathlib; pathlib.Path(" + repr(str(pid_path)) + ").write_text(str(os.getpid())); time.sleep(10)"], timeout=15)
+        finally:
+            cleaning.set()
+            release.wait(2)
+            completed.set()
+    monkeypatch.setattr(browser, "_run_curl", local_transport)
+    scripts.extend([route("investigate"), turn(calls=[call("fetch_raw", url="https://example.invalid")])])
+    from tests.test_shared_conversation import options
+    terminals = []
+    def emit(event):
+        if event["kind"] == "run_finished":
+            terminals.append(completed.is_set())
+    task = asyncio.create_task(coordinator.run_conversation_with_callback(
+        "Read https://example.invalid", emit, options(tmp_path), {"ollama-cloud": object()}))
+    async def wait_until(predicate):
+        while not predicate():
+            await asyncio.sleep(.005)
+    try:
+        await asyncio.wait_for(wait_until(pid_path.exists), 2)
+        cancel_started = time.monotonic()
+        task.cancel()
+        await asyncio.wait_for(wait_until(cleaning.is_set), 2)
+        task.cancel()
+        await asyncio.sleep(.02)
+        assert not task.done() and terminals == []
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_path.read_text()), 0)
+        release.set()
+        owned_cleanup_seconds = time.monotonic() - cancel_started
+        report = await asyncio.wait_for(task, 2)
+        assert not report["success"] and completed.is_set() and terminals == [True]
+        assert report["metrics"]["tool_seconds"] + .002 >= owned_cleanup_seconds
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("payload", [
+    b'{"query":"x","query":"y"}', b'{"query":"x","freshness_days":true}',
+    b'{"query":"x","freshness_days":NaN}', b'{"query":' + b'[' * 2000 + b'0' + b']' * 2000 + b'}',
+    json.dumps({"query": "x" * (16 * 1024)}).encode(),
+])
+def test_worker_rejects_malformed_or_oversized_search_request_privately(payload):
+    result = subprocess.run([sys.executable, "-m", "omniagent.tools.readonly_worker", "--internal-readonly-worker"],
+                            input=payload, capture_output=True, timeout=5)
+    assert result.returncode == 0 and result.stderr == b""
+    assert json.loads(result.stdout) == {"ok": False, "code": "INVALID_ARGUMENTS", "recoverable": False}
+
+
+def test_bounded_worker_output_overflow_reaps_real_child_and_keeps_diagnostics_private(tmp_path):
+    from omniagent.tools.types import ToolError
+    pid_path = tmp_path / "overflow.pid"
+    token = TOOL_RUNTIME.set({"should_stop": lambda: False, "preemptible": True})
+    try:
+        with pytest.raises(ToolError) as failure:
+            run_preemptible_process([sys.executable, "-c",
+                "import os,time,pathlib; pathlib.Path(" + repr(str(pid_path)) + ").write_text(str(os.getpid())); "
+                "os.write(2,b'PRIVATE diagnostic'); os.write(1,b'x'*100000); time.sleep(10)"],
+                timeout=15, max_output_bytes=1024)
+        assert failure.value.code == "OUTPUT_TOO_LARGE" and "PRIVATE" not in str(failure.value)
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_path.read_text()), 0)
+    finally:
+        TOOL_RUNTIME.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_shared_operation_deadline_rejects_late_completed_receipt():
+    from omniagent.app.conversation_budget import ConversationBudget, ConversationExhausted
+    budget = ConversationBudget(lambda: False, 7, 30)
+    future = asyncio.get_running_loop().create_future()
+    future.set_result("late receipt")
+    with pytest.raises(ConversationExhausted):
+        await budget.wait(future, tool=True, deadline=time.monotonic() - .01)

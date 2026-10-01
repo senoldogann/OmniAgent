@@ -8,7 +8,7 @@ import json
 import logging
 import re
 import time
-from threading import Lock
+from threading import Event, Lock
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -395,6 +395,11 @@ async def execute_tool(
             inflight[cache_key] = pending
 
     method: Callable[..., Any] = dynamic["execute"] if dynamic else getattr(toolbox, name)
+    owned_read = runtime is not None and runtime.cancellable_reads
+    interrupted = Event()
+    requested_stop = should_stop
+    if owned_read:
+        should_stop = lambda: interrupted.is_set() or requested_stop()
     integration_started = time.monotonic()
     # Text-only callbacks cannot distinguish interleaved stdout/stderr. Keep only
     # bounded activity counters; present the canonical returned receipt at the end.
@@ -419,7 +424,8 @@ async def execute_tool(
         "approved": False,
         "request_approval": _async_approver(name),
         "request_approval_blocking": _blocking_approver(name, asyncio.get_running_loop(), should_stop),
-        "preemptible": runtime is not None and runtime.autonomy is not None,
+        "preemptible": owned_read or (runtime is not None and runtime.autonomy is not None),
+        "cancellable_read": owned_read,
     }
     if runtime is not None and runtime.autonomy is not None:
         call_context["mark_gui_input"] = runtime.autonomy["mark_gui_input"]
@@ -459,7 +465,26 @@ async def execute_tool(
             operation = method(**arguments)
             result: Any = await runtime.wait(operation) if runtime is not None and not dynamic else await operation
         else:
-            result = await asyncio.to_thread(method, **arguments)
+            if owned_read:
+                worker = asyncio.create_task(asyncio.to_thread(method, **arguments))
+                try:
+                    result = await asyncio.shield(worker)
+                except BaseException:
+                    interrupted.set()
+                    # to_thread cancellation does not stop its thread. Its tool
+                    # context now cooperates; even repeated coroutine cancellation
+                    # must retain ownership until its actual worker has stopped.
+                    while not worker.done():
+                        try:
+                            await asyncio.shield(worker)
+                        except asyncio.CancelledError:
+                            continue
+                        except BaseException:
+                            break
+                    await asyncio.gather(worker, return_exceptions=True)
+                    raise
+            else:
+                result = await asyncio.to_thread(method, **arguments)
         outcome = {"tool_call_id": call["id"], "ok": True,
                    "result": json.dumps(result, ensure_ascii=False) if dynamic else str(result)}
         if name == "capture_photo" and toolbox.last_capture_path is not None:

@@ -106,6 +106,8 @@ class IntegrationRuntime:
         self.published: Dict[str, Any] = {}
         self.selected: Dict[str, Any] = {}
         self.allowed_tools: Optional[frozenset[str]] = None
+        # Authenticated quick-read scope owns synchronous workers until stopped.
+        self.cancellable_reads = False
         # ask_user'ın yanıt bekleme sınırı; sürekli görevde None: kullanıcı yanıtlayana dek bekler.
         self.user_input_timeout: Optional[float] = APPROVAL_TIMEOUT_SECONDS
         self.unattended: bool = False

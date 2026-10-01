@@ -176,6 +176,7 @@ async def _investigate(decision, evidence, store, options, clients, emit):
     budget = decision.budget
     budget.phase = "generate"
     decision.runtime.allowed_tools = INVESTIGATION_TOOLS
+    decision.runtime.cancellable_reads = True
     toolbox = Toolbox(memory_file=options.get("memory_file"), allow_memory_mutation=False,
                       history_file=options["state_file"])
     schemas = [schema for schema in route_tool_schemas(None, False, False) if schema["function"]["name"] in INVESTIGATION_TOOLS]
@@ -202,7 +203,11 @@ async def _investigate(decision, evidence, store, options, clients, emit):
                     emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
                           "preview": preview_arguments(call["name"], call["arguments"])})
                     with _model_scope(decision):
-                        result = await budget.wait(execute_tool(call, toolbox, {}, _private_emit(emit), budget.should_stop), tool=True)
+                        deadline = budget.operation_deadline()
+                        def tool_should_stop():
+                            return budget.should_stop() or time.monotonic() >= deadline
+                        result = await budget.wait(execute_tool(call, toolbox, {}, _private_emit(emit), tool_should_stop),
+                                                   tool=True, deadline=deadline)
                     if store is not None:
                         try:
                             store.capture(evidence, call["name"], result, arguments=call["arguments"])

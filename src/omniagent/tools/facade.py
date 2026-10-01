@@ -882,6 +882,10 @@ class Toolbox:
         freshness_days: Optional[int] = None,
     ) -> str:
         """Web/haber aramasını ayrık arama katmanına yönlendirir."""
+        runtime = TOOL_RUNTIME.get()
+        if runtime is not None and runtime.get("cancellable_read"):
+            from .readonly_worker import search_in_worker
+            return search_in_worker(query, category, freshness_days)
         return search_web(
             query,
             category,

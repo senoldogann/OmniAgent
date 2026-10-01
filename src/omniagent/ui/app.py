@@ -1,3 +1,12 @@
+import sys
+
+# The windowed bundle is also the narrowly scoped search worker executable.
+# Dispatch before GUI imports, logging or credential startup in that process.
+if __name__ == "__main__" and sys.argv[1:] == ["--internal-readonly-worker"]:
+    from omniagent.tools.readonly_worker import main as readonly_worker_main
+    readonly_worker_main()
+    raise SystemExit(0)
+
 import asyncio
 import gc
 import logging
@@ -3626,6 +3635,10 @@ class OmniUI(ctk.CTk):
 
 def main() -> None:
     """OmniAgent masaüstü arayüzünü başlatır."""
+    if sys.argv[1:] == ["--internal-readonly-worker"]:
+        from omniagent.tools.readonly_worker import main as readonly_worker_main
+        readonly_worker_main()
+        return
     if sys.argv[1:] == ["--bundle-check"]:
         # Paket açılışını Keychain izni istemeden doğrula.
         probe = tk.Tk()

@@ -227,6 +227,7 @@ class ToolRuntime(TypedDict):
     request_approval_blocking: NotRequired[Callable[[ApprovalRequest], None]]
     mark_gui_input: NotRequired[Callable[[], None]]
     preemptible: NotRequired[bool]
+    cancellable_read: NotRequired[bool]
 
 
 TOOL_RUNTIME: ContextVar[Optional[ToolRuntime]] = ContextVar("TOOL_RUNTIME", default=None)

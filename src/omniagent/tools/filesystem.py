@@ -20,6 +20,7 @@ from .types import (
     BACKUP_KEEP_PER_FILE, FILE_READ_LIMIT, FILE_READ_MAX_BYTES,
     PAGE_TEXT_LIMIT, ToolError, clip_text,
 )
+from .process import check_read_stop
 
 BACKUP_DIR: Path = backups_dir()
 
@@ -81,8 +82,10 @@ def list_directory_content(path: str, max_entries: int = DIRECTORY_ENTRY_LIMIT) 
     entries = []
     complete = True
     try:
+        check_read_stop()
         with os.scandir(target) as iterator:
             for entry in iterator:
+                check_read_stop()
                 if len(entries) >= max_entries:
                     complete = False
                     break
@@ -99,6 +102,7 @@ def list_directory_content(path: str, max_entries: int = DIRECTORY_ENTRY_LIMIT) 
 def read_full_file(path: str) -> str:
     source_path = Path(path).expanduser()
     try:
+        check_read_stop()
         # stat() önce: olmayan yol FileNotFoundError ile "en yakın dizin" ipucuna düşer
         # (is_file() False döndüğü için eksik dosya "düzenli dosya değil" sanılıyordu)
         metadata = source_path.stat()
@@ -108,7 +112,17 @@ def read_full_file(path: str) -> str:
         if metadata.st_size > FILE_READ_MAX_BYTES:
             raise ToolError(f"Dosya {FILE_READ_MAX_BYTES} bayt okuma sınırını aşıyor: {source_path}", "FILE_TOO_LARGE", False)
         with source_path.open("rb") as source:
-            raw = source.read(FILE_READ_MAX_BYTES + 1)
+            chunks = []
+            size = 0
+            while size <= FILE_READ_MAX_BYTES:
+                check_read_stop()
+                chunk = source.read(min(65536, FILE_READ_MAX_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
+        check_read_stop()
         if len(raw) > FILE_READ_MAX_BYTES:
             raise ToolError(f"Dosya okuma sırasında boyut sınırını aştı: {source_path}", "FILE_TOO_LARGE", False)
         return raw.decode("utf-8")

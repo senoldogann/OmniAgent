@@ -92,11 +92,16 @@ class ConversationBudget:
         self.max_turns, self.seconds = self.user_turns, self.user_seconds
         self.phase = "task"
 
+    def operation_deadline(self) -> float:
+        return time.monotonic() + min(OPERATION_SECONDS, self.remaining_seconds)
+
     async def wait(self, operation: Awaitable[T], *, model: bool = False, tool: bool = False,
-                   bounded_operation: bool = True) -> T:
+                   bounded_operation: bool = True, deadline: float | None = None) -> T:
         task = asyncio.ensure_future(operation)
         started = time.monotonic()
         timeout = min(OPERATION_SECONDS, self.remaining_seconds) if bounded_operation else self.remaining_seconds
+        if deadline is not None:
+            timeout = min(timeout, max(0.0, deadline - started))
         try:
             self.check(model=model)
             while not task.done():
@@ -106,16 +111,22 @@ class ConversationBudget:
                     raise ConversationExhausted("İşlem zaman sınırına ulaştı.")
                 await asyncio.wait({task}, timeout=min(.05, remaining))
             self.check()
+            if time.monotonic() - started >= timeout:
+                raise ConversationExhausted("İşlem zaman sınırına ulaştı.")
             return task.result()
         finally:
-            elapsed = time.monotonic() - started
-            if model:
-                self.model_seconds += elapsed
-            if tool:
-                self.tool_seconds += elapsed
-            if not task.done():
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+            try:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            finally:
+                # Actual owned work includes cancellation cleanup, even when a
+                # second cancellation interrupts the parent's wait.
+                elapsed = time.monotonic() - started
+                if model:
+                    self.model_seconds += elapsed
+                if tool:
+                    self.tool_seconds += elapsed
 
     def metrics(self):
         return {"turns": self.turns, "tool_calls": self.tools,
