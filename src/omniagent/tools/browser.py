@@ -38,7 +38,7 @@ from .types import (
     APP_ACTIVATION_WAIT_SECONDS, CHROME_APP_NAME, CHROME_LOAD_WAIT_SECONDS, CHROME_SCRIPT_TIMEOUT_SECONDS,
     FETCH_ERROR_BODY_LIMIT, PAGE_ACTION_TIMEOUT_MS,
     PAGE_ELEMENT_LIMIT, PAGE_LOAD_TIMEOUT_MS,
-    SHELL_STDOUT_LIMIT, ApprovalRefused, BrowserAction, ToolError, clip_text,
+    ApprovalRefused, BrowserAction, ToolError, clip_text,
 )
 
 _clip = clip_text
@@ -278,10 +278,11 @@ def fetch_raw_content(url: str) -> str:
             "FETCH_FAILED",
             True,
         )
+    # Capture successful bodies in full; event/model/archive limits apply downstream.
     stripped = stdout.lstrip()
     if stripped.startswith("{") or stripped.startswith("["):
-        return _clip(stdout, SHELL_STDOUT_LIMIT)
-    text: str = clean_html(stdout)
+        return stdout
+    text: str = clean_html(stdout, limit=None)
     challenge: Optional[AccessChallenge] = classify_access_challenge(stdout, text)
     _raise_if_access_wall("fetch_raw", url, stdout, challenge)
     return text + _challenge_note(url, challenge)

@@ -292,6 +292,8 @@ def render_official_research(bundle: EvidenceBundle) -> str:
     for source in bundle["observations"]:
         if primary_observation(bundle, source):
             lines.append("\nOkunan resmi duyuru: " + source_receipt_url(source))
+            if source.get("artifact_path"):
+                lines.append("Tam kaynak dosyası: " + source["artifact_path"])
             single = {**bundle, "observations": [source]}
             identifiers = required_identifiers(single)
             if identifiers:
@@ -332,8 +334,13 @@ def render_official_research(bundle: EvidenceBundle) -> str:
                  "Eksik sağlayıcılar için belirli resmi duyuru sayfaları okunmalı; tam alınan makbuzlar özel kaynak kaydında korundu.")
     return sanitize_text("\n".join(lines))
 
-def render_evidence(bundle: EvidenceBundle) -> str:
+def render_evidence(bundle: EvidenceBundle, store=None) -> str:
     """Readable fallback; full sanitized receipts remain in the private evidence store."""
+    if store is not None:
+        try:
+            bundle = store.authoritative_bundle(bundle)
+        except (OSError, ValueError):
+            return render_evidence(bundle) + "\nTam kaynak dosyası okunamadı; doğrulama eksik."
     if official_model_research(bundle):
         return render_official_research(bundle)
     lines = [f"İstek: {bundle['contract']['subject']}"]

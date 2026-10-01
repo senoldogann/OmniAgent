@@ -47,6 +47,7 @@ class SourceObservation(TypedDict):
     complete: bool
     completeness: str
     artifact_path: NotRequired[str]
+    captured_complete: NotRequired[bool]
 
 
 class EvidenceBundle(TypedDict):
@@ -249,6 +250,7 @@ class EvidenceStore:
                 if (not all(isinstance(observation[field], str) for field in
                     ("tool", "source_type", "source_reference", "text", "status", "completeness"))
                     or type(observation["ok"]) is not bool or type(observation["complete"]) is not bool
+                    or ("captured_complete" in observation and type(observation["captured_complete"]) is not bool)
                     or len(_encoded(observation)) > MAX_OBSERVATION_BYTES
                     or len(observation["source_reference"].encode()) > MAX_SOURCE_REFERENCE_BYTES):
                     raise ValueError("Invalid source observation")
@@ -349,6 +351,8 @@ class EvidenceStore:
                     low = middle
                 else:
                     high = middle - 1
+            # Preserve tool capture status separately from bounded inline presentation.
+            observation["captured_complete"] = complete
             observation["text"] = excerpt(low)
             observation["complete"] = False
             observation["completeness"] = "bounded"
@@ -384,6 +388,18 @@ class EvidenceStore:
         if observation.get("artifact_path"):
             return self._read(self._artifact_name(bundle["run_id"], index), MAX_RUN_BYTES).decode("utf-8")
         return observation["text"]
+
+    def authoritative_bundle(self, bundle: EvidenceBundle) -> EvidenceBundle:
+        """Read verified private artifacts without treating tool truncation as complete."""
+        self._validate(bundle)
+        sources = []
+        for index, source in enumerate(bundle["observations"]):
+            copy = dict(source)
+            if source.get("artifact_path"):
+                copy["text"] = self.observation_text(bundle, index)
+                copy["complete"] = source.get("captured_complete", False)
+            sources.append(copy)
+        return {**bundle, "observations": sources}
 
     def mark_delivered(self, run_id: str, *, delivered_at: str | None = None) -> EvidenceBundle:
         bundle = self.load(run_id)

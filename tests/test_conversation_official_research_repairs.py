@@ -30,7 +30,7 @@ async def test_real_coordinator_cannot_borrow_primary_status_for_a_search_snippe
     real_facts = [fact("model_names", "GPT Real", 1, "model: GPT Real"),
                   fact("release_dates", "2026-09-29", 1, "OpenAI released GPT Real on 2026-09-29.")]
     scripts.extend([route("investigate", ["model_names", "release_dates", "source_urls"]),
-        turn(calls=[call("web_search", query="site:openai.com/index/ latest model", category="web")]),
+        turn(calls=[call("web_search", query="site:openai.com/index/ latest model", category="text")]),
         turn(calls=[call("fetch_raw", url=url)]),
         turn("Official models: GPT Phantom — 2026-09-28; GPT Real — 2026-09-29. " + url + " Arama kapsamı eksik."),
         checked([fact("model_names", "GPT Phantom", 0, "model: GPT Phantom"),
@@ -64,17 +64,17 @@ async def test_official_planning_precedes_search_and_post_search_generation(coor
             return item
         return boundary
     scripts.extend([route("investigate", ["model_names", "source_urls"]),
-        capture(turn(calls=[call("web_search", query="site:openai.com/index/ latest model release", category="web"),
-                    call("web_search", query="site:anthropic.com/news/ latest model release", category="web")])),
+        capture(turn(calls=[call("web_search", query="site:openai.com/index/ latest model release", category="text"),
+                    call("web_search", query="site:anthropic.com/news/ latest model release", category="text")])),
         capture(turn(calls=[call("fetch_raw", url=url) for url in urls])),
         turn("GPT Real; Claude Real. " + " ".join(urls) + " Arama kapsamı eksik; resmi duyuru sayfaları okundu."),
         checked([fact("model_names", "GPT Real", 2, "model: GPT Real"), fact("model_names", "Claude Real", 3, "model: Claude Real")])])
     report, _ = await run(coordinator, tmp_path, RESEARCH)
     assert report["success"] and report["metrics"]["turns"] == 5 and report["metrics"]["tool_calls"] == 4
-    assert all(category == "web" for _, category in observations)
+    assert all(category == "text" for _, category in observations)
     first = "\n".join(message["content"] for message in snapshots[0] if message["role"] == "system")
     second = "\n".join(message["content"] for message in snapshots[1] if message["role"] == "system")
-    assert 'category="web"' in first and "site:openai.com/index/" in first and "site:anthropic.com/news/" in first
+    assert 'category="text"' in first and "site:openai.com/index/" in first and "site:anthropic.com/news/" in first
     assert "READ SPECIFIC PRIMARY PAGES NOW" in second and urls[0] in second and urls[1] in second
     assert "not news indexes" in second and datetime.now(timezone.utc).date().isoformat() in second
 
@@ -114,3 +114,89 @@ def test_official_fallback_preserves_actual_primary_essential_identifiers(tmp_pa
     assert "GPT Real" in rendered and "2026-09-29" in rendered and "https://openai.com/index/gpt-real/" in rendered
     assert "anthropic.com" in rendered and "eksik" in rendered.casefold()
     assert len(rendered) < 1800 and store.load(bundle["run_id"])["observations"][0]["text"] == text
+
+
+@pytest.mark.asyncio
+async def test_complete_retained_middle_facts_survive_model_context_exhaustion(tmp_path):
+    from omniagent.app.conversation_grounding import ground_answer
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("Verify OpenAI official model names, release dates and source links", route="investigate", required_fields=["model_names", "release_dates", "source_urls"]))
+    text = "Preface prose.\n" + "page plumbing\n" * 18000 + "\nmodel: GPT Exact Middle\nOpenAI released GPT Exact Middle on 2026-09-29.\n" + "page plumbing\n" * 14000
+    source = store.capture(bundle, "fetch_raw", {"ok": True, "result": text}, arguments='{"url":"https://openai.com/index/middle/"}')
+    assert not source["complete"] and "GPT Exact Middle" not in source["text"]
+    assert store.observation_text(bundle, 0) == text
+    async def no_model(messages):
+        pytest.fail("full artifact exceeds the existing 80k model context")
+    answer, success = await ground_answer("Draft", bundle, store, no_model)
+    assert not success
+    assert "GPT Exact Middle" in answer and "2026-09-29" in answer
+    assert source["artifact_path"] in answer and "bağlam" in answer
+    assert "sayfası okunamadı" not in answer
+    assert len(answer) < 2500
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed,truncated", [(False, True), (True, False)])
+async def test_retained_artifact_does_not_upgrade_incomplete_tool_capture(tmp_path, failed, truncated):
+    from omniagent.app.conversation_grounding import ground_answer
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("Verify OpenAI official model names", route="investigate", required_fields=["model_names"]))
+    text = "model: GPT Incomplete\n" + "page plumbing\n" * 32000
+    source = store.capture(bundle, "fetch_raw", {"ok": not failed, "result": text, "truncated": truncated, "error": "HTTP 403"}, arguments='{"url":"https://openai.com/index/incomplete/"}')
+    assert source["artifact_path"]
+    async def no_model(messages):
+        pytest.fail("incomplete or failed captures cannot certify primary facts")
+    answer, success = await ground_answer("Draft", bundle, store, no_model)
+    assert not success and "sayfası okunamadı" in answer
+    assert "Kaynakta bulunan istenen bilgiler: GPT Incomplete" not in answer
+
+
+@pytest.mark.asyncio
+async def test_real_fetch_execution_retains_full_middle_facts_and_masks_presentation(coordinator, scripted, tmp_path, monkeypatch):
+    import subprocess
+    from omniagent import config
+    from omniagent.tools import browser
+    from omniagent.tools.filesystem import clean_html
+    secret = "sk-retained-fetch-secret-123456789"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    url = "https://www.anthropic.com/news/claude-middle"
+    primary = "page plumbing " * 700 + "model: Claude Exact Middle\nAnthropic released Claude Exact Middle on 2026-09-29.\n" + "page plumbing " * 700 + secret
+    html = "<html><body><article>" + primary + "</article></body></html>"
+    monkeypatch.setattr(browser, "_fetch_with_retries", lambda request: subprocess.CompletedProcess([], 0, html, ""))
+    scripts, requests = scripted
+    scripts.extend([route("investigate", ["model_names", "release_dates", "source_urls"]),
+        turn(calls=[call("fetch_raw", url=url)]),
+        turn("Claude Exact Middle — 2026-09-29. " + url),
+        checked([fact("model_names", "Claude Exact Middle", 0, "model: Claude Exact Middle"), fact("release_dates", "2026-09-29", 0, "Anthropic released Claude Exact Middle on 2026-09-29.")])])
+    report, events = await run(coordinator, tmp_path, "Verify Anthropic official model names, release dates and source links")
+    assert report["success"] and report["metrics"]["tool_calls"] == 1
+    source = report["evidence"]["observations"][0]
+    assert source["complete"] and len(source["text"]) > 19000
+    assert any("Claude Exact Middle" in message["content"] for message in requests[2][0] if message["role"] == "tool")
+    assert "Claude Exact Middle" in source["text"] and "2026-09-29" in source["text"]
+    assert secret not in source["text"] and secret not in json.dumps(events) and secret not in json.dumps(requests)
+    assert all(len(event.get("text", "")) <= 4000 for event in events if event["kind"] == "tool_finished")
+    assert len(clean_html(html)) < 5100  # generic UI cleaner remains bounded
+
+
+def test_legacy_bounded_artifact_has_no_implicit_capture_upgrade(tmp_path):
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("Verify OpenAI official model names", route="investigate", required_fields=["model_names"]))
+    source = store.capture(bundle, "fetch_raw", {"ok": True, "result": "model: GPT Legacy\n" + "page plumbing\n" * 32000}, arguments='{"url":"https://openai.com/index/legacy/"}')
+    source.pop("captured_complete")
+    assert not store.authoritative_bundle(bundle)["observations"][0]["complete"]
+    assert primary_source_gaps(store.authoritative_bundle(bundle))
+    source["captured_complete"] = "true"
+    with pytest.raises(ValueError, match="Invalid source observation"):
+        store.authoritative_bundle(bundle)
+
+
+def test_missing_retained_artifact_is_honest_and_does_not_certify(tmp_path):
+    from pathlib import Path
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("Verify OpenAI official model names", route="investigate", required_fields=["model_names"]))
+    source = store.capture(bundle, "fetch_raw", {"ok": True, "result": "model: GPT Missing\n" + "page plumbing\n" * 32000}, arguments='{"url":"https://openai.com/index/missing/"}')
+    Path(source["artifact_path"]).unlink()
+    rendered = render_evidence(bundle, store)
+    assert "Tam kaynak dosyası okunamadı" in rendered
+    assert "Kaynakta bulunan istenen bilgiler" not in rendered

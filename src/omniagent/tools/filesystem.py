@@ -58,14 +58,14 @@ def missing_path_hint(path: Path) -> str:
     return (f" En yakın mevcut dizin: {ancestor} → içerik: {', '.join(names) or '(boş)'}. "
             "Yolu hedef metninden harf harf kontrol et.")
 
-def clean_html(html: str) -> str:
+def clean_html(html: str, *, limit: int | None = PAGE_TEXT_LIMIT) -> str:
     if not html: return ""
     soup = BeautifulSoup(html, "html.parser")
     for element in soup(["script", "style", "meta", "noscript", "header", "footer", "nav"]):
         element.decompose()
     text = soup.get_text(separator=" ")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return clip_text(" ".join(lines), PAGE_TEXT_LIMIT)
+    return " ".join(lines) if limit is None else clip_text(" ".join(lines), limit)
 
 DIRECTORY_ENTRY_LIMIT = 1000
 

@@ -34,18 +34,15 @@ search snippets, news indexes, third-party excerpts or failed/incomplete receipt
 
 def authoritative_context(bundle: EvidenceBundle, store: EvidenceStore | None) -> tuple[str, list[str]]:
     """Use artifacts when capture retained full source; refuse model clipping."""
-    texts = []
-    for index, observation in enumerate(bundle["observations"]):
-        if observation.get("artifact_path"):
-            if store is None:
-                raise ValueError("Tam kaynak dosyası okunamadı.")
-            text = store.observation_text(bundle, index)
-        else:
-            text = observation["text"]
-        texts.append(text)
-    data = {"contract": bundle["contract"], "complete": bundle["complete"],
-            "limitations": bundle["limitations"], "sources": [
-                {**observation, "text": text} for observation, text in zip(bundle["observations"], texts)]}
+    if store is not None:
+        authoritative = store.authoritative_bundle(bundle)
+    elif any(source.get("artifact_path") for source in bundle["observations"]):
+        raise ValueError("Tam kaynak dosyası okunamadı.")
+    else:
+        authoritative = bundle
+    texts = [source["text"] for source in authoritative["observations"]]
+    data = {"contract": authoritative["contract"], "complete": authoritative["complete"],
+            "limitations": authoritative["limitations"], "sources": authoritative["observations"]}
     return json.dumps(data, ensure_ascii=False), texts
 
 
@@ -146,6 +143,12 @@ def semantic_check(answer: str, bundle: EvidenceBundle, content: str, source_tex
 async def ground_answer(answer: str, bundle: EvidenceBundle, store: EvidenceStore | None,
                         model: Callable[[list[dict]], Awaitable[ModelTurn]]) -> tuple[str, bool]:
     """One verify, one correction, one reverify; budget errors bubble to caller."""
+    original_bundle = bundle
+    try:
+        if store is not None:
+            bundle = store.authoritative_bundle(bundle)
+    except (OSError, ValueError):
+        return render_evidence(original_bundle) + "\nTam kaynak dosyası okunamadı; doğrulama eksik.", False
     gaps = primary_source_gaps(bundle)
     if gaps:
         outcome = render_evidence(bundle)
@@ -157,7 +160,7 @@ async def ground_answer(answer: str, bundle: EvidenceBundle, store: EvidenceStor
     if bundle["contract"]["needs_observation"] and not any(source["ok"] for source in bundle["observations"]):
         return render_evidence(bundle), False
     try:
-        evidence, source_texts = authoritative_context(bundle, store)
+        evidence, source_texts = authoritative_context(original_bundle, store)
     except (OSError, ValueError):
         return render_evidence(bundle) + "\nTam kaynak dosyası okunamadı; doğrulama eksik.", False
     # Entire request includes answer and instructions: never silently clip required facts.
