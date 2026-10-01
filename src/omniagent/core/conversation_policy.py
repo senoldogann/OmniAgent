@@ -337,6 +337,8 @@ def render_official_research(bundle: EvidenceBundle) -> str:
                     lines.append("Hata ayrıntısının gösterimi eksik; tam hata kaynak kaydında korundu.")
             else:
                 lines.append("\n" + url + ": belirli bir model duyurusunu doğrulayan tamamlanmış birincil makbuz sağlamadı.")
+    read_urls = {source_receipt_url(source) for source in bundle["observations"]
+                 if source["tool"] == "fetch_raw" and source["ok"]}
     candidates = []
     domains = official_source_domains(bundle) or []
     for source in bundle["observations"]:
@@ -346,7 +348,7 @@ def render_official_research(bundle: EvidenceBundle) -> str:
             url = str(record.get("url") or record.get("href") or "")
             host = urlsplit(url).hostname
             if host and any(host == domain or host.endswith("." + domain) for domain in domains):
-                if url not in candidates:
+                if url not in read_urls and url not in candidates:
                     candidates.append(url)
     if candidates and gaps:
         lines.append("\nHenüz okunmamış resmi arama bağlantıları (doğrulanmış sonuç değil):")

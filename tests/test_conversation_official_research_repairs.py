@@ -235,3 +235,18 @@ def test_specific_named_model_announcement_is_primary_without_synthetic_labels(t
     bundle = store.create(derive_request_contract("Verify " + provider + " official model release names", route="investigate", required_fields=["model_names"]))
     store.capture(bundle, "fetch_raw", {"ok": True, "result": text}, arguments=json.dumps({"url": url}))
     assert not primary_source_gaps(bundle)
+
+
+def test_partial_fallback_does_not_label_successfully_read_source_unread(tmp_path):
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract(RESEARCH, route="investigate", required_fields=["model_names", "source_urls"]))
+    read_url = "https://www.anthropic.com/news/claude-opus-4-5"
+    unread_url = "https://www.anthropic.com/news/claude-sonnet-next"
+    records = [{"title": "Anthropic model release", "url": url, "body": "Specific model announcement."} for url in (read_url, unread_url)]
+    store.capture(bundle, "web_search", {"ok": True, "result": json.dumps(records)})
+    store.capture(bundle, "fetch_raw", {"ok": True, "result": "Introducing Claude Opus 4.5.\nmodel: Claude Opus 4.5"}, arguments=json.dumps({"url": read_url}))
+    rendered = render_evidence(bundle)
+    assert "Okunan resmi duyuru: " + read_url in rendered
+    assert "openai.com: resmi birincil kaynak sayfası okunamadı" in rendered
+    unread_section = rendered.split("Henüz okunmamış resmi arama bağlantıları", 1)[1]
+    assert unread_url in unread_section and read_url not in unread_section
