@@ -8,9 +8,11 @@ değişiklikleri incelendi. Önceki bağımsız SPEC/QUALITY incelemeleri `cf608
 için geçerlidir; bu son inceleme root tarafından yapılmıştır.
 
 İncelemede bulunan kod/paket sorunları giderildi. İncelenen kapsamda açık
-Critical/High kod bulgusu kalmadı. Son sertifikalı paket kuruldu; bu paketin
-modelle son masaüstü kontrolü, ilk Keychain kimlik geçişinin kullanıcı yanıtını
-bekliyor. Bu bekleyiş başarılı canlı kontrol olarak kaydedilmedi.
+Critical/High kod bulgusu kalmadı. Son sertifikalı paket kuruldu. Keychain bekleyişi kalktıktan sonra gerçek
+masaüstü kontrolü tamamlandı: “Bilgisayarda tam disk erişimi açık mı” sorusu
+2,0 saniye, 2 tur ve 1 gerçek `inspect_host_capabilities` çağrısıyla başarılı
+tamamlandı. Bu çalışan uygulama sürecinde Tam Disk Erişimi reddediliyor;
+başarılı denetim, iznin verildiği anlamına gelmez.
 
 ## Bulgular ve düzeltmeler
 
@@ -40,9 +42,9 @@ Kaynak ve uygulama bildirimleri: [PyInstaller macOS imzalama](https://pyinstalle
 
 Keychain erişimi, macOS Ekran Kaydı/Erişilebilirlik/Tam Disk Erişimi ve Apple
 Mesajlar hesabının aktivasyonu ayrı durumlardır. Köprünün `connected` olması,
-Apple hesabının giriş yaptığını veya mesaj teslimini kanıtlamaz. Son önceki
-masaüstü denetiminde Tam Disk Erişimi bu uygulama süreci için reddediliyordu;
-bu sonuç yeni sertifikalı pakete genellenmez.
+Apple hesabının giriş yaptığını veya mesaj teslimini kanıtlamaz. Son sertifikalı paketin gerçek
+masaüstü denetiminde Tam Disk Erişimi bu çalışan uygulama süreci için
+reddedildi. Bu uygulamanın korumalı verilere erişmesi için macOS izni gerekir.
 
 Linux teslim kapısı değildir. VPS kurulmadı. Noter onayı/başka Mac'lere dağıtım
 bu yerel kurulumun doğrulanmış kapsamı değildir.
@@ -58,5 +60,5 @@ gerçek kontrol sonucu özel teslim kaydında tutulur:
 
 - [x] Kod ve paket bulgularını yeniden üret, düzelt ve sınır testlerini çalıştır.
 - [x] Sertifikalı paketi doğrula, geri dönüş kopyasıyla kur ve iki köprüyü güncelle.
-- [ ] İlk sertifikalı paket Keychain yanıtından sonra masaüstünde son salt okunur kontrolü tamamla.
+- [x] İlk sertifikalı paket Keychain bekleyişi kalktıktan sonra masaüstünde son salt okunur kontrolü tamamla.
 ```
