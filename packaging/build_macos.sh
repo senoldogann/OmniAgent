@@ -34,6 +34,19 @@ uv run --python 3.11 --frozen --with pyinstaller==6.22.3 pyinstaller \
   --workpath build/pyinstaller \
   packaging/OmniAgent.spec
 
+# PyInstaller signs nested binaries with hardened runtime. The Playwright Node
+# driver needs MAP_JIT; grant it to Node only, then reseal the outer bundle.
+if [ -n "$OMNIAGENT_CODESIGN_IDENTITY" ]; then
+  codesign --force --options runtime --timestamp \
+    --entitlements packaging/playwright-node-entitlements.plist \
+    --sign "$OMNIAGENT_CODESIGN_IDENTITY" \
+    dist/OmniAgent.app/Contents/Frameworks/playwright/driver/node
+  codesign --force --options runtime --timestamp \
+    --sign "$OMNIAGENT_CODESIGN_IDENTITY" dist/OmniAgent.app
+fi
+
+dist/OmniAgent.app/Contents/Frameworks/playwright/driver/node \
+  -e 'if (2 + 2 !== 4) process.exit(1)'
 plutil -lint dist/OmniAgent.app/Contents/Info.plist
 codesign --verify --deep --strict --verbose=2 dist/OmniAgent.app
 codesign -d -r- dist/OmniAgent.app
