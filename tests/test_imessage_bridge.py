@@ -580,7 +580,8 @@ async def test_unknown_delivery_of_the_task_ack_still_starts_the_task(parts: Par
 
 
 @pytest.mark.asyncio
-async def test_listen_survives_failed_control_replies(parts: Parts, tmp_path: Path) -> None:
+async def test_listen_survives_failed_control_replies(parts: Parts, tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
     """
     Gerçek istemci + sahte imsg: '/durum' yanıtında -32001 (teslim bilinmiyor) ve reddedilen gönderim (-32602)
     dinlemeyi düşürmez; süreç hatası olmayan hiçbir ImsgError listen'dan kaçmaz, sonraki mesaj işlenir.
@@ -603,9 +604,26 @@ async def test_listen_survives_failed_control_replies(parts: Parts, tmp_path: Pa
         lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
         return len([line for line in lines if json.loads(line)["method"] == "send"])
 
+    # The fake transport logs a request before its RPC response is consumed.
+    # Wait for actual handlers, including delivery bookkeeping, before cancellation.
+    controls_completed = 0
+    third_control_done = asyncio.Event()
+    on_message = bridge.on_message
+    async def observed_on_message(message: IncomingMessage) -> None:
+        nonlocal controls_completed
+        try:
+            await on_message(message)
+        finally:
+            # Rejected replies propagate to the real listener; they still completed.
+            controls_completed += 1
+            if controls_completed == 3:
+                third_control_done.set()
+    monkeypatch.setattr(bridge, "on_message", observed_on_message)
+
     listening = asyncio.create_task(session.listen(bridge))
     try:
-        await until(lambda: sends() == 3 or listening.done())
+        await until(lambda: third_control_done.is_set() or listening.done())
+        assert third_control_done.is_set() and controls_completed == sends() == 3
         assert not listening.done()
     finally:
         await stop_task(listening)

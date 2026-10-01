@@ -109,7 +109,7 @@ def official_source_domains(bundle: EvidenceBundle) -> list[str] | None:
 
 
 def official_model_research(bundle: EvidenceBundle) -> bool:
-    return official_source_domains(bundle) is not None and bool(
+    return bool(official_source_domains(bundle)) and bool(
         re.search(r"\bmodels?\b", bundle["contract"]["subject"], re.I)
         or set(bundle["contract"]["required_fields"]) & {"model_names", "release_dates"})
 
@@ -134,12 +134,10 @@ def primary_observation(bundle: EvidenceBundle, source: SourceObservation) -> bo
 
 
 def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
-    """Official verification needs real page receipts, not snippets or model assertions."""
+    """Strict primary checks apply to provider models or user-supplied authority URLs."""
     domains = official_source_domains(bundle)
-    if domains is None:
+    if not domains or (not official_model_research(bundle) and not _URL.search(bundle["contract"]["subject"])):
         return []
-    if not domains:
-        return ["Resmi kaynak yetkilisi belirlenemedi; birincil sayfa doğrulaması eksik."]
     read_hosts = {urlsplit(source_receipt_url(source)).hostname for source in bundle["observations"]
                   if primary_observation(bundle, source)}
     return [f"{domain}: resmi birincil kaynak sayfası okunamadı; doğrulama eksik."

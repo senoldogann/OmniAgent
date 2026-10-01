@@ -250,3 +250,32 @@ def test_partial_fallback_does_not_label_successfully_read_source_unread(tmp_pat
     assert "openai.com: resmi birincil kaynak sayfası okunamadı" in rendered
     unread_section = rendered.split("Henüz okunmamış resmi arama bağlantıları", 1)[1]
     assert unread_url in unread_section and read_url not in unread_section
+
+
+@pytest.mark.asyncio
+async def test_generic_official_documentation_uses_real_receipt_and_semantic_verifier(coordinator, scripted, tmp_path, monkeypatch):
+    import subprocess
+    from omniagent.tools import browser
+    url = "https://docs.python.org/3/library/asyncio.html"
+    body = "asyncio provides APIs for asynchronous code."
+    monkeypatch.setattr(browser, "_fetch_with_retries", lambda request: subprocess.CompletedProcess([], 0, "<html><body>" + body + "</body></html>", ""))
+    scripts, requests = scripted
+    scripts.extend([route("investigate", ["source_urls"]),
+        turn(calls=[call("fetch_raw", url=url)]),
+        turn(body + " " + url),
+        checked([fact("summary", "asyncio", 0, body)])])
+    report, _ = await run(coordinator, tmp_path, "Research the official Python documentation on asyncio and explain its asynchronous APIs with source links.")
+    assert report["success"] and report["outcome"] == body + " " + url
+    assert report["metrics"]["turns"] == len(requests) == 4 and report["metrics"]["tool_calls"] == 1
+    assert report["evidence"]["observations"][0]["complete"]
+    assert "AUTHORITATIVE EVIDENCE" in requests[-1][0][-1]["content"]
+    assert not primary_source_gaps(report["evidence"])
+
+
+def test_explicit_official_authority_still_requires_matching_primary_receipt(tmp_path):
+    store = EvidenceStore(tmp_path / "state.json")
+    bundle = store.create(derive_request_contract("Research official asyncio documentation at https://docs.python.org/3/library/asyncio.html", route="investigate", required_fields=["source_urls"]))
+    store.capture(bundle, "fetch_raw", {"ok": True, "result": "asyncio documentation."}, arguments='{"url":"https://unrelated.example/asyncio"}')
+    assert primary_source_gaps(bundle)
+    store.capture(bundle, "fetch_raw", {"ok": True, "result": "asyncio documentation."}, arguments='{"url":"https://docs.python.org/3/library/asyncio.html"}')
+    assert not primary_source_gaps(bundle)
