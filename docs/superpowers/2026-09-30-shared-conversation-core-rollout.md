@@ -1,9 +1,9 @@
 # Shared conversation core: acceptance and rollout
 
-Status: source integration approved at `c7145c0b`; final full suite GREEN and native
-macOS package installed. Paired-service startup, main publication and CI observations
-are recorded in the local delivery receipt listed below. Source review and scripted
-adapter verification do not establish visible delivery on a recipient’s phone.
+Status: reported live-failure repairs approved at `cf608b18`; full macOS suite GREEN
+(2,838 passed, 26 skipped). Native installation, paired-service startup and main
+publication are recorded in the local delivery receipt listed below. Source review
+and scripted adapter verification do not establish visible delivery on a recipient’s phone.
 
 ## Reopened delivery gate
 
@@ -390,3 +390,65 @@ Installed native application verification: a new empty chat using the preserved
 ollama-cloud/gemma4:cloud profile answered the public arithmetic probe with `4`
 in 1.9 seconds, two model turns and zero tools. The user-visible final was marked
 completed; startup keys were ready and no new Keychain interaction was needed.
+
+
+## Reported live failures: 2026-10-01 macOS repair
+
+The user supplied iMessage and Telegram screenshots showing repeated busy failures,
+missing observations for screen questions, and literal Markdown in Messages. Actual
+private receipts confirmed no-tool screen endings and user-task contention. The
+desktop X task was still awaiting user approval during the earlier busy failures;
+it subsequently captured screens successfully and ended on user cancellation.
+A stale lock was not assumed or forcibly removed.
+
+Repairs at `198da07a`, with the final permission/report compatibility correction
+at `cf608b18`, received independent specification and quality approval:
+
+- User host contention waits for up to the existing 15-second interval, remains
+  cancellable, and never steals another user task’s ownership. Singleton locks
+  remain immediate; autonomous preemption retains its existing scope. Longer
+  contention gives one actionable explanation about the running channel/on-screen
+  approval, rather than repeated generic missing-source summaries.
+- Failed execution retains its verdict and completed source receipts. Empty-source
+  exceptions report their actual cause once. Existing failed-task captions remain
+  compatible with desktop and Telegram delivery.
+- Ollama tool-only assistant messages send an empty content string in place of
+  null, without changing canonical history or other provider requests. An actual
+  `gemma4:cloud` protocol fixture completed in 0.727 seconds without the recorded
+  HTTP 400 nil-content error; this was a synthetic tool history, not a user action.
+- iMessage converts the complete reply to native readable text before splitting.
+  Code contents, indentation, tabs, final code newlines, technical filenames and
+  URL destinations remain intact. Displayed text is also the archived/echo-matched
+  text. Unknown-delivery groups still are not replayed automatically.
+- Explicit current-screen questions, including the supplied Turkish typos, require
+  real capture. The same run’s private image checks the answer; a failed or newer
+  unreadable capture cannot reuse an older image. Images are not persisted into
+  evidence/history. The 80,000-character text guard remains; only identity-matched
+  host-generated JPEG parts receive a separately bounded visual allowance.
+- Local permission/capability questions use read-only calling-process checks and
+  the registered tool catalog without acquiring the effectful host lock. Catalog
+  membership does not establish access to every target. No permission is requested
+  or changed, and read-only help no longer claims a prompt was displayed.
+
+Observed gates (overlapping counts are not additive):
+
+- Implementer focused gate: 304 passed in 21.60 seconds.
+- Initial full macOS run: 2,828 passed, 26 skipped, 8 failed in 303.39 seconds.
+  Six old chat test doubles rejected the new optional presentation parameter; two
+  host-rejection tests expected the previous caption. Original voice, memory,
+  archive and failed-effect assertions were retained when correcting these cases.
+- Final followup real-Tk gate: 47 passed in 4.37 seconds.
+- Independent final specification gate: 31 passed in 3.36 seconds.
+- Independent quality gate: 42 passed in 3.47 seconds; no Critical or Important
+  findings remain.
+- Final full suite at `cf608b18`, with `OMNI_UI_TEST=1`: 2,838 passed, 26 skipped,
+  zero failures in 301.44 seconds.
+- CCM refreshed 329 files, zero failures, 21,708 graph nodes; the actual capability
+  implementation and its coordinator path were checked.
+
+The user explicitly selected macOS as the delivery gate; Linux CI is informative
+and does not delay this Mac-only delivery. Remote workflows are retained. Only
+the merged, unattached `feat/shared-conversation-core` and
+`design/shared-conversation-core` local branches were deleted after an all-ref
+bundle backup. Unique work and attached worktrees were preserved. Final binary,
+rollback copy, service checks and published main SHA belong to the delivery receipt.
