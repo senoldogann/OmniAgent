@@ -117,12 +117,38 @@ def primary_source_gaps(bundle: EvidenceBundle) -> list[str]:
         except ValueError:
             url = source["source_reference"]
         host = urlsplit(url).hostname
-        if host:
+        if host and model_page_relevant(bundle, source, url):
             read_hosts.add(host.casefold())
     if not domains:
         return ["Resmi kaynak yetkilisi belirlenemedi; birincil sayfa doğrulaması eksik."]
     return [f"{domain}: resmi birincil kaynak sayfası okunamadı; doğrulama eksik."
             for domain in domains if not any(host == domain or host.endswith("." + domain) for host in read_hosts)]
+
+
+def model_page_relevant(bundle: EvidenceBundle, source: SourceObservation, url: str) -> bool:
+    """A model-release request cannot be verified by an arbitrary provider page."""
+    subject = bundle["contract"]["subject"].casefold()
+    if not re.search(r"\bmodels?\b", subject):
+        return True
+    path = urlsplit(url).path.casefold()
+    if re.search(r"/(?:careers?|about|contact|privacy|terms|policies|login)(?:/|$)", path):
+        return False
+    text = essential_web_text(source["text"])
+    return bool(re.search(r"\b(?:models?|gpt|claude)\b|gpt[- ]|claude[- ]", text, re.I)
+                and (re.search(r"release|launch|introduc|announc|çıkış|yayın|duyur", text, re.I)
+                     or _MODEL.search(text)))
+
+
+def essential_web_text(text: str) -> str:
+    """Navigation/related blocks do not establish the release page's essential facts."""
+    markers = re.finditer(r"(?im)^\s*(?:footer\b|careers?\b|navigation\b|related (?:posts|articles|releases)\b)", text)
+    for marker in markers:
+        prefix = text[:marker.start()]
+        # Leading site navigation can precede the actual article. Trim only after
+        # source prose has established a model/release body, never at a header link.
+        if _MODEL.search(prefix) or re.search(r"(?:releas\w*|launch\w*|introduc\w*|announc\w*)[^\n]{0,160}(?:model|gpt|claude)", prefix, re.I):
+            return prefix
+    return text
 
 
 def _search_records(text: str) -> list[dict] | None:
@@ -168,8 +194,14 @@ def supported_source_urls(bundle: EvidenceBundle) -> list[str]:
             urls.extend(str(record.get("url") or record.get("href")) for record in records
                         if record.get("url") or record.get("href"))
         else:
-            urls.extend(_URL.findall(source["text"]))
-            urls.extend(_URL.findall(source["source_reference"]))
+            references = _URL.findall(source["source_reference"])
+            if source["tool"] == "fetch_raw" and references:
+                urls.extend(url for url in references if model_page_relevant(bundle, source, url))
+                urls.extend(url for url in _URL.findall(essential_web_text(source["text"]))
+                            if not re.search(r"/(?:careers?|about|contact|privacy|terms|policies|login)(?:/|$)", urlsplit(url).path, re.I))
+            else:
+                urls.extend(_URL.findall(source["text"]))
+                urls.extend(references)
     return list(dict.fromkeys(url.rstrip(".,;:") for url in urls))
 
 
@@ -179,7 +211,7 @@ def _field_identifiers(bundle: EvidenceBundle) -> dict[str, list[str]]:
     for observation in bundle["observations"]:
         if not observation["ok"]:
             continue
-        text = observation["text"]
+        text = essential_web_text(observation["text"]) if observation["tool"] == "fetch_raw" else observation["text"]
         records = relevant_search_records(bundle, text) if observation["tool"] == "web_search" else None
         if records is not None:
             text = "\n".join("\n".join(str(record.get(key, "")) for key in ("title", "body", "content", "snippet"))

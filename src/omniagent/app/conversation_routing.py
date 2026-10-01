@@ -1,7 +1,6 @@
 """Semantic decisions constrained by authenticated host input and existing routes."""
 from __future__ import annotations
 
-import json
 import re
 from typing import Any
 from datetime import datetime, timezone
@@ -12,6 +11,7 @@ from omniagent.app.types import RunOptions
 from omniagent.core.conversation import to_messages
 from omniagent.core.conversation_policy import derive_request_contract
 from omniagent.core.evidence import RequestContract, sanitize_text
+from omniagent.core.structured_response import parse_complete_json
 
 ROUTING_POLICY = """Return only JSON: {"route":"chat|investigate|task", "required_fields":[...],
 "needs_observation":true|false}. No tools and no user-facing answer.
@@ -51,15 +51,13 @@ _READ_TAIL = re.compile(r"^\s*(?:[.!?]\s*)?(?:Türlerini de belirt,?\s*|içerikl
 _READ_HEAD = re.compile(_POLITE_START + r"(?=[^\n]*(?:dosya|klasör|dizin|masaüst|/))"
                         r"[^\n]+?\s+(?:oku|okur musun|okuyabilir misin|listele|listeler misin|listeleyebilir misin)"
                         r"(?=\s*[.!?]|\s*$)", re.I)
-_STABLE_REQUEST = re.compile(_POLITE_START + r"(?:tell (?:me )?(?:a |an )?(?:fictional )?story\b|"
-                            r"(?:write|create) (?:me )?(?:a |an )?(?:fictional story|story|poem)\b|"
-                            r"explain\b|(?:bir )?(?:hikâye|hikaye|masal|şiir)\b)", re.I)
 _EXTERNAL_TARGET = re.compile(r"https?://|(?:^|\s)[/~][\w.]|\b(?:current|latest|today|now|güncel|bugün|"
-                              r"dosya|klasör|dizin|directory|folder|files?|releases?|price|availability|inbox|calendar|desktop|ekran)\b|"
-                              r"\b(?:new|yeni)\s+(?:models?|model)\b", re.I)
+                              r"dosya\w*|klasör\w*|dizin\w*|directory|folders?|files?|releases?|prices?|availability|inbox|calendar|desktop|ekran|"
+                              r"ceo|president|chairman|başkan\w*|yönetici\w*|news|haber\w*|stocks?|weather|hava durumu|email|e-posta|"
+                              r"downloads?|masaüst\w*)\b|"
+                              r"\b(?:new|yeni)\s+(?:models?|model)\b|\b[\w-]*[a-z][\w-]*\.[\w]{1,12}\b", re.I)
 _EFFECT = re.compile(r"\b(?:send|delete|remove|install|schedule|click|gönder|sil|kur|zamanla|tıkla)\b", re.I)
 _COMPOUND_EFFECT = re.compile(r"\b(?:write|edit|create|move|save|deploy|run|execute|taşı|kaydet|kopyala|oluştur|düzenle|çalıştır)\b|dosyasına\s+yaz", re.I)
-_MEDIA_SUBJECT = re.compile(r"\b(?:image|photo|picture|görsel|fotoğraf)(?:i|ı|deki|daki)?\b", re.I)
 
 
 def host_time_context() -> str:
@@ -77,15 +75,15 @@ def pure_read_requested(goal: str) -> bool:
 
 
 def needs_external_observation(goal: str, options: RunOptions) -> bool:
-    """Execution mode is not evidence scope. Only narrow supplied/creative requests opt out."""
+    """Require observations for external state/effects, independently of execution mode.
+
+    Stable knowledge and user-supplied/creative content do not become an external
+    inspection merely because the user selected a full-agent mode. The existing
+    engine still owns the verdict and its effect/continuous completion guards.
+    """
     subject = subject_for_turn(goal, options)
-    if _EXTERNAL_TARGET.search(subject) or _EFFECT.search(subject) or force_task_effect(goal, options):
-        return True
-    if _STABLE_REQUEST.search(subject):
-        return False
-    if options.get("images") and _MEDIA_SUBJECT.search(subject):
-        return False  # the authenticated image itself is observed by the full model
-    return True
+    return bool(_EXTERNAL_TARGET.search(subject) or _EFFECT.search(subject)
+                or force_task_effect(goal, options) or pure_read_requested(subject))
 
 
 def force_task_effect(goal: str, options: RunOptions) -> bool:
@@ -115,7 +113,7 @@ def routing_messages(goal: str, options: RunOptions) -> list[dict[str, Any]]:
 def contract_from_decision(goal: str, options: RunOptions, content: str) -> RequestContract:
     subject = subject_for_turn(goal, options)
     try:
-        parsed = json.loads(content)
+        parsed = parse_complete_json(content)
         if (not isinstance(parsed, dict) or parsed.get("route") not in ("chat", "investigate", "task")
             or type(parsed.get("needs_observation")) is not bool
             or not isinstance(parsed.get("required_fields"), list)
@@ -125,8 +123,10 @@ def contract_from_decision(goal: str, options: RunOptions, content: str) -> Requ
         fields = parsed["required_fields"]
         observation = parsed["needs_observation"]
     except (ValueError, TypeError):
-        # An invalid classifier may not quietly answer from prior model knowledge.
-        return derive_request_contract(subject, route="task")
+        # Invalid model format cannot defeat an authenticated, bounded pure read.
+        # All other malformed decisions retain the existing conservative task fallback.
+        route = "investigate" if not force_task(goal, options) and pure_read_requested(goal) else "task"
+        return derive_request_contract(subject, route=route)
     if force_task(goal, options) or _EXPLICIT_ACTION.search(goal):
         route = "task"
     elif pure_read_requested(goal):

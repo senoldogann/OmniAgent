@@ -105,7 +105,11 @@ async def test_host_date_and_batched_primary_pages_within_quick_budget(coordinat
     scripts.extend([route("investigate", ["model_names", "source_urls"]),
         turn(calls=[call("web_search", query="OpenAI official latest models"), call("web_search", query="Anthropic official latest models")]),
         turn(calls=[call("fetch_raw", url=url) for url in urls]),
-        turn("GPT Example; Claude Example. " + " ".join(urls) + " Arama özeti kapsamı eksik; resmi sayfalar okundu."), verified()])
+        turn("GPT Example; Claude Example. " + " ".join(urls) + " Arama özeti kapsamı eksik; resmi sayfalar okundu."),
+        turn(json.dumps({"ok": True, "facts": [
+            {"field": "model_names", "value": "GPT Example", "source": 2, "quote": "model: GPT Example"},
+            {"field": "model_names", "value": "Claude Example", "source": 3, "quote": "model: Claude Example"}],
+            "missing_fields": [], "unsupported_claims": []}))])
     report, _ = await run(coordinator, tmp_path, RESEARCH)
     assert report["success"] and report["metrics"]["tool_calls"] == 4 and report["metrics"]["turns"] == 5
     today = datetime.now(timezone.utc).date().isoformat()
@@ -140,7 +144,8 @@ def test_incidental_search_url_and_date_do_not_override_semantically_supported_a
     store.capture(bundle, "web_search", {"ok": True, "result": json.dumps([relevant, incidental])})
     answer = "GPT Example — 2026-09-29. https://openai.com/index/example/ Arama kaynakları eksik; tam sayfa incelenmedi."
     verification = json.dumps({"ok": True, "facts": [{"field": "model_names", "value": "GPT Example", "source": 0,
-        "quote": "model: GPT Example"}], "missing_fields": [], "unsupported_claims": []})
+        "quote": "model: GPT Example"}, {"field": "release_dates", "value": "2026-09-29", "source": 0,
+        "quote": "Released on 2026-09-29"}], "missing_fields": [], "unsupported_claims": []})
     assert semantic_check(answer, bundle, verification, [bundle["observations"][0]["text"]])[0]
     rendered = render_evidence(bundle)
     assert "GPT Example" in rendered and "2026-09-29" in rendered
@@ -194,9 +199,11 @@ def test_primary_page_incidental_navigation_dates_and_links_are_not_essential(tm
     text = "model: GPT Exact\nOpenAI released GPT Exact on 2026-09-29.\nFooter updated 2024-01-01\nCareers https://openai.com/careers/"
     store.capture(bundle, "fetch_raw", {"ok": True, "result": text}, arguments=json.dumps({"url": "https://openai.com/index/exact/"}))
     answer = "GPT Exact — 2026-09-29. https://openai.com/index/exact/"
-    assert semantic_check(answer, bundle, json.dumps({"ok": True, "facts": [], "missing_fields": [], "unsupported_claims": []}), [text])[0]
-    assert not semantic_check("2026-09-29. https://openai.com/index/exact/", bundle,
-        json.dumps({"ok": True, "facts": [], "missing_fields": [], "unsupported_claims": []}), [text])[0]
+    verification = json.dumps({"ok": True, "facts": [
+        {"field": "model_names", "value": "GPT Exact", "source": 0, "quote": "OpenAI released GPT Exact on 2026-09-29."}],
+        "missing_fields": [], "unsupported_claims": []})
+    assert semantic_check(answer, bundle, verification, [text])[0]
+    assert not semantic_check("2026-09-29. https://openai.com/index/exact/", bundle, verification, [text])[0]
 
 
 @pytest.mark.asyncio
