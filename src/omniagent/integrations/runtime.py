@@ -108,9 +108,10 @@ class IntegrationRuntime:
         self.allowed_tools: Optional[frozenset[str]] = None
         # Authenticated quick-read scope owns synchronous workers until stopped.
         self.cancellable_reads = False
-        # ask_user'ın yanıt bekleme sınırı; sürekli görevde None: kullanıcı yanıtlayana dek bekler.
+        # Etkileşimli modun bekleme sınırı; nonblocking mod kullanıcı girdisini bağımlılığa dönüştürür.
         self.user_input_timeout: Optional[float] = APPROVAL_TIMEOUT_SECONDS
         self.unattended: bool = False
+        self.nonblocking: bool = False
         self.autonomy: Optional["AutonomyGuards"] = None
         self.deferred_questions: set[str] = set()
         self.gui_draft_text: str = ""
@@ -158,6 +159,8 @@ class IntegrationRuntime:
         düşülür. timeout verilirse süre dolunca TimeoutError yükselir (onay/soru görevi
         sonsuza dek kilitlemesin); None kurulum akışlarında sınırsız bekler.
         """
+        if self.nonblocking:
+            raise InteractionRequired(title)
         if self.answer is None or (self.unattended and not allow_unattended):
             raise InteractionRequired(title)
         if self.autonomy is not None and self.autonomy["quiet_now"]():

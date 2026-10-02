@@ -334,7 +334,10 @@ class OmniUI(ctk.CTk):
         self.configure(fg_color=BG)
         self.bind("<Map>", lambda event: self.after_idle(self._style_native_window)
                   if event.widget is self else None, add="+")
-        self._system_ui_family: str = tkfont.nametofont("TkDefaultFont").actual("family")
+        self._system_ui_family: str = (
+            "Helvetica Neue" if sys.platform == "darwin"
+            else tkfont.nametofont("TkDefaultFont").actual("family")
+        )
         try:
             self._appearance: AppearanceSettings = load_appearance()
         except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -614,6 +617,8 @@ class OmniUI(ctk.CTk):
         self._body.configure(family=self._ui_family, size=READING_SIZE + delta)
         for name, style in transcript_tag_styles(self._ui_family, delta).items():
             self._text.tag_configure(name, **style)
+        for name in ("md_h3", "md_h2", "md_h1"):
+            self._text.tag_raise(name)
         if hasattr(self, "_activity"):
             self._configure_activity_tags(delta)
 
@@ -1436,7 +1441,7 @@ class OmniUI(ctk.CTk):
         """Seçilen modun çalışma sınırını composer'ın altında görünür kılar."""
         mode: str = RUN_MODE_KEYS.get(label, "normal")
         if mode == "continuous":
-            hint: str = "Sürekli · onay gerektiğinde bekler · /btw ile yön ver"
+            hint: str = "Sürekli · kanıtla tamamlar · /btw ile yön ver"
         else:
             profile = RUN_MODE_PROFILES[mode]
             minutes = int(profile["max_wall_clock_seconds"] / 60)
@@ -1832,9 +1837,9 @@ class OmniUI(ctk.CTk):
         ).pack(anchor="w", padx=12, pady=(24, 3))
         ctk.CTkLabel(
             panel, text=(
-                "Sürekli görev sen durdurana, sınır dolana veya hedefi /approve ile onaylayana kadar çalışır; "
+                "Sürekli görev sen durdurana, sınır dolana veya hedef kanıtla doğrulanana kadar çalışır; "
                 "bilgisayar başında olmasan da bağımsız işleri sürdürür. Çalışırken /btw <mesaj> ile yön verirsin. "
-                "Kanıtlı hedef onayı beklerken süre sınırı işlemeye devam eder."
+                "Tamamlanma onayı beklemez; eksik izin veya bilgi varsa bağımsız adımları sürdürür."
             ),
             text_color=TEXT_DIM, wraplength=560, justify="left", anchor="w",
             font=self._ui_font(11, "normal"),

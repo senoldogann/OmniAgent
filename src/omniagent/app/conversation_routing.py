@@ -101,7 +101,7 @@ def subject_for_turn(goal: str, options: RunOptions) -> str:
 
 
 def force_task(goal: str, options: RunOptions) -> bool:
-    return bool(options.get("run_mode", "normal") != "normal" or options.get("autonomy") is not None
+    return bool(options.get("run_mode", "normal") not in ("normal", "continuous") or options.get("autonomy") is not None
                 or options.get("unattended") or options.get("scheduled_run") or options.get("images")
                 or force_task_effect(goal, options) or screen_inspection_requested(goal))
 

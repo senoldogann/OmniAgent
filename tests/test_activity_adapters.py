@@ -277,7 +277,8 @@ async def test_status_question_preserves_explicit_force_task_mode(tmp_path, monk
     options = {'state_file': str(tmp_path / 'mode.json'), 'requested_backend': 'ollama-cloud',
                'should_stop': lambda: False, 'history': [], 'run_mode': mode}
     decision = await conversation.decide_conversation('what are you doing?', lambda event: None, options, {'ollama-cloud': object()})
-    assert decision.contract['route'] == 'task' and decision.run_mode == mode
+    assert decision.contract['route'] == ('chat' if mode == 'continuous' else 'task')
+    assert decision.run_mode == mode
 
 
 @pytest.mark.asyncio

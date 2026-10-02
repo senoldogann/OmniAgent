@@ -466,3 +466,31 @@ def test_required_artifact_text_api_preserves_authoritative_middle(tmp_path):
     result = "a" * MAX_OBSERVATION_BYTES + "MIDDLE REQUIRED" + "b" * MAX_OBSERVATION_BYTES
     store.capture(bundle, "read_file", {"ok": True, "result": result})
     assert store.observation_text(store.load(bundle["run_id"]), 0) == result
+
+
+def test_continuous_research_uses_shared_routing_and_effectful_requests_still_force_task():
+    from omniagent.app.conversation_routing import force_task
+    assert not force_task("Son iki gündeki yapay zeka haberlerini araştır ve rapor ver", {"run_mode": "continuous", "history": []})
+    assert force_task("Ekranda ne görüyorsun?", {"run_mode": "continuous", "history": []})
+    assert force_task("Dosyayı sil", {"run_mode": "continuous", "history": [], "autonomy": {"enabled": True}})
+
+
+@pytest.mark.asyncio
+async def test_continuous_candidate_is_not_success_when_verification_budget_expires(coordinator, scripted, tmp_path, monkeypatch):
+    from omniagent.app.conversation_budget import ConversationExhausted
+    scripts, requests = scripted
+    scripts.append(route("task"))
+    async def heavy(goal, emit, opts, clients):
+        store = EvidenceStore(opts["state_file"])
+        bundle = store.load(opts["evidence_run_id"])
+        store.capture(bundle, "read_file", {"ok": True, "result": "Only a local draft exists"})
+        return {"outcome": "Published and sold", "success": True, "reason": "done", "evidence": bundle,
+                "exchange": make_exchange(goal, "Published and sold", []), "metrics": {}}
+    async def exhausted(*args, **kwargs):
+        raise ConversationExhausted("verification budget exhausted")
+    monkeypatch.setattr(coordinator, "run_agent_with_callback", heavy)
+    monkeypatch.setattr(coordinator, "ground_answer", exhausted)
+    report, events = await run(coordinator, tmp_path, "Perform substantial work", {"run_mode": "continuous"})
+    assert not report["success"]
+    assert not report["evidence"]["complete"]
+    assert not any(e.get("kind") == "text_delta" and "Published and sold" in e.get("text", "") for e in events)

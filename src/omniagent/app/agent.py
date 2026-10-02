@@ -1098,11 +1098,12 @@ async def resolve_goal_report(
     call: ToolCallDraft, index: int, evidence: Dict[str, str], runtime: IntegrationRuntime, emit: EventSink,
     seen_evidence: frozenset[str], report_count: int, pending_commit: bool = False,
     defer_confirmation: bool = False,
+    automatic_completion: bool = False,
 ) -> Tuple[ToolResult, Optional[str], frozenset[str], bool]:
     """
     report_goal_met çağrısını host'ta işler: kanıt id'lerini görevin başarılı çağrılarıyla
     karşılaştırır, aynı kanıtla yinelenen bildirimi ve bildirim tavanını reddeder, geçerliyse
-    kullanıcıya onaylatır. Onaylanan özeti ve o ana dek değerlendirilmiş kanıt id'lerini döner.
+    tamamlanma adayını kanıt denetimine gönderir. Değerlendirilen özeti ve o ana dek değerlendirilmiş kanıt id'lerini döner.
     """
     started: float = time.monotonic()
     emit({"kind": "tool_started", "call_id": call["id"], "index": index, "name": call["name"],
@@ -1146,8 +1147,12 @@ async def resolve_goal_report(
         result: ToolResult = {"tool_call_id": call["id"], "ok": False, "error_type": "GoalNotProven",
                               "error": problem, "code": "GOAL_NOT_PROVEN", "recoverable": True}
     else:
-        asked = True
-        if defer_confirmation:
+        if automatic_completion:
+            confirmed = sanitize_text(summary.strip())
+            result = {"tool_call_id": call["id"], "ok": True,
+                      "result": "Hedef için sonuç kayıtları bulundu; yanıt ortak kanıt denetimine gönderiliyor."}
+        elif defer_confirmation:
+            asked = True
             result = {"tool_call_id": call["id"], "ok": True,
                       "code": "GOAL_AWAITING_APPROVAL",
                       "result": "Başarılı sonuç/okuma kayıtları bulundu; hedefin gerçekleşmesini kullanıcı doğrular. "
@@ -1159,6 +1164,7 @@ async def resolve_goal_report(
                 "içinde yanıt gelmezse oturum onaylanmamış olarak kapanır."
             )})
         else:
+            asked = True
             try:
                 # Gerçek boolean onay: masaüstünde izin/ret kartı, uzak arayüzde onay düğmesi.
                 answer: Dict[str, Any] = await runtime.ask(
@@ -1326,10 +1332,6 @@ async def run_agent_with_callback(
         return startup_failure(error, DEFAULT_BACKEND)
     continuous: bool = run_mode == CONTINUOUS_MODE
     max_total_tokens: Optional[int] = None if options.get("autonomy") is not None else options.get("max_total_tokens")
-    if continuous and options.get("answer") is None:
-        return startup_failure(ValueError(
-            "Sürekli mod, soru sorup yanıt bekleyebileceği bir kanal ister (masaüstü uygulaması veya Telegram)."
-        ), DEFAULT_BACKEND)
     available: frozenset[str] = frozenset(clients)
     try:
         selected_backend, current_backend, startup_announced = select_initial_backend(options, clients, emit, fallback_policy)
@@ -1407,9 +1409,10 @@ async def run_agent_with_callback(
         runtime = IntegrationRuntime(emit, options["should_stop"], options.get("answer"), options.get("deliver"))
         runtime.autonomy = options.get("autonomy")
         if continuous:
+            runtime.nonblocking = True
             runtime.unattended = bool(options.get("unattended"))
-            # Etkileşimli eski akış kullanıcı yanıtını süresiz bekleyebilir.
-            runtime.user_input_timeout = None
+            # Sürekli modda kullanıcı girdisi ayrı bir bağımlılık olarak kaydedilir.
+            runtime.user_input_timeout = 0.0
         if not chrome_session or skills_sh_goal(goal):
             runtime.selected["discover_capabilities"] = discovery_entry(service, runtime)
         file_cwd: Path = Path.cwd()
@@ -1579,6 +1582,9 @@ async def run_agent_with_callback(
         if continuous_replans < MAX_CONTINUOUS_REPLANS:
             recover_continuous(stall)
             return True
+        if runtime.nonblocking:
+            outcome, reason = f"Görev ilerleyemedi: {stall}", "ilerleme yok: yeni yön verilmedi"
+            return False
         if runtime.unattended:
             if options.get("pop_control_messages") is not None:
                 waiting_for_direction = True
@@ -2201,6 +2207,7 @@ async def run_agent_with_callback(
                             call, index, goal_evidence, runtime, emit,
                             goal_reports_seen, goal_report_count, turn_commit_pending,
                             defer_confirmation=runtime.unattended,
+                            automatic_completion=True,
                         )
                         # Tavan yalnız kullanıcıya gerçekten sorulan bildirimleri sayar: geçersiz
                         # kanıtla yapılan denemeler sonraki meşru bildirimi engellememeli.

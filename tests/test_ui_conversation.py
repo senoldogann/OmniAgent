@@ -155,7 +155,7 @@ def test_stream_delta_is_visible_in_one_frame(app: ui.OmniUI) -> None:
     ("Normal", "25 tur · 10 dk"),
     ("Uzun", "50 tur · 20 dk"),
     ("Otonom", "100 tur · 45 dk"),
-    ("Sürekli", "onay gerektiğinde bekler"),
+    ("Sürekli", "kanıtla tamamlar"),
 ])
 def test_mode_hint_explains_selected_budget(app: ui.OmniUI, label: str, expected: str) -> None:
     app.mode_menu.set(label)
@@ -1480,3 +1480,19 @@ def test_desktop_agent_success_without_presented_final_does_not_deliver_evidence
     app._on_run_done("", {"success":True, "reason":"", "outcome":"final", "exchange":make_exchange("report","final",[]), "evidence":bundle})
     assert pump_until(app, lambda: app._chat_write.done(), 3)
     assert store.load(bundle["run_id"])["delivery_status"] == "pending"
+
+
+def test_transcript_heading_priority_and_readable_font_hierarchy(app):
+    _start(app)
+    app._handle_event({"kind": "text_delta", "text": "## **Özet**\n1. Normal metin\n\n`komut`"})
+    _drain(app)
+    tags = app._text.tag_names()
+    assert tags.index("md_h2") > tags.index("md_bold")
+    heading = ui.tkfont.Font(font=app._text.tag_cget("md_h2", "font"))
+    body = ui.tkfont.Font(font=app._text.tag_cget("assistant", "font"))
+    marker = ui.tkfont.Font(font=app._text.tag_cget("md_list_marker", "font"))
+    assert heading.actual("size") > body.actual("size")
+    assert heading.actual("weight") == "bold" and body.actual("weight") == "normal"
+    assert marker.actual("weight") == "bold"
+    assert app._text.tag_cget("md_list_marker", "foreground") != app._text.tag_cget("assistant", "foreground")
+    assert app._text.tag_ranges("md_list_marker")

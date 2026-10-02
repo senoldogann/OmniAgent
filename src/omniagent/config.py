@@ -500,7 +500,7 @@ FILE_EXCHANGE_GUIDANCE: str = """
 # Yalnız sürekli görev modunda sistem isteminin sonuna eklenir (bkz. app/continuous.py).
 CONTINUOUS_GUIDANCE: str = """
 ### CONTINUOUS MODE
-- This task runs until the user stops it, a limit is reached or the user confirms the goal. A reply
+- This task runs until the user stops it, a limit is reached or evidence proves the goal. A reply
   without tool calls is shown as a progress report and the task continues; never claim in plain text
   that the goal is done.
 - The user may be away. When you need information, an account, a choice or approval only the user can
@@ -509,7 +509,8 @@ CONTINUOUS_GUIDANCE: str = """
   Never ask for API keys,
   passwords or tokens in chat; ask the user to enter them in ⚙ Settings and confirm with kind=confirm.
 - When earlier successful tool results prove the goal is met, call report_goal_met with the ids of
-  those tool calls. The host checks the ids and asks the user; without confirmation the task continues.
+  those tool calls. The host checks the ids and submits the result for evidence verification,
+  without asking the user to reconfirm completion.
 - Report the goal ONCE per genuinely new result. After a rejection do not send another report with the
   same evidence: first complete the missing work so new successful calls exist, then report those ids.
   Repeating a report does not close the goal and only interrupts the user.

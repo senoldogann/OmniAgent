@@ -197,7 +197,7 @@ async def test_forced_continuous_keeps_selected_limits_and_failed_engine_status(
         seen.append(opts)
         return failed_report(opts)
     monkeypatch.setattr(coordinator, "run_agent_with_callback", engine)
-    report, _ = await run(coordinator, tmp_path, "task", {"run_mode": "continuous", "task_context": lock})
+    report, _ = await run(coordinator, tmp_path, "task", {"run_mode": "continuous", "scheduled_run": True, "task_context": lock})
     assert not scripted[1] and 120 < seen[0]["max_wall_clock_seconds"] <= 900
     assert seen[0]["run_mode"] == "continuous" and seen[0]["max_total_tokens"] == 50000
     assert not report["success"] and report["reason"] == "effect failed"

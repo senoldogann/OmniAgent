@@ -163,7 +163,7 @@ async def test_real_continuous_engine_failure_is_not_upgraded_for_stable_goal(co
     async def answer(*args, **kwargs):
         return {"onay": False}
     report, _ = await run(coordinator, tmp_path, "Tell me a fictional story about a dragon", {
-        "run_mode": "continuous", "task_context": task_lock, "answer": answer, "max_iterations": 1})
+        "run_mode": "continuous", "scheduled_run": True, "task_context": task_lock, "answer": answer, "max_iterations": 1})
     assert not report["success"] and len(requests) == 1
     assert report["evidence"]["contract"]["needs_observation"] is False
     assert "tamamlanamadı" in report["outcome"]

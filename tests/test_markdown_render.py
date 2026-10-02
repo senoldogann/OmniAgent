@@ -90,3 +90,13 @@ def test_wide_table_without_rows_keeps_its_header_visible() -> None:
     header = " | ".join(f"Uzun sütun başlığı {number}" for number in range(1, 5))
     parts = render_markdown(f"| {header} |\n| --- | --- | --- | --- |", max_columns=64)
     assert "Uzun sütun başlığı 4" in "".join(value for value, _ in parts)
+
+
+def test_numbered_markers_and_source_headers_are_distinct_and_lossless():
+    parts = render_markdown("## **Özet**\n1. Birinci sonuç\n2. **İkinci sonuç**\n\nKaynak 1: web_search — başarılı", max_columns=64)
+    assert any(text == "1. " and "md_list_marker" in tags for text, tags in parts)
+    assert any(text == "2. " and "md_list_marker" in tags for text, tags in parts)
+    assert any("md_h2" in tags and "md_bold" in tags for text, tags in parts)
+    assert any(text.startswith("Kaynak 1:") and "md_h3" in tags for text, tags in parts)
+    visible = "".join(text for text, tags in parts)
+    assert "1. Birinci sonuç" in visible and "2. İkinci sonuç" in visible

@@ -696,10 +696,10 @@ async def test_new_clears_history_and_status_reports_next_task_settings(
 
 
 @pytest.mark.asyncio
-async def test_continuous_goal_prompt_has_buttons_and_approve_tap_closes_the_session(
+async def test_continuous_goal_completes_without_approval_buttons(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Sürekli oturumun onay istemi butonlu kalıcı iletidir; Onayla oturumu kapatır, başka oturumun butonu işlemez."""
+    """Gerçek ortak çekirdek ve Telegram sunucusu tamamlanma onayı istemez."""
     monkeypatch.setenv("OMNI_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(telegram, "STATE_FILE", str(tmp_path / "memory.json"))
     monkeypatch.setattr(telegram, "create_model_clients", lambda: {"ollama-cloud": object()})
@@ -716,10 +716,14 @@ async def test_continuous_goal_prompt_has_buttons_and_approve_tap_closes_the_ses
     ) -> tuple[dict[str, Any], str]:
         nonlocal turns
         turns += 1
+        if turns == 1:
+            return {"content": json.dumps({"route": "task", "required_fields": [], "needs_observation": True}), "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
+        if turns == 4:
+            return {"content": json.dumps({"ok": True, "facts": [], "missing_fields": [], "unsupported_claims": []}), "tool_calls": [], "finish_reason": "stop", "usage": main.ZERO_USAGE}, backend
         calls: dict[int, dict[str, str]] = {
-            1: {"id": "w1", "name": "write_file",
+            2: {"id": "w1", "name": "write_file",
                 "arguments": json.dumps({"path": str(tmp_path / "plan.md"), "content": "plan"})},
-            2: {"id": "g1", "name": "report_goal_met",
+            3: {"id": "g1", "name": "report_goal_met",
                 "arguments": json.dumps({"summary": "Plan hazır.", "evidence_call_ids": ["w1"]})},
         }
         if turns in calls:
@@ -727,29 +731,24 @@ async def test_continuous_goal_prompt_has_buttons_and_approve_tap_closes_the_ses
                     "usage": main.ZERO_USAGE}, backend
         return {"content": "", "tool_calls": [], "finish_reason": "stopped", "usage": main.ZERO_USAGE}, backend
 
+    async def stream(client, profile, messages, schemas, session_id, emit, stop):
+        response, _ = await fake_model(None, messages, schemas, session_id, "ollama-cloud", emit, stop)
+        return response
+
+    monkeypatch.setattr(main, "_stream_completion", stream)
     monkeypatch.setattr(main, "_call_model_with_retries", fake_model)
     try:
         await bridge.handle(text_message("Plan yaz"))
         task = bridge.active
         assert task is not None
-        for _ in range(100):
-            if api.buttons:
-                break
-            await asyncio.sleep(0.05)
-        text, rows = api.buttons[-1]
-        assert "Plan hazır." in text and "/approve" in text
-        assert [label for label, _ in rows[0]] == ["✅ Onayla", "⏹ Durdur"]
-        assert "Yanıtınız bekleniyor" in api.drafts[-1][1]["html"]
-        await bridge.handle(text_message("/status"))
-        assert "Çalışıyor: Plan yaz" in api.sent[-1] and "Token:" in api.sent[-1]
-        assert any("✍️ Yazıyor" in text for text in api.html_sent + api.html_edited)
-        await bridge.handle(tap("ctl:eskioturum:approve", 456))
-        assert "artık açık değil" in api.callback_answers[-1] and not task.done()
-        await bridge.handle(tap(rows[0][0][1], 456))
         await asyncio.wait_for(task, timeout=5)
+        assert api.buttons == []
+        assert not any("Yanıtınız bekleniyor" in item[1]["html"] for item in api.drafts)
+        assert (tmp_path / "plan.md").read_text() == "plan"
+
     finally:
         await bridge.integrations.close()
-    assert turns == 2
+    assert turns == 4
     assert "Plan hazır." in "\n".join(api.sent + api.edited + api.html_sent + api.html_edited)
 
 

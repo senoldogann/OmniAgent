@@ -1,5 +1,5 @@
 """
-Sürekli görev modu: kullanıcı durdurana, sınır dolana veya kullanıcı hedefi onaylayana kadar
+Sürekli görev modu: kullanıcı durdurana, sınır dolana veya hedef kanıtla doğrulanana kadar
 süren görevin saf kuralları ve kullanıcı sınır dosyası. Döngü entegrasyonu app/agent.py içindedir.
 """
 import json

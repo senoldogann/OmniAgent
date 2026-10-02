@@ -139,6 +139,7 @@ def _startup(goal: str, emit: EventSink, options: RunOptions, clients) -> Conver
     policy = agent.load_fallback_policy()
     selected, backend, announced = agent.select_initial_backend(options, clients, emit, policy)
     runtime = IntegrationRuntime(_private_emit(emit), options["should_stop"], options.get("answer"), options.get("deliver"))
+    runtime.nonblocking = options.get("run_mode") == "continuous"
     runtime.primary_backend, runtime.fallback_backends, runtime.fallback_images = selected, frozenset(policy["backends"]), policy["allow_images"]
     if announced is not None:
         runtime.announced_fallbacks.add(announced)
@@ -506,7 +507,7 @@ async def _run_conversation(goal: str, emit: EventSink, options: RunOptions, cli
                             if visual_observations else ()),
                         visual_observation=visual_observations[-1] if visual_observations else None)
                 except ConversationExhausted as error:
-                    if (screen_inspection_requested(decision.contract["subject"]) or inner is None or not inner["success"]
+                    if (decision.run_mode == "continuous" or screen_inspection_requested(decision.contract["subject"]) or inner is None or not inner["success"]
                         or (budget.token_limit is not None and budget.tokens > budget.token_limit)):
                         raise
                     completed_presentation = True

@@ -79,13 +79,13 @@ def _function_schema(
     }}
 
 
-# Sürekli görevin tek başarı yolu; host kanıtı denetleyip kullanıcıya onaylatır (bkz. agent.py).
+# Sürekli görevin tek başarı yolu; host sonucu ortak kanıt denetimine gönderir (bkz. agent.py).
 GOAL_REPORT_TOOL: str = "report_goal_met"
 GOAL_REPORT_SCHEMA: Dict[str, Any] = _function_schema(
     GOAL_REPORT_TOOL,
     "Sürekli görevde hedefe ulaşıldığını bildirir. Yalnız önceki başarılı araç çağrılarının "
-    "id'leriyle kanıtlanabiliyorsa çağır; host kanıtı denetler ve kullanıcıya onaylatır, "
-    "onaylanmazsa görev sürer.",
+    "id'leriyle kanıtlanabiliyorsa çağır; host sonucu ortak kanıt denetimine gönderir, "
+    "kullanıcıdan tamamlanma onayı beklemez.",
     {
         "summary": {"type": "string", "description": "Ulaşılan somut sonuç (tutar, hesap, bağlantı dahil)."},
         "evidence_call_ids": {

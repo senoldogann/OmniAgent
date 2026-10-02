@@ -1,4 +1,4 @@
-"""Sürekli mod: son yanıt görevi bitirmez; görev yalnız kanıt + kullanıcı onayıyla başarılı biter."""
+"""Sürekli mod: son yanıt görevi bitirmez; tamamlanma adayı kullanıcı onayı beklemeden ortak kanıt denetimine gönderilir."""
 import asyncio
 import json
 from pathlib import Path
@@ -81,7 +81,7 @@ def tool_messages(messages: List[Message]) -> str:
 
 
 @pytest.mark.asyncio
-async def test_plain_text_approval_request_opens_real_confirmation_before_next_model_turn(
+async def test_plain_text_approval_request_does_not_open_a_dialog(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = ContinuousRun([
@@ -89,9 +89,10 @@ async def test_plain_text_approval_request_opens_real_confirmation_before_next_m
         text_turn("Onay verilmedi; taslak olarak kaldı."),
     ], [{"onay": False}], 0.0)
     await session.run(tmp_path, monkeypatch, {})
-    assert len(session.questions) == 1
-    assert "Merhaba" in session.questions[0]
-    assert "ONAYLAMADI" in tool_messages(session.model_inputs[1])
+    assert session.questions == []
+    assert "Merhaba" in tool_messages(session.model_inputs[1])
+    assert not any(event["kind"] == "tool_started" and event.get("name") != "ask_user"
+                   for event in session.events)
 
 
 @pytest.mark.asyncio
@@ -108,15 +109,15 @@ async def test_continuous_loop_without_state_does_not_treat_repeated_reads_as_pr
 
 
 @pytest.mark.asyncio
-async def test_unattended_confirmation_still_reaches_user_and_never_runs_on_silence(
+async def test_continuous_confirmation_is_deferred_and_never_runs_on_silence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = ContinuousRun([
         tool_turn(call("a1", "ask_user", {"question": "Taslağı yayınlayayım mı?", "kind": "confirm"})),
     ], [{"onay": False}], 0.0)
     await session.run(tmp_path, monkeypatch, {"unattended": True})
-    assert session.questions == ["Taslağı yayınlayayım mı?"]
-    assert "ONAYLAMADI" in tool_messages(session.model_inputs[1])
+    assert session.questions == []
+    assert "Taslağı yayınlayayım mı?" in tool_messages(session.model_inputs[1])
 
 
 def test_bare_gui_actions_are_not_goal_evidence():
@@ -159,7 +160,7 @@ async def test_stopped_continuous_history_does_not_preserve_false_model_state_as
 
 
 @pytest.mark.asyncio
-async def test_final_answer_continues_until_user_confirms_proven_goal(
+async def test_final_answer_continues_until_completion_candidate_has_receipts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     product = tmp_path / "urun.md"
@@ -175,12 +176,12 @@ async def test_final_answer_continues_until_user_confirms_proven_goal(
     assert "report_goal_met" in session.schema_names
     assert any(message["role"] == "user" and str(message["content"]).startswith(CONTINUE_PROMPT)
                for message in session.model_inputs[2])
-    assert len(session.questions) == 1 and "Ürün yayında, ilk satış alındı." in session.questions[0]
+    assert session.questions == []
     assert session.events[-1]["kind"] == "run_finished" and session.events[-1]["success"]
 
 
 @pytest.mark.asyncio
-async def test_unproven_or_rejected_goal_keeps_the_run_going(
+async def test_unknown_receipts_are_rejected_before_valid_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = ContinuousRun([
@@ -189,19 +190,16 @@ async def test_unproven_or_rejected_goal_keeps_the_run_going(
         tool_turn(call("g2", "report_goal_met", {"summary": "Plan hazır.", "evidence_call_ids": ["w1"]})),
     ], [{"yanit": "Hayır: satış kanıtı yok"}], 0.0)
     report = await session.run(tmp_path, monkeypatch, {})
-    assert not report["success"]
-    assert report["reason"] == "durduruldu"
-    assert len(session.questions) == 1 and "Plan hazır." in session.questions[0]
+    assert report["success"] and report["outcome"] == "Plan hazır."
+    assert session.questions == []
     assert "başarılı bir araç çağrısı değil" in tool_messages(session.model_inputs[1])
-    rejection = tool_messages(session.model_inputs[3])
-    assert "ONAYLAMADI" in rejection and "Hayır: satış kanıtı yok" in rejection
 
 
 @pytest.mark.asyncio
-async def test_repeated_goal_report_with_same_evidence_is_not_asked_again(
+async def test_valid_candidate_ends_loop_before_repeated_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Aynı kanıtla yinelenen bildirim kullanıcıya ikinci kez sorulmaz (canlı kayıtta soruluyordu)."""
+    """Geçerli aday sonraki yinelenen model bildiriminden önce denetime döner."""
     product = tmp_path / "urun.md"
     session = ContinuousRun([
         tool_turn(call("w1", "write_file", {"path": str(product), "content": "ürün"})),
@@ -212,16 +210,16 @@ async def test_repeated_goal_report_with_same_evidence_is_not_asked_again(
     ], [{"yanit": "hayır, satış kanıtı yok"}], 0.0)
     report = await session.run(tmp_path, monkeypatch, {})
 
-    assert not report["success"]
-    assert len(session.questions) == 1
-    assert "zaten değerlendirildi" in tool_messages(session.model_inputs[3])
+    assert report["success"]
+    assert session.questions == []
+    assert len(session.model_inputs) == 2
 
 
 @pytest.mark.asyncio
-async def test_goal_report_with_new_evidence_is_asked(
+async def test_valid_candidate_does_not_wait_for_another_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Yeni başarılı çağrı içeren bildirim yine değerlendirilir; yalnız tekrar reddedilir."""
+    """Geçerli aday ikinci bir rapor için kullanıcıdan yanıt beklemez."""
     session = ContinuousRun([
         tool_turn(call("w1", "write_file", {"path": str(tmp_path / "a.md"), "content": "a"})),
         tool_turn(call("g1", "report_goal_met", {"summary": "İlk iddia.",
@@ -233,7 +231,9 @@ async def test_goal_report_with_new_evidence_is_asked(
     report = await session.run(tmp_path, monkeypatch, {})
 
     assert report["success"]
-    assert len(session.questions) == 2 and "İkinci iddia." in session.questions[1]
+    assert session.questions == []
+    assert report["outcome"] == "İlk iddia."
+    assert not (tmp_path / "b.md").exists()
 
 
 @pytest.mark.asyncio
@@ -321,7 +321,7 @@ async def test_repeated_successful_reads_exhaust_recovery_and_require_new_direct
     report = await session.run(tmp_path, monkeypatch, {})
     assert report["reason"] == "ilerleme yok: yeni yön verilmedi"
     assert report["metrics"]["turns"] < 26
-    assert len(session.questions) == 1
+    assert session.questions == []
     assert not any("HOST FAST LOOP" in str(message.get("content", ""))
                    for turn in session.model_inputs for message in turn)
     assert not any(event["kind"] == "notice" and "bütçesi baskısı" in event["text"].lower()
@@ -329,7 +329,7 @@ async def test_repeated_successful_reads_exhaust_recovery_and_require_new_direct
 
 
 @pytest.mark.asyncio
-async def test_ask_user_waits_past_timeout_and_refuses_secret_questions(
+async def test_ask_user_defers_without_waiting_and_refuses_secret_questions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(runtime_module, "APPROVAL_TIMEOUT_SECONDS", 0.05)
@@ -338,8 +338,8 @@ async def test_ask_user_waits_past_timeout_and_refuses_secret_questions(
         tool_turn(call("a2", "ask_user", {"question": "Stripe API anahtarını yazar mısın?", "kind": "text"})),
     ], [{"yanit": "TR00 0000 0000"}], 0.2)
     await session.run(tmp_path, monkeypatch, {})
-    assert session.questions == ["Ödemeler için IBAN numaran nedir?"]
-    assert "Kullanıcı yanıtı" in tool_messages(session.model_inputs[1])
+    assert session.questions == []
+    assert "Ödemeler için IBAN numaran nedir?" in tool_messages(session.model_inputs[1])
     assert "⚙ Ayarlar" in tool_messages(session.model_inputs[2])
 
 
@@ -375,7 +375,7 @@ async def test_unattended_question_is_deferred_and_btw_reaches_next_turn(
 
 
 @pytest.mark.asyncio
-async def test_unattended_proven_goal_waits_for_approve_without_model_calls(
+async def test_unattended_candidate_finishes_without_approve_or_extra_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     session = ContinuousRun([
@@ -398,10 +398,10 @@ async def test_unattended_proven_goal_waits_for_approve_without_model_calls(
 
 
 @pytest.mark.asyncio
-async def test_unattended_proven_goal_closes_when_approve_never_arrives(
+async def test_unattended_candidate_needs_no_approval_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Onay bekleyen oturum host kilidini süresiz tutmaz; sessizlik başarı değildir."""
+    """Tamamlanma adayı onay zaman aşımını beklemeden denetime döner."""
     monkeypatch.setattr(main, "GOAL_APPROVAL_TIMEOUT_SECONDS", 0.5)
     session = ContinuousRun([
         tool_turn(call("w1", "write_file", {"path": str(tmp_path / "plan.md"), "content": "plan"})),
@@ -415,12 +415,11 @@ async def test_unattended_proven_goal_closes_when_approve_never_arrives(
     report = await asyncio.wait_for(session.run(
         tmp_path, monkeypatch, {"unattended": True, "pop_control_messages": pop_controls},
     ), timeout=5)
-    assert not report["success"] and report["outcome"] == "Plan hazır."
-    assert report["reason"] == "hedef kullanıcı tarafından onaylanmadı"
+    assert report["success"] and report["outcome"] == "Plan hazır."
+    assert session.questions == []
     assert len(session.model_inputs) == 2
-    prompts: List[str] = [str(event.get("text")) for event in session.events
-                          if event["kind"] == "notice" and event.get("code") == AWAITING_APPROVAL_CODE]
-    assert len(prompts) == 1 and "/approve" in prompts[0]
+    assert not any(event.get("code") == AWAITING_APPROVAL_CODE for event in session.events)
+
 
 
 @pytest.mark.asyncio
@@ -467,15 +466,12 @@ async def test_token_cap_ends_continuous_run_with_limit_reason(
 
 
 @pytest.mark.asyncio
-async def test_continuous_mode_requires_an_interactive_channel(tmp_path: Path) -> None:
-    report = await main.run_agent_with_callback(
-        "Durmadan çalış", lambda event: None,
-        {"requested_backend": None, "should_stop": lambda: False,
-         "state_file": str(tmp_path / "memory.json"), "history": [], "run_mode": "continuous"},
-        {"ollama-cloud": object()},
-    )
-    assert not report["success"]
-    assert "Sürekli mod" in report["outcome"]
+async def test_continuous_mode_runs_without_an_interactive_channel(tmp_path, monkeypatch):
+    session = ContinuousRun([text_turn("Rapor")], [], 0.0)
+    report = await session.run(tmp_path, monkeypatch, {"answer": None})
+    assert report["reason"] == "durduruldu"
+    assert len(session.model_inputs) == 2
+    assert session.questions == []
 
 
 def test_context_window_keeps_goal_and_newest_turns_at_turn_boundaries() -> None:

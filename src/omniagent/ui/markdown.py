@@ -164,6 +164,8 @@ def parse_blocks(text: str) -> List[Block]:
             blocks.append(_block("list_item", " " * len(item.group(1)) + prefix + " " + item.group(3)))
         elif quote:
             blocks.append(_block("quote", "│ " + quote.group(1)))
+        elif re.match(r"^Kaynak \d+:\s", line):
+            blocks.append(_block("heading", line, 3))
         else:
             blocks.append(_block("paragraph", line))
         index += 1
@@ -234,6 +236,12 @@ def render_markdown(text: str, max_columns: int) -> List[Part]:
         else:
             tag = f"md_h{block['level']}" if kind == "heading" else {"list_item": "md_bullet", "quote": "md_quote"}.get(kind)
             tags = base + ((tag,) if tag else ())
+            if kind == "list_item" and block["spans"]:
+                first = block["spans"][0]
+                marker = re.match(r"^(\s*(?:•|\d+[.)])\s+)(.*)$", first["text"])
+                if marker:
+                    parts.append((marker.group(1), tags + ("md_list_marker",)))
+                    block["spans"][0] = {**first, "text": marker.group(2)}
             for span in block["spans"]:
                 span_tags = tags + ((f"md_{span['style']}",) if span["style"] != "plain" else ())
                 if span.get("url", "").startswith(("https://", "http://")):

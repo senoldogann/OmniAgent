@@ -41,8 +41,8 @@ CODE_TEXT: str = "#E8846B"
 MONO_FAMILY: str = "Menlo"
 # Görünüm ayarındaki varsayılan yazı boyutu; transkript boyutları bu tabana göre kayar.
 BASE_FONT_SIZE: int = 13
-# Asistan metni ve kullanıcı kabarcığı (okunan asıl içerik) arayüz metninden iki punto büyüktür.
-READING_SIZE: int = 15
+# Asistan metni ve kullanıcı kabarcığı (okunan asıl içerik) arayüz metninden üç punto büyüktür.
+READING_SIZE: int = 16
 
 # --- Yerleşim ---
 # İçerik sütunu en çok bu kadar geniş olur ve pencerede ortalanır.
@@ -172,9 +172,9 @@ def transcript_tag_styles(ui_family: str, delta: int) -> Dict[str, TagStyle]:
         "notice_warning": {"foreground": WARNING, "font": mono(12, "normal"), "spacing1": 3},
         "notice_error": {"foreground": ERROR, "font": mono(12, "normal"), "spacing1": 3},
         # --- Markdown ---
-        "md_h1": {"font": ui(22, "bold"), "spacing1": 16, "spacing3": 6},
-        "md_h2": {"font": ui(19, "bold"), "spacing1": 14, "spacing3": 4},
-        "md_h3": {"font": ui(16, "bold"), "spacing1": 10, "spacing3": 3},
+        "md_h1": {"foreground": TEXT, "font": ui(25, "bold"), "spacing1": 20, "spacing3": 10},
+        "md_h2": {"foreground": TEXT, "font": ui(21, "bold"), "spacing1": 18, "spacing3": 8},
+        "md_h3": {"foreground": SHINE, "font": ui(18, "bold"), "spacing1": 14, "spacing3": 6},
         "md_bold": {"font": ui(READING_SIZE, "bold")},
         "md_italic": {"font": ui(READING_SIZE, "italic")},
         "md_code": {"font": mono(13, "normal"), "background": SURFACE_RAISED, "foreground": CODE_TEXT},
@@ -183,7 +183,8 @@ def transcript_tag_styles(ui_family: str, delta: int) -> Dict[str, TagStyle]:
                          "spacing1": 1, "spacing2": 2, "spacing3": 1},
         "md_codeblock_first": {"spacing1": 9},
         "md_codeblock_last": {"spacing3": 9},
-        "md_bullet": {"lmargin2": 16},
+        "md_bullet": {"lmargin1": 8, "lmargin2": 30, "spacing1": 5, "spacing3": 5},
+        "md_list_marker": {"font": ui(READING_SIZE, "bold"), "foreground": ACCENT},
         "md_quote": {"foreground": TEXT_DIM, "lmargin1": 12, "lmargin2": 12},
         "md_rule": {"foreground": BORDER},
         "md_table": {"font": mono(12, "normal")},
